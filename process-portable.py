@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.2.0"
+PORTABLE_VERSION = "2.2.1"
 
 import argparse
 import difflib
@@ -119,7 +119,6 @@ DEFAULT_CONFIG = {
     "trope_map_threshold": 0.78,  # cosine threshold for catalog mapping
     "trope_map_cache": "trope-vectors.json",  # cached catalog embeddings
     "v2_prompt_cache": False,  # put chapter first for llama.cpp KV cache reuse
-    "v2_roster_prepass": False,  # build roster from full-book name scan (parallel Call A)
     "pipeline": "legacy",  # or "v2": chapter-level map/reduce (--pipeline v2)
     "v2_max_chapter_chars": 16000,  # ~4k tokens; keep well under your
     # server's context window minus prompt (~1k) minus output (~3k)
@@ -729,75 +728,6 @@ def v2_call_a(call, roster, chapter, n_chapters):
 
 V2_SHARED_SYSTEM = "You are a book analysis assistant. Return only valid JSON. No commentary, no markdown."
 
-
-V2_PREPASS_PROMPT = """You are building a character roster for a book. Below are the most frequent capitalized names found in the text, with example context lines.
-
-Merge aliases (same person, different names) and assign a role to each. Return ONLY valid JSON.
-
-{
-  "characters": [
-    {"name": "canonical full name", "aliases": ["other names for this person"],
-     "role": "protagonist|antagonist|supporting|minor",
-     "description": "one-line description"}
-  ]
-}
-
-RULES:
-1. Merge obvious aliases: "Violet", "Violet Sorrengail", "Violence" (nickname) are one person.
-2. Do NOT merge distinct people who share a first name or title.
-3. Skip non-persons (places, objects, titles like "General" alone).
-4. Keep at most 40 characters; drop the least important.
-
-Names and context:
-{names}
-"""
-
-
-def v2_roster_prepass(call, full_text):
-    """Build a character roster from a full-book capitalized-name scan.
-
-    Returns a roster dict compatible with the sequential builder
-    (name -> {name, aliases, appearances, chapters, roles, descriptions}).
-    One LLM call. Experimental.
-    """
-    import re
-    from collections import Counter
-    # Count capitalized words not at sentence start.
-    counts = Counter()
-    contexts = {}
-    for m in re.finditer(r"(?<![.!?]\s)(?<![.!?]\s\")[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}", full_text):
-        name = m.group(0).strip()
-        if len(name) < 3:
-            continue
-        counts[name] += 1
-        if name not in contexts:
-            start = max(0, m.start() - 120)
-            contexts[name] = full_text[start:m.end() + 80].replace("\n", " ")
-    top = counts.most_common(60)
-    if not top:
-        return {}
-    name_block = "\n".join(
-        f"- {name} ({count}x): ...{contexts[name]}..."
-        for name, count in top)
-    prompt = V2_PREPASS_PROMPT.replace("{names}", name_block)
-    out = _run_task(call, V2_SHARED_SYSTEM, prompt, 1, 1,
-                    "v2-roster-prepass", sanitize_fn=lambda r: r if isinstance(r, dict) else None)
-    if not out or not isinstance(out.get("characters"), list):
-        print("  (pre-pass failed, falling back to sequential)")
-        return None
-    roster = {}
-    for c in out["characters"][:40]:
-        name = _s(c.get("name"), 120)
-        if not name:
-            continue
-        nkey = norm_name(name)
-        roster[nkey] = {"name": name, "aliases": set(_s(a, 120) for a in _list(c.get("aliases"))),
-                        "alias_keys": {nkey}, "primary_keys": {nkey},
-                        "appearances": counts.get(name, 0), "last_seen": 0,
-                        "chapters": set(), "roles": Counter({_s(c.get("role"), 30): 1}),
-                        "descriptions": [_s(c.get("description"), 500)]}
-    print(f"  Pre-pass roster: {len(roster)} characters")
-    return roster
 
 
 def _v2_call_a_inner(call, roster, chapter, n_chapters):
@@ -2409,47 +2339,21 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     call = backends.get(CONFIG["llm"], llm_ollama)
     batch_size = max(1, CONFIG.get("batch_size", BATCH_SIZE))
 
-    # Pass 1: Call A (sequential by default; parallel with --roster-prepass).
+    # Pass 1: Call A sequential (roster must see chapters in order).
     roster, chapter_as = {}, {}
     a_ok = a_failed = a_fallback = 0
-    use_prepass = CONFIG.get("v2_roster_prepass")
-    if use_prepass:
-        full_text = "\n\n".join(ch["text"] for _, ch in indexed)
-        roster = v2_roster_prepass(call, full_text)
-        if roster is None:
-            roster = {}  # pre-pass failed; fall back to sequential
-            use_prepass = False
-    if use_prepass:
-        # Parallel Call A with pre-built roster (no ordering dependency).
-        import concurrent.futures
-        print(f"  Call A parallel (pre-pass roster, {len(roster)} chars)...")
-        def _do_a(args):
-            i, ch = args
-            a, fell_back = v2_call_a(call, roster, ch, n)
-            return i, a, fell_back
-        with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as ex:
-            for i, a, fell_back in ex.map(_do_a, indexed):
-                chapter_as[i] = a
-                if a is None:
-                    a_failed += 1
-                else:
-                    a_ok += 1
-                    if fell_back:
-                        a_fallback += 1
-        print(f"  Call A done: {a_ok} ok, {a_failed} failed")
-    else:
-        for i, ch in indexed:
-            print(f"  Chapter {i}/{n} (A)...", end=" ", flush=True)
-            a, fell_back = v2_call_a(call, roster, ch, n)
-            chapter_as[i] = a
-            if a is None:
-                a_failed += 1
-                print("FAILED")
-            else:
-                a_ok += 1
-                if fell_back:
-                    a_fallback += 1
-                print("done" + (" (simple)" if fell_back else ""))
+    for i, ch in indexed:
+        print(f"  Chapter {i}/{n} (A)...", end=" ", flush=True)
+        a, fell_back = v2_call_a(call, roster, ch, n)
+        chapter_as[i] = a
+        if a is None:
+            a_failed += 1
+            print("FAILED")
+        else:
+            a_ok += 1
+            if fell_back:
+                a_fallback += 1
+            print("done" + (" (simple)" if fell_back else ""))
 
     # Pass 2: Call B parallel (independent per chapter).
     chapter_bs = {}
@@ -2990,19 +2894,12 @@ def main():
     ap.add_argument("--trope-map", metavar="PREVIEW_JSON",
                     help="map a preview file's tropes to the Cozy Libram catalog "
                          "via embeddings; writes a review JSON, nothing to Supabase")
-    ap.add_argument("--roster-prepass", action="store_true",
-                    help="v2: build character roster from a full-book name scan "
-                         "instead of sequential per-chapter discovery (experimental; "
-                         "allows parallel Call A)")
     args = ap.parse_args()
 
     if args.trope_map:
         load_config()
         cmd_trope_map(args.trope_map)
         return
-
-    if args.roster_prepass:
-        CONFIG["v2_roster_prepass"] = True
 
     if args.llm:
         CONFIG["llm"] = args.llm
