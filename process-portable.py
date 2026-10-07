@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.0.7"
+PORTABLE_VERSION = "2.0.8"
 
 import argparse
 import difflib
@@ -2212,14 +2212,32 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     red = v2_reduce(chapter_as, chapter_bs, roster,
                     [ch for _, ch in indexed])
 
-    # Trope confirmation gate (one LLM call, skipped in dry-run).
+    # Trope confirmation: frequency tiers, LLM gate only for the borderline.
+    # - 5+ chapters: auto-confirm (a recurring pattern is a trope).
+    # - 2-4 chapters: LLM gate judges against summaries.
+    # - 1 chapter: drop (not a book-level trope).
     tropes, trope_conf = [], {}
     if not dry_run and red["trope_candidates"]:
-        print(f"  Trope gate: {len(red['trope_candidates'])} candidates...",
-              end=" ", flush=True)
-        tropes, trope_conf = v2_trope_gate(
-            call, red["chapter_summaries"], red["trope_candidates"],
-            red["trope_candidate_counts"])
+        counts = red["trope_candidate_counts"]
+        auto, gated, dropped = [], [], 0
+        for c in red["trope_candidates"]:
+            n = counts.get(_tnorm(c), 1)
+            if n >= 5:
+                auto.append(c)
+            elif n >= 2:
+                gated.append(c)
+            else:
+                dropped += 1
+        print(f"  Tropes: {len(auto)} auto (5+ ch), {len(gated)} to gate, "
+              f"{dropped} single-ch dropped...", end=" ", flush=True)
+        for c in auto:
+            tropes.append(c)
+            trope_conf[c] = round(min(0.9, 0.55 + 0.1 * counts.get(_tnorm(c), 5)), 2)
+        if gated:
+            g_tropes, g_conf = v2_trope_gate(
+                call, red["chapter_summaries"], gated, counts)
+            tropes.extend(g_tropes)
+            trope_conf.update(g_conf)
         print(f"{len(tropes)} confirmed")
     red["tropes"] = tropes
     red["trope_confidence"] = trope_conf
