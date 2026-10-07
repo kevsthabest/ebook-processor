@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.2.3"
+PORTABLE_VERSION = "2.3.0"
 
 import argparse
 import difflib
@@ -128,7 +128,8 @@ DEFAULT_CONFIG = {
 # Config keys that must be int (env overrides arrive as strings).
 _INT_CONFIG_KEYS = {"sample_rate", "sample_edges", "batch_size", "llm_max_tokens"}
 # Config keys that are bools (EBOOK_DEDUPE=false must not be truthy).
-_BOOL_CONFIG_KEYS = {"debug", "dedupe"}
+_BOOL_CONFIG_KEYS = {"debug", "dedupe", "llm_enable_thinking", "llm_json_schema",
+                     "v2_prompt_cache"}
 
 
 def load_config():
@@ -373,8 +374,8 @@ def extract_epub_text(epub_path):
 # --- Chapter splitter (v2 pipeline; legacy chunking untouched) ---
 # Front/back-matter heuristic, matched against the spine filename.
 _SKIP_UNIT_RE = re.compile(
-    r"copyright|toc|table.?of.?contents|dedication|acknowledg|also.?by|"
-    r"about.?(the.?)?author|title.?page|\bcover\b|\bnav\b", re.IGNORECASE)
+    r"copyright|(?<![a-z])toc(?![a-z])|table.?of.?contents|dedication|acknowledg|also.?by|"
+    r"about.?(the.?)?author|title.?page|cover|\bnav\b", re.IGNORECASE)
 
 MIN_CHAPTER_CHARS = 1500   # smaller units merge into the next one
 MAX_CHAPTER_CHARS = 16000  # ~4k tokens; must leave room in the context window
@@ -851,7 +852,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
     characters = []
     for e in sorted(roster.values(), key=lambda x: -x["appearances"]):
         n_ch = len(e.get("chapters", set()))
-        if not (_is_proper(e["name"]) or n_ch >= 3):
+        # Keep proper names (2+ chapters in long books) or 3+ chapter appearances.
+        min_ch = 2 if n > 30 else 1
+        if not ((_is_proper(e["name"]) and n_ch >= min_ch) or n_ch >= 3):
             continue
         role = e["roles"].most_common(1)[0][0] if e["roles"] else None
         desc = max(e["descriptions"], key=len) if e["descriptions"] else ""
@@ -945,6 +948,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
     povs = sorted(p for p, c in pov_counts.items() if c >= threshold)
 
     # --- Trope candidates: union across chapters (gate runs separately) ---
+    # Map to catalog IDs via embeddings when available, so paraphrases
+    # ("enemies to lovers" vs "enemies-to-lovers dynamic") collapse before
+    # tiering. Falls back to text normalization if embeddings unavailable.
     trope_candidates = []
     trope_counts = Counter()
     seen_t = set()
@@ -960,6 +966,52 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
             if k not in seen_t:
                 seen_t.add(k)
                 trope_candidates.append(_clean_trope(t))
+    # Catalog mapping: collapse paraphrases to catalog IDs before tiering.
+    catalog_map = {}  # _tnorm(candidate) -> catalog_id (or None if unmapped)
+    if trope_candidates and CONFIG.get("embed_url"):
+        try:
+            catalog = trope_catalog_vectors()
+            if catalog:
+                threshold = CONFIG.get("trope_map_threshold", 0.78)
+                vecs = embed_vectors(CONFIG["embed_url"],
+                                     CONFIG.get("embed_model", ""),
+                                     trope_candidates)
+                for name, vec in zip(trope_candidates, vecs):
+                    best_id, best_sim = None, -1
+                    for cid, cname, cvec in catalog:
+                        sim = _cosine(vec, cvec)
+                        if sim > best_sim:
+                            best_id, best_sim = cid, sim
+                    catalog_map[_tnorm(name)] = best_id if best_sim >= threshold else None
+                # Re-count chapters per catalog ID (or original key if unmapped).
+                new_counts, new_candidates, new_seen = Counter(), [], set()
+                key_to_display = {}
+                for idx in sorted(chapter_bs):
+                    b = chapter_bs[idx]
+                    if not b:
+                        continue
+                    for t in b["trope_candidates"]:
+                        k = _tnorm(t)
+                        if not k:
+                            continue
+                        cid = catalog_map.get(k)
+                        key = f"catalog:{cid}" if cid else k
+                        new_counts[key] += 1
+                        if key not in new_seen:
+                            new_seen.add(key)
+                            # Display the catalog name for mapped, original for unmapped.
+                            disp = next((cn for ci, cn, _ in catalog if ci == cid), None) if cid else None
+                            new_candidates.append(disp or _clean_trope(t))
+                            key_to_display[key] = disp or _clean_trope(t)
+                # Swap in the catalog-collapsed counts (keep display names).
+                trope_candidates = new_candidates
+                trope_counts = new_counts
+                print(f"  Trope catalog mapping: {sum(1 for v in catalog_map.values() if v)} "
+                      f"mapped, {sum(1 for v in catalog_map.values() if not v)} unmapped")
+        except Exception as e:
+            print(f"  (catalog mapping skipped: {e})")
+    # Stash the mapping for write_claims.
+    red_catalog_map = {k: v for k, v in catalog_map.items() if v}
 
     # --- Quotes: verified, spread across chapters ---
     all_quotes = []
@@ -990,6 +1042,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         "povs": povs,
         "trope_candidates": trope_candidates,
         "trope_candidate_counts": dict(trope_counts),
+        "trope_catalog_map": red_catalog_map,
         "tropes": [],  # filled by the trope gate
         "trope_confidence": {},
         "quotes": quotes,
@@ -2061,8 +2114,8 @@ def write_claims(work_id, result, trope_mappings=None):
     """Insert only what is not already there. Returns the number of failed operations.
 
     trope_mappings: optional dict {pipeline_trope_name: catalog_id} from
-    embedding-based mapping. Falls back to _trope_lookup (exact match) when
-    not provided. Unmapped tropes go to trope_proposals.
+    embedding-based mapping. Falls back to result["trope_catalog_map"], then
+    _trope_lookup (exact match). Unmapped tropes go to trope_proposals.
     """
     errors = 0
     _models = {"ollama": CONFIG["ollama_model"], "openrouter": CONFIG["openrouter_model"],
@@ -2070,6 +2123,10 @@ def write_claims(work_id, result, trope_mappings=None):
     model = _models.get(CONFIG["llm"], "")
     conf_t = result.get("trope_confidence", {})
     wrote = {"tropes": 0, "triggers": 0, "characters": 0, "proposals": 0}
+    # Merge explicit mappings with the in-pipeline catalog map.
+    _cat = dict(result.get("trope_catalog_map", {}) or {})
+    if trope_mappings:
+        _cat.update({_tnorm(k): v for k, v in trope_mappings.items()})
     unmatched = []
 
     # Tropes (embedding-mapped when available, else exact lookup)
@@ -2079,9 +2136,10 @@ def write_claims(work_id, result, trope_mappings=None):
     else:
         rows, used = [], set(seen)
         for t in result["tropes"]:
-            if trope_mappings and t in trope_mappings:
+            tid = _cat.get(_tnorm(t))
+            if tid is None and trope_mappings and t in trope_mappings:
                 tid = trope_mappings[t]
-            else:
+            if tid is None:
                 tid = _trope_lookup(t)
             if tid is None:
                 unmatched.append(t)
@@ -2452,8 +2510,16 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     batch_size = max(1, CONFIG.get("batch_size", BATCH_SIZE))
 
     # Pass 1: Call A sequential (roster must see chapters in order).
-    roster, chapter_as = {}, {}
+    # When v2_prompt_cache is on, submit B(i) right after A(i) so the
+    # chapter's KV cache is still hot (interleaved, B on worker threads).
+    roster, chapter_as, chapter_bs = {}, {}, {}
     a_ok = a_failed = a_fallback = 0
+    b_ok = b_failed = 0
+    interleave = CONFIG.get("v2_prompt_cache") and batch_size > 1
+    b_futs = {}
+    if interleave:
+        from concurrent.futures import ThreadPoolExecutor
+        b_pool = ThreadPoolExecutor(max_workers=batch_size)
     for i, ch in indexed:
         print(f"  Chapter {i}/{n} (A)...", end=" ", flush=True)
         a, fell_back = v2_call_a(call, roster, ch, n)
@@ -2466,40 +2532,56 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             if fell_back:
                 a_fallback += 1
             print("done" + (" (simple)" if fell_back else ""))
-
-    # Pass 2: Call B parallel (independent per chapter).
-    chapter_bs = {}
-    b_ok = b_failed = 0
-    if batch_size > 1:
-        print(f"  Batching {batch_size} parallel content calls...")
-        with ThreadPoolExecutor(max_workers=batch_size) as ex:
-            futs = {ex.submit(v2_call_b, call, ch, n): i for i, ch in indexed}
-            done_count = 0
-            for fut in as_completed(futs):
-                i = futs[fut]
-                b = fut.result()
-                chapter_bs[i] = b
-                done_count += 1
-                if b is None:
-                    b_failed += 1
-                else:
-                    b_ok += 1
-                print(f"\r  Content: {done_count}/{n} done", end="", flush=True)
-        print()
-    else:
-        for i, ch in indexed:
-            print(f"  Chapter {i}/{n} (B)...", end=" ", flush=True)
-            b = v2_call_b(call, ch, n)
+        if interleave:
+            b_futs[b_pool.submit(v2_call_b, call, ch, n)] = i
+    if interleave:
+        from concurrent.futures import as_completed
+        done_count = 0
+        for fut in as_completed(b_futs):
+            i = b_futs[fut]
+            b = fut.result()
             chapter_bs[i] = b
+            done_count += 1
             if b is None:
                 b_failed += 1
-                print("FAILED")
             else:
                 b_ok += 1
-                print("done")
+            print(f"\r  Content: {done_count}/{n} done", end="", flush=True)
+        print()
+        b_pool.shutdown()
+
+    # Pass 2: Call B parallel (independent per chapter; skipped if interleaved).
+    if not interleave:
+        if batch_size > 1:
+            print(f"  Batching {batch_size} parallel content calls...")
+            with ThreadPoolExecutor(max_workers=batch_size) as ex:
+                futs = {ex.submit(v2_call_b, call, ch, n): i for i, ch in indexed}
+                done_count = 0
+                for fut in as_completed(futs):
+                    i = futs[fut]
+                    b = fut.result()
+                    chapter_bs[i] = b
+                    done_count += 1
+                    if b is None:
+                        b_failed += 1
+                    else:
+                        b_ok += 1
+                    print(f"\r  Content: {done_count}/{n} done", end="", flush=True)
+            print()
+        else:
+            for i, ch in indexed:
+                print(f"  Chapter {i}/{n} (B)...", end=" ", flush=True)
+                b = v2_call_b(call, ch, n)
+                chapter_bs[i] = b
+                if b is None:
+                    b_failed += 1
+                    print("FAILED")
+                else:
+                    b_ok += 1
+                    print("done")
 
     failed = a_failed + b_failed
-    aborted = (a_ok == 0 and b_ok == 0) or failed / max(n, 1) > MAX_FAILED_CHUNK_RATIO
+    aborted = (a_ok == 0 and b_ok == 0) or failed / max(2 * n, 1) > MAX_FAILED_CHUNK_RATIO
     if aborted:
         print(f"  {failed}/{2 * n} calls failed; not writing partial results")
 
@@ -2514,20 +2596,23 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     tropes, trope_conf = [], {}
     if not dry_run and red["trope_candidates"]:
         counts = red["trope_candidate_counts"]
+        # Scale thresholds with book length.
+        auto_min = max(3, n // 20)  # 5% of chapters, min 3
+        drop_single = n >= 20  # only drop single-chapter tropes in long books
         auto, gated, dropped = [], [], 0
         for c in red["trope_candidates"]:
-            n = counts.get(_tnorm(c), 1)
-            if n >= 5:
+            n_ch = counts.get(_tnorm(c), 1)
+            if n_ch >= auto_min:
                 auto.append(c)
-            elif n >= 2:
+            elif n_ch >= 2 or not drop_single:
                 gated.append(c)
             else:
                 dropped += 1
-        print(f"  Tropes: {len(auto)} auto (5+ ch), {len(gated)} to gate, "
+        print(f"  Tropes: {len(auto)} auto ({auto_min}+ ch), {len(gated)} to gate, "
               f"{dropped} single-ch dropped...", end=" ", flush=True)
         for c in auto:
             tropes.append(c)
-            trope_conf[c] = round(min(0.9, 0.55 + 0.1 * counts.get(_tnorm(c), 5)), 2)
+            trope_conf[c] = round(min(0.9, 0.55 + 0.1 * counts.get(_tnorm(c), auto_min)), 2)
         if gated:
             g_tropes, g_conf = v2_trope_gate(
                 call, red["chapter_summaries"], gated, counts)
