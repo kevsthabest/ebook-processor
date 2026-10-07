@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.1.0"
+PORTABLE_VERSION = "2.1.1"
 
 import argparse
 import difflib
@@ -1915,24 +1915,32 @@ def _trope_lookup(name):
     return rows[0]["id"] if rows else None
 
 
-def write_claims(work_id, result):
-    """Insert only what is not already there. Returns the number of failed operations."""
+def write_claims(work_id, result, trope_mappings=None):
+    """Insert only what is not already there. Returns the number of failed operations.
+
+    trope_mappings: optional dict {pipeline_trope_name: catalog_id} from
+    embedding-based mapping. Falls back to _trope_lookup (exact match) when
+    not provided. Unmapped tropes go to trope_proposals.
+    """
     errors = 0
     _models = {"ollama": CONFIG["ollama_model"], "openrouter": CONFIG["openrouter_model"],
                "openai": CONFIG.get("openai_model", "")}
     model = _models.get(CONFIG["llm"], "")
     conf_t = result.get("trope_confidence", {})
-    wrote = {"tropes": 0, "triggers": 0, "characters": 0}
+    wrote = {"tropes": 0, "triggers": 0, "characters": 0, "proposals": 0}
     unmatched = []
 
-    # Tropes
+    # Tropes (embedding-mapped when available, else exact lookup)
     seen = _existing("book_trope_claims", "trope_id", work_id)
     if seen is None:
         errors += 1
     else:
         rows, used = [], set(seen)
         for t in result["tropes"]:
-            tid = _trope_lookup(t)
+            if trope_mappings and t in trope_mappings:
+                tid = trope_mappings[t]
+            else:
+                tid = _trope_lookup(t)
             if tid is None:
                 unmatched.append(t)
                 continue
@@ -1940,13 +1948,34 @@ def write_claims(work_id, result):
                 continue
             used.add(str(tid).lower())
             rows.append({"work_id": work_id, "trope_id": tid, "status": "candidate",
-                         "confidence": conf_t.get(_tnorm(t), 0.7), "source_type": "import",
+                         "confidence": conf_t.get(_tnorm(t), 0.7),
+                         "source_type": "ebook-processor",
                          "model": model, "evidence": {"source": "ebook-extraction"}})
         if rows:
             if sb("book_trope_claims", method="POST", data=rows) is None:
                 errors += 1
             else:
                 wrote["tropes"] = len(rows)
+
+    # Unmapped tropes -> trope_proposals (with book provenance)
+    if unmatched:
+        seen_prop = sb("trope_proposals", params="?select=name_key&limit=1000") or []
+        seen_keys = {r["name_key"] for r in seen_prop}
+        prop_rows = []
+        for t in unmatched:
+            key = _tnorm(t)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            prop_rows.append({"name": t, "name_key": key,
+                              "description": f"Detected by ebook processor in '{result.get('title', '')}'.",
+                              "book_key": result.get("isbn") or result.get("title", ""),
+                              "status": "pending"})
+        if prop_rows:
+            if sb("trope_proposals", method="POST", data=prop_rows) is None:
+                errors += 1
+            else:
+                wrote["proposals"] = len(prop_rows)
 
     # Triggers
     seen = _existing("book_trigger_claims", "warning", work_id)
@@ -1955,14 +1984,18 @@ def write_claims(work_id, result):
     else:
         rows = []
         for t in result["triggers"]:
-            if t["warning"].lower() in seen:
+            warn = t["warning"] if isinstance(t, dict) else t
+            if str(warn).lower() in seen:
                 continue
-            seen.add(t["warning"].lower())
-            rows.append({"work_id": work_id, "warning": t["warning"], "status": "candidate",
-                         "confidence": t.get("confidence", 0.7), "source_type": "import",
+            seen.add(str(warn).lower())
+            td = t if isinstance(t, dict) else {}
+            rows.append({"work_id": work_id, "warning": warn, "status": "candidate",
+                         "confidence": td.get("confidence", 0.7),
+                         "source_type": "ebook-processor",
+                         "model": model,
                          "evidence": {"source": "ebook-extraction",
-                                      "detail": t.get("detail", ""),
-                                      "spoiler": t.get("spoiler", False)}})
+                                      "severity": td.get("severity", ""),
+                                      "chapters": td.get("chapters", [])}})
         if rows:
             if sb("book_trigger_claims", method="POST", data=rows) is None:
                 errors += 1
@@ -1985,18 +2018,45 @@ def write_claims(work_id, result):
             rows.append({"work_id": work_id, "name": c["name"], "role": c["role"],
                          "description": c.get("description", ""),
                          "relationships": rel_map.get(c["name"].lower(), []),
-                         "source_type": "import", "confidence": c.get("confidence", 0.7)})
+                         "source_type": "ebook-processor",
+                         "confidence": c.get("confidence", 0.7)})
         if rows:
             if sb("book_characters", method="POST", data=rows) is None:
                 errors += 1
             else:
                 wrote["characters"] = len(rows)
 
+    # Spice -> works.spice_detected
+    spice = result.get("spice_level")
+    if spice is not None:
+        r = sb("works", method="PATCH", params=f"?id=eq.{work_id}",
+               data={"spice_detected": spice})
+        if r is None:
+            errors += 1
+
+    # POVs, quotes -> book_meta.data (merge with existing)
+    meta_updates = {}
+    if result.get("povs"):
+        meta_updates["povs"] = result["povs"]
+    quotes = [{"text": q["text"], "chapter": q.get("chapter", "")}
+              for q in result.get("quotes", []) if q.get("text")]
+    if quotes:
+        meta_updates["notable_quotes"] = quotes[:20]  # cap at 20
+    if meta_updates:
+        isbn = result.get("isbn")
+        if isbn:
+            existing = sb("book_meta", params=f"?isbn=eq.{isbn}&select=data")
+            merged = dict(existing[0]["data"]) if existing and existing[0].get("data") else {}
+            merged.update(meta_updates)
+            # POST with upsert
+            r = sb("book_meta", method="POST",
+                   params="?on_conflict=isbn",
+                   data={"isbn": isbn, "data": merged})
+            if r is None:
+                errors += 1
+
     print(f"  Wrote {wrote['tropes']} tropes, {wrote['triggers']} triggers, "
-          f"{wrote['characters']} characters (new rows only)")
-    if unmatched:
-        print(f"  {len(unmatched)} tropes not in tropes table: {', '.join(unmatched[:8])}"
-              f"{'...' if len(unmatched) > 8 else ''}")
+          f"{wrote['characters']} characters, {wrote['proposals']} proposals (new rows only)")
     return errors
 
 
