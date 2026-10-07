@@ -1,0 +1,1 @@
+{"_comment":"Copy to config.json and fill in your values","import_dir":"./import","llm":"ollama","ollama_host":"http://localhost:11434","ollama_model":"qwen2.5-coder:7b","openrouter_key":"","openrouter_model":"qwen/qwen3-27b","supabase_key":"YOUR_SUPABASE_SERVICE_OR_ANON_KEY_HERE","supabase_url":"https://dvhimjkrroxuatthiizc.supabase.co"}

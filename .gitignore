@@ -1,0 +1,9 @@
+# Secrets — copy config.example.json to config.json, never commit the real one
+config.json
+
+# Runtime state
+preview/
+__pycache__/
+*.pyc
+import/done/
+import/failed/
