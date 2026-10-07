@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.2.1"
+PORTABLE_VERSION = "2.2.2"
 
 import argparse
 import difflib
@@ -1729,6 +1729,92 @@ def trope_catalog_vectors():
             for r in rows if r["id"] in cached]
 
 
+def cmd_validate(preview_path):
+    """Run automated quality checks on a preview JSON. Prints a report."""
+    import os
+    from collections import Counter
+    d = json.load(open(preview_path, encoding="utf-8"))
+    issues, notes = [], []
+    chars = d.get("characters", [])
+    tropes = d.get("tropes", [])
+    triggers = d.get("triggers", [])
+    ver = d.get("verification", {})
+
+    # --- Bad merge detection: A's aliases contain B's canonical name ---
+    names = {c["name"].lower(): c["name"] for c in chars}
+    for c in chars:
+        for alias in c.get("aliases", []):
+            al = alias.lower()
+            if al in names and names[al] != c["name"]:
+                issues.append(f"BAD MERGE: '{c['name']}' claims alias '{alias}' "
+                              f"which is also a standalone character")
+
+    # --- Suspicious shared surnames (hallucinated last names) ---
+    surnames = Counter()
+    for c in chars:
+        parts = c["name"].split()
+        if len(parts) >= 2:
+            surnames[parts[-1].lower()] += 1
+    for surname, count in surnames.most_common():
+        if count >= 3 and len(surname) > 3:
+            # Check if it's a known family name (shared legitimately)
+            issues.append(f"SUSPICIOUS SURNAME: '{surname}' on {count} characters "
+                          f"(possible hallucinated last name)")
+
+    # --- Generic/noise characters ---
+    generic = [c["name"] for c in chars
+               if not _is_proper(c["name"]) or c.get("appearances", 0) <= 1]
+    if generic:
+        notes.append(f"{len(generic)} generic/low-appearance characters: "
+                     f"{', '.join(generic[:8])}{'...' if len(generic) > 8 else ''}")
+
+    # --- POVs ---
+    povs = d.get("povs", [])
+    notes.append(f"POVs ({len(povs)}): {', '.join(povs) if povs else 'none'}")
+
+    # --- Tropes ---
+    notes.append(f"Tropes ({len(tropes)}): {', '.join(tropes[:10])}"
+                 f"{'...' if len(tropes) > 10 else ''}")
+    long_tropes = [t for t in tropes if len(t.split()) > 4]
+    if long_tropes:
+        issues.append(f"PLOT-SUMMARY TROPES (not reusable patterns): {long_tropes[:5]}")
+
+    # --- Verification rates ---
+    checked = ver.get("evidence_checked", 0)
+    verified = ver.get("evidence_verified", 0)
+    rate = f"{100*verified//checked}%" if checked else "n/a"
+    notes.append(f"Evidence: {verified}/{checked} verified ({rate})")
+    if checked and verified / checked < 0.4:
+        issues.append(f"LOW VERIFICATION RATE ({rate}) — model may be paraphrasing")
+
+    # --- Triggers ---
+    trig_list = triggers if isinstance(triggers, list) else []
+    no_evidence = [t.get("warning") for t in trig_list
+                   if isinstance(t, dict) and t.get("severity") in ("on_page", "graphic")
+                   and not t.get("evidence")]
+    if no_evidence:
+        issues.append(f"TRIGGERS WITHOUT EVIDENCE: {no_evidence[:5]}")
+
+    # --- Spice ---
+    notes.append(f"Spice: {d.get('spice_level', 'n/a')}/5")
+
+    # --- Report ---
+    print(f"\n=== Validation: {os.path.basename(preview_path)} ===")
+    print(f"Characters: {len(chars)}, Tropes: {len(tropes)}, "
+          f"Triggers: {len(trig_list)}")
+    if issues:
+        print(f"\nISSUES ({len(issues)}):")
+        for i in issues:
+            print(f"  ! {i}")
+    else:
+        print("\nNo issues detected.")
+    if notes:
+        print(f"\nNOTES:")
+        for n_ in notes:
+            print(f"  - {n_}")
+    print()
+
+
 def cmd_trope_map(preview_path):
     """Map a preview JSON's tropes to the catalog. Writes a review JSON;
     nothing is written to Supabase."""
@@ -2894,11 +2980,18 @@ def main():
     ap.add_argument("--trope-map", metavar="PREVIEW_JSON",
                     help="map a preview file's tropes to the Cozy Libram catalog "
                          "via embeddings; writes a review JSON, nothing to Supabase")
+    ap.add_argument("--validate", metavar="PREVIEW_JSON",
+                    help="run automated quality checks on a preview file")
     args = ap.parse_args()
 
     if args.trope_map:
         load_config()
         cmd_trope_map(args.trope_map)
+        return
+
+    if args.validate:
+        load_config()
+        cmd_validate(args.validate)
         return
 
     if args.llm:
