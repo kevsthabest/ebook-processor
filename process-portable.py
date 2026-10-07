@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.2.2"
+PORTABLE_VERSION = "2.2.3"
 
 import argparse
 import difflib
@@ -1730,7 +1730,31 @@ def trope_catalog_vectors():
 
 
 def cmd_validate(preview_path):
-    """Run automated quality checks on a preview JSON. Prints a report."""
+    """Run automated quality checks on a preview JSON or a directory of them.
+    Prints a report per file, plus a summary table for directories."""
+    import os
+    import glob as _glob
+    if os.path.isdir(preview_path):
+        files = sorted(_glob.glob(os.path.join(preview_path, "*.json")))
+        # Skip trope-map review files.
+        files = [f for f in files if "trope-map" not in os.path.basename(f)]
+        if not files:
+            print(f"  No preview JSON files in {preview_path}")
+            return
+        print(f"  Validating {len(files)} preview files...\n")
+        summary = []
+        for f in files:
+            issues, notes = _validate_one(f, quiet=True)
+            status = f"{len(issues)} issues" if issues else "clean"
+            summary.append((os.path.basename(f)[:50], status, len(issues)))
+            print(f"  {os.path.basename(f)[:60]:62} {status}")
+        print(f"\n  {sum(1 for _, _, n in summary if n == 0)}/{len(summary)} clean")
+        return
+    issues, notes = _validate_one(preview_path, quiet=False)
+
+
+def _validate_one(preview_path, quiet=False):
+    """Run checks on one file. Returns (issues, notes). Prints unless quiet."""
     import os
     from collections import Counter
     d = json.load(open(preview_path, encoding="utf-8"))
@@ -1799,20 +1823,22 @@ def cmd_validate(preview_path):
     notes.append(f"Spice: {d.get('spice_level', 'n/a')}/5")
 
     # --- Report ---
-    print(f"\n=== Validation: {os.path.basename(preview_path)} ===")
-    print(f"Characters: {len(chars)}, Tropes: {len(tropes)}, "
-          f"Triggers: {len(trig_list)}")
-    if issues:
-        print(f"\nISSUES ({len(issues)}):")
-        for i in issues:
-            print(f"  ! {i}")
-    else:
-        print("\nNo issues detected.")
-    if notes:
-        print(f"\nNOTES:")
-        for n_ in notes:
-            print(f"  - {n_}")
-    print()
+    if not quiet:
+        print(f"\n=== Validation: {os.path.basename(preview_path)} ===")
+        print(f"Characters: {len(chars)}, Tropes: {len(tropes)}, "
+              f"Triggers: {len(trig_list)}")
+        if issues:
+            print(f"\nISSUES ({len(issues)}):")
+            for i in issues:
+                print(f"  ! {i}")
+        else:
+            print("\nNo issues detected.")
+        if notes:
+            print(f"\nNOTES:")
+            for n_ in notes:
+                print(f"  - {n_}")
+        print()
+    return issues, notes
 
 
 def cmd_trope_map(preview_path):
