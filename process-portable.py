@@ -45,9 +45,10 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "1.21-identityfallback"
+PORTABLE_VERSION = "1.22-evidence"
 
 import argparse
+import difflib
 import json
 import math
 import os
@@ -56,6 +57,7 @@ import re
 import shutil
 import struct
 import sys
+import threading
 import time
 import traceback
 import unicodedata
@@ -456,21 +458,50 @@ def llm_openrouter(prompt, chunk, i, n):
     return None
 
 
+# Thread-local stash for per-call LLM diagnostics (empty-response forensics).
+# Set by llm_openai_compat, read by _run_task. Thread-local because chunks run
+# in a ThreadPoolExecutor when --batch > 1.
+_DIAG = threading.local()
+
+
+def _diag_reset():
+    _DIAG.info = {"finish_reason": None, "completion_tokens": None,
+                  "reasoning_content": False}
+
+
 def llm_openai_compat(prompt, chunk, i, n):
-    """Generic OpenAI-compatible API (Unsloth, vLLM, llama.cpp, etc.)"""
+    """Generic OpenAI-compatible API (Unsloth, vLLM, llama.cpp, etc.)
+
+    Empty-response forensics: finish_reason, completion_tokens and whether
+    the server split thinking into reasoning_content are stashed in _DIAG so
+    _run_task can report WHY a response came back empty. A model that spends
+    its whole token budget thinking (or a json constraint fighting <think>)
+    shows up here as finish_reason=length + reasoning_content=yes.
+    """
+    _diag_reset()
     base = CONFIG.get("openai_base_url", "http://127.0.0.1:8888/v1").rstrip("/")
     model = CONFIG.get("openai_model", "")
+    max_tokens = CONFIG.get("llm_max_tokens", 4000)
+    system_prefix = CONFIG.get("llm_system_prefix", "")
+    system_prompt = f"{system_prefix}\n{prompt}" if system_prefix else prompt
     try:
         resp = _post_json(
             f"{base}/chat/completions",
             {"model": model,
-             "messages": [{"role": "system", "content": prompt},
+             "messages": [{"role": "system", "content": system_prompt},
                           {"role": "user", "content": f"Excerpt {i}/{n}:\n\n{chunk}"}],
              "temperature": 0.2,
-             "max_tokens": 4000,
+             "max_tokens": max_tokens,
              "response_format": {"type": "json_object"}},
             {"Content-Type": "application/json"}, 300)
-        return resp["choices"][0]["message"]["content"]
+        choice = (resp.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        _DIAG.info = {
+            "finish_reason": choice.get("finish_reason"),
+            "completion_tokens": (resp.get("usage") or {}).get("completion_tokens"),
+            "reasoning_content": bool(msg.get("reasoning_content")),
+        }
+        return msg.get("content")
     except urllib.error.HTTPError as e:
         print(f"\n  OpenAI-compat {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}")
     except Exception as e:
@@ -516,6 +547,105 @@ def _s(x, limit=500):
 
 def _list(x):
     return x if isinstance(x, list) else []
+
+
+# --- Evidence verification (Phase 1) ---
+# Checks that model-quoted evidence/quotes actually appear in the source text.
+# Small models invent plausible-sounding quotes; verification keeps the claim
+# but drops the fabricated quote and flags it.
+_QUOTE_NORM_TABLE = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+    "\u201c": '"', "\u201d": '"', "\u201e": '"',
+    "\u2013": "-", "\u2014": "-", "\u2212": "-",
+    "\u2026": "...", "\u00a0": " ",
+})
+
+def _norm_quote(s):
+    """Normalize for evidence matching: unify quotes/dashes, casefold,
+    collapse whitespace, strip trailing punctuation."""
+    if not isinstance(s, str):
+        return ""
+    s = s.translate(_QUOTE_NORM_TABLE).casefold()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.rstrip(".,;:!?\"'").strip()
+
+
+def _verify_against_norm(q_norm, src_norm):
+    """Core check on pre-normalized strings. Exact substring first, then a
+    light fuzzy fallback: anchor on the quote's opening tokens and compare a
+    local window (keeps it cheap on book-length text)."""
+    if len(q_norm) < 12:  # too short to be meaningful evidence
+        return False
+    if q_norm in src_norm:
+        return True
+    qtokens = q_norm.split()
+    if len(qtokens) < 6:
+        return False
+    anchor = " ".join(qtokens[:4])
+    start, checked = 0, 0
+    while checked < 5:
+        pos = src_norm.find(anchor, start)
+        if pos == -1:
+            break
+        # Compare the quote against source windows of the same length near
+        # the anchor hit; a minor transcription slip still scores >= 0.9.
+        for off in range(-8, 9):
+            wstart = max(0, pos + off)
+            window = src_norm[wstart:wstart + len(q_norm)]
+            if len(window) < len(q_norm) * 0.8:
+                continue
+            if difflib.SequenceMatcher(None, q_norm, window, autojunk=False).ratio() >= 0.9:
+                return True
+        start = pos + 1
+        checked += 1
+    return False
+
+
+def verify_evidence(quote, source_text):
+    """True if the quote appears in the source text (normalized comparison
+    with a light fuzzy fallback for minor OCR/whitespace differences)."""
+    return _verify_against_norm(_norm_quote(quote), _norm_quote(source_text))
+
+
+def verify_all_evidence(characters, relationships, quotes, source_text):
+    """Verify every evidence/quote string against the source text.
+
+    Unverified quotes are dropped (a fabricated notable quote is worse than
+    none). Character/relationship claims are kept but their evidence is
+    cleared and flagged evidence_verified=false.
+    Returns (characters, relationships, quotes, stats)."""
+    src_norm = _norm_quote(source_text)
+    stats = {"evidence_checked": 0, "evidence_verified": 0, "quotes_dropped": 0}
+
+    def check(ev):
+        if not ev:
+            return "", False, False  # no evidence offered: not checked, not failed
+        stats["evidence_checked"] += 1
+        ok = _verify_against_norm(_norm_quote(ev), src_norm)
+        if ok:
+            stats["evidence_verified"] += 1
+            return ev, True, False
+        return "", False, True  # checked and failed
+
+    for c in characters:
+        ev, ok, failed = check(c.get("evidence"))
+        c["evidence"] = ev
+        c["evidence_verified"] = ok
+    for r in relationships:
+        ev, ok, failed = check(r.get("evidence"))
+        r["evidence"] = ev
+        r["evidence_verified"] = ok
+    kept_quotes = []
+    for q in quotes:
+        qtext = q.get("text", "") if isinstance(q, dict) else ""
+        ev, ok, failed = check(qtext)
+        if failed:
+            stats["quotes_dropped"] += 1
+            continue
+        if isinstance(q, dict):
+            q["evidence_verified"] = ok
+        kept_quotes.append(q)
+    return characters, relationships, kept_quotes, stats
 
 
 def sanitize(r):
@@ -599,11 +729,23 @@ def _run_task(call, prompt, chunk, i, n, task_name):
             return result
         if out is not None:
             raws.append(out)
-            print("(unparseable, retrying)", end=" ", flush=True)
+            if not out:
+                # Empty response: report the forensics stashed by the backend.
+                d = getattr(_DIAG, "info", None) or {}
+                print(f"(empty: finish_reason={d.get('finish_reason')}, "
+                      f"completion_tokens={d.get('completion_tokens')}, "
+                      f"reasoning_content={'yes' if d.get('reasoning_content') else 'no'})",
+                      end=" ", flush=True)
+            else:
+                print("(unparseable, retrying)", end=" ", flush=True)
     if raws and CONFIG.get("debug") and _DEBUG_TAG:
         dbg = SCRIPT_DIR / "preview" / "debug"
         dbg.mkdir(parents=True, exist_ok=True)
         with open(dbg / f"{_DEBUG_TAG}-chunk{i}-{task_name}.txt", "w", encoding="utf-8") as f:
+            d = getattr(_DIAG, "info", None) or {}
+            f.write(f"--- diag: finish_reason={d.get('finish_reason')} "
+                    f"completion_tokens={d.get('completion_tokens')} "
+                    f"reasoning_content={d.get('reasoning_content')} ---\n\n")
             for a, raw in enumerate(raws, 1):
                 f.write(f"--- attempt {a} ({len(raw)} chars) ---\n{raw}\n\n")
         print(f"(debug saved: chunk{i}-{task_name})", end=" ", flush=True)
@@ -1231,6 +1373,18 @@ def process_file(fpath, dry_run=False, preview=False):
         "tasks": task_ok,
     }
 
+    # Phase 1: verify every evidence quote and notable quote against the
+    # source text. Fabricated quotes are dropped; claims are kept but flagged.
+    v_chars, v_rels, v_quotes, vstats = verify_all_evidence(
+        result["characters"], result["relationships"], result["quotes"], text)
+    result["characters"], result["relationships"], result["quotes"] = \
+        v_chars, v_rels, v_quotes
+    result["verification"] = vstats
+    if vstats["evidence_checked"]:
+        print(f"  Evidence: {vstats['evidence_verified']}/{vstats['evidence_checked']} "
+              f"verified" + (f", {vstats['quotes_dropped']} quotes dropped"
+                             if vstats["quotes_dropped"] else ""))
+
     # Work identity resolution (read-only in preview/dry-run).
     wid, how = resolve_work(title or fpath.stem, author, identifiers, is_anth,
                             create=not (preview or dry_run))
@@ -1331,8 +1485,13 @@ def save_preview(fpath, result):
         md.append(f"**Work:** matched via {how}")
     else:
         md.append(f"**Work:** resolution failed ({how})")
-    if result["is_anthology"]:
+    if result.get("is_anthology"):
         md.append(f"**Anthology:** {len(result['stories'])} stories")
+    v = result.get("verification") or {}
+    if v.get("evidence_checked"):
+        md.append(f"**Evidence:** {v['evidence_verified']}/{v['evidence_checked']} quotes verified"
+                  + (f", {v['quotes_dropped']} fabricated quotes dropped"
+                     if v.get("quotes_dropped") else ""))
     md.append("")
     md.append(f"## Tropes ({len(result['tropes'])})")
     for t in result["tropes"]:
@@ -1358,7 +1517,9 @@ def save_preview(fpath, result):
         if c.get("description"):
             md.append(c["description"])
         if c.get("evidence"):
-            md.append(f"> {c['evidence'][:300]}")
+            md.append(f"> {c['evidence'][:300]} ✓")
+        elif c.get("evidence_verified") is False:
+            md.append("> *evidence quote failed verification — dropped*")
         md.append("")
     if result["relationships"]:
         md.append(f"## Relationships ({len(result['relationships'])})")

@@ -85,6 +85,35 @@ fallback prompt (`PROMPT_IDENTITY_SIMPLE`) — names without quotes beat no
 characters at all. Per-task ok counts (and fallback recoveries) print in
 the console and land in the preview.
 
+### Evidence verification (v1.22+)
+
+Every evidence quote and notable quote is checked against the source text
+before the preview is saved: normalization (casefold, curly/straight quote
+and dash unification, whitespace collapsing, trailing punctuation stripped),
+exact substring match first, then a light fuzzy fallback for minor
+transcription slips. Fabricated quotes are dropped; the claim is kept but
+flagged `evidence_verified: false`. Verification stats
+(verified/checked, quotes dropped) print in the console and appear in the
+preview report.
+
+### Empty-response diagnostics (v1.22+)
+
+If the OpenAI-compatible backend returns an empty response, the console now
+reports *why*: `finish_reason`, `completion_tokens`, and whether the server
+split thinking into `reasoning_content`. A model that spends its whole
+token budget thinking shows up as
+`(empty: finish_reason=length, completion_tokens=4000, reasoning_content=yes)`.
+With `--debug`, the same forensics land in the chunk's debug file.
+
+**Troubleshooting empty responses** — re-run one failing chunk with each
+change in isolation:
+1. Double `llm_max_tokens` in `config.json` (thinking ate the budget).
+2. Remove `response_format` (the JSON constraint is fighting `<think>`).
+3. Set `llm_system_prefix` to `{REASON:ilow}` (Turbo Brilliance verbosity tag).
+
+New config keys: `llm_max_tokens` (default 4000), `llm_system_prefix`
+(default "").
+
 ## Work identity (ISBN)
 
 The ISBN is read from the file itself — EPUB `<dc:identifier>`, MOBI/AZW3
