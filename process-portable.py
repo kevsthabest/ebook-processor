@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "1.22.3"
+PORTABLE_VERSION = "1.23-tokenbudget"
 
 import argparse
 import difflib
@@ -101,7 +101,7 @@ DEFAULT_CONFIG = {
     "embed_url": "",
     "embed_model": "",
     "dedupe_threshold": 0.85,
-    "llm_max_tokens": 4000,
+    "llm_max_tokens": 8000,
     "llm_system_prefix": "",
     "llm_response_format": "json_object",  # or "none"
 }

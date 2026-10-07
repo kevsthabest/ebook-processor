@@ -108,7 +108,7 @@ If the OpenAI-compatible backend returns an empty response, the console now
 reports *why*: `finish_reason`, `completion_tokens`, and whether the server
 split thinking into `reasoning_content`. A model that spends its whole
 token budget thinking shows up as
-`(empty: finish_reason=length, completion_tokens=4000, reasoning_content=yes)`.
+`(empty: finish_reason=length, completion_tokens=8000, reasoning_content=yes)`.
 With `--debug`, the same forensics land in the chunk's debug file.
 
 **Troubleshooting empty responses** — re-run one failing chunk with each
@@ -117,7 +117,7 @@ change in isolation:
 2. Set `llm_response_format` to `"none"` (the JSON constraint is fighting `<think>`).
 3. Set `llm_system_prefix` to `{REASON:ilow}` (Turbo Brilliance verbosity tag).
 
-New config keys: `llm_max_tokens` (default 4000), `llm_system_prefix`
+New config keys: `llm_max_tokens` (default 8000), `llm_system_prefix`
 (default ""), `llm_response_format` (default `"json_object"`, or `"none"`).
 Int-typed keys (`llm_max_tokens`, `sample_rate`, `sample_edges`,
 `batch_size`) can also be set via environment as `EBOOK_LLM_MAX_TOKENS`

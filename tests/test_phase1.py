@@ -107,7 +107,7 @@ class TestEmptyResponseDiagnostics(unittest.TestCase):
 
     def test_diag_captured_on_empty(self):
         pp.CONFIG.update({"openai_base_url": "http://127.0.0.1:9999/v1",
-                          "openai_model": "x", "llm_max_tokens": 4000,
+                          "openai_model": "x", "llm_max_tokens": 8000,
                           "llm_system_prefix": ""})
         resp = {"choices": [{"message": {"content": "",
                                          "reasoning_content": "<think>...</think>"},
@@ -201,7 +201,7 @@ class TestPhase1bFixes(unittest.TestCase):
         self.assertEqual(r["characters"][0]["name"], "Laurie")
 
     def test_default_config_new_keys(self):
-        self.assertEqual(pp.DEFAULT_CONFIG["llm_max_tokens"], 4000)
+        self.assertEqual(pp.DEFAULT_CONFIG["llm_max_tokens"], 8000)
         self.assertEqual(pp.DEFAULT_CONFIG["llm_system_prefix"], "")
         self.assertEqual(pp.DEFAULT_CONFIG["llm_response_format"], "json_object")
 
