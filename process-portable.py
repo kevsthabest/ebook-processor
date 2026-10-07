@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.0.4"
+PORTABLE_VERSION = "2.0.5"
 
 import argparse
 import difflib
@@ -108,6 +108,8 @@ DEFAULT_CONFIG = {
     # (default false: json_schema silently truncates on some servers;
     #  json_object is the proven mode)
     "llm_think_suffix": "",  # appended to system prompt; e.g. "/no_think" for Qwen3
+    "v2_think_suffix_a": None,  # Call A (identity) override; None = use llm_think_suffix
+    "v2_think_suffix_b": None,  # Call B (content) override; None = use llm_think_suffix
     "pipeline": "legacy",  # or "v2": chapter-level map/reduce (--pipeline v2)
     "v2_max_chapter_chars": 16000,  # ~4k tokens; keep well under your
     # server's context window minus prompt (~1k) minus output (~3k)
@@ -684,11 +686,27 @@ def _verify_trigger_evidence(trigger_evidence, text):
     return verified
 
 
+def _v2_think_suffix(which):
+    """Resolve the think suffix for Call A/B: per-call override, else global."""
+    key = "v2_think_suffix_a" if which == "a" else "v2_think_suffix_b"
+    val = CONFIG.get(key)
+    return val if val is not None else CONFIG.get("llm_think_suffix", "")
+
+
 def v2_call_a(call, roster, chapter, n_chapters):
     """Call A: characters/relationships/POV for one chapter.
 
     Must run in chapter order (roster dependency). Returns (result, fell_back).
     """
+    idx = chapter["index"]
+    _DIAG.think_suffix = _v2_think_suffix("a")
+    try:
+        return _v2_call_a_inner(call, roster, chapter, n_chapters)
+    finally:
+        _DIAG.think_suffix = None
+
+
+def _v2_call_a_inner(call, roster, chapter, n_chapters):
     idx = chapter["index"]
     roster_text, dropped = _roster_prompt(roster)
     if dropped and CONFIG.get("debug"):
@@ -717,6 +735,14 @@ def v2_call_a(call, roster, chapter, n_chapters):
 
 def v2_call_b(call, chapter, n_chapters):
     """Call B: summary/triggers/spice/tropes/quotes. Independent per chapter."""
+    _DIAG.think_suffix = _v2_think_suffix("b")
+    try:
+        return _v2_call_b_inner(call, chapter, n_chapters)
+    finally:
+        _DIAG.think_suffix = None
+
+
+def _v2_call_b_inner(call, chapter, n_chapters):
     idx = chapter["index"]
     b = _run_task(call, PROMPT_V2_CONTENT, chapter["text"], idx, n_chapters,
                   f"v2-ch{idx}-content", sanitize_fn=_sanitize_v2b)
@@ -1224,7 +1250,10 @@ def llm_openai_compat(prompt, chunk, i, n):
         max_tokens *= 2  # truncation retry: doubled budget, thread-local
     system_prefix = CONFIG.get("llm_system_prefix", "")
     system_prompt = f"{system_prefix}\n{prompt}" if system_prefix else prompt
-    think_suffix = CONFIG.get("llm_think_suffix", "")
+    # Per-call override (v2 sets this thread-locally); falls back to global.
+    think_suffix = getattr(_DIAG, "think_suffix", None)
+    if think_suffix is None:
+        think_suffix = CONFIG.get("llm_think_suffix", "")
     if think_suffix:
         system_prompt = f"{system_prompt}\n{think_suffix}"
     base_payload = {"model": model,
