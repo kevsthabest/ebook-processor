@@ -304,6 +304,44 @@ class TestPhase1bFixes(unittest.TestCase):
         for key in ("llm_max_tokens", "llm_system_prefix", "llm_response_format"):
             self.assertIn(key, readme)
 
+    def test_trivial_evidence_excluded_from_stats(self):
+        src = "Mother was in the kitchen. Mother cooked dinner daily."
+        chars = [{"name": "Mother", "evidence": "Mother"},
+                 {"name": "Cook", "evidence": "Mother cooked dinner daily"}]
+        vc, _, _, stats = pp.verify_all_evidence(chars, [], [], src)
+        # one-word evidence: offered but not counted, text dropped
+        self.assertTrue(vc[0]["evidence_offered"])
+        self.assertFalse(vc[0]["evidence_verified"])
+        self.assertEqual(vc[0]["evidence"], "")
+        # real evidence still verifies and counts
+        self.assertTrue(vc[1]["evidence_verified"])
+        self.assertEqual(stats["evidence_checked"], 1)
+        self.assertEqual(stats["evidence_verified"], 1)
+
+    def test_spread_quotes(self):
+        quotes = [{"text": f"quote {i}"} for i in range(30)]
+        picked = pp._spread_quotes(quotes, 10)
+        self.assertEqual(len(picked), 10)
+        # evenly spaced: first, middle and last regions represented
+        self.assertEqual(picked[0]["text"], "quote 0")
+        self.assertEqual(picked[5]["text"], "quote 15")
+        self.assertEqual(picked[9]["text"], "quote 27")
+        # short lists pass through untouched
+        short = [{"text": "a"}, {"text": "b"}]
+        self.assertEqual(pp._spread_quotes(short, 10), short)
+
+    def test_env_bool_casting(self):
+        import os
+        os.environ["EBOOK_DEDUPE"] = "false"
+        os.environ["EBOOK_DEBUG"] = "yes"
+        try:
+            cfg = pp.load_config()
+        finally:
+            del os.environ["EBOOK_DEDUPE"]
+            del os.environ["EBOOK_DEBUG"]
+        self.assertIs(cfg["dedupe"], False)
+        self.assertIs(cfg["debug"], True)
+
 
 if __name__ == "__main__":
     unittest.main()

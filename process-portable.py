@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "1.22.1"
+PORTABLE_VERSION = "1.22.2"
 
 import argparse
 import difflib
@@ -109,6 +109,8 @@ DEFAULT_CONFIG = {
 
 # Config keys that must be int (env overrides arrive as strings).
 _INT_CONFIG_KEYS = {"sample_rate", "sample_edges", "batch_size", "llm_max_tokens"}
+# Config keys that are bools (EBOOK_DEDUPE=false must not be truthy).
+_BOOL_CONFIG_KEYS = {"debug", "dedupe"}
 
 
 def load_config():
@@ -128,6 +130,8 @@ def load_config():
                     print(f"  Warning: {env_k}={v!r} is not an int; "
                           f"using default {cfg[k]}")
                     continue
+            elif k in _BOOL_CONFIG_KEYS:
+                v = v.strip().lower() in ("1", "true", "yes", "on")
             cfg[k] = v
     return cfg
 
@@ -642,27 +646,37 @@ def verify_all_evidence(characters, relationships, quotes, source_text):
     stats = {"evidence_checked": 0, "evidence_verified": 0, "quotes_dropped": 0}
 
     def check(ev):
-        if not ev:
-            return "", False, False  # no evidence offered: not checked, not failed
+        # Returns (kept_text, verified, failed, offered).
+        # Trivially short evidence (< 3 words, e.g. "Mother") is not
+        # meaningful support: excluded from the stats so it can't inflate
+        # the verified ratio, but offered=True distinguishes it from the
+        # model offering nothing at all.
+        offered = bool(ev and ev.strip())
+        if not offered:
+            return "", False, False, False
+        if len(_norm_quote(ev).split()) < 3:
+            return "", False, False, True
         stats["evidence_checked"] += 1
         ok = _verify_against_norm(_norm_quote(ev), src_norm)
         if ok:
             stats["evidence_verified"] += 1
-            return ev, True, False
-        return "", False, True  # checked and failed
+            return ev, True, False, True
+        return "", False, True, True  # checked and failed
 
     for c in characters:
-        ev, ok, failed = check(c.get("evidence"))
+        ev, ok, failed, offered = check(c.get("evidence"))
         c["evidence"] = ev
         c["evidence_verified"] = ok
+        c["evidence_offered"] = offered
     for r in relationships:
-        ev, ok, failed = check(r.get("evidence"))
+        ev, ok, failed, offered = check(r.get("evidence"))
         r["evidence"] = ev
         r["evidence_verified"] = ok
+        r["evidence_offered"] = offered
     kept_quotes = []
     for q in quotes:
         qtext = q.get("text", "") if isinstance(q, dict) else ""
-        ev, ok, failed = check(qtext)
+        ev, ok, failed, offered = check(qtext)
         if failed:
             stats["quotes_dropped"] += 1
             continue
@@ -670,6 +684,15 @@ def verify_all_evidence(characters, relationships, quotes, source_text):
             q["evidence_verified"] = ok
         kept_quotes.append(q)
     return characters, relationships, kept_quotes, stats
+
+
+def _spread_quotes(quotes, limit=10):
+    """Pick `limit` quotes evenly spaced across the book instead of the
+    first N in chunk order (which biases toward the front)."""
+    if len(quotes) <= limit:
+        return quotes
+    step = len(quotes) / limit
+    return [quotes[int(i * step)] for i in range(limit)]
 
 
 def sanitize(r):
@@ -794,7 +817,8 @@ def extract_llm(chunk, i, n):
                           "identity-fallback")
         if ident is not None:
             ident_simple = True
-            print("(identity fallback ok)", end=" ", flush=True)
+            if CONFIG.get("debug"):
+                print("(identity fallback ok)", end=" ", flush=True)
     if disc is None and ident is None:
         return None
     result = disc if disc is not None else ident
@@ -1418,7 +1442,7 @@ def process_file(fpath, dry_run=False, preview=False):
         "tropes": tropes, "trope_confidence": trope_conf,
         "triggers": triggers, "characters": characters,
         "relationships": relationships, "spice_level": spice_level,
-        "povs": sorted(povs), "quotes": quotes[:10],
+        "povs": sorted(povs), "quotes": _spread_quotes(quotes, 10),
         "is_anthology": is_anth, "stories": stories,
         "aborted": aborted, "chunks_ok": ok,
         "tasks": task_ok,
@@ -1565,8 +1589,8 @@ def save_preview(fpath, result):
             md.append(c["description"])
         if c.get("evidence"):
             md.append(f"> {c['evidence'][:300]} ✓")
-        elif c.get("evidence_verified") is False:
-            md.append("> *evidence quote failed verification — dropped*")
+        elif c.get("evidence_offered"):
+            md.append("> *offered evidence failed verification — dropped*")
         md.append("")
     if result["relationships"]:
         md.append(f"## Relationships ({len(result['relationships'])})")
