@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "1.22.2"
+PORTABLE_VERSION = "1.22.3"
 
 import argparse
 import difflib
@@ -1287,6 +1287,17 @@ def read_ebook(fpath):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _select_chunks(chunks, only):
+    """Filter chunks by --chunks spec (e.g. '2' or '2,5,8'). Indices are
+    1-based into the sampled chunk list; original numbering is kept so debug
+    output stays comparable across runs."""
+    indexed = list(enumerate(chunks, 1))
+    if not only:
+        return indexed
+    wanted = {int(x) for x in str(only).split(",") if x.strip().isdigit()}
+    return [(i, ch) for i, ch in indexed if i in wanted]
+
+
 def process_file(fpath, dry_run=False, preview=False):
     print(f"\nProcessing: {fpath.name}")
     global _DEBUG_TAG
@@ -1325,7 +1336,20 @@ def process_file(fpath, dry_run=False, preview=False):
         chunks = all_chunks
         indices = list(range(n_total))
     n = len(chunks)
-    print(f"  {n} chunks, LLM: {CONFIG['llm']}")
+    # --chunks: restrict to specific chunk indices (1-based, as numbered in
+    # debug files). Applied after sampling; original numbering is kept so
+    # debug output stays comparable across runs.
+    only = CONFIG.get("only_chunks")
+    indexed = _select_chunks(chunks, only)
+    if only:
+        if not indexed:
+            print(f"  --chunks {only}: no chunks match (1-{n})")
+            return False
+        print(f"  {n} chunks, selecting {len(indexed)} (--chunks {only}), "
+              f"LLM: {CONFIG['llm']}")
+    else:
+        print(f"  {n} chunks, LLM: {CONFIG['llm']}")
+    n = len(indexed)
 
     trope_hits, trope_name = Counter(), {}
     trig_hits, trig_data = Counter(), {}
@@ -1348,7 +1372,7 @@ def process_file(fpath, dry_run=False, preview=False):
     if batch_size > 1:
         print(f"  Batching {batch_size} parallel requests...")
         with ThreadPoolExecutor(max_workers=batch_size) as ex:
-            futs = {ex.submit(_run_chunk, (i, ch)): i for i, ch in enumerate(chunks, 1)}
+            futs = {ex.submit(_run_chunk, (i, ch)): i for i, ch in indexed}
             done_count = 0
             for fut in as_completed(futs):
                 idx, r = fut.result()
@@ -1357,13 +1381,13 @@ def process_file(fpath, dry_run=False, preview=False):
                 print(f"\r  Chunks: {done_count}/{n} done", end="", flush=True)
         print()  # newline after progress
     else:
-        for i, ch in enumerate(chunks, 1):
+        for i, ch in indexed:
             print(f"  Chunk {i}/{n}...", end=" ", flush=True)
             _, r = _run_chunk((i, ch))
             results[i] = r
             print("done" if r else "FAILED")
 
-    for i in range(1, n + 1):
+    for i, _ch in indexed:
         r = results.get(i)
         if r is None:
             failed += 1
@@ -1648,6 +1672,9 @@ def main():
     ap.add_argument("--sample", type=int, default=None, help="process every Nth chunk (e.g. --sample 3)")
     ap.add_argument("--full", action="store_true", help="disable sampling, process every chunk")
     ap.add_argument("--batch", type=int, default=None, help="parallel LLM requests (e.g. --batch 4)")
+    ap.add_argument("--chunks", default=None,
+                    help="process only these chunk indices (e.g. --chunks 2 or --chunks 2,5,8); "
+                         "numbering matches the sampled chunk list and debug files")
     ap.add_argument("--debug", action="store_true",
                     help="save raw LLM output of failed chunks to preview/debug/")
     ap.add_argument("--dedupe", action="store_true",
@@ -1663,6 +1690,8 @@ def main():
         CONFIG["sample_rate"] = args.sample
     if args.batch:
         CONFIG["batch_size"] = args.batch
+    if args.chunks:
+        CONFIG["only_chunks"] = args.chunks
     if args.debug:
         CONFIG["debug"] = True
     if args.dedupe:

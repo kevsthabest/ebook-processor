@@ -330,6 +330,20 @@ class TestPhase1bFixes(unittest.TestCase):
         short = [{"text": "a"}, {"text": "b"}]
         self.assertEqual(pp._spread_quotes(short, 10), short)
 
+    def test_select_chunks(self):
+        chunks = ["a", "b", "c", "d", "e"]
+        # no filter: all chunks, 1-based numbering
+        self.assertEqual(pp._select_chunks(chunks, None),
+                         [(1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")])
+        self.assertEqual(pp._select_chunks(chunks, ""), [(1, "a"), (2, "b"),
+                         (3, "c"), (4, "d"), (5, "e")])
+        # single + multi select keep original numbering
+        self.assertEqual(pp._select_chunks(chunks, "2"), [(2, "b")])
+        self.assertEqual(pp._select_chunks(chunks, "2,5"), [(2, "b"), (5, "e")])
+        # junk ignored, no match -> empty
+        self.assertEqual(pp._select_chunks(chunks, "9"), [])
+        self.assertEqual(pp._select_chunks(chunks, "x,3"), [(3, "c")])
+
     def test_env_bool_casting(self):
         import os
         os.environ["EBOOK_DEDUPE"] = "false"

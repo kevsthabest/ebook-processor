@@ -64,8 +64,11 @@ python process-portable.py --watch --llm openai
 Key flags: `--preview` (save report, no DB writes), `--dry-run` (extract,
 skip writes, no preview files), `--sample N` (1 of every N chunks),
 `--batch N` (parallel requests), `--full` (ignore sampling),
-`--debug` (save raw failed-chunk output), `--dedupe` (embedding merge),
-`--max-fail-ratio` (abort threshold, default 0.5).
+`--chunks 2` or `--chunks 2,5,8` (process only those chunk indices —
+numbering matches the sampled list and debug files; handy for re-testing
+one failing chunk), `--debug` (save raw failed-chunk output),
+`--dedupe` (embedding merge), `--max-fail-ratio` (abort threshold,
+default 0.5).
 
 ## Two-task extraction (v1.19+)
 
