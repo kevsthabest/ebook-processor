@@ -85,14 +85,17 @@ fallback prompt (`PROMPT_IDENTITY_SIMPLE`) — names without quotes beat no
 characters at all. Per-task ok counts (and fallback recoveries) print in
 the console and land in the preview.
 
-### Evidence verification (v1.22+)
+### Evidence verification (v1.22+, per-chunk since v1.22.1)
 
-Every evidence quote and notable quote is checked against the source text
-before the preview is saved: normalization (casefold, curly/straight quote
-and dash unification, whitespace collapsing, trailing punctuation stripped),
-exact substring match first, then a light fuzzy fallback for minor
-transcription slips. Fabricated quotes are dropped; the claim is kept but
-flagged `evidence_verified: false`. Verification stats
+Every evidence quote and notable quote is checked against the chunk text it
+came from, right after extraction and before aggregation: normalization
+(casefold, curly/straight quote and dash unification, whitespace collapsing,
+trailing punctuation stripped), exact substring match first, then a light
+fuzzy fallback for minor transcription slips (short quotes under 12 chars
+use exact match only). Fabricated quotes are dropped before the quote cuts,
+so the top-10 only ever contains verified lines; the claim is kept but
+flagged `evidence_verified: false`. During aggregation, the first *verified*
+evidence wins per character/relationship. Verification stats
 (verified/checked, quotes dropped) print in the console and appear in the
 preview report.
 
@@ -108,11 +111,14 @@ With `--debug`, the same forensics land in the chunk's debug file.
 **Troubleshooting empty responses** — re-run one failing chunk with each
 change in isolation:
 1. Double `llm_max_tokens` in `config.json` (thinking ate the budget).
-2. Remove `response_format` (the JSON constraint is fighting `<think>`).
+2. Set `llm_response_format` to `"none"` (the JSON constraint is fighting `<think>`).
 3. Set `llm_system_prefix` to `{REASON:ilow}` (Turbo Brilliance verbosity tag).
 
 New config keys: `llm_max_tokens` (default 4000), `llm_system_prefix`
-(default "").
+(default ""), `llm_response_format` (default `"json_object"`, or `"none"`).
+Int-typed keys (`llm_max_tokens`, `sample_rate`, `sample_edges`,
+`batch_size`) can also be set via environment as `EBOOK_LLM_MAX_TOKENS`
+etc.; invalid values warn and keep the default.
 
 ## Work identity (ISBN)
 

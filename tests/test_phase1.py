@@ -43,8 +43,11 @@ class TestVerifyEvidence(unittest.TestCase):
         self.assertFalse(pp.verify_evidence(
             "Laurie rode his bicycle to the haunted mansion", self.SRC))
 
-    def test_too_short_rejected(self):
-        self.assertFalse(pp.verify_evidence("Laurie was", self.SRC))
+    def test_short_quote_exact_match(self):
+        # under 12 chars: exact normalized substring verifies...
+        self.assertTrue(pp.verify_evidence("Laurie was", self.SRC))
+        # ...but a short quote NOT in the source still fails
+        self.assertFalse(pp.verify_evidence("Zebedee ran", self.SRC))
 
     def test_fuzzy_minor_difference_accepted(self):
         # dropped short word (typical transcription slip) still verifies
@@ -156,6 +159,150 @@ class TestEmptyResponseDiagnostics(unittest.TestCase):
         payload = fake.last_payload
         self.assertEqual(payload["max_tokens"], 8000)
         self.assertTrue(payload["messages"][0]["content"].startswith("{REASON:ilow}"))
+
+
+class TestPhase1bFixes(unittest.TestCase):
+    """Tests for the Phase 1b fix list."""
+
+    def test_simple_prompt_single_braces_no_placeholders(self):
+        p = pp.PROMPT_IDENTITY_SIMPLE
+        self.assertNotIn("{{", p)
+        self.assertNotIn("{chunk_info}", p)
+        # the JSON example block must parse as JSON
+        start, end = p.index("{"), p.rindex("}")
+        obj = __import__("json").loads(p[start:end + 1])
+        self.assertIn("characters", obj)
+        self.assertIn("relationships", obj)
+
+    def test_fallback_routed_through_run_task(self):
+        orig_task, orig_backend = pp._run_task, pp.llm_openai_compat
+        seen = []
+
+        def spy(call, prompt, chunk, i, n, task_name):
+            seen.append(task_name)
+            return orig_task(call, prompt, chunk, i, n, task_name)
+
+        def fake_backend(prompt, chunk, i, n):
+            if prompt is pp.PROMPT_IDENTITY_SIMPLE:
+                return ('{"characters": [{"name": "Laurie", "role": "supporting", '
+                        '"description": "a boy"}], "relationships": []}')
+            return ""  # rich prompts fail empty
+
+        pp._run_task, pp.llm_openai_compat = spy, fake_backend
+        pp.CONFIG.update({"llm": "openai", "debug": False})
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                r = pp.extract_llm("Our son Laurie was three and a half.", 1, 2)
+        finally:
+            pp._run_task, pp.llm_openai_compat = orig_task, orig_backend
+        self.assertIn("identity-fallback", seen)
+        self.assertTrue(r["task_status"]["identity_simple"])
+        self.assertEqual(r["characters"][0]["name"], "Laurie")
+
+    def test_default_config_new_keys(self):
+        self.assertEqual(pp.DEFAULT_CONFIG["llm_max_tokens"], 4000)
+        self.assertEqual(pp.DEFAULT_CONFIG["llm_system_prefix"], "")
+        self.assertEqual(pp.DEFAULT_CONFIG["llm_response_format"], "json_object")
+
+    def test_env_int_casting(self):
+        import os
+        os.environ["EBOOK_LLM_MAX_TOKENS"] = "8000"
+        try:
+            cfg = pp.load_config()
+        finally:
+            del os.environ["EBOOK_LLM_MAX_TOKENS"]
+        self.assertEqual(cfg["llm_max_tokens"], 8000)
+        self.assertIsInstance(cfg["llm_max_tokens"], int)
+
+    def test_env_int_invalid_keeps_default(self):
+        import os
+        os.environ["EBOOK_BATCH_SIZE"] = "notanint"
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cfg = pp.load_config()
+        finally:
+            del os.environ["EBOOK_BATCH_SIZE"]
+        self.assertEqual(cfg["batch_size"], pp.DEFAULT_CONFIG["batch_size"])
+        self.assertIn("Warning", buf.getvalue())
+
+    def test_response_format_none_omits_key(self):
+        pp.CONFIG.update({"openai_base_url": "http://127.0.0.1:9999/v1",
+                          "openai_model": "x", "llm_response_format": "none"})
+        fake = self._fake_post({"choices": [{"message": {"content": "{}"},
+                                             "finish_reason": "stop"}]})
+        orig = pp._post_json
+        pp._post_json = fake
+        try:
+            pp.llm_openai_compat("PROMPT", "chunk", 1, 2)
+        finally:
+            pp._post_json = orig
+            pp.CONFIG["llm_response_format"] = "json_object"
+        self.assertNotIn("response_format", fake.last_payload)
+
+    def test_response_format_json_object_included(self):
+        pp.CONFIG.update({"llm_response_format": "json_object"})
+        fake = self._fake_post({"choices": [{"message": {"content": "{}"},
+                                             "finish_reason": "stop"}]})
+        orig = pp._post_json
+        pp._post_json = fake
+        try:
+            pp.llm_openai_compat("PROMPT", "chunk", 1, 2)
+        finally:
+            pp._post_json = orig
+        self.assertEqual(fake.last_payload["response_format"],
+                         {"type": "json_object"})
+
+    def _fake_post(self, response):
+        def fake(url, payload, headers, timeout):
+            fake.last_payload = payload
+            return response
+        return fake
+
+    def test_per_chunk_verification_in_extract(self):
+        chunk = "Our son Laurie was three and a half. The sky was blue."
+        disc_json = ('{"tropes": [], "triggers": [], "spice_level": 0, "povs": [], '
+                     '"quotes": [{"text": "our son Laurie was three and a half", "spoiler": false}, '
+                     '{"text": "a completely fabricated notable line here", "spoiler": false}], '
+                     '"is_anthology": false, "stories": []}')
+        ident_json = ('{"characters": [{"name": "Laurie", "role": "supporting", '
+                      '"description": "a boy", '
+                      '"evidence": "our son Laurie was three and a half"}, '
+                      '{"name": "Ghost", "role": "minor", "description": "spooky", '
+                      '"evidence": "the ghost haunted the attic nightly"}], '
+                      '"relationships": []}')
+
+        def fake_backend(prompt, chunk, i, n):
+            if prompt is pp.PROMPT_DISCIPLINE:
+                return disc_json
+            return ident_json
+
+        orig = pp.llm_openai_compat
+        pp.llm_openai_compat = fake_backend
+        pp.CONFIG.update({"llm": "openai", "debug": False})
+        try:
+            r = pp.extract_llm(chunk, 1, 2)
+        finally:
+            pp.llm_openai_compat = orig
+        # fabricated character evidence dropped + flagged, claim kept
+        by_name = {c["name"]: c for c in r["characters"]}
+        self.assertTrue(by_name["Laurie"]["evidence_verified"])
+        self.assertEqual(by_name["Ghost"]["evidence"], "")
+        self.assertFalse(by_name["Ghost"]["evidence_verified"])
+        # fabricated quote dropped before any cut
+        self.assertEqual(len(r["quotes"]), 1)
+        self.assertTrue(r["quotes"][0]["evidence_verified"])
+        # per-chunk stats attached
+        vs = r["verification"]
+        self.assertEqual(vs["evidence_checked"], 4)  # 2 char + 2 quotes
+        self.assertEqual(vs["evidence_verified"], 2)
+        self.assertEqual(vs["quotes_dropped"], 1)
+
+    def test_readme_documents_new_keys(self):
+        readme = Path(pp.SCRIPT_DIR, "README.md").read_text()
+        for key in ("llm_max_tokens", "llm_system_prefix", "llm_response_format"):
+            self.assertIn(key, readme)
 
 
 if __name__ == "__main__":

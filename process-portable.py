@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "1.22-evidence"
+PORTABLE_VERSION = "1.22.1"
 
 import argparse
 import difflib
@@ -101,7 +101,14 @@ DEFAULT_CONFIG = {
     "embed_url": "",
     "embed_model": "",
     "dedupe_threshold": 0.85,
+    "llm_max_tokens": 4000,
+    "llm_system_prefix": "",
+    "llm_response_format": "json_object",  # or "none"
 }
+
+
+# Config keys that must be int (env overrides arrive as strings).
+_INT_CONFIG_KEYS = {"sample_rate", "sample_edges", "batch_size", "llm_max_tokens"}
 
 
 def load_config():
@@ -113,7 +120,15 @@ def load_config():
     for k in cfg:
         env_k = "EBOOK_" + k.upper()
         if env_k in os.environ:
-            cfg[k] = os.environ[env_k]
+            v = os.environ[env_k]
+            if k in _INT_CONFIG_KEYS:
+                try:
+                    v = int(v)
+                except ValueError:
+                    print(f"  Warning: {env_k}={v!r} is not an int; "
+                          f"using default {cfg[k]}")
+                    continue
+            cfg[k] = v
     return cfg
 
 
@@ -332,19 +347,19 @@ def chunk_text(text, chunk_size=CHUNK_CHARS):
 # identity prompt returns empty/unparseable output twice. The old mega-prompt's
 # evidence-free character section worked reliably on small models, so this is the
 # graceful-degradation path: names and descriptions beat no characters at all.
-PROMPT_IDENTITY_SIMPLE = """You are extracting character information from a book excerpt (chunk {chunk_info}).
+PROMPT_IDENTITY_SIMPLE = """You are extracting character information from a book excerpt.
 
 List every person named or clearly present in this excerpt. Merge obvious aliases: "I"/"my husband"/"the narrator" refer to the narrator; use the most complete name available. Do not invent names. If gender is ambiguous from the name alone, leave it out of the description rather than guessing.
 
 For each pair with a clear relationship, note it.
 
 Respond with ONLY this JSON object, no other text:
-{{
-  "characters": [{{"name": "...", "role": "protagonist|antagonist|supporting|minor", "description": "..."}}],
-  "relationships": [{{"from": "...", "to": "...", "type": "spouse|parent|child|sibling|friend|enemy|mentor|colleague|neighbor|other"}}]
-}}
+{
+  "characters": [{"name": "...", "role": "protagonist|antagonist|supporting|minor", "description": "..."}],
+  "relationships": [{"from": "...", "to": "...", "type": "spouse|parent|child|sibling|friend|enemy|mentor|colleague|neighbor|other"}]
+}
 
-Start your response with {{."""
+Start your response with {."""
 
 PROMPT_DISCIPLINE = """Analyze this book excerpt and return ONLY valid JSON. No commentary, no markdown, just the JSON object.
 Keep any internal reasoning extremely brief — a complete, valid JSON object is the priority; do not let thinking crowd out the answer.
@@ -484,16 +499,22 @@ def llm_openai_compat(prompt, chunk, i, n):
     max_tokens = CONFIG.get("llm_max_tokens", 4000)
     system_prefix = CONFIG.get("llm_system_prefix", "")
     system_prompt = f"{system_prefix}\n{prompt}" if system_prefix else prompt
+    payload = {"model": model,
+               "messages": [{"role": "system", "content": system_prompt},
+                            {"role": "user", "content": f"Excerpt {i}/{n}:\n\n{chunk}"}],
+               "temperature": 0.2,
+               "max_tokens": max_tokens}
+    fmt = CONFIG.get("llm_response_format", "json_object")
+    if fmt == "json_object":
+        payload["response_format"] = {"type": "json_object"}
+    elif fmt == "none":
+        pass  # send no response_format; lets the model answer freely
+    else:
+        print(f"\n  Warning: llm_response_format={fmt!r} unknown; using json_object")
+        payload["response_format"] = {"type": "json_object"}
     try:
-        resp = _post_json(
-            f"{base}/chat/completions",
-            {"model": model,
-             "messages": [{"role": "system", "content": system_prompt},
-                          {"role": "user", "content": f"Excerpt {i}/{n}:\n\n{chunk}"}],
-             "temperature": 0.2,
-             "max_tokens": max_tokens,
-             "response_format": {"type": "json_object"}},
-            {"Content-Type": "application/json"}, 300)
+        resp = _post_json(f"{base}/chat/completions", payload,
+                          {"Content-Type": "application/json"}, 300)
         choice = (resp.get("choices") or [{}])[0]
         msg = choice.get("message") or {}
         _DIAG.info = {
@@ -574,8 +595,11 @@ def _verify_against_norm(q_norm, src_norm):
     """Core check on pre-normalized strings. Exact substring first, then a
     light fuzzy fallback: anchor on the quote's opening tokens and compare a
     local window (keeps it cheap on book-length text)."""
-    if len(q_norm) < 12:  # too short to be meaningful evidence
+    if not q_norm:
         return False
+    if len(q_norm) < 12:
+        # Short quotes: exact normalized substring only, no fuzzy.
+        return q_norm in src_norm
     if q_norm in src_norm:
         return True
     qtokens = q_norm.split()
@@ -764,13 +788,13 @@ def extract_llm(chunk, i, n):
     ident = _run_task(call, PROMPT_IDENTITY, chunk, i, n, "identity")
     ident_simple = False
     if ident is None:
-        # Graceful degradation: one shot with the evidence-free fallback prompt.
-        out = call(PROMPT_IDENTITY_SIMPLE, chunk, i, n)
-        ident = sanitize(parse_json_obj(out)) if out else None
+        # Graceful degradation: evidence-free fallback prompt, routed through
+        # _run_task for retries, debug dumps and empty-response diagnostics.
+        ident = _run_task(call, PROMPT_IDENTITY_SIMPLE, chunk, i, n,
+                          "identity-fallback")
         if ident is not None:
             ident_simple = True
-            if CONFIG.get("debug") and _DEBUG_TAG:
-                print("(identity fallback ok)", end=" ", flush=True)
+            print("(identity fallback ok)", end=" ", flush=True)
     if disc is None and ident is None:
         return None
     result = disc if disc is not None else ident
@@ -780,6 +804,14 @@ def extract_llm(chunk, i, n):
     result["task_status"] = {"discipline": "ok" if disc is not None else "failed",
                              "identity": "ok" if ident is not None else "failed",
                              "identity_simple": ident_simple}
+    # Phase 1b: verify evidence against THIS chunk's text, before aggregation.
+    # Fabricated quotes are dropped here so the [:3]/[:10] cuts below only
+    # ever see verified quotes.
+    v_chars, v_rels, v_quotes, vstats = verify_all_evidence(
+        result["characters"], result["relationships"], result["quotes"], chunk)
+    result["characters"], result["relationships"], result["quotes"] = \
+        v_chars, v_rels, v_quotes
+    result["verification"] = vstats
     return result
 
 
@@ -1274,10 +1306,11 @@ def process_file(fpath, dry_run=False, preview=False):
     trope_hits, trope_name = Counter(), {}
     trig_hits, trig_data = Counter(), {}
     char_hits, char_data = Counter(), {}
-    rel_seen, relationships = set(), []
+    rel_seen, rel_idx, relationships = set(), {}, []
     povs, quotes, spice_votes = set(), [], []
     is_anth, stories = False, []
     ok = failed = 0
+    v_checked = v_verified = v_dropped = 0
     task_ok = {"discipline": 0, "identity": 0, "identity_simple": 0}
 
     batch_size = max(1, CONFIG.get("batch_size", BATCH_SIZE))
@@ -1329,12 +1362,30 @@ def process_file(fpath, dry_run=False, preview=False):
         for c in r["characters"]:
             k = c["name"].lower()
             char_hits[k] += 1
-            char_data.setdefault(k, c)
+            if k not in char_data:
+                char_data[k] = c
+            else:
+                # Keep the first VERIFIED evidence: upgrade when the stored
+                # entry's evidence failed verification but this one passed.
+                ex = char_data[k]
+                if not ex.get("evidence_verified") and c.get("evidence_verified"):
+                    ex["evidence"] = c["evidence"]
+                    ex["evidence_verified"] = True
         for rel in r["relationships"]:
             k = (rel["from"].lower(), rel["to"].lower(), rel["type"].lower())
             if k not in rel_seen:
                 rel_seen.add(k)
+                rel_idx[k] = len(relationships)
                 relationships.append(rel)
+            else:
+                ex = relationships[rel_idx[k]]
+                if not ex.get("evidence_verified") and rel.get("evidence_verified"):
+                    ex["evidence"] = rel["evidence"]
+                    ex["evidence_verified"] = True
+        v = r.get("verification", {})
+        v_checked += v.get("evidence_checked", 0)
+        v_verified += v.get("evidence_verified", 0)
+        v_dropped += v.get("quotes_dropped", 0)
         povs.update(r["povs"])
         quotes.extend(r["quotes"][:3])
         spice_votes.append(r["spice_level"])
@@ -1373,17 +1424,13 @@ def process_file(fpath, dry_run=False, preview=False):
         "tasks": task_ok,
     }
 
-    # Phase 1: verify every evidence quote and notable quote against the
-    # source text. Fabricated quotes are dropped; claims are kept but flagged.
-    v_chars, v_rels, v_quotes, vstats = verify_all_evidence(
-        result["characters"], result["relationships"], result["quotes"], text)
-    result["characters"], result["relationships"], result["quotes"] = \
-        v_chars, v_rels, v_quotes
+    # Phase 1b: evidence was verified per-chunk in extract_llm; aggregate stats.
+    vstats = {"evidence_checked": v_checked, "evidence_verified": v_verified,
+              "quotes_dropped": v_dropped}
     result["verification"] = vstats
-    if vstats["evidence_checked"]:
-        print(f"  Evidence: {vstats['evidence_verified']}/{vstats['evidence_checked']} "
-              f"verified" + (f", {vstats['quotes_dropped']} quotes dropped"
-                             if vstats["quotes_dropped"] else ""))
+    if v_checked:
+        print(f"  Evidence: {v_verified}/{v_checked} verified"
+              + (f", {v_dropped} quotes dropped" if v_dropped else ""))
 
     # Work identity resolution (read-only in preview/dry-run).
     wid, how = resolve_work(title or fpath.stem, author, identifiers, is_anth,

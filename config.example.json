@@ -10,5 +10,6 @@
   "supabase_url": "https://dvhimjkrroxuatthiizc.supabase.co",
   "llm_max_tokens": 4000,
   "llm_system_prefix": "",
-  "_comment_llm": "llm_max_tokens: output budget per call (raise if you see finish_reason=length on empty responses); llm_system_prefix: prepended to the system prompt, e.g. '{REASON:ilow}' for Turbo Brilliance verbosity control"
+  "_comment_llm": "llm_max_tokens: output budget per call (raise if you see finish_reason=length on empty responses); llm_system_prefix: prepended to the system prompt, e.g. '{REASON:ilow}'; llm_response_format: 'json_object' or 'none'",
+  "llm_response_format": "json_object"
 }
