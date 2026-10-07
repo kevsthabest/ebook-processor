@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.0.3"
+PORTABLE_VERSION = "2.0.4"
 
 import argparse
 import difflib
@@ -107,6 +107,7 @@ DEFAULT_CONFIG = {
     "llm_json_schema": False,  # try response_format json_schema first, fall back on 400
     # (default false: json_schema silently truncates on some servers;
     #  json_object is the proven mode)
+    "llm_think_suffix": "",  # appended to system prompt; e.g. "/no_think" for Qwen3
     "pipeline": "legacy",  # or "v2": chapter-level map/reduce (--pipeline v2)
     "v2_max_chapter_chars": 16000,  # ~4k tokens; keep well under your
     # server's context window minus prompt (~1k) minus output (~3k)
@@ -495,10 +496,12 @@ Keep any internal reasoning extremely brief — a complete, valid JSON object is
 
 RULES:
 1. TRIGGERS: emit a severity for EVERY category below — none, mentioned (referenced but not shown), on_page (depicted), graphic (depicted in disturbing detail). Be conservative: ordinary life stress is not a trigger.
-2. Every category at on_page or graphic REQUIRES an evidence quote in trigger_evidence, copied exactly.
+   NON-EXAMPLES (do NOT flag these): children playing or play-fighting; a child getting a minor injury during normal activity; characters discussing or joking about a topic; a passing mention of someone's death; childbirth or pregnancy described without distress; pretend-play scenarios (e.g. "playing Indians", toy weapons).
+   When in doubt between two severities, choose the LOWER one.
+2. Every category at on_page or graphic REQUIRES an evidence quote in trigger_evidence, copied EXACTLY character-for-character from the chapter.
 3. SPICE LEVEL rubric: 0 = none at all. 1 = chaste romance. 2 = kissing/mild innuendo. 3 = explicit references, fade-to-black. 4 = on-page sex, moderate detail. 5 = explicit/graphic.
-4. QUOTES must be exact text copied from the chapter, not paraphrases. Empty array if none stand out.
-5. TROPE_CANDIDATES: narrative patterns genuinely present (e.g. "enemies to lovers" needs an actual romantic arc). Few accurate beats many questionable.
+4. QUOTES must be exact text copied from the chapter, character-for-character. Do not paraphrase, clean up punctuation, or normalize wording. If you cannot reproduce a line exactly, omit it. Empty array if none stand out.
+5. TROPE_CANDIDATES: list AT MOST 5 narrative patterns genuinely present in this chapter. A trope is a reusable storytelling pattern (e.g. "enemies to lovers", "found family"), NOT a plot summary ("learning to drive", "car trouble"). "Enemies to lovers" needs an actual romantic arc. Few accurate beats many questionable. Empty array is fine.
 
 Trigger categories (severity for each, exactly these names):
 TRIGGER_CATEGORIES_PLACEHOLDER2"""
@@ -1221,6 +1224,9 @@ def llm_openai_compat(prompt, chunk, i, n):
         max_tokens *= 2  # truncation retry: doubled budget, thread-local
     system_prefix = CONFIG.get("llm_system_prefix", "")
     system_prompt = f"{system_prefix}\n{prompt}" if system_prefix else prompt
+    think_suffix = CONFIG.get("llm_think_suffix", "")
+    if think_suffix:
+        system_prompt = f"{system_prompt}\n{think_suffix}"
     base_payload = {"model": model,
                     "messages": [{"role": "system", "content": system_prompt},
                                  {"role": "user", "content": f"Excerpt {i}/{n}:\n\n{chunk}"}],
