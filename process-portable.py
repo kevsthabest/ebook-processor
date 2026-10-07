@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.0.6"
+PORTABLE_VERSION = "2.0.7"
 
 import argparse
 import difflib
@@ -1004,21 +1004,27 @@ def v2_trope_gate(call, chapter_summaries, candidates, candidate_counts):
     summaries = "\n".join(
         f"Ch {s['index']} ({s['label']}): {s['summary']}"
         for s in chapter_summaries if s.get("summary"))
-    prompt = (PROMPT_V2_TROPE_GATE
-              .replace("{summaries}", summaries)
-              .replace("{candidates}", "\n".join(f"- {c}" for c in candidates)))
-    out = _run_task(call, prompt, "", 1, 1, "v2-trope-gate",
-                    sanitize_fn=_sanitize_v2_gate)
-    if not out:
-        return confirmed, conf
+    # Batch candidates (large books can produce 200+; a single gate call
+    # can't judge them all carefully). Summaries are repeated per batch.
+    BATCH = 30
     cand_keys = {_tnorm(c): c for c in candidates}
-    for v in out["verdicts"]:
-        key = _tnorm(v["trope"])
-        if v["verdict"] == "yes" and key in cand_keys:
-            name = cand_keys[key]
-            confirmed.append(name)
-            n_ch = candidate_counts.get(key, 1)
-            conf[name] = round(min(0.9, 0.55 + 0.1 * n_ch), 2)
+    for bi in range(0, len(candidates), BATCH):
+        batch = candidates[bi:bi + BATCH]
+        prompt = (PROMPT_V2_TROPE_GATE
+                  .replace("{summaries}", summaries)
+                  .replace("{candidates}", "\n".join(f"- {c}" for c in batch)))
+        out = _run_task(call, prompt, "", 1, 1, f"v2-trope-gate-b{bi // BATCH + 1}",
+                        sanitize_fn=_sanitize_v2_gate)
+        if not out:
+            continue
+        for v in out["verdicts"]:
+            key = _tnorm(v["trope"])
+            if v["verdict"] == "yes" and key in cand_keys:
+                name = cand_keys[key]
+                if name not in confirmed:
+                    confirmed.append(name)
+                    n_ch = candidate_counts.get(key, 1)
+                    conf[name] = round(min(0.9, 0.55 + 0.1 * n_ch), 2)
     return confirmed, conf
 
 
