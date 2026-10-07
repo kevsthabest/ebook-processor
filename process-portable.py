@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.0.9"
+PORTABLE_VERSION = "2.1.0"
 
 import argparse
 import difflib
@@ -116,6 +116,8 @@ DEFAULT_CONFIG = {
     "v2_think_suffix_b": None,  # Call B (content) override; None = use llm_think_suffix
     "v2_enable_thinking_a": None,  # Call A override; None = use llm_enable_thinking
     "v2_enable_thinking_b": None,  # Call B override; None = use llm_enable_thinking
+    "trope_map_threshold": 0.78,  # cosine threshold for catalog mapping
+    "trope_map_cache": "trope-vectors.json",  # cached catalog embeddings
     "pipeline": "legacy",  # or "v2": chapter-level map/reduce (--pipeline v2)
     "v2_max_chapter_chars": 16000,  # ~4k tokens; keep well under your
     # server's context window minus prompt (~1k) minus output (~3k)
@@ -1657,6 +1659,88 @@ def extract_llm(chunk, i, n):
 
 
 # --- Supabase REST ---
+def _cosine(a, b):
+    import math
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def trope_catalog_vectors():
+    """Load trope catalog with embeddings. Fetches from Supabase `tropes`,
+    embeds name+description via the dedupe embedding endpoint, caches to
+    CONFIG['trope_map_cache']. Returns [(id, name, vector)]."""
+    import os
+    cache_path = CONFIG.get("trope_map_cache", "trope-vectors.json")
+    cached = {}
+    if os.path.exists(cache_path):
+        try:
+            cached = json.load(open(cache_path, encoding="utf-8"))
+        except Exception:
+            pass
+    rows = sb("tropes", params="?select=id,name,description&order=id")
+    if not rows:
+        print("  ERROR: could not load tropes from Supabase")
+        return []
+    # Embed any catalog entries missing from cache.
+    missing = [r for r in rows if r["id"] not in cached]
+    if missing:
+        texts = [f"{r['name']}: {r.get('description') or ''}" for r in missing]
+        vecs = embed_vectors(CONFIG["embed_url"], CONFIG.get("embed_model", ""),
+                             texts)
+        for r, v in zip(missing, vecs):
+            cached[r["id"]] = v
+        try:
+            json.dump(cached, open(cache_path, "w", encoding="utf-8"))
+        except Exception as e:
+            print(f"  warning: could not write vector cache: {e}")
+    return [(r["id"], r["name"], cached[r["id"]])
+            for r in rows if r["id"] in cached]
+
+
+def cmd_trope_map(preview_path):
+    """Map a preview JSON's tropes to the catalog. Writes a review JSON;
+    nothing is written to Supabase."""
+    import os
+    d = json.load(open(preview_path, encoding="utf-8"))
+    tropes = d.get("tropes") or []
+    if not tropes:
+        print("  No tropes in preview file.")
+        return
+    print(f"  Loading catalog vectors...")
+    catalog = trope_catalog_vectors()
+    if not catalog:
+        return
+    print(f"  {len(catalog)} catalog tropes, {len(tropes)} to map...")
+    # Embed the pipeline tropes.
+    trope_vecs = embed_vectors(CONFIG["embed_url"], CONFIG.get("embed_model", ""),
+                               tropes)
+    threshold = CONFIG.get("trope_map_threshold", 0.78)
+    mappings, proposals = [], []
+    for name, vec in zip(tropes, trope_vecs):
+        best, best_sim = None, -1
+        for cid, cname, cvec in catalog:
+            sim = _cosine(vec, cvec)
+            if sim > best_sim:
+                best, best_sim = (cid, cname), sim
+        if best_sim >= threshold:
+            mappings.append({"pipeline_trope": name, "catalog_id": best[0],
+                             "catalog_name": best[1],
+                             "similarity": round(best_sim, 3)})
+        else:
+            proposals.append({"pipeline_trope": name,
+                              "nearest_catalog_id": best[0] if best else None,
+                              "nearest_similarity": round(best_sim, 3) if best else None,
+                              "book": d.get("title"), "isbn": d.get("isbn")})
+    out = {"preview": os.path.basename(preview_path),
+           "threshold": threshold,
+           "mappings": mappings, "proposals": proposals}
+    out_path = os.path.splitext(preview_path)[0] + "-trope-map.json"
+    json.dump(out, open(out_path, "w", encoding="utf-8"), indent=2)
+    print(f"  {len(mappings)} mapped, {len(proposals)} proposals -> {out_path}")
+
+
 def sb(table, method="GET", data=None, params=""):
     """Returns a list on success (possibly empty) or None on any error."""
     url = f"{CONFIG['supabase_url']}/rest/v1/{table}{params}"
@@ -2717,7 +2801,15 @@ def main():
     ap.add_argument("--dedupe", action="store_true",
                     help="merge duplicate characters (name normalization + "
                          "embeddings) before writing; needs embed_url/embed_model")
+    ap.add_argument("--trope-map", metavar="PREVIEW_JSON",
+                    help="map a preview file's tropes to the Cozy Libram catalog "
+                         "via embeddings; writes a review JSON, nothing to Supabase")
     args = ap.parse_args()
+
+    if args.trope_map:
+        load_config()
+        cmd_trope_map(args.trope_map)
+        return
 
     if args.llm:
         CONFIG["llm"] = args.llm
