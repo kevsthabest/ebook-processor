@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.0.5"
+PORTABLE_VERSION = "2.0.6"
 
 import argparse
 import difflib
@@ -108,8 +108,14 @@ DEFAULT_CONFIG = {
     # (default false: json_schema silently truncates on some servers;
     #  json_object is the proven mode)
     "llm_think_suffix": "",  # appended to system prompt; e.g. "/no_think" for Qwen3
+    # (note: /no_think does NOT work on Qwen3.5; use llm_enable_thinking)
+    "llm_enable_thinking": None,  # None=auto, True/False -> extra_body
+    # chat_template_kwargs.enable_thinking (Qwen3.5 mechanism; servers that
+    # don't support it ignore extra_body harmlessly)
     "v2_think_suffix_a": None,  # Call A (identity) override; None = use llm_think_suffix
     "v2_think_suffix_b": None,  # Call B (content) override; None = use llm_think_suffix
+    "v2_enable_thinking_a": None,  # Call A override; None = use llm_enable_thinking
+    "v2_enable_thinking_b": None,  # Call B override; None = use llm_enable_thinking
     "pipeline": "legacy",  # or "v2": chapter-level map/reduce (--pipeline v2)
     "v2_max_chapter_chars": 16000,  # ~4k tokens; keep well under your
     # server's context window minus prompt (~1k) minus output (~3k)
@@ -693,6 +699,13 @@ def _v2_think_suffix(which):
     return val if val is not None else CONFIG.get("llm_think_suffix", "")
 
 
+def _v2_enable_thinking(which):
+    """Resolve enable_thinking for Call A/B: per-call override, else global."""
+    key = "v2_enable_thinking_a" if which == "a" else "v2_enable_thinking_b"
+    val = CONFIG.get(key)
+    return val if val is not None else CONFIG.get("llm_enable_thinking")
+
+
 def v2_call_a(call, roster, chapter, n_chapters):
     """Call A: characters/relationships/POV for one chapter.
 
@@ -700,10 +713,12 @@ def v2_call_a(call, roster, chapter, n_chapters):
     """
     idx = chapter["index"]
     _DIAG.think_suffix = _v2_think_suffix("a")
+    _DIAG.enable_thinking = _v2_enable_thinking("a")
     try:
         return _v2_call_a_inner(call, roster, chapter, n_chapters)
     finally:
         _DIAG.think_suffix = None
+        _DIAG.enable_thinking = None
 
 
 def _v2_call_a_inner(call, roster, chapter, n_chapters):
@@ -736,10 +751,12 @@ def _v2_call_a_inner(call, roster, chapter, n_chapters):
 def v2_call_b(call, chapter, n_chapters):
     """Call B: summary/triggers/spice/tropes/quotes. Independent per chapter."""
     _DIAG.think_suffix = _v2_think_suffix("b")
+    _DIAG.enable_thinking = _v2_enable_thinking("b")
     try:
         return _v2_call_b_inner(call, chapter, n_chapters)
     finally:
         _DIAG.think_suffix = None
+        _DIAG.enable_thinking = None
 
 
 def _v2_call_b_inner(call, chapter, n_chapters):
@@ -1256,11 +1273,18 @@ def llm_openai_compat(prompt, chunk, i, n):
         think_suffix = CONFIG.get("llm_think_suffix", "")
     if think_suffix:
         system_prompt = f"{system_prompt}\n{think_suffix}"
+    # Qwen3.5 thinking control via chat_template_kwargs (ignored if unsupported).
+    enable_thinking = getattr(_DIAG, "enable_thinking", None)
+    if enable_thinking is None:
+        enable_thinking = CONFIG.get("llm_enable_thinking")
     base_payload = {"model": model,
                     "messages": [{"role": "system", "content": system_prompt},
                                  {"role": "user", "content": f"Excerpt {i}/{n}:\n\n{chunk}"}],
                     "temperature": 0.2,
                     "max_tokens": max_tokens}
+    if enable_thinking is not None:
+        base_payload["extra_body"] = {
+            "chat_template_kwargs": {"enable_thinking": bool(enable_thinking)}}
     global _JSON_SCHEMA_OK
     last_err = None
     for rf in _response_format_candidates():
