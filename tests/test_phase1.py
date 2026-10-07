@@ -242,7 +242,8 @@ class TestPhase1bFixes(unittest.TestCase):
         self.assertNotIn("response_format", fake.last_payload)
 
     def test_response_format_json_object_included(self):
-        pp.CONFIG.update({"llm_response_format": "json_object"})
+        pp.CONFIG.update({"llm_response_format": "json_object",
+                          "llm_json_schema": False})
         fake = self._fake_post({"choices": [{"message": {"content": "{}"},
                                              "finish_reason": "stop"}]})
         orig = pp._post_json
@@ -251,8 +252,85 @@ class TestPhase1bFixes(unittest.TestCase):
             pp.llm_openai_compat("PROMPT", "chunk", 1, 2)
         finally:
             pp._post_json = orig
+            pp.CONFIG["llm_json_schema"] = True
         self.assertEqual(fake.last_payload["response_format"],
                          {"type": "json_object"})
+
+    def test_json_schema_first_by_default(self):
+        pp._JSON_SCHEMA_OK = None
+        pp.CONFIG.update({"llm_response_format": "json_object",
+                          "llm_json_schema": True})
+        fake = self._fake_post({"choices": [{"message": {"content": "{}"},
+                                             "finish_reason": "stop"}]})
+        orig = pp._post_json
+        pp._post_json = fake
+        try:
+            pp.llm_openai_compat("PROMPT", "chunk", 1, 2)
+        finally:
+            pp._post_json = orig
+        self.assertEqual(fake.last_payload["response_format"]["type"],
+                         "json_schema")
+
+    def test_json_schema_400_falls_back_and_caches(self):
+        import urllib.error
+        pp._JSON_SCHEMA_OK = None
+        pp.CONFIG.update({"llm_response_format": "json_object",
+                          "llm_json_schema": True})
+        calls = []
+
+        def fake_400_then_ok(url, payload, headers, timeout):
+            calls.append((payload.get("response_format") or {}).get("type"))
+            rf = (payload.get("response_format") or {}).get("type")
+            if rf == "json_schema":
+                raise urllib.error.HTTPError(url, 400, "bad", {}, None)
+            return {"choices": [{"message": {"content": "{}"},
+                                 "finish_reason": "stop"}]}
+
+        orig = pp._post_json
+        pp._post_json = fake_400_then_ok
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                out = pp.llm_openai_compat("PROMPT", "chunk", 1, 2)
+            # second call: json_schema skipped (cached rejection)
+            out2 = pp.llm_openai_compat("PROMPT", "chunk", 1, 2)
+        finally:
+            pp._post_json = orig
+            pp._JSON_SCHEMA_OK = None
+        self.assertEqual(out, "{}")
+        self.assertEqual(calls[0], "json_schema")
+        self.assertEqual(calls[1], "json_object")
+        self.assertNotIn("json_schema", calls[2:])
+        self.assertEqual(out2, "{}")
+
+    def test_truncation_retry_boosts_budget(self):
+        pp._JSON_SCHEMA_OK = None
+        pp.CONFIG.update({"llm_max_tokens": 8000, "llm_json_schema": False,
+                          "llm_response_format": "json_object"})
+        seen_tokens = []
+
+        def fake_trunc_then_ok(url, payload, headers, timeout):
+            seen_tokens.append(payload["max_tokens"])
+            if len(seen_tokens) == 1:
+                return {"choices": [{"message": {"content": "",
+                                                 "reasoning_content": "think"},
+                                     "finish_reason": "length"}],
+                        "usage": {"completion_tokens": 8000}}
+            return {"choices": [{"message": {"content": '{"a": 1}'},
+                                 "finish_reason": "stop"}]}
+
+        orig_post, orig_task = pp._post_json, pp._run_task
+        pp._post_json = fake_trunc_then_ok
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                r = orig_task(pp.llm_openai_compat, "PROMPT", "chunk", 1, 2,
+                              "t", sanitize_fn=lambda d: d)
+        finally:
+            pp._post_json = orig_post
+        self.assertEqual(r, {"a": 1})
+        self.assertEqual(seen_tokens, [8000, 16000])  # second call boosted
+        self.assertIn("2x budget", buf.getvalue())
 
     def _fake_post(self, response):
         def fake(url, payload, headers, timeout):

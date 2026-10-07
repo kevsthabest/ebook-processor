@@ -88,6 +88,47 @@ fallback prompt (`PROMPT_IDENTITY_SIMPLE`) — names without quotes beat no
 characters at all. Per-task ok counts (and fallback recoveries) print in
 the console and land in the preview.
 
+## v2 chapter pipeline (`--pipeline v2`)
+
+The legacy path chunks the book into fixed 8000-char pieces. The v2 path
+works at chapter level:
+
+1. **Chapter splitting** — EPUB: per-spine units via `extract_epub_units()`,
+   then `split_chapters()` (front/back-matter skip by filename heuristic,
+   sub-1500-char units merged forward, 40k+ char units split on paragraph
+   boundaries, labels from the first heading). MOBI/AZW3: `_prose_chapters()`
+   splits on chapter/part headings, falling back to fixed-size paragraph
+   splits. Legacy chunking is untouched.
+2. **Call A (characters)** — per chapter, in order, with a running
+   **character roster** in the prompt (alias-aware merging, capped by token
+   budget, recency+frequency priority). Carries the simplified evidence-free
+   fallback prompt; fallback rates are reported.
+3. **Call B (content)** — per chapter, parallelizable: summary, per-category
+   trigger severities (24-category closed taxonomy, every category explicit),
+   spice 0-5, trope candidates, quotes.
+4. **Deterministic reduce** (pure code, no LLM): max trigger severity per
+   category with chapter counts and verified evidence; 75th-percentile spice;
+   POVs named in 2+ chapters; relationship dedup with roster remap;
+   evidence-based confidence (documented formulas in code).
+5. **Trope confirmation gate** — one LLM call judges each per-chapter
+   candidate against the chapter summaries (yes/no/unsure); only "yes"
+   becomes a claim, still subject to the closed-vocabulary DB gate.
+
+Reasoning-model handling (both pipelines): `llm_json_schema` tries
+`response_format: json_schema` first and falls back to `json_object` then
+unconstrained on HTTP 400 (cached per session). If a response comes back
+empty with `finish_reason=length`, the next attempt retries with a doubled
+token budget (thread-local, `--batch` safe).
+
+Compare pipelines on a known book:
+
+```bash
+python process-portable.py --preview --llm openai --pipeline legacy book.epub
+python process-portable.py --preview --llm openai --pipeline v2 book.epub
+```
+
+Default is `legacy` (also settable via `pipeline` in `config.json`).
+
 ### Evidence verification (v1.22+, per-chunk since v1.22.1)
 
 Every evidence quote and notable quote is checked against the chunk text it
@@ -163,8 +204,5 @@ results are never written to Supabase.
 - Anthologies are detected per chunk; stories link as separate works via
   the `edition_works` junction table.
 - Each full novel costs roughly 100k tokens through the LLM.
-- **v2 pipeline (in progress):** `extract_epub_units()` +
-  `split_chapters()` provide chapter-sized units (front/back-matter skip,
-  small-unit merge, paragraph-boundary split) for the upcoming
-  chapter-level map/reduce pipeline. The legacy fixed-chunk path is
-  unchanged.
+- Legacy `--pipeline legacy` and v2 `--pipeline v2` share the same result
+  shape, so previews, work resolution, and DB writes work identically.

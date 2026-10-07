@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "1.23-tokenbudget"
+PORTABLE_VERSION = "2.0"
 
 import argparse
 import difflib
@@ -104,6 +104,8 @@ DEFAULT_CONFIG = {
     "llm_max_tokens": 8000,
     "llm_system_prefix": "",
     "llm_response_format": "json_object",  # or "none"
+    "llm_json_schema": True,  # try response_format json_schema first, fall back on 400
+    "pipeline": "legacy",  # or "v2": chapter-level map/reduce (--pipeline v2)
 }
 
 
@@ -422,6 +424,549 @@ def split_chapters(units):
             for i, u in enumerate(out, 1)]
 
 
+# --- v2 pipeline: chapter-level map/reduce ---
+# Per-chapter extraction (Call A: characters, Call B: content) with a running
+# character roster, then a deterministic reduce in code. The legacy
+# fixed-chunk pipeline is untouched; select v2 with --pipeline v2.
+
+# Closed trigger taxonomy (editable constant). Call B must emit a severity
+# for EVERY category so absence is recorded, not assumed.
+TRIGGER_CATEGORIES = [
+    "sexual_violence", "non_consent", "domestic_abuse", "child_abuse",
+    "self_harm", "suicide", "death_of_loved_one", "graphic_violence",
+    "murder", "torture", "kidnapping_captivity", "stalking",
+    "substance_abuse", "addiction", "eating_disorder",
+    "miscarriage_pregnancy_loss", "infidelity", "animal_harm", "war",
+    "medical_trauma", "bullying", "racism", "homophobia", "cheating",
+    "explicit_sex",
+]
+_SEVERITY_ORDER = {"none": 0, "mentioned": 1, "on_page": 2, "graphic": 3}
+
+PROMPT_V2_CHARACTERS = """Analyze this book chapter and return ONLY valid JSON. No commentary, no markdown, just the JSON object.
+Keep any internal reasoning extremely brief — a complete, valid JSON object is the priority; do not let thinking crowd out the answer.
+
+Chapter: {chapter_label}
+
+Known characters so far (reuse these EXACT names when the same person appears; add new aliases instead of creating duplicates):
+{roster}
+
+{
+  "characters": [{"name": "...", "aliases": ["other names used in this chapter"], "role": "protagonist|antagonist|supporting|minor", "description": "...", "evidence": "exact sentence from the chapter"}],
+  "relationships": [{"from": "...", "to": "...", "type": "spouse|parent|child|sibling|friend|enemy|mentor|colleague|neighbor|other", "evidence": "exact sentence from the chapter"}],
+  "pov_character": "name of the character narrating this chapter, or null"
+}
+
+RULES:
+1. ENTITY MERGING: "Mother", "the narrator", "I" and the author's name are one person — list ONCE under the most specific name, put the rest in aliases.
+2. NEVER INVENT NAMES. If gender is ambiguous from the name alone, leave it out rather than guessing.
+3. REAL PEOPLE ONLY who appear or are directly involved in this chapter.
+4. EVIDENCE: best supporting sentence copied exactly from the chapter; empty string if none — never invent, never repeat.
+5. ROLE must be exactly one of: protagonist, antagonist, supporting, minor. When in doubt, supporting.
+6. pov_character is ONLY someone who narrates this chapter. Most chapters have one; some have none (null)."""
+
+PROMPT_V2_CHARACTERS_SIMPLE = """Extract character information from this book chapter. Return ONLY valid JSON, no other text.
+{
+  "characters": [{"name": "...", "aliases": [], "role": "protagonist|antagonist|supporting|minor", "description": "..."}],
+  "relationships": [{"from": "...", "to": "...", "type": "spouse|parent|child|sibling|friend|enemy|mentor|colleague|neighbor|other"}],
+  "pov_character": null
+}
+List every person named or clearly present. Merge obvious aliases. Do not invent names.
+Start your response with {."""
+
+PROMPT_V2_CONTENT = """Analyze this book chapter and return ONLY valid JSON. No commentary, no markdown, just the JSON object.
+Keep any internal reasoning extremely brief — a complete, valid JSON object is the priority; do not let thinking crowd out the answer.
+
+{
+  "summary": "2-3 sentence summary of what happens in this chapter",
+  "spice_level": 0,
+  "triggers": {"TRIGGER_CATEGORIES_PLACEHOLDER": "none|mentioned|on_page|graphic"},
+  "trigger_evidence": {"category": "exact quote from the chapter supporting on_page/graphic"},
+  "trope_candidates": ["trope names you notice in this chapter"],
+  "quotes": [{"text": "exact notable line from the chapter", "spoiler": false}]
+}
+
+RULES:
+1. TRIGGERS: emit a severity for EVERY category below — none, mentioned (referenced but not shown), on_page (depicted), graphic (depicted in disturbing detail). Be conservative: ordinary life stress is not a trigger.
+2. Every category at on_page or graphic REQUIRES an evidence quote in trigger_evidence, copied exactly.
+3. SPICE LEVEL rubric: 0 = none at all. 1 = chaste romance. 2 = kissing/mild innuendo. 3 = explicit references, fade-to-black. 4 = on-page sex, moderate detail. 5 = explicit/graphic.
+4. QUOTES must be exact text copied from the chapter, not paraphrases. Empty array if none stand out.
+5. TROPE_CANDIDATES: narrative patterns genuinely present (e.g. "enemies to lovers" needs an actual romantic arc). Few accurate beats many questionable.
+
+Trigger categories (severity for each, exactly these names):
+TRIGGER_CATEGORIES_PLACEHOLDER2"""
+
+PROMPT_V2_CONTENT = PROMPT_V2_CONTENT.replace(
+    "TRIGGER_CATEGORIES_PLACEHOLDER",
+    "\n".join(f'"{c}": "..."' for c in TRIGGER_CATEGORIES))
+PROMPT_V2_CONTENT = PROMPT_V2_CONTENT.replace(
+    "TRIGGER_CATEGORIES_PLACEHOLDER2", ", ".join(TRIGGER_CATEGORIES))
+
+
+# --- v2 character roster ---
+# Carried between chapters in order. Alias-aware: a new name matching any
+# known name/alias (normalized) merges instead of creating a duplicate.
+
+def _roster_update(roster, characters, chapter_idx):
+    """Fold one chapter's characters into the roster. Mutates roster."""
+    for c in characters:
+        name = c.get("name", "")
+        nkey = norm_name(name)
+        if not nkey:
+            continue
+        found = None
+        keys_to_check = {nkey} | {norm_name(a) for a in c.get("aliases", [])}
+        for k, e in roster.items():
+            if keys_to_check & e["alias_keys"]:
+                found = k
+                break
+        if found is None:
+            roster[nkey] = {"name": name, "aliases": set(), "alias_keys": {nkey},
+                            "appearances": 0, "last_seen": chapter_idx,
+                            "roles": Counter(), "descriptions": []}
+            found = nkey
+        e = roster[found]
+        e["appearances"] += 1
+        e["last_seen"] = chapter_idx
+        e["alias_keys"] |= keys_to_check
+        for alias in {name} | set(c.get("aliases", [])):
+            if alias and alias != e["name"]:
+                e["aliases"].add(alias)
+        if c.get("role"):
+            e["roles"][c["role"]] += 1
+        if c.get("description"):
+            e["descriptions"].append(c["description"])
+        if c.get("evidence") and not e.get("evidence"):
+            e["evidence"] = c["evidence"]  # first verified evidence wins
+
+
+def _roster_prompt(roster, budget=1500):
+    """Render the roster for a Call A prompt. Capped by char budget (~tokens);
+    priority is recency then frequency. Returns (text, dropped_names)."""
+    ranked = sorted(roster.values(),
+                    key=lambda e: (e["last_seen"], e["appearances"]),
+                    reverse=True)
+    lines, dropped, total = [], [], 0
+    for e in ranked:
+        alias_str = f" (also: {', '.join(sorted(e['aliases']))})" if e["aliases"] else ""
+        line = f"- {e['name']}{alias_str}"
+        if total + len(line) > budget:
+            dropped.append(e["name"])
+            continue
+        lines.append(line)
+        total += len(line)
+    text = "\n".join(lines) if lines else "(no characters known yet)"
+    return text, dropped
+
+
+def _sanitize_v2a(r):
+    """Sanitize Call A output (characters/relationships/POV). None if unusable."""
+    if not isinstance(r, dict):
+        return None
+    characters = []
+    for c in _list(r.get("characters")):
+        if not isinstance(c, dict):
+            continue
+        name = _s(c.get("name"), 120)
+        if not name:
+            continue
+        role = _s(c.get("role"), 30).lower()
+        characters.append({
+            "name": name,
+            "aliases": [a for a in (_s(x, 120) for x in _list(c.get("aliases"))) if a],
+            "role": role if role in VALID_ROLES else None,
+            "description": _s(c.get("description"), 1000),
+            "evidence": _s(c.get("evidence"), 500),
+        })
+    relationships = []
+    for rel in _list(r.get("relationships")):
+        if not isinstance(rel, dict):
+            continue
+        a, b = _s(rel.get("from"), 120), _s(rel.get("to"), 120)
+        ty = _s(rel.get("type"), 60).lower()
+        if a and b and ty:
+            relationships.append({"from": a, "to": b, "type": ty,
+                                  "evidence": _s(rel.get("evidence"), 500)})
+    pov = _s(r.get("pov_character"), 120)
+    return {"characters": characters, "relationships": relationships,
+            "pov_character": pov or None}
+
+
+def _sanitize_v2b(r):
+    """Sanitize Call B output (summary/triggers/spice/tropes/quotes)."""
+    if not isinstance(r, dict):
+        return None
+    raw_trig = r.get("triggers") if isinstance(r.get("triggers"), dict) else {}
+    triggers = {}
+    for cat in TRIGGER_CATEGORIES:
+        sev = _s(raw_trig.get(cat), 20).lower()
+        triggers[cat] = sev if sev in _SEVERITY_ORDER else "none"
+    trigger_evidence = {}
+    raw_tev = r.get("trigger_evidence")
+    if isinstance(raw_tev, dict):
+        for cat in TRIGGER_CATEGORIES:
+            q = _s(raw_tev.get(cat), 500)
+            if q:
+                trigger_evidence[cat] = q
+    try:
+        spice = max(0, min(5, int(float(r.get("spice_level", 0)))))
+    except (TypeError, ValueError):
+        spice = 0
+    tropes = [_s(t, 80) for t in _list(r.get("trope_candidates")) if _s(t, 80)]
+    quotes = []
+    for q in _list(r.get("quotes")):
+        if isinstance(q, dict):
+            text = _s(q.get("text"), 600)
+            spoiler = q.get("spoiler") in (True, "true", "True")
+        else:
+            text, spoiler = _s(q, 600), False
+        if text:
+            quotes.append({"text": text, "spoiler": spoiler})
+    return {"summary": _s(r.get("summary"), 1000),
+            "spice_level": spice,
+            "triggers": triggers,
+            "trigger_evidence": trigger_evidence,
+            "trope_candidates": tropes,
+            "quotes": quotes}
+
+
+def _verify_trigger_evidence(trigger_evidence, text):
+    """Verify Call B trigger quotes against the chapter text. Drops failures."""
+    verified = {}
+    for cat, q in trigger_evidence.items():
+        if verify_evidence(q, text):
+            verified[cat] = q
+    return verified
+
+
+def v2_call_a(call, roster, chapter, n_chapters):
+    """Call A: characters/relationships/POV for one chapter.
+
+    Must run in chapter order (roster dependency). Returns (result, fell_back).
+    """
+    idx = chapter["index"]
+    roster_text, dropped = _roster_prompt(roster)
+    if dropped and CONFIG.get("debug"):
+        print(f"(roster capped, dropped: {', '.join(dropped[:5])})",
+              end=" ", flush=True)
+    prompt = (PROMPT_V2_CHARACTERS
+              .replace("{chapter_label}", chapter["label"])
+              .replace("{roster}", roster_text))
+    a = _run_task(call, prompt, chapter["text"], idx, n_chapters,
+                  f"v2-ch{idx}-identity", sanitize_fn=_sanitize_v2a)
+    fell_back = False
+    if a is None:
+        a = _run_task(call, PROMPT_V2_CHARACTERS_SIMPLE, chapter["text"], idx,
+                      n_chapters, f"v2-ch{idx}-identity-fallback",
+                      sanitize_fn=_sanitize_v2a)
+        fell_back = a is not None
+    if a is not None:
+        # Verify evidence against this chapter's text before roster merge.
+        vc, vr, _, vstats = verify_all_evidence(
+            a["characters"], a["relationships"], [], chapter["text"])
+        a["characters"], a["relationships"] = vc, vr
+        a["verification"] = vstats
+        _roster_update(roster, vc, idx)
+    return a, fell_back
+
+
+def v2_call_b(call, chapter, n_chapters):
+    """Call B: summary/triggers/spice/tropes/quotes. Independent per chapter."""
+    idx = chapter["index"]
+    b = _run_task(call, PROMPT_V2_CONTENT, chapter["text"], idx, n_chapters,
+                  f"v2-ch{idx}-content", sanitize_fn=_sanitize_v2b)
+    if b is not None:
+        b["trigger_evidence"] = _verify_trigger_evidence(
+            b["trigger_evidence"], chapter["text"])
+        _, _, vq, vstats = verify_all_evidence([], [], b["quotes"], chapter["text"])
+        b["quotes"] = vq
+        b["verification"] = vstats
+    return b
+
+
+def _roster_canonical(roster, name):
+    """Map any name/alias to the roster's canonical name (or the name itself)."""
+    nkey = norm_name(name)
+    for k, e in roster.items():
+        if nkey == k or nkey in e["alias_keys"]:
+            return e["name"]
+    return name
+
+
+def _v2_char_confidence(appearances, has_verified_evidence):
+    """Evidence-based character confidence (replaces legacy hit-count formula).
+
+    0.5 base + 0.1 per chapter appearance (capped at +0.3) + 0.15 for
+    verified evidence. Capped at 0.95.
+    """
+    return round(min(0.95, 0.5 + min(0.3, 0.1 * appearances) +
+                     (0.15 if has_verified_evidence else 0)), 2)
+
+
+def _v2_trigger_confidence(severity_level, n_chapters, n_evidence):
+    """Evidence-based trigger confidence.
+
+    0.4 base + 0.15 per severity level + 0.05 per chapter (capped at +0.15)
+    + 0.1 per verified quote (capped at +0.2). Capped at 0.95.
+    """
+    return round(min(0.95, 0.4 + 0.15 * severity_level +
+                     min(0.15, 0.05 * n_chapters) +
+                     min(0.2, 0.1 * n_evidence)), 2)
+
+
+def v2_reduce(chapter_as, chapter_bs, roster, chapters):
+    """Deterministic reduce over per-chapter v2 results. Pure code, no LLM.
+
+    chapter_as/bs: {chapter_index: result or None}. Returns a result dict
+    shaped for write_claims()/save_preview()/resolve_work()/dedupe_characters().
+    """
+    n = len(chapters)
+    idx_to_label = {c["index"]: c["label"] for c in chapters}
+
+    # --- Characters: from the roster (aliases already merged) ---
+    characters = []
+    for e in sorted(roster.values(), key=lambda x: -x["appearances"]):
+        role = e["roles"].most_common(1)[0][0] if e["roles"] else None
+        desc = max(e["descriptions"], key=len) if e["descriptions"] else ""
+        ev = e.get("evidence", "")
+        characters.append({
+            "name": e["name"],
+            "aliases": sorted(e["aliases"]),
+            "role": role,
+            "description": desc,
+            "evidence": ev,
+            "evidence_verified": bool(ev),
+            "evidence_offered": bool(ev),
+            "appearances": e["appearances"],
+            "confidence": _v2_char_confidence(e["appearances"], bool(ev)),
+        })
+
+    # --- Relationships: canonical-remap, dedupe by (from, to, type) ---
+    seen_rel, relationships = set(), []
+    for idx in sorted(chapter_as):
+        a = chapter_as[idx]
+        if not a:
+            continue
+        for r in a["relationships"]:
+            frm = _roster_canonical(roster, r["from"])
+            to = _roster_canonical(roster, r["to"])
+            key = (frm, to, r["type"])
+            if key in seen_rel:
+                continue
+            seen_rel.add(key)
+            relationships.append({
+                "from": frm, "to": to, "type": r["type"],
+                "evidence": r.get("evidence", ""),
+                "evidence_verified": bool(r.get("evidence")),
+                "evidence_offered": bool(r.get("evidence")),
+                "chapter": idx_to_label.get(idx, ""),
+            })
+
+    # --- Triggers: max severity per category, chapter counts, top evidence ---
+    trig_acc = {c: {"sev": 0, "chapters": [], "evidence": []}
+                for c in TRIGGER_CATEGORIES}
+    for idx in sorted(chapter_bs):
+        b = chapter_bs[idx]
+        if not b:
+            continue
+        for cat in TRIGGER_CATEGORIES:
+            sev = _SEVERITY_ORDER[b["triggers"][cat]]
+            if sev > 0:
+                acc = trig_acc[cat]
+                acc["sev"] = max(acc["sev"], sev)
+                acc["chapters"].append(idx_to_label.get(idx, ""))
+                q = b["trigger_evidence"].get(cat)
+                if q and len(acc["evidence"]) < 3:
+                    acc["evidence"].append({"quote": q,
+                                            "chapter": idx_to_label.get(idx, "")})
+    sev_names = ["none", "mentioned", "on_page", "graphic"]
+    triggers = []
+    for cat in TRIGGER_CATEGORIES:
+        acc = trig_acc[cat]
+        if acc["sev"] == 0:
+            continue
+        triggers.append({
+            "warning": cat,
+            "severity": sev_names[acc["sev"]],
+            "chapters": acc["chapters"],
+            "evidence": acc["evidence"],
+            "evidence_verified": bool(acc["evidence"]),
+            "evidence_offered": bool(acc["evidence"]),
+            "confidence": _v2_trigger_confidence(acc["sev"], len(acc["chapters"]),
+                                                 len(acc["evidence"])),
+        })
+
+    # --- Spice: 75th percentile across chapters ---
+    spices = sorted(b["spice_level"] for b in chapter_bs.values() if b)
+    spice_level = spices[max(0, math.ceil(0.75 * len(spices)) - 1)] if spices else 0
+
+    # --- POVs: named in >=2 chapters (or >=1 if fewer than 4 chapters) ---
+    pov_counts = Counter()
+    for idx in sorted(chapter_as):
+        a = chapter_as[idx]
+        if a and a.get("pov_character"):
+            pov_counts[_roster_canonical(roster, a["pov_character"])] += 1
+    threshold = 2 if n >= 4 else 1
+    povs = sorted(p for p, c in pov_counts.items() if c >= threshold)
+
+    # --- Trope candidates: union across chapters (gate runs separately) ---
+    trope_candidates = []
+    trope_counts = Counter()
+    seen_t = set()
+    for idx in sorted(chapter_bs):
+        b = chapter_bs[idx]
+        if not b:
+            continue
+        for t in b["trope_candidates"]:
+            k = _tnorm(t)
+            if not k:
+                continue
+            trope_counts[k] += 1
+            if k not in seen_t:
+                seen_t.add(k)
+                trope_candidates.append(_clean_trope(t))
+
+    # --- Quotes: verified, spread across chapters ---
+    all_quotes = []
+    for idx in sorted(chapter_bs):
+        b = chapter_bs[idx]
+        if b:
+            for q in b["quotes"]:
+                all_quotes.append({**q, "chapter": idx_to_label.get(idx, "")})
+    quotes = _spread_quotes(all_quotes)
+
+    # --- Chapter summaries ---
+    chapter_summaries = [{"index": c["index"], "label": c["label"],
+                          "summary": (chapter_bs.get(c["index"]) or {}).get("summary", "")}
+                         for c in chapters]
+
+    # --- Verification totals ---
+    v_checked = v_verified = 0
+    for src in list(chapter_as.values()) + list(chapter_bs.values()):
+        if src and src.get("verification"):
+            v_checked += src["verification"].get("evidence_checked", 0)
+            v_verified += src["verification"].get("evidence_verified", 0)
+
+    return {
+        "characters": characters,
+        "relationships": relationships,
+        "triggers": triggers,
+        "spice_level": spice_level,
+        "povs": povs,
+        "trope_candidates": trope_candidates,
+        "trope_candidate_counts": dict(trope_counts),
+        "tropes": [],  # filled by the trope gate
+        "trope_confidence": {},
+        "quotes": quotes,
+        "chapter_summaries": chapter_summaries,
+        "verification": {"evidence_checked": v_checked,
+                         "evidence_verified": v_verified},
+    }
+
+
+PROMPT_V2_TROPE_GATE = """You are confirming trope candidates for a book. For each candidate trope, judge whether it is GENUINELY present based on the chapter summaries. Return ONLY valid JSON. No commentary, no markdown.
+
+Chapter summaries:
+{summaries}
+
+Candidate tropes:
+{candidates}
+
+{
+  "verdicts": [{"trope": "...", "verdict": "yes|no|unsure", "justification": "one line citing a chapter number"}]
+}
+
+RULES:
+1. "yes" only if a summary clearly supports the trope. "unsure" if plausible but not clearly supported. "no" otherwise.
+2. Every verdict needs a justification citing the chapter number (e.g. "Ch 3").
+3. Do not add tropes that are not in the candidate list."""
+
+
+def _sanitize_v2_gate(r):
+    if not isinstance(r, dict):
+        return None
+    verdicts = []
+    for v in _list(r.get("verdicts")):
+        if not isinstance(v, dict):
+            continue
+        trope = _s(v.get("trope"), 80)
+        verdict = _s(v.get("verdict"), 10).lower()
+        if trope and verdict in ("yes", "no", "unsure"):
+            verdicts.append({"trope": trope, "verdict": verdict,
+                             "justification": _s(v.get("justification"), 300)})
+    return {"verdicts": verdicts}
+
+
+def v2_trope_gate(call, chapter_summaries, candidates, candidate_counts):
+    """Confirm/deny trope candidates against chapter summaries (one LLM call).
+
+    Returns (confirmed_names, confidence_dict). Evidence-based trope
+    confidence: 0.55 base for a gate "yes" + 0.1 per candidating chapter,
+    capped at 0.9.
+    """
+    confirmed, conf = [], {}
+    if not candidates:
+        return confirmed, conf
+    summaries = "\n".join(
+        f"Ch {s['index']} ({s['label']}): {s['summary']}"
+        for s in chapter_summaries if s.get("summary"))
+    prompt = (PROMPT_V2_TROPE_GATE
+              .replace("{summaries}", summaries)
+              .replace("{candidates}", "\n".join(f"- {c}" for c in candidates)))
+    out = _run_task(call, prompt, "", 1, 1, "v2-trope-gate",
+                    sanitize_fn=_sanitize_v2_gate)
+    if not out:
+        return confirmed, conf
+    cand_keys = {_tnorm(c): c for c in candidates}
+    for v in out["verdicts"]:
+        key = _tnorm(v["trope"])
+        if v["verdict"] == "yes" and key in cand_keys:
+            name = cand_keys[key]
+            confirmed.append(name)
+            n_ch = candidate_counts.get(key, 1)
+            conf[name] = round(min(0.9, 0.55 + 0.1 * n_ch), 2)
+    return confirmed, conf
+
+
+# --- v2 chapter extraction for non-EPUB (single-text) books ---
+_CHAPTER_HEADING_RE = re.compile(
+    r"(?m)^[ \t]*(chapter\s+\d+|chapter\s+[ivxlc]+|part\s+\d+|"
+    r"prologue|epilogue)[ \t]*$", re.IGNORECASE)
+
+
+def _prose_chapters(text):
+    """Split non-EPUB text into chapter-ish units, then run split_chapters().
+
+    Splits on chapter/part headings when detectable; otherwise falls back to
+    fixed-size paragraph splits. Returns indexed chapter units.
+    """
+    matches = list(_CHAPTER_HEADING_RE.finditer(text))
+    units = []
+    if len(matches) >= 2:
+        bounds = [m.start() for m in matches] + [len(text)]
+        for i in range(len(matches)):
+            chunk = text[bounds[i]:bounds[i + 1]].strip()
+            if len(chunk) > 500:
+                label = chunk.split("\n", 1)[0].strip()[:80]
+                units.append({"spine": f"part{i + 1}", "label": label,
+                              "text": chunk})
+    else:
+        target = 30000
+        cur, clen = [], 0
+        for p in text.split("\n\n"):
+            if clen + len(p) > target and cur:
+                units.append({"spine": f"part{len(units) + 1}",
+                              "label": f"Part {len(units) + 1}",
+                              "text": "\n\n".join(cur)})
+                cur, clen = [], 0
+            cur.append(p)
+            clen += len(p)
+        if cur:
+            units.append({"spine": f"part{len(units) + 1}",
+                          "label": f"Part {len(units) + 1}",
+                          "text": "\n\n".join(cur)})
+    return split_chapters(units)
+
+
 def chunk_text(text, chunk_size=CHUNK_CHARS):
     # Hard-split any single paragraph larger than a chunk
     paras = []
@@ -585,6 +1130,31 @@ def _diag_reset():
                   "reasoning_content": False}
 
 
+# Per-session cache for the json_schema fallback chain: None = untested,
+# False = server rejected json_schema with 400 (skip it from then on).
+_JSON_SCHEMA_OK = None
+
+
+def _response_format_candidates():
+    """Ordered response_format payloads to try; first accepted by the server wins."""
+    fmt = CONFIG.get("llm_response_format", "json_object")
+    if fmt == "none":
+        return [None]  # explicit: no constraint at all
+    cands = []
+    if CONFIG.get("llm_json_schema", True) and _JSON_SCHEMA_OK is not False:
+        cands.append({"type": "json_schema",
+                      "json_schema": {"name": "extraction",
+                                      "schema": {"type": "object"},
+                                      "strict": False}})
+    if fmt == "json_object":
+        cands.append({"type": "json_object"})
+    else:
+        print(f"\n  Warning: llm_response_format={fmt!r} unknown; using json_object")
+        cands.append({"type": "json_object"})
+    cands.append(None)  # last resort: unconstrained
+    return cands
+
+
 def llm_openai_compat(prompt, chunk, i, n):
     """Generic OpenAI-compatible API (Unsloth, vLLM, llama.cpp, etc.)
 
@@ -597,25 +1167,39 @@ def llm_openai_compat(prompt, chunk, i, n):
     _diag_reset()
     base = CONFIG.get("openai_base_url", "http://127.0.0.1:8888/v1").rstrip("/")
     model = CONFIG.get("openai_model", "")
-    max_tokens = CONFIG.get("llm_max_tokens", 4000)
+    max_tokens = CONFIG.get("llm_max_tokens", 8000)
+    if getattr(_DIAG, "token_boost", False):
+        max_tokens *= 2  # truncation retry: doubled budget, thread-local
     system_prefix = CONFIG.get("llm_system_prefix", "")
     system_prompt = f"{system_prefix}\n{prompt}" if system_prefix else prompt
-    payload = {"model": model,
-               "messages": [{"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"Excerpt {i}/{n}:\n\n{chunk}"}],
-               "temperature": 0.2,
-               "max_tokens": max_tokens}
-    fmt = CONFIG.get("llm_response_format", "json_object")
-    if fmt == "json_object":
-        payload["response_format"] = {"type": "json_object"}
-    elif fmt == "none":
-        pass  # send no response_format; lets the model answer freely
-    else:
-        print(f"\n  Warning: llm_response_format={fmt!r} unknown; using json_object")
-        payload["response_format"] = {"type": "json_object"}
-    try:
-        resp = _post_json(f"{base}/chat/completions", payload,
-                          {"Content-Type": "application/json"}, 300)
+    base_payload = {"model": model,
+                    "messages": [{"role": "system", "content": system_prompt},
+                                 {"role": "user", "content": f"Excerpt {i}/{n}:\n\n{chunk}"}],
+                    "temperature": 0.2,
+                    "max_tokens": max_tokens}
+    global _JSON_SCHEMA_OK
+    last_err = None
+    for rf in _response_format_candidates():
+        payload = dict(base_payload)
+        if rf is not None:
+            payload["response_format"] = rf
+        try:
+            resp = _post_json(f"{base}/chat/completions", payload,
+                              {"Content-Type": "application/json"}, 300)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")[:200]
+            last_err = f"{e.code}: {body}"
+            if e.code == 400 and rf is not None:
+                if rf.get("type") == "json_schema":
+                    _JSON_SCHEMA_OK = False
+                print(f"\n  response_format {rf.get('type')} rejected (400); "
+                      f"trying fallback", end=" ", flush=True)
+                continue
+            print(f"\n  OpenAI-compat {e.code}: {body}")
+            return None
+        except Exception as e:
+            print(f"\n  OpenAI-compat error: {e}")
+            return None
         choice = (resp.get("choices") or [{}])[0]
         msg = choice.get("message") or {}
         _DIAG.info = {
@@ -624,10 +1208,7 @@ def llm_openai_compat(prompt, chunk, i, n):
             "reasoning_content": bool(msg.get("reasoning_content")),
         }
         return msg.get("content")
-    except urllib.error.HTTPError as e:
-        print(f"\n  OpenAI-compat {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}")
-    except Exception as e:
-        print(f"\n  OpenAI-compat error: {e}")
+    print(f"\n  OpenAI-compat: all response_format options rejected ({last_err})")
     return None
 
 
@@ -863,25 +1444,41 @@ def sanitize(r):
             "stories": stories}
 
 
-def _run_task(call, prompt, chunk, i, n, task_name):
-    """Run one prompt task with retries. Returns sanitized dict or None."""
+def _run_task(call, prompt, chunk, i, n, task_name, sanitize_fn=None):
+    """Run one prompt task with retries. Returns sanitized dict or None.
+
+    sanitize_fn defaults to the legacy sanitize(); v2 passes its own.
+    If a response comes back empty with finish_reason=length, attempt 2
+    retries with a doubled token budget (thread-local boost, --batch safe).
+    """
+    san = sanitize_fn or sanitize
     raws = []
+    boosted = False
     for attempt in (1, 2):
-        out = call(prompt, chunk, i, n)
-        result = sanitize(parse_json_obj(out)) if out is not None else None
+        _DIAG.token_boost = boosted
+        try:
+            out = call(prompt, chunk, i, n)
+        finally:
+            _DIAG.token_boost = False
+        result = san(parse_json_obj(out)) if out is not None else None
         if result is not None:
             return result
-        if out is not None:
-            raws.append(out)
-            if not out:
-                # Empty response: report the forensics stashed by the backend.
-                d = getattr(_DIAG, "info", None) or {}
-                print(f"(empty: finish_reason={d.get('finish_reason')}, "
-                      f"completion_tokens={d.get('completion_tokens')}, "
-                      f"reasoning_content={'yes' if d.get('reasoning_content') else 'no'})",
-                      end=" ", flush=True)
-            else:
-                print("(unparseable, retrying)", end=" ", flush=True)
+        if out is None:
+            continue  # backend error already reported; spend next attempt
+        raws.append(out)
+        d = getattr(_DIAG, "info", None) or {}
+        if not out and d.get("finish_reason") == "length" and not boosted and attempt == 1:
+            boosted = True
+            print("(truncated, retrying with 2x budget)", end=" ", flush=True)
+            continue  # attempt 2 runs boosted
+        if not out:
+            # Empty response: report the forensics stashed by the backend.
+            print(f"(empty: finish_reason={d.get('finish_reason')}, "
+                  f"completion_tokens={d.get('completion_tokens')}, "
+                  f"reasoning_content={'yes' if d.get('reasoning_content') else 'no'})",
+                  end=" ", flush=True)
+        else:
+            print("(unparseable, retrying)", end=" ", flush=True)
     if raws and CONFIG.get("debug") and _DEBUG_TAG:
         dbg = SCRIPT_DIR / "preview" / "debug"
         dbg.mkdir(parents=True, exist_ok=True)
@@ -1395,7 +1992,206 @@ def _select_chunks(chunks, only):
     return [(i, ch) for i, ch in indexed if i in wanted]
 
 
+def process_file_v2(fpath, dry_run=False, preview=False):
+    """v2 pipeline: chapter-level map/reduce. Chapters run Call A (characters,
+    sequential for the roster) then Call B (content, parallelizable), followed
+    by a deterministic reduce and a trope confirmation gate."""
+    print(f"\nProcessing (v2): {fpath.name}")
+    global _DEBUG_TAG
+    _DEBUG_TAG = fpath.stem if (preview or dry_run) and CONFIG.get("debug") else None
+    suffix = fpath.suffix.lower()
+
+    if suffix == ".epub":
+        units, title, author, identifiers = extract_epub_units(fpath)
+        chapters = split_chapters(units)
+        word_count = sum(len(u["text"].split()) for u in units)
+    else:
+        extracted = read_ebook(fpath)
+        if extracted is None:
+            return False
+        text, title, author, identifiers = extracted
+        chapters = _prose_chapters(text)
+        word_count = len(text.split())
+
+    print(f"  Title: {title or fpath.stem}, Chars: "
+          f"{sum(len(c['text']) for c in chapters)}")
+    if identifiers.get("isbn"):
+        print(f"  ISBN: {identifiers['isbn']}")
+    elif identifiers.get("asin"):
+        print(f"  ASIN: {identifiers['asin']} (no ISBN found)")
+    if not chapters:
+        print("  No chapters extracted")
+        return False
+
+    # --chunks: restrict to specific chapter indices (1-based). Applied to the
+    # chapter list; original numbering is kept for debug comparability.
+    only = CONFIG.get("only_chunks")
+    indexed = _select_chunks(chapters, only)
+    if only:
+        if not indexed:
+            print(f"  --chunks {only}: no chapters match (1-{len(chapters)})")
+            return False
+        print(f"  {len(chapters)} chapters, selecting {len(indexed)} "
+              f"(--chunks {only}), LLM: {CONFIG['llm']}")
+    else:
+        print(f"  {len(chapters)} chapters, LLM: {CONFIG['llm']}")
+    n = len(indexed)
+
+    backends = {"ollama": llm_ollama, "openrouter": llm_openrouter,
+                "openai": llm_openai_compat}
+    call = backends.get(CONFIG["llm"], llm_ollama)
+    batch_size = max(1, CONFIG.get("batch_size", BATCH_SIZE))
+
+    # Pass 1: Call A sequential (roster must see chapters in order).
+    roster, chapter_as = {}, {}
+    a_ok = a_failed = a_fallback = 0
+    for i, ch in indexed:
+        print(f"  Chapter {i}/{n} (A)...", end=" ", flush=True)
+        a, fell_back = v2_call_a(call, roster, ch, n)
+        chapter_as[i] = a
+        if a is None:
+            a_failed += 1
+            print("FAILED")
+        else:
+            a_ok += 1
+            if fell_back:
+                a_fallback += 1
+            print("done" + (" (simple)" if fell_back else ""))
+
+    # Pass 2: Call B parallel (independent per chapter).
+    chapter_bs = {}
+    b_ok = b_failed = 0
+    if batch_size > 1:
+        print(f"  Batching {batch_size} parallel content calls...")
+        with ThreadPoolExecutor(max_workers=batch_size) as ex:
+            futs = {ex.submit(v2_call_b, call, ch, n): i for i, ch in indexed}
+            done_count = 0
+            for fut in as_completed(futs):
+                i = futs[fut]
+                b = fut.result()
+                chapter_bs[i] = b
+                done_count += 1
+                if b is None:
+                    b_failed += 1
+                else:
+                    b_ok += 1
+                print(f"\r  Content: {done_count}/{n} done", end="", flush=True)
+        print()
+    else:
+        for i, ch in indexed:
+            print(f"  Chapter {i}/{n} (B)...", end=" ", flush=True)
+            b = v2_call_b(call, ch, n)
+            chapter_bs[i] = b
+            if b is None:
+                b_failed += 1
+                print("FAILED")
+            else:
+                b_ok += 1
+                print("done")
+
+    failed = a_failed + b_failed
+    aborted = (a_ok == 0 and b_ok == 0) or failed / max(n, 1) > MAX_FAILED_CHUNK_RATIO
+    if aborted:
+        print(f"  {failed}/{2 * n} calls failed; not writing partial results")
+
+    # Deterministic reduce (no LLM).
+    red = v2_reduce(chapter_as, chapter_bs, roster,
+                    [ch for _, ch in indexed])
+
+    # Trope confirmation gate (one LLM call, skipped in dry-run).
+    tropes, trope_conf = [], {}
+    if not dry_run and red["trope_candidates"]:
+        print(f"  Trope gate: {len(red['trope_candidates'])} candidates...",
+              end=" ", flush=True)
+        tropes, trope_conf = v2_trope_gate(
+            call, red["chapter_summaries"], red["trope_candidates"],
+            red["trope_candidate_counts"])
+        print(f"{len(tropes)} confirmed")
+    red["tropes"] = tropes
+    red["trope_confidence"] = trope_conf
+
+    reading_mins = word_count // 250
+    result = {
+        "file": fpath.name, "title": title or fpath.stem, "author": author,
+        "isbn": identifiers.get("isbn"), "asin": identifiers.get("asin"),
+        "word_count": word_count, "reading_time_mins": reading_mins,
+        "chunks": n, "chunks_failed": a_failed,
+        "pipeline": "v2",
+        "tropes": tropes, "trope_confidence": trope_conf,
+        "triggers": red["triggers"], "characters": red["characters"],
+        "relationships": red["relationships"],
+        "spice_level": red["spice_level"],
+        "povs": red["povs"], "quotes": red["quotes"],
+        "chapter_summaries": red["chapter_summaries"],
+        "is_anthology": False, "stories": [],
+        "aborted": aborted, "chunks_ok": a_ok,
+        "tasks": {"discipline": b_ok, "identity": a_ok,
+                  "identity_simple": a_fallback},
+        "verification": red["verification"],
+        "roster_size": len(roster),
+    }
+    v = red["verification"]
+    if v["evidence_checked"]:
+        print(f"  Evidence: {v['evidence_verified']}/{v['evidence_checked']} verified")
+
+    # Work identity resolution (read-only in preview/dry-run).
+    wid, how = resolve_work(title or fpath.stem, author, identifiers, False,
+                            create=not (preview or dry_run))
+    result["work_id"] = wid
+    result["work_resolution"] = how
+    if how == "new":
+        result["work_candidates"] = _title_candidates(title or fpath.stem)
+        print("  Work: no match — NEW WORK would be created")
+    elif wid:
+        print(f"  Work: matched via {how} -> {wid[:8]}")
+    else:
+        print(f"  Work: resolution failed ({how})")
+
+    print(f"  Found: {len(tropes)} tropes, {len(red['triggers'])} triggers, "
+          f"{len(red['characters'])} characters ({len(roster)} roster)")
+    smsg = f" ({a_fallback} via simple fallback)" if a_fallback else ""
+    print(f"  Tasks: content {b_ok}/{n} ok, identity {a_ok}/{n} ok{smsg}")
+    print(f"  Spice: {red['spice_level']}/5, POVs: {', '.join(red['povs']) or 'none'}, "
+          f"~{reading_mins}min read")
+
+    if CONFIG.get("dedupe") and result["characters"]:
+        n_before = len(result["characters"])
+        try:
+            d_chars, d_rels, d_povs, dreport = dedupe_characters(
+                result["characters"], result["relationships"], result["povs"])
+        except Exception as e:
+            print(f"  Dedup failed ({e}); not writing partial results")
+            return False
+        result["characters"], result["relationships"], result["povs"] = \
+            d_chars, d_rels, d_povs
+        result["dedup_merges"] = dreport
+        print(f"  Dedup: {n_before} -> {len(d_chars)} characters "
+              f"({len(dreport)} clusters merged)")
+
+    if dry_run:
+        print("  DRY RUN — nothing written")
+        return not aborted
+    if preview:
+        save_preview(fpath, result)
+        print(f"  Preview saved (pipeline=v2)")
+        return not aborted
+    if aborted:
+        print("  ABORTED — not writing partial results")
+        return False
+    if not wid:
+        print(f"  Could not find or create work ({how})")
+        return False
+    print(f"  Work ID: {wid}")
+    errors = write_claims(wid, result)
+    if errors:
+        print(f"  {errors} database operation(s) failed")
+        return False
+    return True
+
+
 def process_file(fpath, dry_run=False, preview=False):
+    if CONFIG.get("pipeline") == "v2":
+        return process_file_v2(fpath, dry_run, preview)
     print(f"\nProcessing: {fpath.name}")
     global _DEBUG_TAG
     _DEBUG_TAG = fpath.stem if (preview or dry_run) and CONFIG.get("debug") else None
@@ -1772,6 +2568,9 @@ def main():
     ap.add_argument("--chunks", default=None,
                     help="process only these chunk indices (e.g. --chunks 2 or --chunks 2,5,8); "
                          "numbering matches the sampled chunk list and debug files")
+    ap.add_argument("--pipeline", default=None, choices=["legacy", "v2"],
+                    help="extraction pipeline: legacy (fixed chunks) or v2 "
+                         "(chapter-level map/reduce with character roster)")
     ap.add_argument("--debug", action="store_true",
                     help="save raw LLM output of failed chunks to preview/debug/")
     ap.add_argument("--dedupe", action="store_true",
@@ -1789,6 +2588,8 @@ def main():
         CONFIG["batch_size"] = args.batch
     if args.chunks:
         CONFIG["only_chunks"] = args.chunks
+    if args.pipeline:
+        CONFIG["pipeline"] = args.pipeline
     if args.debug:
         CONFIG["debug"] = True
     if args.dedupe:
