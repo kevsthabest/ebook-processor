@@ -303,8 +303,27 @@ def extract_mobi_identifiers(path):
     return ids
 
 
-def extract_epub_text(epub_path):
-    texts = []
+def extract_headings(html, limit=1):
+    """Return up to `limit` heading texts (h1-h3) from raw HTML, for chapter labels."""
+    heads = []
+    for m in re.finditer(r"<h[1-3][^>]*>(.*?)</h[1-3]>", html, re.DOTALL | re.IGNORECASE):
+        t = re.sub(r"<[^>]+>", "", m.group(1))
+        t = re.sub(r"\s+", " ", t).strip()
+        if t:
+            heads.append(t)
+        if len(heads) >= limit:
+            break
+    return heads
+
+
+def extract_epub_units(epub_path):
+    """Return ([{"spine", "label", "text"}], title, author, identifiers).
+
+    Per-spine units in reading order, front matter included. Use
+    split_chapters() for clean chapter-sized units; extract_epub_text()
+    keeps the legacy joined-string behavior.
+    """
+    units = []
     with zipfile.ZipFile(epub_path, "r") as z:
         available = set(z.namelist())
         names, title, author, opf_ids = read_opf(z)
@@ -319,10 +338,88 @@ def extract_epub_text(epub_path):
                 content = z.read(fname).decode("utf-8", errors="ignore")
                 text = html_to_text(content)
                 if len(text) > 100:
-                    texts.append(text)
+                    heads = extract_headings(content)
+                    label = heads[0][:80] if heads else posixpath.splitext(
+                        posixpath.basename(fname))[0]
+                    units.append({"spine": fname, "label": label, "text": text})
             except Exception as e:
                 print(f"  Warning: {fname}: {e}")
-    return "\n\n".join(texts), title, author, _pick_identifiers(opf_ids["raw"])
+    return units, title, author, _pick_identifiers(opf_ids["raw"])
+
+
+def extract_epub_text(epub_path):
+    units, title, author, identifiers = extract_epub_units(epub_path)
+    return "\n\n".join(u["text"] for u in units), title, author, identifiers
+
+
+# --- Chapter splitter (v2 pipeline; legacy chunking untouched) ---
+# Front/back-matter heuristic, matched against the spine filename.
+_SKIP_UNIT_RE = re.compile(
+    r"copyright|toc|table.?of.?contents|dedication|acknowledg|also.?by|"
+    r"about.?(the.?)?author|title.?page|\bcover\b|\bnav\b", re.IGNORECASE)
+
+MIN_CHAPTER_CHARS = 1500   # smaller units merge into the next one
+MAX_CHAPTER_CHARS = 40000  # ~10k tokens; larger units split on paragraphs
+
+
+def _chapter_part(u, text, part):
+    return {"spine": u["spine"],
+            "label": u["label"] if part == 1 else f"{u['label']} (part {part})",
+            "text": text}
+
+
+def split_chapters(units):
+    """Turn raw spine units into chapter-sized units for the v2 pipeline.
+
+    - Drops front/back matter by filename heuristic.
+    - Merges units under MIN_CHAPTER_CHARS into the next unit.
+    - Splits units over MAX_CHAPTER_CHARS on paragraph boundaries.
+    Returns [{"index", "label", "text"}] in reading order.
+    """
+    kept = [u for u in units if not _SKIP_UNIT_RE.search(u["spine"])]
+    # Merge small units forward (label of the following, larger unit wins).
+    merged = []
+    pending = None
+    for u in kept:
+        if pending is not None:
+            u = {"spine": u["spine"], "label": u["label"],
+                 "text": pending["text"] + "\n\n" + u["text"]}
+            pending = None
+        if len(u["text"]) < MIN_CHAPTER_CHARS:
+            pending = u
+        else:
+            merged.append(u)
+    if pending is not None:
+        if merged:
+            merged[-1]["text"] += "\n\n" + pending["text"]
+        else:
+            merged.append(pending)
+    # Split oversized units on paragraph boundaries.
+    out = []
+    for u in merged:
+        if len(u["text"]) <= MAX_CHAPTER_CHARS:
+            out.append(u)
+            continue
+        cur, clen, part = [], 0, 1
+        for p in u["text"].split("\n\n"):
+            while len(p) > MAX_CHAPTER_CHARS:  # hard-split giant paragraph
+                if cur:
+                    out.append(_chapter_part(u, "\n\n".join(cur), part))
+                    part += 1
+                    cur, clen = [], 0
+                out.append(_chapter_part(u, p[:MAX_CHAPTER_CHARS], part))
+                part += 1
+                p = p[MAX_CHAPTER_CHARS:]
+            if clen + len(p) > MAX_CHAPTER_CHARS and cur:
+                out.append(_chapter_part(u, "\n\n".join(cur), part))
+                part += 1
+                cur, clen = [], 0
+            cur.append(p)
+            clen += len(p)
+        if cur:
+            out.append(_chapter_part(u, "\n\n".join(cur), part))
+    return [{"index": i, "label": u["label"], "text": u["text"]}
+            for i, u in enumerate(out, 1)]
 
 
 def chunk_text(text, chunk_size=CHUNK_CHARS):

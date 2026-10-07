@@ -163,3 +163,8 @@ results are never written to Supabase.
 - Anthologies are detected per chunk; stories link as separate works via
   the `edition_works` junction table.
 - Each full novel costs roughly 100k tokens through the LLM.
+- **v2 pipeline (in progress):** `extract_epub_units()` +
+  `split_chapters()` provide chapter-sized units (front/back-matter skip,
+  small-unit merge, paragraph-boundary split) for the upcoming
+  chapter-level map/reduce pipeline. The legacy fixed-chunk path is
+  unchanged.
