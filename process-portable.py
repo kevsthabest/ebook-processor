@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.0.1"
+PORTABLE_VERSION = "2.0.2"
 
 import argparse
 import difflib
@@ -108,6 +108,8 @@ DEFAULT_CONFIG = {
     # (default false: json_schema silently truncates on some servers;
     #  json_object is the proven mode)
     "pipeline": "legacy",  # or "v2": chapter-level map/reduce (--pipeline v2)
+    "v2_max_chapter_chars": 16000,  # ~4k tokens; keep well under your
+    # server's context window minus prompt (~1k) minus output (~3k)
 }
 
 
@@ -363,7 +365,9 @@ _SKIP_UNIT_RE = re.compile(
     r"about.?(the.?)?author|title.?page|\bcover\b|\bnav\b", re.IGNORECASE)
 
 MIN_CHAPTER_CHARS = 1500   # smaller units merge into the next one
-MAX_CHAPTER_CHARS = 40000  # ~10k tokens; larger units split on paragraphs
+MAX_CHAPTER_CHARS = 16000  # ~4k tokens; must leave room in the context window
+# for the prompt + the model's thinking + JSON output. Override with
+# v2_max_chapter_chars in config.json if your server has a larger context.
 
 
 def _chapter_part(u, text, part):
@@ -377,9 +381,11 @@ def split_chapters(units):
 
     - Drops front/back matter by filename heuristic.
     - Merges units under MIN_CHAPTER_CHARS into the next unit.
-    - Splits units over MAX_CHAPTER_CHARS on paragraph boundaries.
+    - Splits units over the configured max (v2_max_chapter_chars, default
+      MAX_CHAPTER_CHARS) on paragraph boundaries.
     Returns [{"index", "label", "text"}] in reading order.
     """
+    max_chars = CONFIG.get("v2_max_chapter_chars", MAX_CHAPTER_CHARS)
     kept = [u for u in units if not _SKIP_UNIT_RE.search(u["spine"])]
     # Merge small units forward (label of the following, larger unit wins).
     merged = []
@@ -401,20 +407,20 @@ def split_chapters(units):
     # Split oversized units on paragraph boundaries.
     out = []
     for u in merged:
-        if len(u["text"]) <= MAX_CHAPTER_CHARS:
+        if len(u["text"]) <= max_chars:
             out.append(u)
             continue
         cur, clen, part = [], 0, 1
         for p in u["text"].split("\n\n"):
-            while len(p) > MAX_CHAPTER_CHARS:  # hard-split giant paragraph
+            while len(p) > max_chars:  # hard-split giant paragraph
                 if cur:
                     out.append(_chapter_part(u, "\n\n".join(cur), part))
                     part += 1
                     cur, clen = [], 0
-                out.append(_chapter_part(u, p[:MAX_CHAPTER_CHARS], part))
+                out.append(_chapter_part(u, p[:max_chars], part))
                 part += 1
-                p = p[MAX_CHAPTER_CHARS:]
-            if clen + len(p) > MAX_CHAPTER_CHARS and cur:
+                p = p[max_chars:]
+            if clen + len(p) > max_chars and cur:
                 out.append(_chapter_part(u, "\n\n".join(cur), part))
                 part += 1
                 cur, clen = [], 0

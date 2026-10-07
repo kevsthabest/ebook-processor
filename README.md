@@ -95,7 +95,7 @@ works at chapter level:
 
 1. **Chapter splitting** — EPUB: per-spine units via `extract_epub_units()`,
    then `split_chapters()` (front/back-matter skip by filename heuristic,
-   sub-1500-char units merged forward, 40k+ char units split on paragraph
+   sub-1500-char units merged forward, oversized units split on paragraph
    boundaries, labels from the first heading). MOBI/AZW3: `_prose_chapters()`
    splits on chapter/part headings, falling back to fixed-size paragraph
    splits. Legacy chunking is untouched.
@@ -113,6 +113,13 @@ works at chapter level:
 5. **Trope confirmation gate** — one LLM call judges each per-chapter
    candidate against the chapter summaries (yes/no/unsure); only "yes"
    becomes a claim, still subject to the closed-vocabulary DB gate.
+
+**Context window matters:** v2 chapters default to 16000 chars (~4k tokens)
+via `v2_max_chapter_chars`, sized to leave room in an 8192-token context for
+the prompt plus the model's thinking and JSON output. If your server runs a
+larger context (e.g. Unsloth with Context Length raised), raise
+`v2_max_chapter_chars` proportionally — roughly
+`(context_window - 4000) * 4` chars.
 
 Reasoning-model handling (both pipelines): `llm_json_schema` tries
 `response_format: json_schema` first and falls back to `json_object` then

@@ -109,10 +109,11 @@ class TestChapterSplitter(unittest.TestCase):
         merged = next(c for c in chapters if c["label"] == "Third Chapter")
         self.assertIn("tiny interlude", merged["text"])
         # big chapter split on paragraph boundaries
+        max_chars = pp.CONFIG.get("v2_max_chapter_chars", pp.MAX_CHAPTER_CHARS)
         big_parts = [c for c in chapters if c["label"].startswith("Big Chapter")]
-        self.assertEqual(len(big_parts), 2)
+        self.assertGreater(len(big_parts), 1)
         self.assertEqual(big_parts[1]["label"], "Big Chapter (part 2)")
-        self.assertTrue(all(len(c["text"]) <= pp.MAX_CHAPTER_CHARS for c in chapters))
+        self.assertTrue(all(len(c["text"]) <= max_chars for c in chapters))
         # indices sequential from 1, order preserved
         self.assertEqual([c["index"] for c in chapters], list(range(1, len(chapters) + 1)))
         first_pos = labels.index("First Chapter")
