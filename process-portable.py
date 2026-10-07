@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.3.0"
+PORTABLE_VERSION = "2.3.1"
 
 import argparse
 import difflib
@@ -3093,6 +3093,9 @@ def main():
                          "via embeddings; writes a review JSON, nothing to Supabase")
     ap.add_argument("--validate", metavar="PREVIEW_JSON",
                     help="run automated quality checks on a preview file")
+    ap.add_argument("--prompt-cache", action="store_true",
+                    help="v2: chapter-first prompt layout for llama.cpp KV cache "
+                         "reuse + interleaved A/B calls (experimental)")
     args = ap.parse_args()
 
     if args.trope_map:
@@ -3104,6 +3107,9 @@ def main():
         load_config()
         cmd_validate(args.validate)
         return
+
+    if args.prompt_cache:
+        CONFIG["v2_prompt_cache"] = True
 
     if args.llm:
         CONFIG["llm"] = args.llm
