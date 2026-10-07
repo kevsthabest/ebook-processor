@@ -57,6 +57,26 @@ class TestRoster(unittest.TestCase):
         e = roster[pp.norm_name("Shirley Jackson")]
         self.assertEqual(e["appearances"], 2)
 
+    def test_primary_not_absorbed_as_alias(self):
+        roster = {}
+        # Model wrongly lists Sally as Laurie's alias in ch1...
+        pp._roster_update(roster, [
+            {"name": "Laurie", "aliases": ["Sally", "Sarah"],
+             "role": "supporting", "description": "d", "evidence": ""}], 1)
+        # ...but Sally stands as her own character in ch2: keep separate.
+        pp._roster_update(roster, [
+            {"name": "Sally", "aliases": [],
+             "role": "supporting", "description": "d", "evidence": ""}], 2)
+        self.assertEqual(len(roster), 2)
+        self.assertIn(pp.norm_name("sally"), roster)
+        # And a later chapter re-asserting the bad alias doesn't re-merge.
+        pp._roster_update(roster, [
+            {"name": "Laurie", "aliases": ["Sally"],
+             "role": "supporting", "description": "d", "evidence": ""}], 3)
+        self.assertEqual(len(roster), 2)
+        laurie = roster[pp.norm_name("laurie")]
+        self.assertEqual(laurie["appearances"], 2)
+
     def test_roster_prompt_budget(self):
         roster = {}
         for i in range(20):
@@ -80,6 +100,8 @@ class TestReduce(unittest.TestCase):
     def test_trigger_max_severity(self):
         bs = {1: _b(self._full_triggers(explicit_sex="mentioned"), spice=1),
               2: _b(self._full_triggers(explicit_sex="on_page"), spice=3)}
+        # add verified evidence so on_page stands
+        bs[2]["trigger_evidence"] = {"explicit_sex": "quote here"}
         red = pp.v2_reduce({}, bs, {}, [_ch(1, "A"), _ch(2, "B")])
         self.assertEqual(len(red["triggers"]), 1)
         t = red["triggers"][0]
@@ -87,6 +109,14 @@ class TestReduce(unittest.TestCase):
         self.assertEqual(t["severity"], "on_page")  # max wins
         self.assertEqual(t["chapters"], ["A", "B"])  # both chapters flagged
         self.assertIn("confidence", t)
+
+    def test_trigger_downgrade_without_evidence(self):
+        # on_page claimed but no verified quote -> downgraded to mentioned
+        bs = {1: _b(self._full_triggers(murder="on_page"), spice=1)}
+        red = pp.v2_reduce({}, bs, {}, [_ch(1, "A")])
+        t = red["triggers"][0]
+        self.assertEqual(t["severity"], "mentioned")
+        self.assertEqual(t["severity_claimed"], "on_page")
 
     def test_spice_75th_percentile(self):
         bs = {i: _b(spice=s) for i, s in enumerate([0, 0, 2, 4], start=1)}

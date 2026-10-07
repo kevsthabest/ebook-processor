@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.0.2"
+PORTABLE_VERSION = "2.0.3"
 
 import argparse
 import difflib
@@ -514,28 +514,63 @@ PROMPT_V2_CONTENT = PROMPT_V2_CONTENT.replace(
 # Carried between chapters in order. Alias-aware: a new name matching any
 # known name/alias (normalized) merges instead of creating a duplicate.
 
+# Generic references safe for aggressive roster merging. Proper-name aliases
+# are recorded for display but never trigger a merge — the model lists
+# distinct people as "aliases" too often.
+_GENERIC_ALIASES = {"i", "me", "my", "mine", "myself",
+                    "the narrator", "narrator",
+                    "my husband", "the husband", "husband",
+                    "my wife", "the wife", "wife",
+                    "my mother", "my father", "mom", "dad",
+                    "mother", "father"}
+
+
 def _roster_update(roster, characters, chapter_idx):
-    """Fold one chapter's characters into the roster. Mutates roster."""
+    """Fold one chapter's characters into the roster. Mutates roster.
+
+    Merge rules, in order:
+    1. Incoming primary name matches a known PRIMARY -> merge.
+    2. Incoming name or alias is a GENERIC reference ("i", "the narrator",
+       ...) matching an entry's generic alias -> merge.
+    Proper-name aliases never trigger a merge (they're recorded, not trusted).
+    """
+    primaries = {}
+    for k, e in roster.items():
+        for pk in e.get("primary_keys", {k}):
+            primaries[pk] = k
+
     for c in characters:
         name = c.get("name", "")
         nkey = norm_name(name)
         if not nkey:
             continue
-        found = None
-        keys_to_check = {nkey} | {norm_name(a) for a in c.get("aliases", [])}
-        for k, e in roster.items():
-            if keys_to_check & e["alias_keys"]:
-                found = k
-                break
+        alias_keys = {norm_name(a) for a in c.get("aliases", [])}
+        alias_keys.discard("")
+
+        if nkey in primaries:
+            found = primaries[nkey]
+        else:
+            found = None
+            generic_keys = ({nkey} | alias_keys) & _GENERIC_ALIASES
+            if generic_keys:
+                for k, e in roster.items():
+                    if generic_keys & (e["alias_keys"] & _GENERIC_ALIASES):
+                        found = k
+                        break
+
         if found is None:
             roster[nkey] = {"name": name, "aliases": set(), "alias_keys": {nkey},
+                            "primary_keys": {nkey},
                             "appearances": 0, "last_seen": chapter_idx,
                             "roles": Counter(), "descriptions": []}
             found = nkey
+            primaries[nkey] = nkey
         e = roster[found]
         e["appearances"] += 1
         e["last_seen"] = chapter_idx
-        e["alias_keys"] |= keys_to_check
+        e["alias_keys"].add(nkey)
+        e["alias_keys"] |= alias_keys
+        e["primary_keys"].add(nkey)
         for alias in {name} | set(c.get("aliases", [])):
             if alias and alias != e["name"]:
                 e["aliases"].add(alias)
@@ -792,14 +827,20 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         acc = trig_acc[cat]
         if acc["sev"] == 0:
             continue
+        # on_page/graphic without a verified quote is downgraded: a severity
+        # claim needs textual evidence, not just the model's assertion.
+        sev = acc["sev"]
+        if sev >= 2 and not acc["evidence"]:
+            sev = 1
         triggers.append({
             "warning": cat,
-            "severity": sev_names[acc["sev"]],
+            "severity": sev_names[sev],
+            "severity_claimed": sev_names[acc["sev"]],
             "chapters": acc["chapters"],
             "evidence": acc["evidence"],
             "evidence_verified": bool(acc["evidence"]),
             "evidence_offered": bool(acc["evidence"]),
-            "confidence": _v2_trigger_confidence(acc["sev"], len(acc["chapters"]),
+            "confidence": _v2_trigger_confidence(sev, len(acc["chapters"]),
                                                  len(acc["evidence"])),
         })
 
