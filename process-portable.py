@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.0"
+PORTABLE_VERSION = "2.0.1"
 
 import argparse
 import difflib
@@ -104,7 +104,9 @@ DEFAULT_CONFIG = {
     "llm_max_tokens": 8000,
     "llm_system_prefix": "",
     "llm_response_format": "json_object",  # or "none"
-    "llm_json_schema": True,  # try response_format json_schema first, fall back on 400
+    "llm_json_schema": False,  # try response_format json_schema first, fall back on 400
+    # (default false: json_schema silently truncates on some servers;
+    #  json_object is the proven mode)
     "pipeline": "legacy",  # or "v2": chapter-level map/reduce (--pipeline v2)
 }
 
