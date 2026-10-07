@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.3.1"
+PORTABLE_VERSION = "2.3.2"
 
 import argparse
 import difflib
@@ -375,7 +375,7 @@ def extract_epub_text(epub_path):
 # Front/back-matter heuristic, matched against the spine filename.
 _SKIP_UNIT_RE = re.compile(
     r"copyright|(?<![a-z])toc(?![a-z])|table.?of.?contents|dedication|acknowledg|also.?by|"
-    r"about.?(the.?)?author|title.?page|cover|\bnav\b", re.IGNORECASE)
+    r"about.?(the.?)?author|title.?page|(?<![a-z])cover(?![a-z])|\bnav\b", re.IGNORECASE)
 
 MIN_CHAPTER_CHARS = 1500   # smaller units merge into the next one
 MAX_CHAPTER_CHARS = 16000  # ~4k tokens; must leave room in the context window
@@ -983,9 +983,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
                         if sim > best_sim:
                             best_id, best_sim = cid, sim
                     catalog_map[_tnorm(name)] = best_id if best_sim >= threshold else None
-                # Re-count chapters per catalog ID (or original key if unmapped).
+                # Re-count chapters per displayed name (catalog name for mapped).
+                names = {ci: cn for ci, cn, _ in catalog}  # catalog_id -> name
                 new_counts, new_candidates, new_seen = Counter(), [], set()
-                key_to_display = {}
+                new_catalog_map = {}
                 for idx in sorted(chapter_bs):
                     b = chapter_bs[idx]
                     if not b:
@@ -995,17 +996,19 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
                         if not k:
                             continue
                         cid = catalog_map.get(k)
-                        key = f"catalog:{cid}" if cid else k
+                        shown = names.get(cid) if cid else None
+                        shown = shown or _clean_trope(t)
+                        key = _tnorm(shown)
                         new_counts[key] += 1
+                        if cid:
+                            new_catalog_map[key] = cid
                         if key not in new_seen:
                             new_seen.add(key)
-                            # Display the catalog name for mapped, original for unmapped.
-                            disp = next((cn for ci, cn, _ in catalog if ci == cid), None) if cid else None
-                            new_candidates.append(disp or _clean_trope(t))
-                            key_to_display[key] = disp or _clean_trope(t)
-                # Swap in the catalog-collapsed counts (keep display names).
+                            new_candidates.append(shown)
+                # Swap in the catalog-collapsed counts (keyed by display name).
                 trope_candidates = new_candidates
                 trope_counts = new_counts
+                catalog_map = new_catalog_map
                 print(f"  Trope catalog mapping: {sum(1 for v in catalog_map.values() if v)} "
                       f"mapped, {sum(1 for v in catalog_map.values() if not v)} unmapped")
         except Exception as e:
@@ -1764,7 +1767,10 @@ def trope_catalog_vectors():
             pass
     rows = sb("tropes", params="?select=id,name,description&order=id")
     if not rows:
-        print("  ERROR: could not load tropes from Supabase")
+        if not CONFIG.get("supabase_url"):
+            print("  (trope catalog mapping skipped: no Supabase credentials)")
+        else:
+            print("  WARNING: could not load tropes from Supabase")
         return []
     # Embed any catalog entries missing from cache.
     missing = [r for r in rows if r["id"] not in cached]
@@ -2516,9 +2522,10 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     a_ok = a_failed = a_fallback = 0
     b_ok = b_failed = 0
     interleave = CONFIG.get("v2_prompt_cache") and batch_size > 1
+    # Single-slot prompt-cache: run B inline right after A (cache is hottest).
+    inline_b = CONFIG.get("v2_prompt_cache") and batch_size <= 1
     b_futs = {}
     if interleave:
-        from concurrent.futures import ThreadPoolExecutor
         b_pool = ThreadPoolExecutor(max_workers=batch_size)
     for i, ch in indexed:
         print(f"  Chapter {i}/{n} (A)...", end=" ", flush=True)
@@ -2534,8 +2541,14 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             print("done" + (" (simple)" if fell_back else ""))
         if interleave:
             b_futs[b_pool.submit(v2_call_b, call, ch, n)] = i
+        elif inline_b:
+            b = v2_call_b(call, ch, n)
+            chapter_bs[i] = b
+            if b is None:
+                b_failed += 1
+            else:
+                b_ok += 1
     if interleave:
-        from concurrent.futures import as_completed
         done_count = 0
         for fut in as_completed(b_futs):
             i = b_futs[fut]
@@ -2551,7 +2564,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         b_pool.shutdown()
 
     # Pass 2: Call B parallel (independent per chapter; skipped if interleaved).
-    if not interleave:
+    if not interleave and not inline_b:
         if batch_size > 1:
             print(f"  Batching {batch_size} parallel content calls...")
             with ThreadPoolExecutor(max_workers=batch_size) as ex:
