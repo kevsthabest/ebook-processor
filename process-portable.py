@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.3.2"
+PORTABLE_VERSION = "2.3.3"
 
 import argparse
 import difflib
@@ -976,14 +976,17 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
                 vecs = embed_vectors(CONFIG["embed_url"],
                                      CONFIG.get("embed_model", ""),
                                      trope_candidates)
+                vecs = [_normalize(v) for v in vecs]  # dot == cosine now
                 for name, vec in zip(trope_candidates, vecs):
                     best_id, best_sim = None, -1
                     for cid, cname, cvec in catalog:
-                        sim = _cosine(vec, cvec)
+                        sim = _dot(vec, cvec)
                         if sim > best_sim:
                             best_id, best_sim = cid, sim
                     catalog_map[_tnorm(name)] = best_id if best_sim >= threshold else None
                 # Re-count chapters per displayed name (catalog name for mapped).
+                # One chapter can list two paraphrases of the same trope —
+                # count each key at most once per chapter.
                 names = {ci: cn for ci, cn, _ in catalog}  # catalog_id -> name
                 new_counts, new_candidates, new_seen = Counter(), [], set()
                 new_catalog_map = {}
@@ -991,6 +994,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
                     b = chapter_bs[idx]
                     if not b:
                         continue
+                    seen_this_chapter = set()
                     for t in b["trope_candidates"]:
                         k = _tnorm(t)
                         if not k:
@@ -999,6 +1003,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
                         shown = names.get(cid) if cid else None
                         shown = shown or _clean_trope(t)
                         key = _tnorm(shown)
+                        if key in seen_this_chapter:
+                            continue
+                        seen_this_chapter.add(key)
                         new_counts[key] += 1
                         if cid:
                             new_catalog_map[key] = cid
@@ -1009,8 +1016,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
                 trope_candidates = new_candidates
                 trope_counts = new_counts
                 catalog_map = new_catalog_map
-                print(f"  Trope catalog mapping: {sum(1 for v in catalog_map.values() if v)} "
-                      f"mapped, {sum(1 for v in catalog_map.values() if not v)} unmapped")
+                n_mapped = len(new_catalog_map)
+                n_unmapped = len(new_candidates) - n_mapped
+                print(f"  Trope catalog mapping: {n_mapped} mapped, {n_unmapped} unmapped")
         except Exception as e:
             print(f"  (catalog mapping skipped: {e})")
     # Stash the mapping for write_claims.
@@ -1413,11 +1421,19 @@ def llm_openai_compat(prompt, chunk, i, n):
             return None
         choice = (resp.get("choices") or [{}])[0]
         msg = choice.get("message") or {}
+        usage = resp.get("usage") or {}
+        timings = resp.get("timings") or {}
         _DIAG.info = {
             "finish_reason": choice.get("finish_reason"),
-            "completion_tokens": (resp.get("usage") or {}).get("completion_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
             "reasoning_content": bool(msg.get("reasoning_content")),
+            "prompt_n": timings.get("prompt_n"),
+            "cache_n": timings.get("cache_n"),
         }
+        if CONFIG.get("debug") and timings.get("prompt_n"):
+            _p = timings.get("prompt_n") or 0
+            _c = timings.get("cache_n") or 0
+            print(f" (cache {_c}/{_p})", end="", flush=True)
         return msg.get("content")
     print(f"\n  OpenAI-compat: all response_format options rejected ({last_err})")
     return None
@@ -1746,11 +1762,23 @@ def extract_llm(chunk, i, n):
 
 # --- Supabase REST ---
 def _cosine(a, b):
+    """Cosine similarity. For repeated comparisons, normalize once with
+    _normalize() and use _dot() instead — this recomputes norms every call."""
     import math
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(x * x for x in b))
     return dot / (na * nb) if na and nb else 0.0
+
+
+def _normalize(v):
+    import math
+    n = math.sqrt(sum(x * x for x in v))
+    return [x / n for x in v] if n else v
+
+
+def _dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
 
 
 def trope_catalog_vectors():
@@ -1765,7 +1793,9 @@ def trope_catalog_vectors():
             cached = json.load(open(cache_path, encoding="utf-8"))
         except Exception:
             pass
-    rows = sb("tropes", params="?select=id,name,description&order=id")
+    rows = []
+    if CONFIG.get("supabase_url"):
+        rows = sb("tropes", params="?select=id,name,description&order=id")
     if not rows:
         if not CONFIG.get("supabase_url"):
             print("  (trope catalog mapping skipped: no Supabase credentials)")
@@ -1784,7 +1814,8 @@ def trope_catalog_vectors():
             json.dump(cached, open(cache_path, "w", encoding="utf-8"))
         except Exception as e:
             print(f"  warning: could not write vector cache: {e}")
-    return [(r["id"], r["name"], cached[r["id"]])
+    # Return normalized vectors so callers can use _dot() for fast comparison.
+    return [(r["id"], r["name"], _normalize(cached[r["id"]]))
             for r in rows if r["id"] in cached]
 
 
