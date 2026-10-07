@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.0.8"
+PORTABLE_VERSION = "2.0.9"
 
 import argparse
 import difflib
@@ -509,7 +509,7 @@ RULES:
 2. Every category at on_page or graphic REQUIRES an evidence quote in trigger_evidence, copied EXACTLY character-for-character from the chapter.
 3. SPICE LEVEL rubric: 0 = none at all. 1 = chaste romance. 2 = kissing/mild innuendo. 3 = explicit references, fade-to-black. 4 = on-page sex, moderate detail. 5 = explicit/graphic.
 4. QUOTES must be exact text copied from the chapter, character-for-character. Do not paraphrase, clean up punctuation, or normalize wording. If you cannot reproduce a line exactly, omit it. Empty array if none stand out.
-5. TROPE_CANDIDATES: list AT MOST 5 narrative patterns genuinely present in this chapter. A trope is a reusable storytelling pattern (e.g. "enemies to lovers", "found family"), NOT a plot summary ("learning to drive", "car trouble"). "Enemies to lovers" needs an actual romantic arc. Few accurate beats many questionable. Empty array is fine.
+5. TROPE_CANDIDATES: list 0-2 narrative patterns STRONGLY present in this chapter, and only then. A trope is a reusable storytelling pattern (e.g. "enemies to lovers", "found family"), NOT a plot summary ("learning to drive", "car trouble"). "Enemies to lovers" needs an actual romantic arc. Empty array is the default; most chapters have no tropes worth naming.
 
 Trigger categories (severity for each, exactly these names):
 TRIGGER_CATEGORIES_PLACEHOLDER2"""
@@ -573,12 +573,14 @@ def _roster_update(roster, characters, chapter_idx):
             roster[nkey] = {"name": name, "aliases": set(), "alias_keys": {nkey},
                             "primary_keys": {nkey},
                             "appearances": 0, "last_seen": chapter_idx,
+                            "chapters": set(),
                             "roles": Counter(), "descriptions": []}
             found = nkey
             primaries[nkey] = nkey
         e = roster[found]
         e["appearances"] += 1
         e["last_seen"] = chapter_idx
+        e["chapters"].add(chapter_idx)
         e["alias_keys"].add(nkey)
         e["alias_keys"] |= alias_keys
         e["primary_keys"].add(nkey)
@@ -812,8 +814,13 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
     idx_to_label = {c["index"]: c["label"] for c in chapters}
 
     # --- Characters: from the roster (aliases already merged) ---
+    # Keep only characters with a proper name OR 3+ chapter appearances.
+    # (Filters the long tail of generic one-off mentions.)
     characters = []
     for e in sorted(roster.values(), key=lambda x: -x["appearances"]):
+        n_ch = len(e.get("chapters", set()))
+        if not (_is_proper(e["name"]) or n_ch >= 3):
+            continue
         role = e["roles"].most_common(1)[0][0] if e["roles"] else None
         desc = max(e["descriptions"], key=len) if e["descriptions"] else ""
         ev = e.get("evidence", "")
@@ -826,6 +833,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
             "evidence_verified": bool(ev),
             "evidence_offered": bool(ev),
             "appearances": e["appearances"],
+            "chapters_present": n_ch,
             "confidence": _v2_char_confidence(e["appearances"], bool(ev)),
         })
 
@@ -900,7 +908,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         a = chapter_as[idx]
         if a and a.get("pov_character"):
             pov_counts[_roster_canonical(roster, a["pov_character"])] += 1
-    threshold = 2 if n >= 4 else 1
+    # Require POV in at least max(2, 10%) of chapters (filters one-off misfires).
+    threshold = max(2, n // 10) if n >= 4 else 1
     povs = sorted(p for p, c in pov_counts.items() if c >= threshold)
 
     # --- Trope candidates: union across chapters (gate runs separately) ---
