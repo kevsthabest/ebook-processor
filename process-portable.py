@@ -2919,6 +2919,8 @@ def write_claims(work_id, result, trope_mappings=None):
             continue
         rel_map.setdefault(r["from"].lower(), []).append(
             {"to": r["to"], "type": r["type"], "evidence": r.get("evidence", "")})
+    if _evidenceless_rels:
+        print(f"  Skipped {_evidenceless_rels} evidence-less relationships (kept in preview)")
     seen = _existing("book_characters", "name", work_id)
     if seen is None:
         errors += 1
