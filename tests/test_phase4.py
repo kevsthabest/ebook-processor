@@ -112,11 +112,20 @@ class TestReduce(unittest.TestCase):
 
     def test_trigger_downgrade_without_evidence(self):
         # on_page claimed but no verified quote -> downgraded to mentioned
-        bs = {1: _b(self._full_triggers(murder="on_page"), spice=1)}
-        red = pp.v2_reduce({}, bs, {}, [_ch(1, "A")])
+        # (2 chapters so it passes the 2+ chapter minimum)
+        bs = {1: _b(self._full_triggers(murder="on_page"), spice=1),
+              2: _b(self._full_triggers(murder="on_page"), spice=1)}
+        red = pp.v2_reduce({}, bs, {}, [_ch(1, "A"), _ch(2, "B")])
         t = red["triggers"][0]
         self.assertEqual(t["severity"], "mentioned")
         self.assertEqual(t["severity_claimed"], "on_page")
+
+    def test_trigger_single_chapter_dropped(self):
+        # Single-chapter trigger is noise — dropped entirely
+        bs = {1: _b(self._full_triggers(murder="graphic"), spice=1)}
+        bs[1]["trigger_evidence"] = {"murder": "quote here"}
+        red = pp.v2_reduce({}, bs, {}, [_ch(1, "A")])
+        self.assertEqual(len(red["triggers"]), 0)
 
     def test_spice_75th_percentile(self):
         bs = {i: _b(spice=s) for i, s in enumerate([0, 0, 2, 4], start=1)}
