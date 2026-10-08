@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.5.0"
+PORTABLE_VERSION = "2.5.1"
 
 import argparse
 import difflib
@@ -570,7 +570,13 @@ def _roster_update(roster, characters, chapter_idx):
         if nkey in primaries:
             found = primaries[nkey]
         else:
-            found = None
+            # Substring/fuzzy match: "bodhi" vs "bodhi durran"
+            for pk, rk in primaries.items():
+                if _names_overlap(nkey, pk):
+                    found = rk
+                    break
+            else:
+                found = None
             generic_keys = ({nkey} | alias_keys) & _GENERIC_ALIASES
             if generic_keys:
                 for k, e in roster.items():
@@ -2078,6 +2084,32 @@ def norm_name(n):
     return n
 
 
+# Common words that are never distinctive surnames.
+_NAME_STOPWORDS = frozenset({
+    "name", "names", "man", "woman", "boy", "girl", "child", "kid",
+    "person", "people", "guy", "lady", "lord", "sir", "mr", "mrs",
+    "ms", "dr", "professor", "general", "colonel", "major", "captain",
+    "commander", "king", "queen", "prince", "princess", "number",
+})
+
+def _names_overlap(a, b):
+    """True if two normalized names likely refer to the same person.
+    Matches: exact, one is a word-prefix of the other ("bodhi" vs "bodhi durran"),
+    or they share a distinctive last word ("melgren" in "general melgren" vs
+    "augustine melgren")."""
+    if not a or not b or a == b:
+        return a == b
+    aw, bw = a.split(), b.split()
+    # One is a prefix of the other (first name vs full name)
+    if aw == bw[:len(aw)] or bw == aw[:len(bw)]:
+        return True
+    # Share a distinctive last word (surname)
+    if (len(aw) > 1 and len(bw) > 1 and aw[-1] == bw[-1]
+            and len(aw[-1]) > 3 and aw[-1] not in _NAME_STOPWORDS):
+        return True
+    return False
+
+
 def _tnorm(t):
     """Trope dedup key: lowercase, underscores -> spaces, tidy spaces."""
     return re.sub(r"\s+", " ", (t or "").lower().replace("_", " ")).strip()
@@ -2139,7 +2171,13 @@ _NONPERSON_NOUNS = {
     "house", "car", "truck", "town", "city", "village", "school",
     "store", "church", "hospital", "office", "building", "room",
     "garden", "farm", "hotel", "station", "bridge", "road",
-    "street", "park",
+    "street", "park", "kingdom", "empire", "province", "region",
+    "territory", "realm", "nation", "country", "continent", "island",
+    "mountain", "river", "forest", "desert", "valley", "castle",
+    "fortress", "tower", "keep", "palace", "temple", "shrine",
+    # Generic family references (not named characters)
+    "dad", "mom", "father", "mother", "daddy", "mommy", "papa",
+    "grandfather", "grandmother", "grandpa", "grandma",
 }
 
 
@@ -2253,10 +2291,14 @@ def write_claims(work_id, result, trope_mappings=None):
             if str(tid).lower() in used:
                 continue
             used.add(str(tid).lower())
+            _chaps = (result.get("trope_chapters") or {}).get(_tnorm(t), [])
             rows.append({"work_id": work_id, "trope_id": tid, "status": "candidate",
                          "confidence": conf_t.get(_tnorm(t), 0.7),
                          "source_type": "ai",
-                         "model": model, "evidence": {"source": "ebook-extraction"}})
+                         "model": model,
+                         "evidence": {"source": "ebook-extraction",
+                                      "chapters": _chaps,
+                                      "chapter_count": len(_chaps)}})
         if rows:
             if sb("book_trope_claims", method="POST", data=rows) is None:
                 errors += 1
@@ -2721,6 +2763,29 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         auto_min = max(3, n // 20)  # 5% of chapters, min 3
         drop_single = n >= 20  # only drop single-chapter tropes in long books
         auto, gated, dropped = [], [], 0
+        # Build chapter lists per trope for evidence.
+        trope_chapters = {}
+        for idx in sorted(chapter_bs):
+            b = chapter_bs[idx]
+            if not b:
+                continue
+            seen_ch = set()
+            for tc in b.get("trope_candidates", []):
+                k = _tnorm(tc)
+                # Map to display name via catalog if available
+                disp = None
+                cmap = red.get("trope_catalog_map", {})
+                if k in cmap:
+                    # Find display name from candidates
+                    for cand in red["trope_candidates"]:
+                        if _tnorm(cand) == k:
+                            disp = cand
+                            break
+                key = _tnorm(disp or tc)
+                if key not in seen_ch:
+                    seen_ch.add(key)
+                    trope_chapters.setdefault(key, []).append(idx)
+        red["trope_chapters"] = trope_chapters
         for c in red["trope_candidates"]:
             n_ch = counts.get(_tnorm(c), 1)
             if n_ch >= auto_min:
@@ -2766,6 +2831,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "trope_candidates": red.get("trope_candidates", []),
         "trope_candidate_counts": red.get("trope_candidate_counts", {}),
         "trope_catalog_map": red.get("trope_catalog_map", {}),
+        "trope_chapters": red.get("trope_chapters", {}),
     }
     v = red["verification"]
     if v["evidence_checked"]:
