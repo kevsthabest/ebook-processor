@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.5.6"
+PORTABLE_VERSION = "2.5.7"
 
 import argparse
 import difflib
@@ -504,7 +504,7 @@ Keep any internal reasoning extremely brief — a complete, valid JSON object is
   "triggers": {"TRIGGER_CATEGORIES_PLACEHOLDER": "none|mentioned|on_page|graphic"},
   "trigger_evidence": {"category": "exact quote from the chapter supporting on_page/graphic"},
   "trope_candidates": ["trope names you notice in this chapter"],
-  "quotes": [{"text": "exact notable line from the chapter", "spoiler": false}]
+  "quotes": [{"text": "exact notable line from the chapter", "speaker": "character name who said it, or null if narration", "spoiler": false}]
 }
 
 RULES:
@@ -688,10 +688,11 @@ def _sanitize_v2b(r):
         if isinstance(q, dict):
             text = _s(q.get("text"), 600)
             spoiler = q.get("spoiler") in (True, "true", "True")
+            speaker = _s(q.get("speaker"), 100) or None
         else:
-            text, spoiler = _s(q, 600), False
+            text, spoiler, speaker = _s(q, 600), False, None
         if text:
-            quotes.append({"text": text, "spoiler": spoiler})
+            quotes.append({"text": text, "speaker": speaker, "spoiler": spoiler})
     return {"summary": _s(r.get("summary"), 1000),
             "spice_level": spice,
             "triggers": triggers,
@@ -1672,10 +1673,11 @@ def sanitize(r):
         if isinstance(q, dict):
             text = _s(q.get("text"), 600)
             spoiler = q.get("spoiler") in (True, "true", "True")
+            speaker = _s(q.get("speaker"), 100) or None
         else:
-            text, spoiler = _s(q, 600), False
+            text, spoiler, speaker = _s(q, 600), False, None
         if text:
-            quotes.append({"text": text, "spoiler": spoiler})
+            quotes.append({"text": text, "speaker": speaker, "spoiler": spoiler})
 
     stories = [s for s in (_s(x, 200) for x in _list(r.get("stories"))) if s]
 
@@ -2467,8 +2469,10 @@ def write_claims(work_id, result, trope_mappings=None):
             if not qtext or qtext[:100] in seen_q:
                 continue
             seen_q.add(qtext[:100])
+            _spk = q.get("speaker") if isinstance(q, dict) else None
             qrows.append({"work_id": work_id,
                           "quote": qtext,
+                          "speaker_name": _spk,
                           "source_type": "ai",
                           "confidence": 0.7})
         if qrows:
