@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.5.9"
+PORTABLE_VERSION = "2.6.0"
 
 import argparse
 import difflib
@@ -1361,6 +1361,15 @@ def llm_openrouter(prompt, chunk, i, n):
 # Set by llm_openai_compat, read by _run_task. Thread-local because chunks run
 # in a ThreadPoolExecutor when --batch > 1.
 _DIAG = threading.local()
+_PRINT_LOCK = threading.Lock()
+
+
+def effective_batch_size():
+    """Per-book batch size: thread-local override when --jobs splits slots."""
+    override = getattr(_DIAG, "batch_size_override", None)
+    if override is not None:
+        return max(1, override)
+    return max(1, CONFIG.get("batch_size", BATCH_SIZE))
 
 
 def _diag_reset():
@@ -2752,7 +2761,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     backends = {"ollama": llm_ollama, "openrouter": llm_openrouter,
                 "openai": llm_openai_compat}
     call = backends.get(CONFIG["llm"], llm_ollama)
-    batch_size = max(1, CONFIG.get("batch_size", BATCH_SIZE))
+    batch_size = effective_batch_size()
 
     # Pass 1: Call A sequential (roster must see chapters in order).
     # When v2_prompt_cache is on, submit B(i) right after A(i) so the
@@ -3049,7 +3058,7 @@ def process_file(fpath, dry_run=False, preview=False):
     v_checked = v_verified = v_dropped = 0
     task_ok = {"discipline": 0, "identity": 0, "identity_simple": 0}
 
-    batch_size = max(1, CONFIG.get("batch_size", BATCH_SIZE))
+    batch_size = effective_batch_size()
 
     def _run_chunk(args):
         idx, ch = args
@@ -3329,12 +3338,46 @@ def safe_move(src, dst_dir):
     shutil.move(str(src), str(dst))
 
 
+def _process_one(args):
+    """Wrapper for parallel book processing: sets per-book batch split."""
+    f, dry_run, preview, per_book_batch = args
+    _DIAG.batch_size_override = per_book_batch
+    try:
+        ok = process_file(f, dry_run, preview)
+    except Exception as e:
+        with _PRINT_LOCK:
+            print(f"  Error processing {f.name}: {e}")
+            traceback.print_exc()
+        ok = False
+    if not dry_run and not preview:
+        try:
+            safe_move(f, DONE_DIR if ok else FAILED_DIR)
+        except Exception as e:
+            with _PRINT_LOCK:
+                print(f"  Could not move {f.name}: {e}")
+    return ok
+
+
 def run_once(dry_run, preview):
     files = sorted(p for p in IMPORT_DIR.iterdir()
                    if p.is_file() and p.suffix.lower() in (".epub", ".mobi", ".azw3"))
     if not files:
         print("No ebooks found.")
         return 0
+    jobs = max(1, CONFIG.get("jobs", 1))
+    batch_size = max(1, CONFIG.get("batch_size", BATCH_SIZE))
+    if jobs > 1 and len(files) > 1:
+        per_book = max(1, batch_size // jobs)
+        total_slots = per_book * min(jobs, len(files))
+        print(f"Parallel mode: {min(jobs, len(files))} books x {per_book} slots "
+              f"({total_slots}/{batch_size} LLM slots used)")
+        from concurrent.futures import ThreadPoolExecutor
+        failures = 0
+        with ThreadPoolExecutor(max_workers=min(jobs, len(files))) as ex:
+            results = list(ex.map(_process_one,
+                                  [(f, dry_run, preview, per_book) for f in files]))
+        failures = sum(1 for ok in results if not ok)
+        return failures
     failures = 0
     for f in files:
         try:
@@ -3362,6 +3405,8 @@ def main():
     ap.add_argument("--sample", type=int, default=None, help="process every Nth chunk (e.g. --sample 3)")
     ap.add_argument("--full", action="store_true", help="disable sampling, process every chunk")
     ap.add_argument("--batch", type=int, default=None, help="parallel LLM requests (e.g. --batch 4)")
+    ap.add_argument("--jobs", type=int, default=None,
+                    help="process N books in parallel, splitting --batch slots across them (e.g. --jobs 2)")
     ap.add_argument("--chunks", default=None,
                     help="process only these chunk indices (e.g. --chunks 2 or --chunks 2,5,8); "
                          "numbering matches the sampled chunk list and debug files")
@@ -3419,6 +3464,8 @@ def main():
         CONFIG["sample_rate"] = args.sample
     if args.batch:
         CONFIG["batch_size"] = args.batch
+    if args.jobs:
+        CONFIG["jobs"] = max(1, args.jobs)
     if args.chunks:
         CONFIG["only_chunks"] = args.chunks
     if args.pipeline:

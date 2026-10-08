@@ -249,3 +249,26 @@ class TestV2Sanitizers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestParallelJobs(unittest.TestCase):
+    def test_effective_batch_size_default(self):
+        # No override: falls back to CONFIG
+        if hasattr(pp._DIAG, "batch_size_override"):
+            delattr(pp._DIAG, "batch_size_override")
+        pp.CONFIG["batch_size"] = 4
+        self.assertEqual(pp.effective_batch_size(), 4)
+
+    def test_effective_batch_size_override(self):
+        pp._DIAG.batch_size_override = 2
+        try:
+            self.assertEqual(pp.effective_batch_size(), 2)
+        finally:
+            delattr(pp._DIAG, "batch_size_override")
+
+    def test_effective_batch_size_min_one(self):
+        pp._DIAG.batch_size_override = 0
+        try:
+            self.assertEqual(pp.effective_batch_size(), 1)
+        finally:
+            delattr(pp._DIAG, "batch_size_override")
