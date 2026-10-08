@@ -458,3 +458,68 @@ class TestVerifyFlags(unittest.TestCase):
             [], {}, set(), set())
         # Should not crash
         self.assertIsInstance(flags, list)
+
+
+class TestGrounding(unittest.TestCase):
+    def test_grounded_character(self):
+        chars = [{"name": "Violet", "aliases": ["Violence"]}]
+        rels = []
+        chapters = [{"label": "Ch 1", "text": "Violet walked in. Violence was her nickname."}]
+        g = pp._ground_entities(chars, rels, chapters)
+        self.assertTrue(chars[0]["grounded"])
+        self.assertEqual(g["characters_grounded"], 1)
+        self.assertEqual(g["ungrounded_names"], [])
+
+    def test_hallucinated_character(self):
+        chars = [{"name": "Jason", "aliases": []}]
+        rels = []
+        chapters = [{"label": "Ch 1", "text": "Violet and Xaden talked."}]
+        g = pp._ground_entities(chars, rels, chapters)
+        self.assertFalse(chars[0]["grounded"])
+        self.assertEqual(chars[0]["variants_matched"], 0)
+        self.assertIn("Jason", g["ungrounded_names"])
+
+    def test_alias_grounds_character(self):
+        chars = [{"name": "Tairneanach", "aliases": ["Tairn"]}]
+        rels = []
+        chapters = [{"label": "Ch 1", "text": "Tairn roared."}]
+        g = pp._ground_entities(chars, rels, chapters)
+        self.assertTrue(chars[0]["grounded"])
+
+    def test_relationship_grounded(self):
+        chars = []
+        rels = [{"from": "Violet", "to": "Xaden", "chapter": "Ch 1"}]
+        chapters = [{"label": "Ch 1", "text": "Violet looked at Xaden."}]
+        g = pp._ground_entities(chars, rels, chapters)
+        self.assertTrue(rels[0]["grounded"])
+        self.assertEqual(g["relationships_grounded"], 1)
+
+    def test_relationship_not_cogrounded(self):
+        chars = []
+        rels = [{"from": "Violet", "to": "Jason", "chapter": "Ch 1"}]
+        chapters = [{"label": "Ch 1", "text": "Violet looked at Xaden."}]
+        g = pp._ground_entities(chars, rels, chapters)
+        self.assertFalse(rels[0]["grounded"])
+
+    def test_case_insensitive(self):
+        chars = [{"name": "VIOLET", "aliases": []}]
+        rels = []
+        chapters = [{"label": "Ch 1", "text": "violet whispered."}]
+        pp._ground_entities(chars, rels, chapters)
+        self.assertTrue(chars[0]["grounded"])
+
+    def test_word_boundary_no_substring(self):
+        # "Bo" must not match inside "book" — false grounded is the
+        # dangerous direction
+        chars = [{"name": "Bo", "aliases": []}]
+        rels = []
+        chapters = [{"label": "Ch 1", "text": "She opened the book."}]
+        pp._ground_entities(chars, rels, chapters)
+        self.assertFalse(chars[0]["grounded"])
+
+    def test_word_boundary_with_punctuation(self):
+        chars = [{"name": "St. John", "aliases": []}]
+        rels = []
+        chapters = [{"label": "Ch 1", "text": "St. John arrived."}]
+        pp._ground_entities(chars, rels, chapters)
+        self.assertTrue(chars[0]["grounded"])

@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.7.2"
+PORTABLE_VERSION = "2.7.3"
 
 import argparse
 import difflib
@@ -869,6 +869,63 @@ def _v2_trigger_confidence(severity_level, n_chapters, n_evidence):
                      min(0.2, 0.1 * n_evidence)), 2)
 
 
+def _ground_entities(characters, relationships, chapters):
+    """Verify extracted names against the raw chapter text. Pure function.
+
+    Characters: grounded if name or any alias appears as a whole word
+    (case-insensitive, word boundaries) anywhere in the book text.
+    Catches hallucinated names. Word boundaries (not substring) because
+    false-grounded is the dangerous direction — a short hallucinated name
+    like "Bo" must not match inside "book".
+    Relationships: grounded if both parties co-occur as whole words in the
+    claimed chapter (entity co-occurrence, not relationship validation).
+    Mutates the dicts in place, adding grounded/variants_matched. Returns
+    a summary dict.
+    """
+    import re as _re
+    full_text = "\n".join(c.get("text", "") for c in chapters)
+    grounded = 0
+    ungrounded_names = []
+    for ch in characters:
+        variants = {(ch.get("name") or "")}
+        variants |= {(a or "") for a in ch.get("aliases", [])}
+        variants.discard("")
+        matched = 0
+        for v in variants:
+            if not v:
+                continue
+            pat = _re.compile(r"(?<!\w)" + _re.escape(v) + r"(?!\w)", _re.IGNORECASE)
+            if pat.search(full_text):
+                matched += 1
+        ch["grounded"] = matched > 0
+        ch["variants_matched"] = matched
+        if matched > 0:
+            grounded += 1
+        else:
+            _nm = ch.get("name") or "?"
+            ungrounded_names.append(_nm)
+    # Chapter text lookup by label for relationship co-occurrence
+    label_to_text = {c.get("label"): c.get("text", "") for c in chapters}
+    rel_grounded = 0
+    for rel in relationships:
+        ch_text = label_to_text.get(rel.get("chapter", ""), "")
+        a = (rel.get("from") or "")
+        b = (rel.get("to") or "")
+        ok = False
+        if a and b:
+            pa = _re.compile(r"(?<!\w)" + _re.escape(a) + r"(?!\w)", _re.IGNORECASE)
+            pb = _re.compile(r"(?<!\w)" + _re.escape(b) + r"(?!\w)", _re.IGNORECASE)
+            ok = bool(pa.search(ch_text) and pb.search(ch_text))
+        rel["grounded"] = ok
+        if ok:
+            rel_grounded += 1
+    return {"characters_grounded": grounded,
+            "characters_total": len(characters),
+            "ungrounded_names": ungrounded_names,
+            "relationships_grounded": rel_grounded,
+            "relationships_total": len(relationships)}
+
+
 def v2_reduce(chapter_as, chapter_bs, roster, chapters):
     """Deterministic reduce over per-chapter v2 results. Pure code, no LLM.
 
@@ -1113,6 +1170,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
             v_checked += src["verification"].get("evidence_checked", 0)
             v_verified += src["verification"].get("evidence_verified", 0)
 
+    # --- Grounding: verify names against raw text (catches hallucinations) ---
+    _grounding = _ground_entities(characters, relationships, chapters)
+
     return {
         "characters": characters,
         "relationships": relationships,
@@ -1128,6 +1188,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         "chapter_summaries": chapter_summaries,
         "verification": {"evidence_checked": v_checked,
                          "evidence_verified": v_verified},
+        "grounding": _grounding,
     }
 
 
@@ -3322,15 +3383,23 @@ def process_file_v2(fpath, dry_run=False, preview=False):
 
     smsg = f" ({a_fallback} via simple fallback)" if a_fallback else ""
     UI.book_done(_book_key)
+    _gr = red.get("grounding", {})
+    _g_chars = f"{_gr.get('characters_grounded', '?')}/{_gr.get('characters_total', '?')}"
+    _g_rels = f"{_gr.get('relationships_grounded', '?')}/{_gr.get('relationships_total', '?')}"
     UI.summary(f"📖 {title or fpath.stem}", [
         ("Tropes", f"{len(tropes)} confirmed"),
         ("Triggers", len(red['triggers'])),
         ("Characters", f"{len(red['characters'])} ({len(roster)} roster)"),
+        ("Grounded", f"chars {_g_chars}, rels {_g_rels}"),
         ("Tasks", f"content {b_ok}/{n} ok, identity {a_ok}/{n} ok{smsg}"),
         ("Spice", f"{red['spice_level']}/5"),
         ("POVs", ', '.join(red['povs']) or 'none'),
         ("Reading time", f"~{reading_mins} min"),
     ])
+    _ung = _gr.get("ungrounded_names", [])
+    if _ung:
+        UI.status(f"  ⚠ Ungrounded characters (name never appears in text): {', '.join(_ung[:10])}"
+                  + (f" (+{len(_ung)-10} more)" if len(_ung) > 10 else ""))
 
     if CONFIG.get("dedupe") and result["characters"]:
         n_before = len(result["characters"])
