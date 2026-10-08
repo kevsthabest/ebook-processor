@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.5.8"
+PORTABLE_VERSION = "2.5.9"
 
 import argparse
 import difflib
@@ -2489,7 +2489,7 @@ def write_claims(work_id, result, trope_mappings=None):
             qrows.append({"work_id": work_id,
                           "quote": qtext,
                           "speaker_name": _spk,
-                          "source_type": "ai",
+                          "source_type": "pipeline",
                           "confidence": 0.7})
         if qrows:
             if sb("book_quotes", method="POST", data=qrows) is None:
