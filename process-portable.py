@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.3.3"
+PORTABLE_VERSION = "2.3.4"
 
 import argparse
 import difflib
@@ -748,15 +748,17 @@ def _v2_call_a_inner(call, roster, chapter, n_chapters):
     prompt = (PROMPT_V2_CHARACTERS
               .replace("{chapter_label}", chapter["label"])
               .replace("{roster}", roster_text))
-    if CONFIG.get("v2_prompt_cache"):
-        # Chapter first (shared prefix for llama.cpp KV cache), task last.
-        a = _run_task(call, V2_SHARED_SYSTEM,
-                      f"CHAPTER TEXT:\n{chapter['text']}\n\nTASK:\n{prompt}",
-                      idx, n_chapters, f"v2-ch{idx}-identity",
-                      sanitize_fn=_sanitize_v2a)
-    else:
-        a = _run_task(call, prompt, chapter["text"], idx, n_chapters,
-                      f"v2-ch{idx}-identity", sanitize_fn=_sanitize_v2a)
+    _use_shared = CONFIG.get("v2_prompt_cache") or CONFIG.get("v2_shared_system")
+    _task_last = CONFIG.get("v2_prompt_cache") or CONFIG.get("v2_task_last")
+    _system_a = V2_SHARED_SYSTEM if _use_shared else prompt
+    _user_a = (f"CHAPTER TEXT:\n{chapter['text']}\n\nTASK:\n{prompt}"
+               if _task_last else chapter["text"])
+    # When task-last without shared system, task goes in user message.
+    if _task_last and not _use_shared:
+        _user_a = f"CHAPTER TEXT:\n{chapter['text']}\n\nTASK:\n{prompt}"
+        _system_a = prompt
+    a = _run_task(call, _system_a, _user_a, idx, n_chapters,
+                  f"v2-ch{idx}-identity", sanitize_fn=_sanitize_v2a)
     # Apply POV hint if the LLM didn't determine one (or as override).
     if a and pov_hint and not a.get("pov_character"):
         a["pov_character"] = pov_hint
@@ -789,15 +791,15 @@ def v2_call_b(call, chapter, n_chapters):
 
 def _v2_call_b_inner(call, chapter, n_chapters):
     idx = chapter["index"]
-    if CONFIG.get("v2_prompt_cache"):
-        # Chapter first (shared prefix for llama.cpp KV cache), task last.
-        b = _run_task(call, V2_SHARED_SYSTEM,
-                      f"CHAPTER TEXT:\n{chapter['text']}\n\nTASK:\n{PROMPT_V2_CONTENT}",
-                      idx, n_chapters, f"v2-ch{idx}-content",
-                      sanitize_fn=_sanitize_v2b)
+    _use_shared_b = CONFIG.get("v2_prompt_cache") or CONFIG.get("v2_shared_system")
+    _task_last_b = CONFIG.get("v2_prompt_cache") or CONFIG.get("v2_task_last")
+    _system_b = V2_SHARED_SYSTEM if _use_shared_b else PROMPT_V2_CONTENT
+    if _task_last_b:
+        _user_b = f"CHAPTER TEXT:\n{chapter['text']}\n\nTASK:\n{PROMPT_V2_CONTENT}"
     else:
-        b = _run_task(call, PROMPT_V2_CONTENT, chapter["text"], idx, n_chapters,
-                      f"v2-ch{idx}-content", sanitize_fn=_sanitize_v2b)
+        _user_b = chapter["text"]
+    b = _run_task(call, _system_b, _user_b, idx, n_chapters,
+                  f"v2-ch{idx}-content", sanitize_fn=_sanitize_v2b)
     if b is not None:
         b["trigger_evidence"] = _verify_trigger_evidence(
             b["trigger_evidence"], chapter["text"])
@@ -3140,6 +3142,10 @@ def main():
     ap.add_argument("--prompt-cache", action="store_true",
                     help="v2: chapter-first prompt layout for llama.cpp KV cache "
                          "reuse + interleaved A/B calls (experimental)")
+    ap.add_argument("--shared-system", action="store_true",
+                    help="v2: use shared system prompt for A/B calls (isolation test)")
+    ap.add_argument("--task-last", action="store_true",
+                    help="v2: put chapter text before task instructions (isolation test)")
     args = ap.parse_args()
 
     if args.trope_map:
@@ -3154,6 +3160,10 @@ def main():
 
     if args.prompt_cache:
         CONFIG["v2_prompt_cache"] = True
+    if args.shared_system:
+        CONFIG["v2_shared_system"] = True
+    if args.task_last:
+        CONFIG["v2_task_last"] = True
 
     if args.llm:
         CONFIG["llm"] = args.llm
