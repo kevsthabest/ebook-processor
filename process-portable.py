@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.4.6"
+PORTABLE_VERSION = "2.4.7"
 
 import argparse
 import difflib
@@ -119,6 +119,7 @@ DEFAULT_CONFIG = {
     "trope_map_threshold": 0.78,  # cosine threshold for catalog mapping
     "trope_map_cache": "trope-vectors.json",  # cached catalog embeddings
     "v2_prompt_cache": False,  # put chapter first for llama.cpp KV cache reuse
+    "proposer_user_id": "",  # Supabase users.id for trope_proposals.proposed_by
     "pipeline": "legacy",  # or "v2": chapter-level map/reduce (--pipeline v2)
     "v2_max_chapter_chars": 16000,  # ~4k tokens; keep well under your
     # server's context window minus prompt (~1k) minus output (~3k)
@@ -1830,7 +1831,10 @@ def cmd_push_preview(preview_path):
         files = [f for f in files if "trope-map" not in os.path.basename(f)]
         print(f"  Pushing {len(files)} preview files...")
         for f in files:
-            cmd_push_preview(f)
+            try:
+                cmd_push_preview(f)
+            except Exception as e:
+                print(f"  FAILED {os.path.basename(f)}: {type(e).__name__}: {e}")
         return
     if not os.path.isfile(preview_path):
         print(f"  Not found: {preview_path}")
@@ -2261,14 +2265,15 @@ def write_claims(work_id, result, trope_mappings=None):
             if key in seen_keys:
                 continue
             seen_keys.add(key)
-            import uuid as _uuid
-            _proc_uuid = str(_uuid.uuid5(_uuid.NAMESPACE_DNS, "ebook-processor"))
-            prop_rows.append({"name": t, "name_key": key,
-                              "description": f"Detected by ebook processor in '{result.get('title', '')}'.",
-                              "genres": [],
-                              "book_key": result.get("isbn") or result.get("title", ""),
-                              "proposed_by": _proc_uuid,
-                              "status": "pending"})
+            row = {"name": t, "name_key": key,
+                   "description": f"Detected by ebook processor in '{result.get('title', '')}'.",
+                   "genres": [],
+                   "book_key": result.get("isbn") or result.get("title", ""),
+                   "status": "pending"}
+            uid = CONFIG.get("proposer_user_id")
+            if uid:
+                row["proposed_by"] = uid
+            prop_rows.append(row)
         if prop_rows:
             if sb("trope_proposals", method="POST", data=prop_rows) is None:
                 errors += 1
