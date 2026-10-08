@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.4.0"
+PORTABLE_VERSION = "2.4.1"
 
 import argparse
 import difflib
@@ -1933,13 +1933,23 @@ def _validate_one(preview_path, quiet=False):
 
 def cmd_trope_map(preview_path):
     """Map a preview JSON's tropes to the catalog. Writes a review JSON;
-    nothing is written to Supabase."""
+    nothing is written to Supabase.
+
+    Uses saved trope_candidates when present (includes unmapped ones dropped
+    during tiering), falling back to final tropes for older previews."""
     import os
     d = json.load(open(preview_path, encoding="utf-8"))
-    tropes = d.get("tropes") or []
-    if not tropes:
-        print("  No tropes in preview file.")
-        return
+    # Prefer full candidate list (enables remapping previously-unmapped).
+    candidates = d.get("trope_candidates") or []
+    counts = d.get("trope_candidate_counts") or {}
+    if candidates:
+        tropes = candidates
+        print(f"  Using {len(tropes)} saved candidates (incl. unmapped)...")
+    else:
+        tropes = d.get("tropes") or []
+        if not tropes:
+            print("  No tropes in preview file.")
+            return
     print(f"  Loading catalog vectors...")
     catalog = trope_catalog_vectors()
     if not catalog:
@@ -1948,23 +1958,26 @@ def cmd_trope_map(preview_path):
     # Embed the pipeline tropes.
     trope_vecs = embed_vectors(CONFIG["embed_url"], CONFIG.get("embed_model", ""),
                                tropes)
+    trope_vecs = [_normalize(v) for v in trope_vecs]
     threshold = CONFIG.get("trope_map_threshold", 0.78)
     mappings, proposals = [], []
     for name, vec in zip(tropes, trope_vecs):
         best, best_sim = None, -1
         for cid, cname, cvec in catalog:
-            sim = _cosine(vec, cvec)
+            sim = _dot(vec, cvec)
             if sim > best_sim:
                 best, best_sim = (cid, cname), sim
+        entry = {"pipeline_trope": name,
+                 "chapter_count": counts.get(_tnorm(name), 1)}
         if best_sim >= threshold:
-            mappings.append({"pipeline_trope": name, "catalog_id": best[0],
-                             "catalog_name": best[1],
-                             "similarity": round(best_sim, 3)})
+            entry.update({"catalog_id": best[0], "catalog_name": best[1],
+                          "similarity": round(best_sim, 3)})
+            mappings.append(entry)
         else:
-            proposals.append({"pipeline_trope": name,
-                              "nearest_catalog_id": best[0] if best else None,
-                              "nearest_similarity": round(best_sim, 3) if best else None,
-                              "book": d.get("title"), "isbn": d.get("isbn")})
+            entry.update({"nearest_catalog_id": best[0] if best else None,
+                          "nearest_similarity": round(best_sim, 3) if best else None,
+                          "book": d.get("title"), "isbn": d.get("isbn")})
+            proposals.append(entry)
     out = {"preview": os.path.basename(preview_path),
            "threshold": threshold,
            "mappings": mappings, "proposals": proposals}
@@ -2687,6 +2700,10 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                   "identity_simple": a_fallback},
         "verification": red["verification"],
         "roster_size": len(roster),
+        # Saved for future remapping (--trope-map can retry these later).
+        "trope_candidates": red.get("trope_candidates", []),
+        "trope_candidate_counts": red.get("trope_candidate_counts", {}),
+        "trope_catalog_map": red.get("trope_catalog_map", {}),
     }
     v = red["verification"]
     if v["evidence_checked"]:
