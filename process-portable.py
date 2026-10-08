@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.6.1"
+PORTABLE_VERSION = "2.6.2"
 
 import argparse
 import difflib
@@ -473,7 +473,7 @@ Known characters so far (reuse these EXACT names when the same person appears; a
 {roster}
 
 {
-  "characters": [{"name": "...", "aliases": ["other names used in this chapter"], "role": "protagonist|antagonist|supporting|minor", "description": "...", "evidence": "exact sentence from the chapter"}],
+  "characters": [{"name": "...", "aliases": ["other names used in this chapter"], "role": "protagonist|antagonist|supporting|minor", "description": "...", "appearance": "brief physical description (hair, eyes, build, distinctive features), or empty string if not described", "status": "alive|dead|unknown|missing", "evidence": "exact sentence from the chapter"}],
   "relationships": [{"from": "...", "to": "...", "type": "spouse|parent|child|sibling|friend|enemy|mentor|colleague|neighbor|other", "evidence": "exact sentence from the chapter"}],
   "pov_character": "name of the character narrating this chapter, or null"
 }
@@ -485,6 +485,7 @@ RULES:
 4. EVIDENCE: best supporting sentence copied exactly from the chapter; empty string if none — never invent, never repeat.
 5. ROLE must be exactly one of: protagonist, antagonist, supporting, minor. When in doubt, supporting.
 6. pov_character is ONLY someone who narrates this chapter. Most chapters have one; some have none (null).
+8. STATUS must be exactly one of: alive, dead, unknown, missing. Use "unknown" unless the chapter makes it clear. "missing" is for characters who vanished or whose fate is unresolved.
 7. RELATIONSHIPS: only list relationships EXPLICITLY shown or stated in this chapter. Do not infer.
    - Direction matters: if A is B's parent, do NOT also list B as A's parent. Pick ONE direction.
    - "spouse" means married or explicitly romantic partners. A character has at most ONE spouse. Dragons, mentors, and friends are NOT spouses.
@@ -612,6 +613,11 @@ def _roster_update(roster, characters, chapter_idx):
             e["roles"][c["role"]] += 1
         if c.get("description"):
             e["descriptions"].append(c["description"])
+        if c.get("appearance"):
+            e.setdefault("appearances_desc", []).append(c["appearance"])
+        if c.get("status"):
+            e["statuses"] = e.get("statuses", Counter())
+            e["statuses"][c["status"]] += 1
         if c.get("evidence") and not e.get("evidence"):
             e["evidence"] = c["evidence"]  # first verified evidence wins
 
@@ -647,11 +653,19 @@ def _sanitize_v2a(r):
         if not name:
             continue
         role = _s(c.get("role"), 30).lower()
+        _status = _s(c.get("status"), 20).lower()
+        _status = {"deceased": "dead", "killed": "dead", "died": "dead",
+                   "vanished": "missing", "disappeared": "missing",
+                   "gone": "missing"}.get(_status, _status)
+        if _status not in ("alive", "dead", "unknown", "missing"):
+            _status = "unknown"
         characters.append({
             "name": name,
             "aliases": [a for a in (_s(x, 120) for x in _list(c.get("aliases"))) if a],
             "role": role if role in VALID_ROLES else None,
             "description": _s(c.get("description"), 1000),
+            "appearance": _s(c.get("appearance"), 500),
+            "status": _status,
             "evidence": _s(c.get("evidence"), 500),
         })
     relationships = []
@@ -877,11 +891,20 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         role = e["roles"].most_common(1)[0][0] if e["roles"] else None
         desc = max(e["descriptions"], key=len) if e["descriptions"] else ""
         ev = e.get("evidence", "")
+        _statuses = e.get("statuses") or Counter()
+        _status = _statuses.most_common(1)[0][0] if _statuses else "unknown"
+        _appearances = e.get("appearances_desc") or []
+        _appearance = max(_appearances, key=len) if _appearances else ""
+        # First appearance: lowest chapter index (chapters are 0-based internally)
+        _chapters_sorted = sorted(e.get("chapters", set()))
         characters.append({
             "name": e["name"],
             "aliases": sorted(e["aliases"]),
             "role": role,
             "description": desc,
+            "appearance": _appearance,
+            "status": _status,
+            "first_appearance_chapter": (_chapters_sorted[0] + 1) if _chapters_sorted else None,
             "evidence": ev,
             "evidence_verified": bool(ev),
             "evidence_offered": bool(ev),
@@ -892,6 +915,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
 
     # --- Relationships: canonical-remap, dedupe by (from, to, type) ---
     seen_rel, relationships = set(), []
+    _pair_chapters = {}  # (from.lower, to.lower) -> set of chapter indices
     for idx in sorted(chapter_as):
         a = chapter_as[idx]
         if not a:
@@ -910,6 +934,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
                 if contra_keys & seen_rel:
                     continue
             key = (frm, to, rtype)
+            # Track chapter co-occurrence for importance (before dedup).
+            _pair_key = (frm.lower(), to.lower())
+            _pair_chapters.setdefault(_pair_key, set()).add(idx)
             if key in seen_rel:
                 continue
             seen_rel.add(key)
@@ -920,6 +947,15 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
                 "evidence_offered": bool(r.get("evidence")),
                 "chapter": idx_to_label.get(idx, ""),
             })
+
+    # --- Relationship importance: 1-5 from chapter co-occurrence ---
+    # More chapters together = more important. Scaled to book length.
+    _n_chapters = max(1, len(chapters))
+    for rel in relationships:
+        _pk = (rel["from"].lower(), rel["to"].lower())
+        _co = len(_pair_chapters.get(_pk, set()))
+        # 1 chapter = 1, ~20% of book = 5
+        rel["importance"] = max(1, min(5, round(1 + 4 * _co / max(1, _n_chapters * 0.2))))
 
     # --- Triggers: max severity per category, chapter counts, top evidence ---
     trig_acc = {c: {"sev": 0, "chapters": [], "evidence": []}
@@ -2437,6 +2473,10 @@ def write_claims(work_id, result, trope_mappings=None):
             seen.add(c["name"].lower())
             rows.append({"work_id": work_id, "name": c["name"], "role": c["role"],
                          "description": c.get("description", ""),
+                         "appearance": c.get("appearance", ""),
+                         "status": c.get("status", "unknown"),
+                         "aliases": c.get("aliases", []),
+                         "first_appearance_chapter": c.get("first_appearance_chapter"),
                          "relationships": rel_map.get(c["name"].lower(), []),
                          "source_type": "ai",
                          "confidence": c.get("confidence", 0.7)})

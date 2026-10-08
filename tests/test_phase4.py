@@ -272,3 +272,41 @@ class TestParallelJobs(unittest.TestCase):
             self.assertEqual(pp.effective_batch_size(), 1)
         finally:
             delattr(pp._DIAG, "batch_size_override")
+
+
+class TestCharacterEnrichment(unittest.TestCase):
+    def test_status_sanitizer_valid(self):
+        r = pp._sanitize_v2a({"characters": [
+            {"name": "A", "status": "dead"},
+            {"name": "B", "status": "ALIVE"},
+            {"name": "C", "status": "missing"},
+        ], "relationships": []})
+        statuses = [c["status"] for c in r["characters"]]
+        self.assertEqual(statuses, ["dead", "alive", "missing"])
+
+    def test_status_synonyms(self):
+        r = pp._sanitize_v2a({"characters": [
+            {"name": "A", "status": "deceased"},
+            {"name": "B", "status": "vanished"},
+        ], "relationships": []})
+        statuses = [c["status"] for c in r["characters"]]
+        self.assertEqual(statuses, ["dead", "missing"])
+
+    def test_status_defaults_unknown(self):
+        r = pp._sanitize_v2a({"characters": [
+            {"name": "A", "status": "probably fine"},
+            {"name": "B"},
+        ], "relationships": []})
+        statuses = [c["status"] for c in r["characters"]]
+        self.assertEqual(statuses, ["unknown", "unknown"])
+
+    def test_appearance_capped(self):
+        r = pp._sanitize_v2a({"characters": [
+            {"name": "A", "appearance": "x" * 900},
+        ], "relationships": []})
+        self.assertEqual(len(r["characters"][0]["appearance"]), 500)
+
+    def test_prompt_requests_enrichment_fields(self):
+        self.assertIn('"appearance"', pp.PROMPT_V2_CHARACTERS)
+        self.assertIn('"status"', pp.PROMPT_V2_CHARACTERS)
+        self.assertIn("alive", pp.PROMPT_V2_CHARACTERS)
