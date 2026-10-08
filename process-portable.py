@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.6.0"
+PORTABLE_VERSION = "2.6.1"
 
 import argparse
 import difflib
@@ -3373,9 +3373,15 @@ def run_once(dry_run, preview):
               f"({total_slots}/{batch_size} LLM slots used)")
         from concurrent.futures import ThreadPoolExecutor
         failures = 0
-        with ThreadPoolExecutor(max_workers=min(jobs, len(files))) as ex:
+        ex = ThreadPoolExecutor(max_workers=min(jobs, len(files)))
+        try:
             results = list(ex.map(_process_one,
                                   [(f, dry_run, preview, per_book) for f in files]))
+        except KeyboardInterrupt:
+            print("\nInterrupted — cancelling pending books...")
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise
+        ex.shutdown(wait=True)
         failures = sum(1 for ok in results if not ok)
         return failures
     failures = 0
