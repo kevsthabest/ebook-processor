@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.4.5"
+PORTABLE_VERSION = "2.4.6"
 
 import argparse
 import difflib
@@ -2027,14 +2027,17 @@ def cmd_trope_map(preview_path):
     print(f"  {len(mappings)} mapped, {len(proposals)} proposals -> {out_path}")
 
 
-def sb(table, method="GET", data=None, params=""):
+def sb(table, method="GET", data=None, params="", prefer=None):
     """Returns a list on success (possibly empty) or None on any error."""
     url = f"{CONFIG['supabase_url']}/rest/v1/{table}{params}"
+    _prefer = "return=representation"
+    if prefer:
+        _prefer = f"{_prefer},{prefer}"
     headers = {
         "apikey": CONFIG["supabase_key"],
         "Authorization": f"Bearer {CONFIG['supabase_key']}",
         "Content-Type": "application/json",
-        "Prefer": "return=representation",
+        "Prefer": _prefer,
     }
     body = json.dumps(data).encode("utf-8") if data is not None else None
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
@@ -2258,11 +2261,13 @@ def write_claims(work_id, result, trope_mappings=None):
             if key in seen_keys:
                 continue
             seen_keys.add(key)
+            import uuid as _uuid
+            _proc_uuid = str(_uuid.uuid5(_uuid.NAMESPACE_DNS, "ebook-processor"))
             prop_rows.append({"name": t, "name_key": key,
                               "description": f"Detected by ebook processor in '{result.get('title', '')}'.",
                               "genres": [],
                               "book_key": result.get("isbn") or result.get("title", ""),
-                              "proposed_by": "ebook-processor",
+                              "proposed_by": _proc_uuid,
                               "status": "pending"})
         if prop_rows:
             if sb("trope_proposals", method="POST", data=prop_rows) is None:
@@ -2341,10 +2346,11 @@ def write_claims(work_id, result, trope_mappings=None):
             existing = sb("book_meta", params=f"?isbn=eq.{isbn}&select=data")
             merged = dict(existing[0]["data"]) if existing and existing[0].get("data") else {}
             merged.update(meta_updates)
-            # POST with upsert
+            # POST with upsert (merge-duplicates required for on_conflict)
             r = sb("book_meta", method="POST",
                    params="?on_conflict=isbn",
-                   data={"isbn": isbn, "data": merged})
+                   data={"isbn": isbn, "data": merged},
+                   prefer="resolution=merge-duplicates")
             if r is None:
                 errors += 1
 
