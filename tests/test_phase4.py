@@ -91,6 +91,46 @@ class TestRoster(unittest.TestCase):
         self.assertIn("Character Number 19", text)
 
 
+class TestNamesOverlap(unittest.TestCase):
+    def test_title_surname_match(self):
+        # "General Melgren" is Augustine Melgren with a title
+        self.assertTrue(pp._names_overlap("general melgren", "augustine melgren"))
+
+    def test_bare_surname_match(self):
+        self.assertTrue(pp._names_overlap("melgren", "augustine melgren"))
+
+    def test_prefix_match(self):
+        self.assertTrue(pp._names_overlap("bodhi", "bodhi durran"))
+        self.assertTrue(pp._names_overlap("garrick", "garrick tavis"))
+
+    def test_exact_match(self):
+        self.assertTrue(pp._names_overlap("violet sorrengail", "violet sorrengail"))
+
+    def test_siblings_do_not_merge(self):
+        # Two full names sharing only a surname are different people
+        self.assertFalse(pp._names_overlap("brennan sorrengail", "violet sorrengail"))
+        self.assertFalse(pp._names_overlap("mira sorrengail", "violet sorrengail"))
+
+    def test_distinct_names(self):
+        self.assertFalse(pp._names_overlap("xaden riorson", "dain aetos"))
+        self.assertFalse(pp._names_overlap("", "violet"))
+        self.assertFalse(pp._names_overlap("violet", ""))
+
+    def test_roster_keeps_siblings_separate(self):
+        roster = {}
+        pp._roster_update(roster, [
+            {"name": "Violet Sorrengail", "aliases": [], "role": "protagonist",
+             "description": "d1", "evidence": ""}], 1)
+        pp._roster_update(roster, [
+            {"name": "Brennan Sorrengail", "aliases": [], "role": "supporting",
+             "description": "d2", "evidence": ""}], 2)
+        pp._roster_update(roster, [
+            {"name": "Mira Sorrengail", "aliases": [], "role": "supporting",
+             "description": "d3", "evidence": ""}], 3)
+        # Three siblings stay three roster entries
+        self.assertEqual(len(roster), 3)
+
+
 class TestReduce(unittest.TestCase):
     def _full_triggers(self, **over):
         t = {c: "none" for c in pp.TRIGGER_CATEGORIES}
@@ -118,12 +158,44 @@ class TestReduce(unittest.TestCase):
         red = pp.v2_reduce({}, bs, {}, [_ch(1, "A"), _ch(2, "B")])
         t = red["triggers"][0]
         self.assertEqual(t["severity"], "mentioned")
-        self.assertEqual(t["severity_claimed"], "on_page")
 
-    def test_trigger_single_chapter_dropped(self):
-        # Single-chapter trigger is noise — dropped entirely
-        bs = {1: _b(self._full_triggers(murder="graphic"), spice=1)}
+    def test_single_chapter_graphic_kept(self):
+        # A graphic scene in one chapter with evidence is kept — that's
+        # exactly what a trigger warning is for.
+        bs = {1: _b(self._full_triggers(murder="graphic"), spice=1),
+              2: _b(self._full_triggers(), spice=1)}
         bs[1]["trigger_evidence"] = {"murder": "quote here"}
+        red = pp.v2_reduce({}, bs, {}, [_ch(1, "A"), _ch(2, "B")])
+        self.assertEqual(len(red["triggers"]), 1)
+        self.assertEqual(red["triggers"][0]["severity"], "graphic")
+        self.assertEqual(red["triggers"][0]["severity_claimed"], "graphic")
+
+    def test_single_chapter_on_page_kept(self):
+        bs = {1: _b(self._full_triggers(torture="on_page"), spice=1),
+              2: _b(self._full_triggers(), spice=1)}
+        bs[1]["trigger_evidence"] = {"torture": "quote here"}
+        red = pp.v2_reduce({}, bs, {}, [_ch(1, "A"), _ch(2, "B")])
+        self.assertEqual(len(red["triggers"]), 1)
+        self.assertEqual(red["triggers"][0]["severity"], "on_page")
+
+    def test_single_chapter_mentioned_dropped(self):
+        # Lone "mentioned" is noise — still dropped.
+        bs = {1: _b(self._full_triggers(bullying="mentioned"), spice=1),
+              2: _b(self._full_triggers(), spice=1)}
+        red = pp.v2_reduce({}, bs, {}, [_ch(1, "A"), _ch(2, "B")])
+        self.assertEqual(len(red["triggers"]), 0)
+
+    def test_single_chapter_unevidenced_on_page_dropped(self):
+        # on_page without evidence downgrades to mentioned, then the
+        # single-chapter rule drops it.
+        bs = {1: _b(self._full_triggers(murder="on_page"), spice=1),
+              2: _b(self._full_triggers(), spice=1)}
+        red = pp.v2_reduce({}, bs, {}, [_ch(1, "A"), _ch(2, "B")])
+        self.assertEqual(len(red["triggers"]), 0)
+
+    def test_trigger_single_chapter_mentioned_dropped(self):
+        # Single-chapter "mentioned" is noise — dropped entirely
+        bs = {1: _b(self._full_triggers(murder="mentioned"), spice=1)}
         red = pp.v2_reduce({}, bs, {}, [_ch(1, "A")])
         self.assertEqual(len(red["triggers"]), 0)
 
@@ -181,6 +253,37 @@ class TestReduce(unittest.TestCase):
         self.assertEqual(pp._v2_char_confidence(1, False), 0.6)
         self.assertEqual(pp._v2_char_confidence(5, True), 0.95)  # capped
         self.assertEqual(pp._v2_trigger_confidence(2, 2, 1), 0.9)
+
+
+class TestFirstAppearance(unittest.TestCase):
+    def test_first_appearance_is_1based(self):
+        # Roster chapters are 1-based; first_appearance_chapter must not add 1.
+        from collections import Counter
+        roster = {
+            "violet": {"name": "Violet", "aliases": set(), "alias_keys": {"violet"},
+                       "primary_keys": {"violet"}, "appearances": 3, "last_seen": 5,
+                       "chapters": {5, 3, 8}, "roles": Counter({"protagonist": 3}),
+                       "descriptions": ["d"], "evidence": ""},
+        }
+        red = pp.v2_reduce({}, {}, roster, [_ch(1, "A"), _ch(2, "B")])
+        chars = {c["name"]: c for c in red["characters"]}
+        # Lowest chapter is 3, not 4
+        self.assertEqual(chars["Violet"]["first_appearance_chapter"], 3)
+
+    def test_first_appearance_none_when_no_chapters(self):
+        from collections import Counter
+        roster = {
+            "x": {"name": "X", "aliases": set(), "alias_keys": {"x"},
+                  "primary_keys": {"x"}, "appearances": 1, "last_seen": 1,
+                  "chapters": set(), "roles": Counter(), "descriptions": [],
+                  "evidence": ""},
+        }
+        red = pp.v2_reduce({}, {}, roster, [_ch(1, "A")])
+        # X has no proper name and 1 appearance < threshold, may be filtered;
+        # if present, first_appearance_chapter must be None
+        for c in red["characters"]:
+            if c["name"] == "X":
+                self.assertIsNone(c["first_appearance_chapter"])
 
 
 class TestTropeGate(unittest.TestCase):
@@ -460,6 +563,43 @@ class TestVerifyFlags(unittest.TestCase):
         self.assertIsInstance(flags, list)
 
 
+class TestTropeChapters(unittest.TestCase):
+    def test_paraphrase_maps_to_display_key(self):
+        # A paraphrase ("dragon bonding") that maps to a catalog trope
+        # ("Dragons") must have its chapters keyed by the display name,
+        # not the raw paraphrase text.
+        import unittest.mock as mock
+        # Mock catalog: one trope "Dragons" with fake vector
+        fake_catalog = [("cid1", "Dragons", [1.0, 0.0])]
+        # Mock embeddings: "dragon bonding" -> vector close to "Dragons"
+        def fake_embed(base_url, model, texts):
+            return [[1.0, 0.0] for _ in texts]
+        orig_config = dict(pp.CONFIG)
+        pp.CONFIG["embed_url"] = "http://fake"
+        pp.CONFIG["trope_map_threshold"] = 0.5
+        try:
+            with mock.patch.object(pp, "trope_catalog_vectors", return_value=fake_catalog), \
+                 mock.patch.object(pp, "embed_vectors", side_effect=fake_embed):
+                bs = {
+                    1: {"summary": "s", "spice_level": 1,
+                        "triggers": {c: "none" for c in pp.TRIGGER_CATEGORIES},
+                        "trigger_evidence": {}, "trope_candidates": ["dragon bonding"],
+                        "quotes": []},
+                    2: {"summary": "s", "spice_level": 1,
+                        "triggers": {c: "none" for c in pp.TRIGGER_CATEGORIES},
+                        "trigger_evidence": {}, "trope_candidates": ["dragon bonding"],
+                        "quotes": []},
+                }
+                red = pp.v2_reduce({}, bs, {}, [_ch(1, "Ch1"), _ch(2, "Ch2")])
+                # Chapters keyed by display name "dragons", not raw "dragon bonding"
+                self.assertIn("dragons", red["trope_chapters"])
+                self.assertNotIn("dragon bonding", red["trope_chapters"])
+                self.assertEqual(len(red["trope_chapters"]["dragons"]), 2)
+        finally:
+            pp.CONFIG.clear()
+            pp.CONFIG.update(orig_config)
+
+
 class TestGrounding(unittest.TestCase):
     def test_grounded_character(self):
         chars = [{"name": "Violet", "aliases": ["Violence"]}]
@@ -523,3 +663,42 @@ class TestGrounding(unittest.TestCase):
         chapters = [{"label": "Ch 1", "text": "St. John arrived."}]
         pp._ground_entities(chars, rels, chapters)
         self.assertTrue(chars[0]["grounded"])
+
+
+class TestAliasValidation(unittest.TestCase):
+    def test_reject_possessive(self):
+        self.assertFalse(pp._is_valid_alias("Sebeck's wife"))
+        self.assertFalse(pp._is_valid_alias("Sebeck's son"))
+
+    def test_reject_relationship_words(self):
+        self.assertFalse(pp._is_valid_alias("wife"))
+        self.assertFalse(pp._is_valid_alias("son"))
+        self.assertFalse(pp._is_valid_alias("Mrs. Sebeck"))
+
+    def test_reject_generic_descriptors(self):
+        self.assertFalse(pp._is_valid_alias("the major"))
+        self.assertFalse(pp._is_valid_alias("the narrator"))
+
+    def test_accept_real_aliases(self):
+        self.assertTrue(pp._is_valid_alias("Pete Sebeck"))
+        self.assertTrue(pp._is_valid_alias("Trip"))
+        self.assertTrue(pp._is_valid_alias("Leonard Littleton"))
+
+    def test_rejected_aliases_preserved(self):
+        roster = {}
+        pp._roster_update(roster, [
+            {"name": "Peter Sebeck", "aliases": ["Pete Sebeck", "Sebeck's wife", "wife"]}
+        ], 0)
+        e = list(roster.values())[0]
+        self.assertIn("Pete Sebeck", e["aliases"])
+        self.assertNotIn("Sebeck's wife", e["aliases"])
+        self.assertNotIn("wife", e["aliases"])
+        self.assertIn("Sebeck's wife", e.get("unresolved_mentions", set()))
+
+    def test_pete_not_merged_without_validation(self):
+        # "Pete" alone should not merge two named characters
+        roster = {}
+        pp._roster_update(roster, [{"name": "Peter Sebeck", "aliases": []}], 0)
+        pp._roster_update(roster, [{"name": "Jon Ross", "aliases": ["Pete"]}], 1)
+        # Two separate roster entries (no merge on weak alias)
+        self.assertEqual(len(roster), 2)

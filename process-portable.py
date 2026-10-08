@@ -552,6 +552,45 @@ _GENERIC_ALIASES = {"i", "me", "my", "mine", "myself",
                     "mother", "father"}
 
 
+# Words that are relationships/descriptors, not names. Never valid as aliases.
+_ALIAS_BAN_WORDS = frozenset({
+    "wife", "husband", "son", "daughter", "mother", "father", "brother", "sister",
+    "parent", "child", "spouse", "partner", "friend", "enemy", "lover",
+    "boyfriend", "girlfriend", "fiance", "fiancee",
+})
+
+def _is_valid_alias(alias):
+    """Reject aliases that are generic descriptors, not identity claims.
+
+    Rejects: possessives ("Sebeck's wife"), relationship words ("wife", "son"),
+    generic descriptors ("the major", "narrator"). These contaminate the alias
+    list and can cause false merges downstream.
+    """
+    if not alias or not isinstance(alias, str):
+        return False
+    a = alias.strip()
+    if not a:
+        return False
+    al = a.lower()
+    words = [w.strip(".,") for w in al.split()]
+    # Possessives: "Sebeck's wife", "Peter's son" — describes a relationship, not a name
+    if "'s " in al or al.endswith("'s"):
+        return False
+    # Honorific + surname without a first name: "Mrs. Sebeck", "Mr. Ross"
+    # These are relationship descriptors, not identity aliases
+    _honorifics = {"mr", "mrs", "ms", "miss", "dr", "prof"}
+    if len(words) == 2 and words[0].rstrip(".") in _honorifics:
+        return False
+    # Relationship/descriptor words (exact match or as the only meaningful word)
+    if len(words) == 1 and words[0] in _ALIAS_BAN_WORDS:
+        return False
+    # Generic descriptors with articles
+    if al.startswith("the ") and len(words) <= 3:
+        # "the major", "the narrator" — but allow "Theokoles" etc. (single word, no space)
+        return False
+    return True
+
+
 def _roster_update(roster, characters, chapter_idx):
     """Fold one chapter's characters into the roster. Mutates roster.
 
@@ -607,8 +646,14 @@ def _roster_update(roster, characters, chapter_idx):
         e["alias_keys"] |= alias_keys
         e["primary_keys"].add(nkey)
         for alias in {name} | set(c.get("aliases", [])):
-            if alias and alias != e["name"]:
+            if not alias or alias == e["name"]:
+                continue
+            if _is_valid_alias(alias):
                 e["aliases"].add(alias)
+            else:
+                # Preserve rejected aliases as unresolved mentions (GPT audit:
+                # they may be useful clues, don't throw them away)
+                e.setdefault("unresolved_mentions", set()).add(alias)
         if c.get("role"):
             e["roles"][c["role"]] += 1
         if c.get("description"):
@@ -952,16 +997,17 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         _status = _statuses.most_common(1)[0][0] if _statuses else "unknown"
         _appearances = e.get("appearances_desc") or []
         _appearance = max(_appearances, key=len) if _appearances else ""
-        # First appearance: lowest chapter index (chapters are 0-based internally)
+        # First appearance: lowest chapter index (1-based, matches --chunks numbering)
         _chapters_sorted = sorted(e.get("chapters", set()))
         characters.append({
             "name": e["name"],
             "aliases": sorted(e["aliases"]),
+            "unresolved_mentions": sorted(e.get("unresolved_mentions", set())),
             "role": role,
             "description": desc,
             "appearance": _appearance,
             "status": _status,
-            "first_appearance_chapter": (_chapters_sorted[0] + 1) if _chapters_sorted else None,
+            "first_appearance_chapter": _chapters_sorted[0] if _chapters_sorted else None,
             "evidence": ev,
             "evidence_verified": bool(ev),
             "evidence_offered": bool(ev),
@@ -1037,15 +1083,16 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         acc = trig_acc[cat]
         if acc["sev"] == 0:
             continue
-        # Single-chapter triggers are noise — require 2+ chapters.
-        # (A single "mentioned" in one chapter of 100 is not a book trigger.)
-        if len(acc["chapters"]) < 2:
-            continue
-        # on_page/graphic without a verified quote is downgraded: a severity
+        # on_page/graphic without a verified quote is downgraded first: a severity
         # claim needs textual evidence, not just the model's assertion.
         sev = acc["sev"]
         if sev >= 2 and not acc["evidence"]:
             sev = 1
+        # Only drop single-chapter "mentioned" items as noise. A graphic or
+        # on_page scene that happens once is exactly what a trigger warning
+        # is for — never drop those on chapter count alone.
+        if len(acc["chapters"]) < 2 and sev < 2:
+            continue
         triggers.append({
             "warning": cat,
             "severity": sev_names[sev],
@@ -1093,6 +1140,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
                 trope_candidates.append(_clean_trope(t))
     # Catalog mapping: collapse paraphrases to catalog IDs before tiering.
     catalog_map = {}  # _tnorm(candidate) -> catalog_id (or None if unmapped)
+    red_trope_chapters = {}  # display-key -> [chapter labels], built below
     if trope_candidates and CONFIG.get("embed_url"):
         try:
             catalog = trope_catalog_vectors()
@@ -1132,6 +1180,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
                             continue
                         seen_this_chapter.add(key)
                         new_counts[key] += 1
+                        red_trope_chapters.setdefault(key, []).append(
+                            idx_to_label.get(idx, ""))
                         if cid:
                             new_catalog_map[key] = cid
                         if key not in new_seen:
@@ -1148,6 +1198,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
             print(f"  (catalog mapping skipped: {e})")
     # Stash the mapping for write_claims.
     red_catalog_map = {k: v for k, v in catalog_map.items() if v}
+    # red_trope_chapters was built in the recount loop above (empty if skipped).
 
     # --- Quotes: verified, spread across chapters ---
     all_quotes = []
@@ -1182,6 +1233,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         "trope_candidates": trope_candidates,
         "trope_candidate_counts": dict(trope_counts),
         "trope_catalog_map": red_catalog_map,
+        "trope_chapters": red_trope_chapters,
         "tropes": [],  # filled by the trope gate
         "trope_confidence": {},
         "quotes": quotes,
@@ -2221,6 +2273,9 @@ def cmd_push_preview(preview_path):
     Accepts a single file or a directory (all .json files except trope-maps)."""
     import os
     import glob as _glob
+    if not (CONFIG.get("supabase_url") and CONFIG.get("supabase_key")):
+        print("  ERROR: supabase_url and supabase_key must be set in config.json")
+        return
     if os.path.isdir(preview_path):
         files = sorted(_glob.glob(os.path.join(preview_path, "*.json")))
         files = [f for f in files if "trope-map" not in os.path.basename(f)]
@@ -2236,6 +2291,9 @@ def cmd_push_preview(preview_path):
         return
     result = json.load(open(preview_path, encoding="utf-8"))
     title = result.get("title") or os.path.basename(preview_path)
+    if result.get("aborted"):
+        print(f"  Skipping {title}: preview is marked ABORTED (partial results)")
+        return
     print(f"  Pushing: {title}")
     # Resolve work (create if needed).
     identifiers = {}
@@ -2245,8 +2303,19 @@ def cmd_push_preview(preview_path):
         identifiers["asin"] = result["asin"]
     title, _author = correct_metadata(title, result.get("author"), identifiers)[:2]
     result["author"] = _author
+    # Check first without creating: confirm before creating a new work row.
     wid, how = resolve_work(title, result.get("author"), identifiers, False,
-                            create=True)
+                            create=False)
+    if how == "new":
+        try:
+            ans = input(f"  No existing work for '{title}'. Create new work? [y/N] ").strip().lower()
+        except EOFError:
+            ans = "n"
+        if ans != "y":
+            print("  Skipped (new work not confirmed)")
+            return
+        wid, how = resolve_work(title, result.get("author"), identifiers, False,
+                                create=True)
     if not wid:
         print(f"  Could not resolve work ({how})")
         return
@@ -2477,22 +2546,32 @@ _NAME_STOPWORDS = frozenset({
     "commander", "king", "queen", "prince", "princess", "number",
 })
 
+_TITLES = {"mr", "mrs", "ms", "miss", "dr", "professor", "general", "colonel",
+          "major", "captain", "commander", "lieutenant", "sergeant", "lord",
+          "lady", "sir", "king", "queen", "prince", "princess", "master"}
+
+
 def _names_overlap(a, b):
     """True if two normalized names likely refer to the same person.
     Matches: exact, one is a word-prefix of the other ("bodhi" vs "bodhi durran"),
-    or they share a distinctive last word ("melgren" in "general melgren" vs
-    "augustine melgren")."""
+    or a bare surname matches a titled/full name's last word ("melgren" in
+    "general melgren" vs "augustine melgren"). Two full names sharing only a
+    surname ("brennan sorrengail" vs "violet sorrengail") do NOT match —
+    those are different people (siblings)."""
     if not a or not b or a == b:
         return a == b
     aw, bw = a.split(), b.split()
-    # One is a prefix of the other (first name vs full name)
+    # One is a word-prefix of the other (first name vs full name)
     if aw == bw[:len(aw)] or bw == aw[:len(bw)]:
         return True
-    # Share a distinctive last word (surname)
-    if (len(aw) > 1 and len(bw) > 1 and aw[-1] == bw[-1]
-            and len(aw[-1]) > 3 and aw[-1] not in _NAME_STOPWORDS):
-        return True
-    return False
+    # Bare surname vs titled/full name: strip titles, then the single remaining
+    # word must equal the longer name's last word. Two multi-word names sharing
+    # only a surname are siblings, not the same person.
+    sa = [w for w in aw if w.rstrip(".") not in _TITLES]
+    sb_ = [w for w in bw if w.rstrip(".") not in _TITLES]
+    short, long_ = sorted((sa, sb_), key=len)
+    return (len(short) == 1 and len(long_) > 1 and short[0] == long_[-1]
+            and len(short[0]) > 3 and short[0] not in _NAME_STOPWORDS)
 
 
 def _tnorm(t):
@@ -2820,7 +2899,9 @@ def write_claims(work_id, result, trope_mappings=None):
                          "model": model,
                          "evidence": {"source": "ebook-extraction",
                                       "severity": td.get("severity", ""),
-                                      "chapters": td.get("chapters", [])}})
+                                      "severity_claimed": td.get("severity_claimed", ""),
+                                      "chapters": td.get("chapters", []),
+                                      "quotes": td.get("evidence", [])}})
         if rows:
             if sb("book_trigger_claims", method="POST", data=rows) is None:
                 errors += 1
@@ -2829,12 +2910,20 @@ def write_claims(work_id, result, trope_mappings=None):
 
     # Characters (relationships are stored per character)
     rel_map = {}
+    _evidenceless_rels = 0
     for r in result["relationships"]:
-        rel_map.setdefault(r["from"].lower(), []).append({"to": r["to"], "type": r["type"]})
+        # GPT audit: require evidence for DB promotion. Evidence-less relationships
+        # stay in the preview JSON but don't get written to the database.
+        if not r.get("evidence"):
+            _evidenceless_rels += 1
+            continue
+        rel_map.setdefault(r["from"].lower(), []).append(
+            {"to": r["to"], "type": r["type"], "evidence": r.get("evidence", "")})
     seen = _existing("book_characters", "name", work_id)
     if seen is None:
         errors += 1
     else:
+        pre_existing = set(seen)  # for backfill: names already in DB before this run
         rows = []
         for c in result["characters"]:
             if c["name"].lower() in seen:
@@ -2861,6 +2950,47 @@ def write_claims(work_id, result, trope_mappings=None):
                     _suggest_character_links(inserted)
                 except Exception as e:
                     print(f"  (character link suggestions skipped: {e})")
+        # Backfill: existing rows never got the new columns (insert-only).
+        # PATCH NULL fields from the current extraction — never overwrite.
+        _backfilled = 0
+        for c in result["characters"]:
+            if c["name"].lower() not in pre_existing:
+                continue  # was just inserted above; only backfill pre-existing rows
+            patch = {}
+            if c.get("appearance"):
+                patch["appearance"] = c["appearance"]
+            if c.get("status"):
+                patch["vitality"] = c["status"]
+            if c.get("aliases"):
+                patch["aliases"] = c["aliases"]
+            if c.get("first_appearance_chapter") is not None:
+                patch["first_appearance_chapter"] = c["first_appearance_chapter"]
+            if not patch:
+                continue
+            # Only fill NULLs: fetch current values first
+            existing = sb("book_characters",
+                          params=f"?work_id=eq.{work_id}&name=ilike.{quote(c['name'], safe='')}"
+                                 f"&select=id,appearance,vitality,aliases,first_appearance_chapter"
+                                 f"&limit=1")
+            if not existing:
+                continue
+            row = existing[0]
+            null_patch = {k: v for k, v in patch.items() if row.get(k) is None}
+            # Empty aliases array counts as unset
+            if row.get("aliases") == [] and "aliases" in patch:
+                null_patch["aliases"] = patch["aliases"]
+            # Empty appearance string counts as unset (inserts write "", not NULL)
+            if row.get("appearance") == "" and "appearance" in patch:
+                null_patch["appearance"] = patch["appearance"]
+            if null_patch:
+                r = sb("book_characters", method="PATCH",
+                       params=f"?id=eq.{row['id']}", data=null_patch)
+                if r is None:
+                    errors += 1
+                else:
+                    _backfilled += 1
+        if _backfilled:
+            print(f"  Backfilled {_backfilled} existing characters (NULL fields only)")
 
     # Spice -> works.spice_detected
     spice = result.get("spice_level")
@@ -3290,28 +3420,24 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         drop_single = n >= 20  # only drop single-chapter tropes in long books
         auto, gated, dropped = [], [], 0
         # Build chapter lists per trope for evidence.
-        trope_chapters = {}
-        for idx in sorted(chapter_bs):
-            b = chapter_bs[idx]
-            if not b:
-                continue
-            seen_ch = set()
-            for tc in b.get("trope_candidates", []):
-                k = _tnorm(tc)
-                # Map to display name via catalog if available
-                disp = None
-                cmap = red.get("trope_catalog_map", {})
-                if k in cmap:
-                    # Find display name from candidates
-                    for cand in red["trope_candidates"]:
-                        if _tnorm(cand) == k:
-                            disp = cand
-                            break
-                key = _tnorm(disp or tc)
-                if key not in seen_ch:
-                    seen_ch.add(key)
-                    trope_chapters.setdefault(key, []).append(idx)
-        red["trope_chapters"] = trope_chapters
+        # Prefer the display-keyed map from v2_reduce (handles paraphrases);
+        # fall back to raw-text keys only if the reduce didn't build one
+        # (e.g. no embed_url, so no catalog mapping ran).
+        if red.get("trope_chapters"):
+            trope_chapters = red["trope_chapters"]
+        else:
+            trope_chapters = {}
+            for idx in sorted(chapter_bs):
+                b = chapter_bs[idx]
+                if not b:
+                    continue
+                seen_ch = set()
+                for tc in b.get("trope_candidates", []):
+                    key = _tnorm(tc)
+                    if key not in seen_ch:
+                        seen_ch.add(key)
+                        trope_chapters.setdefault(key, []).append(idx)
+            red["trope_chapters"] = trope_chapters
         for c in red["trope_candidates"]:
             n_ch = counts.get(_tnorm(c), 1)
             if n_ch >= auto_min:
@@ -3442,6 +3568,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
 def process_file(fpath, dry_run=False, preview=False):
     if CONFIG.get("pipeline") == "v2":
         return process_file_v2(fpath, dry_run, preview)
+    _t0 = time.time()
     _book_key = str(fpath)
     UI.status(f"\nProcessing: {fpath.name}")
     global _DEBUG_TAG
@@ -3647,7 +3774,7 @@ def process_file(fpath, dry_run=False, preview=False):
     else:
         print(f"  Work: resolution failed ({how})")
 
-    _elapsed = _time.time() - _t0
+    _elapsed = time.time() - _t0
     smsg = f" ({task_ok['identity_simple']} via simple fallback)" if task_ok["identity_simple"] else ""
     UI.book_done(_book_key)
     UI.summary(f"\U0001f4d6 {title or fpath.stem}", [
