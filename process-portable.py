@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.3.4"
+PORTABLE_VERSION = "2.3.5"
 
 import argparse
 import difflib
@@ -2502,6 +2502,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     """v2 pipeline: chapter-level map/reduce. Chapters run Call A (characters,
     sequential for the roster) then Call B (content, parallelizable), followed
     by a deterministic reduce and a trope confirmation gate."""
+    import time as _time
+    _t0 = _time.time()
     print(f"\nProcessing (v2): {fpath.name}")
     global _DEBUG_TAG
     _DEBUG_TAG = fpath.stem if (preview or dry_run) and CONFIG.get("debug") else None
@@ -2951,6 +2953,8 @@ def process_file(fpath, dry_run=False, preview=False):
     smsg = f" ({task_ok['identity_simple']} via simple fallback)" if task_ok["identity_simple"] else ""
     print(f"  Tasks: discipline {task_ok['discipline']}/{n} ok, identity {task_ok['identity']}/{n} ok{smsg}")
     print(f"  Spice: {spice_level}/5, POVs: {', '.join(sorted(povs)) or 'none'}, ~{reading_mins}min read")
+    _elapsed = _time.time() - _t0
+    print(f"  Elapsed: {_elapsed/60:.1f} min ({_elapsed/n:.1f}s/chapter)")
 
     if CONFIG.get("dedupe") and result["characters"]:
         n_before = len(result["characters"])
