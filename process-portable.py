@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.4.2"
+PORTABLE_VERSION = "2.4.3"
 
 import argparse
 import difflib
@@ -2199,7 +2199,7 @@ def write_claims(work_id, result, trope_mappings=None):
             used.add(str(tid).lower())
             rows.append({"work_id": work_id, "trope_id": tid, "status": "candidate",
                          "confidence": conf_t.get(_tnorm(t), 0.7),
-                         "source_type": "ebook-processor",
+                         "source_type": "ai",
                          "model": model, "evidence": {"source": "ebook-extraction"}})
         if rows:
             if sb("book_trope_claims", method="POST", data=rows) is None:
@@ -2219,7 +2219,9 @@ def write_claims(work_id, result, trope_mappings=None):
             seen_keys.add(key)
             prop_rows.append({"name": t, "name_key": key,
                               "description": f"Detected by ebook processor in '{result.get('title', '')}'.",
+                              "genres": [],
                               "book_key": result.get("isbn") or result.get("title", ""),
+                              "proposed_by": "ebook-processor",
                               "status": "pending"})
         if prop_rows:
             if sb("trope_proposals", method="POST", data=prop_rows) is None:
@@ -2241,7 +2243,7 @@ def write_claims(work_id, result, trope_mappings=None):
             td = t if isinstance(t, dict) else {}
             rows.append({"work_id": work_id, "warning": warn, "status": "candidate",
                          "confidence": td.get("confidence", 0.7),
-                         "source_type": "ebook-processor",
+                         "source_type": "ai",
                          "model": model,
                          "evidence": {"source": "ebook-extraction",
                                       "severity": td.get("severity", ""),
@@ -2268,7 +2270,7 @@ def write_claims(work_id, result, trope_mappings=None):
             rows.append({"work_id": work_id, "name": c["name"], "role": c["role"],
                          "description": c.get("description", ""),
                          "relationships": rel_map.get(c["name"].lower(), []),
-                         "source_type": "ebook-processor",
+                         "source_type": "ai",
                          "confidence": c.get("confidence", 0.7)})
         if rows:
             if sb("book_characters", method="POST", data=rows) is None:
