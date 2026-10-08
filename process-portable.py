@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.4.7"
+PORTABLE_VERSION = "2.5.0"
 
 import argparse
 import difflib
@@ -508,9 +508,13 @@ Keep any internal reasoning extremely brief — a complete, valid JSON object is
 }
 
 RULES:
-1. TRIGGERS: emit a severity for EVERY category below — none, mentioned (referenced but not shown), on_page (depicted), graphic (depicted in disturbing detail). Be conservative: ordinary life stress is not a trigger.
-   NON-EXAMPLES (do NOT flag these): children playing or play-fighting; a child getting a minor injury during normal activity; characters discussing or joking about a topic; a passing mention of someone's death; childbirth or pregnancy described without distress; pretend-play scenarios (e.g. "playing Indians", toy weapons).
-   When in doubt between two severities, choose the LOWER one.
+1. TRIGGERS: emit a severity for EVERY category below — none, mentioned, on_page, graphic. DEFAULT TO "none" unless the chapter clearly contains the trigger.
+   - "mentioned": the trigger is a real plot element or substantive discussion (a character's backstory, a central theme, a threat that drives action). NOT a single word in passing, a joke, a metaphor, or world-building flavor.
+   - "on_page": the trigger is depicted happening in the scene.
+   - "graphic": depicted in disturbing detail.
+   Be conservative: ordinary life stress is not a trigger.
+   NON-EXAMPLES (do NOT flag these): children playing or play-fighting; a child getting a minor injury during normal activity; characters discussing or joking about a topic; a passing mention of someone's death; childbirth or pregnancy described without distress; pretend-play scenarios (e.g. "playing Indians", toy weapons); a single metaphorical use of a word (e.g. "killer deal", "torturous wait", "murder mystery" as a genre reference).
+   When in doubt between two severities, choose the LOWER one. When in doubt whether it counts at all, choose "none".
 2. Every category at on_page or graphic REQUIRES an evidence quote in trigger_evidence, copied EXACTLY character-for-character from the chapter.
 3. SPICE LEVEL rubric: 0 = none at all. 1 = chaste romance. 2 = kissing/mild innuendo. 3 = explicit references, fade-to-black. 4 = on-page sex, moderate detail. 5 = explicit/graphic.
 4. QUOTES must be exact text copied from the chapter, character-for-character. Do not paraphrase, clean up punctuation, or normalize wording. If you cannot reproduce a line exactly, omit it. Empty array if none stand out.
@@ -916,6 +920,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
     for cat in TRIGGER_CATEGORIES:
         acc = trig_acc[cat]
         if acc["sev"] == 0:
+            continue
+        # Single-chapter triggers are noise — require 2+ chapters.
+        # (A single "mentioned" in one chapter of 100 is not a book trigger.)
+        if len(acc["chapters"]) < 2:
             continue
         # on_page/graphic without a verified quote is downgraded: a severity
         # claim needs textual evidence, not just the model's assertion.
