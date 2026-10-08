@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.7.0"
+PORTABLE_VERSION = "2.7.1"
 
 import argparse
 import difflib
@@ -2644,7 +2644,8 @@ def write_claims(work_id, result, trope_mappings=None):
             rows.append({"work_id": work_id, "name": c["name"], "role": c["role"],
                          "description": c.get("description", ""),
                          "appearance": c.get("appearance", ""),
-                         "status": c.get("status", "unknown"),
+                         "vitality": c.get("status", "unknown"),
+                         "status": "candidate",
                          "aliases": c.get("aliases", []),
                          "first_appearance_chapter": c.get("first_appearance_chapter"),
                          "relationships": rel_map.get(c["name"].lower(), []),
