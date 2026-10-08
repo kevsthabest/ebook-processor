@@ -3948,9 +3948,12 @@ def _process_one(args):
     return ok
 
 
-def run_once(dry_run, preview):
+def run_once(dry_run, preview, max_books=None):
     files = sorted(p for p in IMPORT_DIR.iterdir()
                    if p.is_file() and p.suffix.lower() in (".epub", ".mobi", ".azw3"))
+    if max_books and len(files) > max_books:
+        print(f"Limiting to {max_books} of {len(files)} books (--max-books)")
+        files = files[:max_books]
     if not files:
         print("No ebooks found.")
         return 0
@@ -4015,6 +4018,8 @@ def main():
     ap.add_argument("--sample", type=int, default=None, help="process every Nth chunk (e.g. --sample 3)")
     ap.add_argument("--full", action="store_true", help="disable sampling, process every chunk")
     ap.add_argument("--batch", type=int, default=None, help="parallel LLM requests (e.g. --batch 4)")
+    ap.add_argument("--max-books", type=int, default=None,
+                        help="process at most N books from the import folder (e.g. --max-books 3)")
     ap.add_argument("--jobs", type=int, default=None,
                     help="process N books in parallel, splitting --batch slots across them (e.g. --jobs 2)")
     ap.add_argument("--chunks", default=None,
@@ -4111,12 +4116,12 @@ def main():
         print(f"Watching {IMPORT_DIR}... (Ctrl+C to stop)")
         try:
             while True:
-                run_once(args.dry_run, args.preview)
+                run_once(args.dry_run, args.preview, args.max_books)
                 time.sleep(60)
         except KeyboardInterrupt:
             print("\nStopped.")
     else:
-        sys.exit(1 if run_once(args.dry_run, args.preview) else 0)
+        sys.exit(1 if run_once(args.dry_run, args.preview, args.max_books) else 0)
 
 
 if __name__ == "__main__":
