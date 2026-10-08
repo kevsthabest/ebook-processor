@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.5.4"
+PORTABLE_VERSION = "2.5.5"
 
 import argparse
 import difflib
@@ -2272,12 +2272,11 @@ def _suggest_character_links(inserted_rows):
             name_to_id[nkey] = None
     if not name_to_id:
         return
-    # Query characters table for matches.
+    # Query characters table for matches (batched via in= operator).
     from urllib.parse import quote as _quote
     keys = list(name_to_id.keys())
-    # PostgREST OR filter for multiple values (URL-encoded).
-    or_filter = ",".join(f"name_norm.eq.{_quote(k, safe='')}" for k in keys)
-    matches = sb("characters", params=f"?or=({or_filter})&select=id,name_norm")
+    in_list = ",".join(_quote(k, safe='') for k in keys)
+    matches = sb("characters", params=f"?name_norm=in.({in_list})&select=id,name_norm")
     if not matches:
         return
     for m in matches:
