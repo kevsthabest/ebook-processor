@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.7.1"
+PORTABLE_VERSION = "2.7.2"
 
 import argparse
 import difflib
@@ -2016,6 +2016,144 @@ def trope_catalog_vectors():
             for r in rows if r["id"] in cached]
 
 
+# Names that are known noise (hallucinations, family generics). "jason" is a
+# Fourth Wing-specific model hallucination. Keep this short — if it grows
+# into a per-book list, it should become a config file instead.
+VERIFY_NOISE_NAMES = {"dad", "mom", "father", "mother", "jason"}
+
+
+def _verify_flags(preview_chars, db_chars, db_tropes, db_triggers, preview_tropes, preview_triggers):
+    """Pure comparison logic for --verify. All args are plain dicts/lists.
+    Returns [(flag_name, description, [items...]), ...]. No I/O, no DB."""
+    import re
+    flags = []
+
+    pv_names = {(c.get("name") or "").strip().lower(): c for c in preview_chars}
+    db_names = {(r.get("name") or "").strip().lower(): r for r in db_chars}
+    # Drop empty keys from NULL/blank names
+    pv_names.pop("", None)
+    db_names.pop("", None)
+
+    new_chars = sorted(pv_names[n]["name"] for n in set(pv_names) - set(db_names))
+    missing = sorted(db_names[n]["name"] for n in set(db_names) - set(pv_names))
+    if new_chars:
+        flags.append(("NEW CHARACTERS", f"{len(new_chars)} in preview, not in DB",
+                      new_chars, len(new_chars) > 15))
+    if missing:
+        real_missing = [m for m in missing if m.lower() not in VERIFY_NOISE_NAMES]
+        gone_noise = [m for m in missing if m.lower() in VERIFY_NOISE_NAMES]
+        if real_missing:
+            flags.append(("MISSING CHARACTERS",
+                          f"{len(real_missing)} in DB, not in preview (possible misses)",
+                          real_missing, len(real_missing) > 15))
+        if gone_noise:
+            flags.append(("DROPPED NOISE",
+                          f"{len(gone_noise)} noisy names correctly absent from preview",
+                          gone_noise, False))
+
+    null_vit = [r["name"] for n, r in db_names.items() if not r.get("vitality")]
+    if null_vit:
+        flags.append(("VITALITY BACKFILL",
+                      f"{len(null_vit)} DB characters have no vitality value",
+                      sorted(null_vit)[:10], len(null_vit) > 10))
+
+    _creature_re = re.compile(r"\b(rider|wyvern|daggertail|dragon)\b", re.IGNORECASE)
+    _suspicious = []
+    for n, c in pv_names.items():
+        cn = c.get("name", "")
+        if _creature_re.search(cn) and len(cn.split()) <= 3:
+            _suspicious.append(f"{cn} (creature type?)")
+        elif "'s " in cn or " husband" in cn.lower() or " wife" in cn.lower():
+            _suspicious.append(f"{cn} (awkward name)")
+    if _suspicious:
+        flags.append(("SUSPICIOUS NAMES", f"{len(_suspicious)} preview names look noisy",
+                      _suspicious[:10], len(_suspicious) > 10))
+
+    # Duplicates keyed on trope_id alone (matches write-path dedup invariant)
+    _seen_tid = set()
+    dupes = []
+    for r in db_tropes:
+        tid = r.get("trope_id")
+        if tid in _seen_tid:
+            dupes.append(f"{str(tid)[:8]} (status={r.get('status')})")
+        _seen_tid.add(tid)
+    if dupes:
+        flags.append(("DUPLICATE TROPE CLAIMS",
+                      f"{len(dupes)} duplicate trope_ids in DB",
+                      dupes[:10], len(dupes) > 10))
+
+    if preview_tropes:
+        flags.append(("PREVIEW TROPES", f"{len(preview_tropes)} tropes in preview",
+                      sorted(preview_tropes)[:15], len(preview_tropes) > 15))
+
+    rejected = {w for w, s in db_triggers.items() if s == "rejected"}
+    overlap = sorted(set(preview_triggers) & rejected)
+    if overlap:
+        flags.append(("TRIGGERS ALREADY REJECTED",
+                      f"{len(overlap)} preview triggers are rejected in DB (won't re-add)",
+                      overlap[:10], len(overlap) > 10))
+    return flags
+
+
+def cmd_verify(preview_path):
+    """Compare a preview JSON against current DB state and flag discrepancies.
+    Read-only: no writes, no LLM calls. Use before --push-preview to review
+    what would change.
+    """
+    if not os.path.isfile(preview_path):
+        print(f"  Not found: {preview_path}")
+        return
+    result = json.load(open(preview_path, encoding="utf-8"))
+    title = result.get("title") or os.path.basename(preview_path)
+    identifiers = {}
+    if result.get("isbn"):
+        identifiers["isbn"] = result["isbn"]
+    if result.get("asin"):
+        identifiers["asin"] = result["asin"]
+    wid, how = resolve_work(title, result.get("author"), identifiers, False,
+                            create=False)
+    if how == "db_error":
+        print(f"  DB lookup failed — cannot verify '{title}'")
+        return
+    if not wid:
+        print(f"  No existing work found for '{title}' ({how}) — nothing to compare")
+        return
+    print(f"  Verifying '{title}' against work {wid[:8]} ({how})")
+
+    db_chars = (sb("book_characters",
+                   params=f"?work_id=eq.{wid}&select=name,role,vitality,status&limit=500") or [])
+    db_tropes = (sb("book_trope_claims",
+                    params=f"?work_id=eq.{wid}&select=trope_id,status&limit=200") or [])
+    db_trig = {r["warning"]: r["status"] for r in (
+        sb("book_trigger_claims",
+           params=f"?work_id=eq.{wid}&select=warning,status&limit=100") or [])}
+    pv_trope_names = {t.get("name", "").lower() if isinstance(t, dict) else str(t).lower()
+                      for t in result.get("tropes", [])}
+    pv_trig = {t.get("warning") if isinstance(t, dict) else t
+               for t in result.get("triggers", [])}
+
+    flags = _verify_flags(result.get("characters", []), db_chars, db_tropes,
+                          db_trig, pv_trope_names, pv_trig)
+
+    if not flags:
+        print("  No flags — preview and DB are consistent")
+        return
+    rejected_n = sum(1 for s in db_trig.values() if s == "rejected")
+    UI.summary(f"Verification: {title}", [
+        ("Flags", len(flags)),
+        ("DB characters", len(db_chars)),
+        ("Preview characters", len(result.get("characters", []))),
+        ("DB trope claims", len(db_tropes)),
+        ("DB triggers", f"{len(db_trig)} ({rejected_n} rejected)"),
+    ])
+    for fname, fdesc, items, has_more in flags:
+        print(f"\n  ⚠ {fname}: {fdesc}")
+        for it in items:
+            print(f"      - {it}")
+        if has_more:
+            print(f"      ... and more")
+
+
 def cmd_push_preview(preview_path):
     """Push a preview JSON's data to Supabase without re-running the LLM.
     Resolves the work, then runs write_claims. Use for retrying failed writes.
@@ -3699,6 +3837,8 @@ def main():
                     help="run automated quality checks on a preview file")
     ap.add_argument("--push-preview", metavar="PREVIEW_JSON",
                     help="push a preview JSON to Supabase without re-running the LLM")
+    ap.add_argument("--verify", metavar="PREVIEW_JSON",
+                    help="compare a preview JSON against the DB and flag discrepancies (read-only)")
     ap.add_argument("--prompt-cache", action="store_true",
                     help="v2: task-last prompt layout for llama.cpp KV cache "
                          "reuse + interleaved A/B calls (experimental)")
@@ -3721,6 +3861,11 @@ def main():
     if args.push_preview:
         load_config()
         cmd_push_preview(args.push_preview)
+        return
+
+    if args.verify:
+        load_config()
+        cmd_verify(args.verify)
         return
 
     if args.prompt_cache:

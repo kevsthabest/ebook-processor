@@ -386,3 +386,75 @@ class TestMetadataCorrectionPath(unittest.TestCase):
         self.assertTrue(corrected)
         self.assertEqual(title, "Daemon")
         self.assertEqual(author, "Daniel Suarez")
+
+
+class TestVerifyFlags(unittest.TestCase):
+    def test_new_and_missing_characters(self):
+        flags = pp._verify_flags(
+            [{"name": "Violet"}, {"name": "Xaden"}],
+            [{"name": "Violet"}, {"name": "Mira"}],
+            [], {}, set(), set())
+        names = {f[0]: f[2] for f in flags}
+        self.assertIn("NEW CHARACTERS", names)
+        self.assertIn("Xaden", names["NEW CHARACTERS"])
+        self.assertIn("MISSING CHARACTERS", names)
+        self.assertIn("Mira", names["MISSING CHARACTERS"])
+
+    def test_noise_filtered(self):
+        flags = pp._verify_flags(
+            [], [{"name": "Dad"}, {"name": "Jason"}, {"name": "Mira"}],
+            [], {}, set(), set())
+        names = {f[0]: f[2] for f in flags}
+        self.assertNotIn("Dad", str(names.get("MISSING CHARACTERS", [])))
+        self.assertIn("DROPPED NOISE", names)
+
+    def test_duplicate_trope_ids(self):
+        flags = pp._verify_flags(
+            [], [],
+            [{"trope_id": "abc", "status": "candidate"},
+             {"trope_id": "abc", "status": "confirmed"},
+             {"trope_id": "def", "status": "candidate"}],
+            {}, set(), set())
+        names = {f[0]: f[2] for f in flags}
+        # Same trope_id in different statuses IS a dupe (write-path invariant)
+        self.assertIn("DUPLICATE TROPE CLAIMS", names)
+
+    def test_no_dupe_different_ids(self):
+        flags = pp._verify_flags(
+            [], [],
+            [{"trope_id": "abc", "status": "candidate"},
+             {"trope_id": "def", "status": "candidate"}],
+            {}, set(), set())
+        self.assertNotIn("DUPLICATE TROPE CLAIMS", {f[0] for f in flags})
+
+    def test_suspicious_names(self):
+        flags = pp._verify_flags(
+            [{"name": "Gryphon Rider"}, {"name": "General X's husband"}, {"name": "Violet"}],
+            [], [], {}, set(), set())
+        names = {f[0]: f[2] for f in flags}
+        self.assertIn("SUSPICIOUS NAMES", names)
+
+    def test_trigger_reject_overlap(self):
+        flags = pp._verify_flags(
+            [], [], [],
+            {"murder": "rejected", "war": "candidate"},
+            set(), {"murder", "theft"})
+        names = {f[0]: f[2] for f in flags}
+        self.assertIn("TRIGGERS ALREADY REJECTED", names)
+        self.assertIn("murder", names["TRIGGERS ALREADY REJECTED"])
+        self.assertNotIn("theft", str(names.get("TRIGGERS ALREADY REJECTED", [])))
+
+    def test_name_stripping(self):
+        flags = pp._verify_flags(
+            [{"name": "Mira "}], [{"name": " Mira"}],
+            [], {}, set(), set())
+        # Same name with whitespace differences -> no flags
+        self.assertNotIn("NEW CHARACTERS", {f[0] for f in flags})
+        self.assertNotIn("MISSING CHARACTERS", {f[0] for f in flags})
+
+    def test_null_names_safe(self):
+        flags = pp._verify_flags(
+            [{"name": None}], [{"name": None}],
+            [], {}, set(), set())
+        # Should not crash
+        self.assertIsInstance(flags, list)
