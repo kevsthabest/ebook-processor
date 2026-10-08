@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.5.5"
+PORTABLE_VERSION = "2.5.6"
 
 import argparse
 import difflib
@@ -2306,7 +2306,7 @@ def write_claims(work_id, result, trope_mappings=None):
                "openai": CONFIG.get("openai_model", "")}
     model = _models.get(CONFIG["llm"], "")
     conf_t = result.get("trope_confidence", {})
-    wrote = {"tropes": 0, "triggers": 0, "characters": 0, "proposals": 0}
+    wrote = {"tropes": 0, "triggers": 0, "characters": 0, "proposals": 0, "quotes": 0}
     # Merge explicit mappings with the in-pipeline catalog map.
     _cat = dict(result.get("trope_catalog_map", {}) or {})
     if trope_mappings:
@@ -2455,8 +2455,31 @@ def write_claims(work_id, result, trope_mappings=None):
             if r is None:
                 errors += 1
 
+    # Quotes -> book_quotes (3-5 memorable per book, no speaker attribution yet)
+    quotes = result.get("quotes", [])
+    if quotes:
+        # Check existing to avoid duplicates
+        existing_q = sb("book_quotes", params=f"?work_id=eq.{work_id}&select=quote&limit=100")
+        seen_q = {r.get("quote", "")[:100] for r in (existing_q or [])}
+        qrows = []
+        for q in quotes[:5]:  # cap at 5
+            qtext = q.get("text", "") if isinstance(q, dict) else str(q)
+            if not qtext or qtext[:100] in seen_q:
+                continue
+            seen_q.add(qtext[:100])
+            qrows.append({"work_id": work_id,
+                          "quote": qtext,
+                          "source_type": "ai",
+                          "confidence": 0.7})
+        if qrows:
+            if sb("book_quotes", method="POST", data=qrows) is None:
+                errors += 1
+            else:
+                wrote["quotes"] = len(qrows)
+
     print(f"  Wrote {wrote['tropes']} tropes, {wrote['triggers']} triggers, "
-          f"{wrote['characters']} characters, {wrote['proposals']} proposals (new rows only)")
+          f"{wrote['characters']} characters, {wrote['proposals']} proposals, "
+          f"{wrote.get('quotes', 0)} quotes (new rows only)")
     return errors
 
 
