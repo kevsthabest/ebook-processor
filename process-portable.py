@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.4.3"
+PORTABLE_VERSION = "2.4.4"
 
 import argparse
 import difflib
@@ -1819,6 +1819,38 @@ def trope_catalog_vectors():
             for r in rows if r["id"] in cached]
 
 
+def cmd_push_preview(preview_path):
+    """Push a preview JSON's data to Supabase without re-running the LLM.
+    Resolves the work, then runs write_claims. Use for retrying failed writes."""
+    import os
+    if not os.path.isfile(preview_path):
+        print(f"  Not found: {preview_path}")
+        return
+    result = json.load(open(preview_path, encoding="utf-8"))
+    title = result.get("title") or os.path.basename(preview_path)
+    print(f"  Pushing: {title}")
+    # Resolve work (create if needed).
+    identifiers = {}
+    if result.get("isbn"):
+        identifiers["isbn"] = result["isbn"]
+    if result.get("asin"):
+        identifiers["asin"] = result["asin"]
+    wid, how = resolve_work(title, result.get("author"), identifiers, False,
+                            create=True)
+    if not wid:
+        print(f"  Could not resolve work ({how})")
+        return
+    print(f"  Work ID: {wid} ({how})")
+    # Ensure the fields write_claims needs are present.
+    result.setdefault("trope_catalog_map", {})
+    result.setdefault("trope_confidence", {})
+    errors = write_claims(wid, result)
+    if errors:
+        print(f"  {errors} database operation(s) failed")
+    else:
+        print(f"  Push complete, no errors")
+
+
 def cmd_validate(preview_path):
     """Run automated quality checks on a preview JSON or a directory of them.
     Prints a report per file, plus a summary table for directories."""
@@ -3163,6 +3195,8 @@ def main():
                          "via embeddings; writes a review JSON, nothing to Supabase")
     ap.add_argument("--validate", metavar="PREVIEW_JSON",
                     help="run automated quality checks on a preview file")
+    ap.add_argument("--push-preview", metavar="PREVIEW_JSON",
+                    help="push a preview JSON to Supabase without re-running the LLM")
     ap.add_argument("--prompt-cache", action="store_true",
                     help="v2: task-last prompt layout for llama.cpp KV cache "
                          "reuse + interleaved A/B calls (experimental)")
@@ -3180,6 +3214,11 @@ def main():
     if args.validate:
         load_config()
         cmd_validate(args.validate)
+        return
+
+    if args.push_preview:
+        load_config()
+        cmd_push_preview(args.push_preview)
         return
 
     if args.prompt_cache:
