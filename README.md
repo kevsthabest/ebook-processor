@@ -26,6 +26,8 @@ touches the database.
 
 1. Python 3.8+ (stdlib only — no pip packages required for EPUB)
 2. For MOBI/AZW3: `pip install mobi`
+3. For the rich terminal UI (progress bars, summary tables): `pip install rich`
+   (optional — falls back to plain output if not installed)
 3. Copy `config.example.json` → `config.json` and fill in:
    - `supabase_url` + `supabase_key` (service role)
    - LLM backend (see below)

@@ -310,3 +310,79 @@ class TestCharacterEnrichment(unittest.TestCase):
         self.assertIn('"appearance"', pp.PROMPT_V2_CHARACTERS)
         self.assertIn('"status"', pp.PROMPT_V2_CHARACTERS)
         self.assertIn("alive", pp.PROMPT_V2_CHARACTERS)
+
+
+class TestMetadataCorrection(unittest.TestCase):
+    def test_no_isbn_noop(self):
+        title, author, corrected = pp.correct_metadata("Some Book", "Some Author", {})
+        self.assertEqual((title, author, corrected), ("Some Book", "Some Author", False))
+
+    def test_no_isbn_none_identifiers(self):
+        title, author, corrected = pp.correct_metadata("Some Book", "Some Author", None)
+        self.assertFalse(corrected)
+
+    def test_network_failure_keeps_parsed(self):
+        # Unreachable ISBN service (invalid URL via monkeypatch) -> silent fallback
+        import urllib.request
+        orig = urllib.request.urlopen
+        def boom(*a, **k):
+            raise ConnectionError("nope")
+        urllib.request.urlopen = boom
+        try:
+            title, author, corrected = pp.correct_metadata(
+                "Parsed Title", "Parsed Author", {"isbn": "9780000000000"})
+        finally:
+            urllib.request.urlopen = orig
+        self.assertEqual((title, author, corrected),
+                         ("Parsed Title", "Parsed Author", False))
+
+
+class TestMetadataCorrectionPath(unittest.TestCase):
+    def _mock_openlibrary(self, title, author_name):
+        import urllib.request, json
+        orig = urllib.request.urlopen
+        payload = json.dumps({
+            "docs": [{"title": title, "author_name": [author_name] if author_name else []}]
+        }).encode("utf-8")
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return payload
+        urllib.request.urlopen = lambda *a, **k: FakeResp()
+        return orig
+
+    def test_title_equals_author_gets_fixed(self):
+        # The Change Agent bug: parsed title == author name
+        import urllib.request
+        orig = self._mock_openlibrary("Change Agent", "Daniel Suarez")
+        try:
+            title, author, corrected = pp.correct_metadata(
+                "Daniel Suarez", "Daniel Suarez", {"isbn": "9783121019618"})
+        finally:
+            urllib.request.urlopen = orig
+        self.assertTrue(corrected)
+        self.assertEqual(title, "Change Agent")
+        self.assertEqual(author, "Daniel Suarez")
+
+    def test_matching_title_not_touched(self):
+        import urllib.request
+        orig = self._mock_openlibrary("Fourth Wing", "Rebecca Yarros")
+        try:
+            title, author, corrected = pp.correct_metadata(
+                "Fourth Wing", "Rebecca Yarros", {"isbn": "9780000000000"})
+        finally:
+            urllib.request.urlopen = orig
+        self.assertFalse(corrected)
+        self.assertEqual(title, "Fourth Wing")
+
+    def test_empty_title_gets_filled(self):
+        import urllib.request
+        orig = self._mock_openlibrary("Daemon", "Daniel Suarez")
+        try:
+            title, author, corrected = pp.correct_metadata(
+                "", "", {"isbn": "9780000000000"})
+        finally:
+            urllib.request.urlopen = orig
+        self.assertTrue(corrected)
+        self.assertEqual(title, "Daemon")
+        self.assertEqual(author, "Daniel Suarez")

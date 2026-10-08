@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.6.2"
+PORTABLE_VERSION = "2.7.0"
 
 import argparse
 import difflib
@@ -1396,8 +1396,127 @@ def llm_openrouter(prompt, chunk, i, n):
 # Thread-local stash for per-call LLM diagnostics (empty-response forensics).
 # Set by llm_openai_compat, read by _run_task. Thread-local because chunks run
 # in a ThreadPoolExecutor when --batch > 1.
+# --- Rich TUI (optional; falls back to plain prints) ---
+try:
+    from rich.console import Console as _RichConsole
+    from rich.progress import (Progress as _RichProgress, BarColumn as _RichBar,
+                               TextColumn as _RichText, TaskProgressColumn as _RichPct,
+                               TimeRemainingColumn as _RichETA)
+    from rich.table import Table as _RichTable
+    from rich import box as _rich_box
+    from rich.markup import escape as _rich_escape
+    _HAS_RICH = True
+except ImportError:
+    _HAS_RICH = False
+
+
+class PipelineUI:
+    """Terminal UI for the pipeline.
+
+    Rich mode: live progress bars (one per book, thread-safe for --jobs),
+    status messages above the bars, summary tables on completion.
+    Fallback: plain prints, same information, no dependencies.
+    """
+    def __init__(self):
+        self.rich = _HAS_RICH and sys.stdout.isatty()
+        self.console = _RichConsole() if self.rich else None
+        self.progress = None
+        self.tasks = {}  # book_key -> task_id
+        self._labels = {}  # book_key -> base label (unescaped)
+        self._lock = threading.Lock()
+
+    def start(self):
+        if self.rich and self.progress is None:
+            self.progress = _RichProgress(
+                _RichText("[bold cyan]{task.description}"),
+                _RichBar(bar_width=30),
+                _RichPct(),
+                _RichETA(),
+                console=self.console,
+                transient=False,
+            )
+            self.progress.start()
+
+    def stop(self):
+        if self.progress:
+            self.progress.stop()
+            self.progress = None
+            self.tasks = {}
+            self._labels = {}
+
+    def book_start(self, book_key, label, total):
+        """Register a book; returns nothing. total = work units."""
+        if self.progress:
+            with self._lock:
+                self._labels[book_key] = label
+                disp = _rich_escape(label) if self.rich else label
+                tid = self.progress.add_task(disp, total=total)
+                self.tasks[book_key] = tid
+        else:
+            print(f"\n{label} ({total} steps)")
+
+    def advance(self, book_key, n=1):
+        if self.progress:
+            tid = self.tasks.get(book_key)
+            if tid is not None:
+                try:
+                    self.progress.update(tid, advance=n)
+                except KeyError:
+                    pass
+
+    def set_phase(self, book_key, phase):
+        """Update the task description to show current phase."""
+        if self.progress:
+            tid = self.tasks.get(book_key)
+            if tid is not None:
+                base = self._labels.get(book_key, "")
+                disp = _rich_escape(f"{base} — {phase}") if self.rich else f"{base} — {phase}"
+                try:
+                    self.progress.update(tid, description=disp)
+                except KeyError:
+                    pass
+
+    def status(self, msg):
+        """Print a status line (above progress bars in rich mode)."""
+        if self.progress:
+            self.progress.console.print(_rich_escape(msg))
+        else:
+            print(msg)
+
+    def book_done(self, book_key):
+        if self.progress:
+            with self._lock:
+                tid = self.tasks.pop(book_key, None)
+                self._labels.pop(book_key, None)
+                if tid is not None:
+                    try:
+                        self.progress.remove_task(tid)
+                    except KeyError:
+                        pass
+
+    def summary(self, title, rows):
+        """Print a summary table. rows = [(metric, value), ...]."""
+        if self.rich:
+            tbl = _RichTable(title=_rich_escape(title), box=_rich_box.ROUNDED,
+                             show_header=False, padding=(0, 2))
+            tbl.add_column("metric", style="dim cyan")
+            tbl.add_column("value", style="bold white")
+            for k, v in rows:
+                tbl.add_row(_rich_escape(k), _rich_escape(str(v)))
+            self.console.print(tbl)
+        else:
+            print(f"  {title}")
+            for k, v in rows:
+                print(f"    {k}: {v}")
+
+
+UI = PipelineUI()
+
 _DIAG = threading.local()
 _PRINT_LOCK = threading.Lock()
+# Set on Ctrl+C; chapter/chunk loops check between iterations and bail early.
+# (Python can't forcibly kill threads, so this is cooperative.)
+_CANCEL = threading.Event()
 
 
 def effective_batch_size():
@@ -1925,6 +2044,8 @@ def cmd_push_preview(preview_path):
         identifiers["isbn"] = result["isbn"]
     if result.get("asin"):
         identifiers["asin"] = result["asin"]
+    title, _author = correct_metadata(title, result.get("author"), identifiers)[:2]
+    result["author"] = _author
     wid, how = resolve_work(title, result.get("author"), identifiers, False,
                             create=True)
     if not wid:
@@ -2256,6 +2377,55 @@ def _is_multi(name):
     return " and " in f" {norm_name(name)} "
 
 
+def correct_metadata(title, author, identifiers):
+    """Cross-check parsed title/author against OpenLibrary via ISBN.
+
+    Returns (title, author, corrected: bool). Only overrides when the API
+    clearly disagrees: empty parsed title, parsed title == author name
+    (the Change Agent bug), or zero shared significant words.
+    One HTTP call per book; failures are silent (keeps parsed values).
+    """
+    isbn = (identifiers or {}).get("isbn")
+    if not isbn:
+        return title, author, False
+    try:
+        url = f"https://openlibrary.org/search.json?q={isbn}&fields=title,author_name&limit=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "ebook-processor/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8") or "{}")
+        docs = data.get("docs") or []
+        if not docs:
+            return title, author, False
+        api_title = (docs[0].get("title") or "").strip()
+        api_authors = docs[0].get("author_name") or []
+        api_author = api_authors[0] if api_authors else ""
+        if not api_title:
+            return title, author, False
+
+        tn, atn = norm(title), norm(api_title)
+        an = norm(author)
+        # Significant words (len >= 4) shared between parsed and API titles.
+        tw = {w for w in tn.split() if len(w) >= 4}
+        aw = {w for w in atn.split() if len(w) >= 4}
+        shared = tw & aw
+
+        needs_fix = (
+            not tn                      # empty parsed title
+            or (tn and tn == an)         # title == author (Change Agent bug)
+            or (tw and aw and not shared)  # completely different titles
+        )
+        if not needs_fix:
+            return title, author, False
+
+        new_title = api_title
+        new_author = author or api_author
+        print(f"  Metadata corrected via OpenLibrary: "
+              f"'{title}' -> '{new_title}'" + (f", author '{new_author}'" if not author and api_author else ""))
+        return new_title, new_author, True
+    except Exception:
+        return title, author, False
+
+
 def resolve_work(title, author, identifiers, is_anthology=False, create=True):
     """Return (work_id, how). Resolution order: ISBN -> edition -> work,
     then exact title/author match. With create=False (preview) never POSTs:
@@ -2546,9 +2716,9 @@ def write_claims(work_id, result, trope_mappings=None):
             else:
                 wrote["quotes"] = len(qrows)
 
-    print(f"  Wrote {wrote['tropes']} tropes, {wrote['triggers']} triggers, "
-          f"{wrote['characters']} characters, {wrote['proposals']} proposals, "
-          f"{wrote.get('quotes', 0)} quotes (new rows only)")
+    UI.status(f"  Wrote {wrote['tropes']} tropes, {wrote['triggers']} triggers, "
+                f"{wrote['characters']} characters, {wrote['proposals']} proposals, "
+                f"{wrote.get('quotes', 0)} quotes (new rows only)")
     return errors
 
 
@@ -2774,14 +2944,15 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         chapters = _prose_chapters(text)
         word_count = len(text.split())
 
-    print(f"  Title: {title or fpath.stem}, Chars: "
-          f"{sum(len(c['text']) for c in chapters)}")
+    _book_key = str(fpath)
+    UI.status(f"  Title: {title or fpath.stem}, "
+              f"Chars: {sum(len(c['text']) for c in chapters):,}")
     if identifiers.get("isbn"):
-        print(f"  ISBN: {identifiers['isbn']}")
+        UI.status(f"  ISBN: {identifiers['isbn']}")
     elif identifiers.get("asin"):
-        print(f"  ASIN: {identifiers['asin']} (no ISBN found)")
+        UI.status(f"  ASIN: {identifiers['asin']} (no ISBN found)")
     if not chapters:
-        print("  No chapters extracted")
+        UI.status("  No chapters extracted")
         return False
 
     # --chunks: restrict to specific chapter indices (1-based). Applied to the
@@ -2792,11 +2963,13 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         if not indexed:
             print(f"  --chunks {only}: no chapters match (1-{len(chapters)})")
             return False
-        print(f"  {len(chapters)} chapters, selecting {len(indexed)} "
-              f"(--chunks {only}), LLM: {CONFIG['llm']}")
+        UI.status(f"  {len(chapters)} chapters, selecting {len(indexed)} "
+                  f"(--chunks {only}), LLM: {CONFIG['llm']}")
     else:
-        print(f"  {len(chapters)} chapters, LLM: {CONFIG['llm']}")
+        UI.status(f"  {len(chapters)} chapters, LLM: {CONFIG['llm']}")
     n = len(indexed)
+    # 2 work units per chapter (Call A identity + Call B content)
+    UI.book_start(_book_key, f"📖 {title or fpath.stem}", total=2 * n)
 
     backends = {"ollama": llm_ollama, "openrouter": llm_openrouter,
                 "openai": llm_openai_compat}
@@ -2815,18 +2988,23 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     b_futs = {}
     if interleave:
         b_pool = ThreadPoolExecutor(max_workers=batch_size)
+    UI.set_phase(_book_key, "characters")
     for i, ch in indexed:
-        print(f"  Chapter {i}/{n} (A)...", end=" ", flush=True)
+        if _CANCEL.is_set():
+            UI.status(f"  Cancelled during chapter {i}/{n}")
+            if interleave:
+                b_pool.shutdown(wait=False, cancel_futures=True)
+            UI.book_done(_book_key)
+            return False
         a, fell_back = v2_call_a(call, roster, ch, n)
         chapter_as[i] = a
         if a is None:
             a_failed += 1
-            print("FAILED")
         else:
             a_ok += 1
             if fell_back:
                 a_fallback += 1
-            print("done" + (" (simple)" if fell_back else ""))
+        UI.advance(_book_key)
         if interleave:
             b_futs[b_pool.submit(v2_call_b, call, ch, n)] = i
         elif inline_b:
@@ -2836,9 +3014,16 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                 b_failed += 1
             else:
                 b_ok += 1
+            UI.advance(_book_key)  # B unit (A already advanced above)
     if interleave:
         done_count = 0
         for fut in as_completed(b_futs):
+            if _CANCEL.is_set():
+                for f in b_futs:
+                    f.cancel()
+                b_pool.shutdown(wait=False, cancel_futures=True)
+                UI.book_done(_book_key)
+                return False
             i = b_futs[fut]
             b = fut.result()
             chapter_bs[i] = b
@@ -2847,18 +3032,23 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                 b_failed += 1
             else:
                 b_ok += 1
-            print(f"\r  Content: {done_count}/{n} done", end="", flush=True)
-        print()
+            UI.advance(_book_key)
         b_pool.shutdown()
 
     # Pass 2: Call B parallel (independent per chapter; skipped if interleaved).
     if not interleave and not inline_b:
+        UI.set_phase(_book_key, "content")
         if batch_size > 1:
-            print(f"  Batching {batch_size} parallel content calls...")
             with ThreadPoolExecutor(max_workers=batch_size) as ex:
                 futs = {ex.submit(v2_call_b, call, ch, n): i for i, ch in indexed}
                 done_count = 0
                 for fut in as_completed(futs):
+                    if _CANCEL.is_set():
+                        # Cancel remaining futures; partial results discarded
+                        for f in futs:
+                            f.cancel()
+                        UI.book_done(_book_key)
+                        return False
                     i = futs[fut]
                     b = fut.result()
                     chapter_bs[i] = b
@@ -2867,19 +3057,17 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                         b_failed += 1
                     else:
                         b_ok += 1
-                    print(f"\r  Content: {done_count}/{n} done", end="", flush=True)
-            print()
+                    UI.advance(_book_key)
         else:
+            UI.set_phase(_book_key, "content")
             for i, ch in indexed:
-                print(f"  Chapter {i}/{n} (B)...", end=" ", flush=True)
                 b = v2_call_b(call, ch, n)
                 chapter_bs[i] = b
                 if b is None:
                     b_failed += 1
-                    print("FAILED")
                 else:
                     b_ok += 1
-                    print("done")
+                UI.advance(_book_key)
 
     failed = a_failed + b_failed
     aborted = (a_ok == 0 and b_ok == 0) or failed / max(2 * n, 1) > MAX_FAILED_CHUNK_RATIO
@@ -2975,6 +3163,11 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if v["evidence_checked"]:
         print(f"  Evidence: {v['evidence_verified']}/{v['evidence_checked']} verified")
 
+    # Metadata correction via OpenLibrary (one call per book; skipped in preview/dry-run).
+    if not (preview or dry_run):
+        title, author, _corrected = correct_metadata(title or fpath.stem, author, identifiers)
+        result["title"] = title
+        result["author"] = author
     # Work identity resolution (read-only in preview/dry-run).
     wid, how = resolve_work(title or fpath.stem, author, identifiers, False,
                             create=not (preview or dry_run))
@@ -2988,12 +3181,17 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     else:
         print(f"  Work: resolution failed ({how})")
 
-    print(f"  Found: {len(tropes)} tropes, {len(red['triggers'])} triggers, "
-          f"{len(red['characters'])} characters ({len(roster)} roster)")
     smsg = f" ({a_fallback} via simple fallback)" if a_fallback else ""
-    print(f"  Tasks: content {b_ok}/{n} ok, identity {a_ok}/{n} ok{smsg}")
-    print(f"  Spice: {red['spice_level']}/5, POVs: {', '.join(red['povs']) or 'none'}, "
-          f"~{reading_mins}min read")
+    UI.book_done(_book_key)
+    UI.summary(f"📖 {title or fpath.stem}", [
+        ("Tropes", f"{len(tropes)} confirmed"),
+        ("Triggers", len(red['triggers'])),
+        ("Characters", f"{len(red['characters'])} ({len(roster)} roster)"),
+        ("Tasks", f"content {b_ok}/{n} ok, identity {a_ok}/{n} ok{smsg}"),
+        ("Spice", f"{red['spice_level']}/5"),
+        ("POVs", ', '.join(red['povs']) or 'none'),
+        ("Reading time", f"~{reading_mins} min"),
+    ])
 
     if CONFIG.get("dedupe") and result["characters"]:
         n_before = len(result["characters"])
@@ -3036,7 +3234,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
 def process_file(fpath, dry_run=False, preview=False):
     if CONFIG.get("pipeline") == "v2":
         return process_file_v2(fpath, dry_run, preview)
-    print(f"\nProcessing: {fpath.name}")
+    _book_key = str(fpath)
+    UI.status(f"\nProcessing: {fpath.name}")
     global _DEBUG_TAG
     _DEBUG_TAG = fpath.stem if (preview or dry_run) and CONFIG.get("debug") else None
     extracted = read_ebook(fpath)
@@ -3044,7 +3243,7 @@ def process_file(fpath, dry_run=False, preview=False):
         return False
     text, title, author, identifiers = extracted
 
-    print(f"  Title: {title or fpath.stem}, Chars: {len(text)}")
+    UI.status(f"  Title: {title or fpath.stem}, Chars: {len(text):,}")
     if identifiers.get("isbn"):
         print(f"  ISBN: {identifiers['isbn']}")
     elif identifiers.get("asin"):
@@ -3085,8 +3284,9 @@ def process_file(fpath, dry_run=False, preview=False):
         print(f"  {n} chunks, selecting {len(indexed)} (--chunks {only}), "
               f"LLM: {CONFIG['llm']}")
     else:
-        print(f"  {n} chunks, LLM: {CONFIG['llm']}")
+        UI.status(f"  {n} chunks, LLM: {CONFIG['llm']}")
     n = len(indexed)
+    UI.book_start(_book_key, f"\U0001f4d6 {title or fpath.stem}", total=n)
 
     trope_hits, trope_name = Counter(), {}
     trig_hits, trig_data = Counter(), {}
@@ -3107,7 +3307,6 @@ def process_file(fpath, dry_run=False, preview=False):
     # Collect results (parallel when batch_size > 1)
     results = {}
     if batch_size > 1:
-        print(f"  Batching {batch_size} parallel requests...")
         with ThreadPoolExecutor(max_workers=batch_size) as ex:
             futs = {ex.submit(_run_chunk, (i, ch)): i for i, ch in indexed}
             done_count = 0
@@ -3115,14 +3314,16 @@ def process_file(fpath, dry_run=False, preview=False):
                 idx, r = fut.result()
                 results[idx] = r
                 done_count += 1
-                print(f"\r  Chunks: {done_count}/{n} done", end="", flush=True)
-        print()  # newline after progress
+                UI.advance(_book_key)
     else:
         for i, ch in indexed:
-            print(f"  Chunk {i}/{n}...", end=" ", flush=True)
+            if _CANCEL.is_set():
+                UI.status(f"  Cancelled during chunk {i}/{n}")
+                UI.book_done(_book_key)
+                return False
             _, r = _run_chunk((i, ch))
             results[i] = r
-            print("done" if r else "FAILED")
+            UI.advance(_book_key)
 
     for i, _ch in indexed:
         r = results.get(i)
@@ -3217,6 +3418,11 @@ def process_file(fpath, dry_run=False, preview=False):
         print(f"  Evidence: {v_verified}/{v_checked} verified"
               + (f", {v_dropped} quotes dropped" if v_dropped else ""))
 
+    # Metadata correction via OpenLibrary (one call per book; skipped in preview/dry-run).
+    if not (preview or dry_run):
+        title, author, _corrected = correct_metadata(title or fpath.stem, author, identifiers)
+        result["title"] = title
+        result["author"] = author
     # Work identity resolution (read-only in preview/dry-run).
     wid, how = resolve_work(title or fpath.stem, author, identifiers, is_anth,
                             create=not (preview or dry_run))
@@ -3233,12 +3439,19 @@ def process_file(fpath, dry_run=False, preview=False):
     else:
         print(f"  Work: resolution failed ({how})")
 
-    print(f"  Found: {len(tropes)} tropes, {len(triggers)} triggers, {len(characters)} characters")
-    smsg = f" ({task_ok['identity_simple']} via simple fallback)" if task_ok["identity_simple"] else ""
-    print(f"  Tasks: discipline {task_ok['discipline']}/{n} ok, identity {task_ok['identity']}/{n} ok{smsg}")
-    print(f"  Spice: {spice_level}/5, POVs: {', '.join(sorted(povs)) or 'none'}, ~{reading_mins}min read")
     _elapsed = _time.time() - _t0
-    print(f"  Elapsed: {_elapsed/60:.1f} min ({_elapsed/n:.1f}s/chapter)")
+    smsg = f" ({task_ok['identity_simple']} via simple fallback)" if task_ok["identity_simple"] else ""
+    UI.book_done(_book_key)
+    UI.summary(f"\U0001f4d6 {title or fpath.stem}", [
+        ("Tropes", f"{len(tropes)} confirmed"),
+        ("Triggers", len(triggers)),
+        ("Characters", len(characters)),
+        ("Tasks", f"discipline {task_ok['discipline']}/{n} ok, identity {task_ok['identity']}/{n} ok{smsg}"),
+        ("Spice", f"{spice_level}/5"),
+        ("POVs", ', '.join(sorted(povs)) or 'none'),
+        ("Reading time", f"~{reading_mins} min"),
+        ("Elapsed", f"{_elapsed/60:.1f} min ({_elapsed/n:.1f}s/chunk)"),
+    ])
 
     if CONFIG.get("dedupe") and result["characters"]:
         n_before = len(result["characters"])
@@ -3404,6 +3617,19 @@ def run_once(dry_run, preview):
     if not files:
         print("No ebooks found.")
         return 0
+    _CANCEL.clear()
+    UI.start()
+    try:
+        return _run_once_inner(dry_run, preview, files)
+    except KeyboardInterrupt:
+        _CANCEL.set()
+        UI.status("\nCancelled — stopping after current chapter...")
+        raise
+    finally:
+        UI.stop()
+
+
+def _run_once_inner(dry_run, preview, files):
     jobs = max(1, CONFIG.get("jobs", 1))
     batch_size = max(1, CONFIG.get("batch_size", BATCH_SIZE))
     if jobs > 1 and len(files) > 1:
@@ -3418,7 +3644,8 @@ def run_once(dry_run, preview):
             results = list(ex.map(_process_one,
                                   [(f, dry_run, preview, per_book) for f in files]))
         except KeyboardInterrupt:
-            print("\nInterrupted — cancelling pending books...")
+            _CANCEL.set()
+            UI.status("\nInterrupted — stopping current chapters, cancelling pending books...")
             ex.shutdown(wait=False, cancel_futures=True)
             raise
         ex.shutdown(wait=True)
