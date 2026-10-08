@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.4.4"
+PORTABLE_VERSION = "2.4.5"
 
 import argparse
 import difflib
@@ -1821,8 +1821,17 @@ def trope_catalog_vectors():
 
 def cmd_push_preview(preview_path):
     """Push a preview JSON's data to Supabase without re-running the LLM.
-    Resolves the work, then runs write_claims. Use for retrying failed writes."""
+    Resolves the work, then runs write_claims. Use for retrying failed writes.
+    Accepts a single file or a directory (all .json files except trope-maps)."""
     import os
+    import glob as _glob
+    if os.path.isdir(preview_path):
+        files = sorted(_glob.glob(os.path.join(preview_path, "*.json")))
+        files = [f for f in files if "trope-map" not in os.path.basename(f)]
+        print(f"  Pushing {len(files)} preview files...")
+        for f in files:
+            cmd_push_preview(f)
+        return
     if not os.path.isfile(preview_path):
         print(f"  Not found: {preview_path}")
         return
