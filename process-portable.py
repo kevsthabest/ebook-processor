@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.5.2"
+PORTABLE_VERSION = "2.5.3"
 
 import argparse
 import difflib
@@ -2070,10 +2070,12 @@ def sb(table, method="GET", data=None, params="", prefer=None):
 
 
 def norm(s):
-    """Lowercase, strip accents and punctuation, keep letters/digits in any script."""
+    """Lowercase, strip accents and punctuation, collapse whitespace to single
+    spaces. Matches the app's tropeNormIdent: "Fourth Wing" -> "fourth wing"."""
     s = unicodedata.normalize("NFKD", s or "")
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return re.sub(r"[\W_]+", "", s.lower())
+    s = re.sub(r"[\W_]+", " ", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def norm_name(n):
