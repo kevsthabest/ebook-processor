@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.5.1"
+PORTABLE_VERSION = "2.5.2"
 
 import argparse
 import difflib
@@ -2254,6 +2254,44 @@ def _trope_lookup(name):
     return rows[0]["id"] if rows else None
 
 
+def _suggest_character_links(inserted_rows):
+    """For newly inserted book_characters rows, look up the canonical
+    characters table by name_norm and set suggested_character_id on matches.
+    Never auto-links; the UI shows accept/reject."""
+    if not inserted_rows:
+        return
+    # Batch lookup: collect unique normalized names.
+    name_to_id = {}
+    for r in inserted_rows:
+        nid = r.get("id")
+        nname = r.get("name", "")
+        nkey = norm_name(nname)
+        if nid and nkey and nkey not in name_to_id:
+            name_to_id[nkey] = None
+    if not name_to_id:
+        return
+    # Query characters table for matches.
+    keys = list(name_to_id.keys())
+    # PostgREST OR filter for multiple values.
+    or_filter = ",".join(f"name_norm.eq.{k}" for k in keys)
+    matches = sb("characters", params=f"?or=({or_filter})&select=id,name_norm")
+    if not matches:
+        return
+    for m in matches:
+        nk = (m.get("name_norm") or "").strip()
+        if nk in name_to_id:
+            name_to_id[nk] = m["id"]
+    # PATCH each matched row with the suggestion.
+    for r in inserted_rows:
+        nid = r.get("id")
+        nkey = norm_name(r.get("name", ""))
+        cid = name_to_id.get(nkey)
+        if nid and cid:
+            sb("book_characters", method="PATCH",
+               params=f"?id=eq.{nid}",
+               data={"suggested_character_id": cid})
+
+
 def write_claims(work_id, result, trope_mappings=None):
     """Insert only what is not already there. Returns the number of failed operations.
 
@@ -2374,10 +2412,16 @@ def write_claims(work_id, result, trope_mappings=None):
                          "source_type": "ai",
                          "confidence": c.get("confidence", 0.7)})
         if rows:
-            if sb("book_characters", method="POST", data=rows) is None:
+            inserted = sb("book_characters", method="POST", data=rows)
+            if inserted is None:
                 errors += 1
             else:
                 wrote["characters"] = len(rows)
+                # Suggest canonical character links via name_norm match.
+                try:
+                    _suggest_character_links(inserted)
+                except Exception as e:
+                    print(f"  (character link suggestions skipped: {e})")
 
     # Spice -> works.spice_detected
     spice = result.get("spice_level")
