@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.5.7"
+PORTABLE_VERSION = "2.5.8"
 
 import argparse
 import difflib
@@ -484,7 +484,13 @@ RULES:
 3. REAL PEOPLE ONLY who appear or are directly involved in this chapter.
 4. EVIDENCE: best supporting sentence copied exactly from the chapter; empty string if none — never invent, never repeat.
 5. ROLE must be exactly one of: protagonist, antagonist, supporting, minor. When in doubt, supporting.
-6. pov_character is ONLY someone who narrates this chapter. Most chapters have one; some have none (null)."""
+6. pov_character is ONLY someone who narrates this chapter. Most chapters have one; some have none (null).
+7. RELATIONSHIPS: only list relationships EXPLICITLY shown or stated in this chapter. Do not infer.
+   - Direction matters: if A is B's parent, do NOT also list B as A's parent. Pick ONE direction.
+   - "spouse" means married or explicitly romantic partners. A character has at most ONE spouse. Dragons, mentors, and friends are NOT spouses.
+   - "sibling" means they share parents. Cousins, friends, and squadmates are NOT siblings.
+   - Every relationship needs a "to" that is a character IN THIS BOOK. Never use real-world names, author names, or names from other books.
+   - When in doubt, use "other" or omit entirely. Fewer, correct relationships beat exhaustive wrong ones."""
 
 PROMPT_V2_CHARACTERS_SIMPLE = """Extract character information from this book chapter. Return ONLY valid JSON, no other text.
 {
@@ -893,12 +899,22 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         for r in a["relationships"]:
             frm = _roster_canonical(roster, r["from"])
             to = _roster_canonical(roster, r["to"])
-            key = (frm, to, r["type"])
+            rtype = r["type"]
+            # Drop contradictions: parent/child are directional, only one per pair.
+            # (A parent of B) contradicts (A child of B) and (B parent of A).
+            if rtype in ("parent", "child"):
+                contra_keys = {
+                    (frm, to, "parent"), (frm, to, "child"),
+                    (to, frm, "parent"), (to, frm, "child"),
+                }
+                if contra_keys & seen_rel:
+                    continue
+            key = (frm, to, rtype)
             if key in seen_rel:
                 continue
             seen_rel.add(key)
             relationships.append({
-                "from": frm, "to": to, "type": r["type"],
+                "from": frm, "to": to, "type": rtype,
                 "evidence": r.get("evidence", ""),
                 "evidence_verified": bool(r.get("evidence")),
                 "evidence_offered": bool(r.get("evidence")),
