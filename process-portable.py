@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.3.5"
+PORTABLE_VERSION = "2.4.0"
 
 import argparse
 import difflib
@@ -748,15 +748,13 @@ def _v2_call_a_inner(call, roster, chapter, n_chapters):
     prompt = (PROMPT_V2_CHARACTERS
               .replace("{chapter_label}", chapter["label"])
               .replace("{roster}", roster_text))
-    _use_shared = CONFIG.get("v2_prompt_cache") or CONFIG.get("v2_shared_system")
-    _task_last = CONFIG.get("v2_prompt_cache") or CONFIG.get("v2_task_last")
+    _use_shared = CONFIG.get("v2_shared_system")  # isolation flag only; hurts quality
+    _task_last = (CONFIG.get("v2_prompt_cache") or CONFIG.get("v2_task_last"))
     _system_a = V2_SHARED_SYSTEM if _use_shared else prompt
-    _user_a = (f"CHAPTER TEXT:\n{chapter['text']}\n\nTASK:\n{prompt}"
-               if _task_last else chapter["text"])
-    # When task-last without shared system, task goes in user message.
-    if _task_last and not _use_shared:
+    if _task_last:
         _user_a = f"CHAPTER TEXT:\n{chapter['text']}\n\nTASK:\n{prompt}"
-        _system_a = prompt
+    else:
+        _user_a = chapter["text"]
     a = _run_task(call, _system_a, _user_a, idx, n_chapters,
                   f"v2-ch{idx}-identity", sanitize_fn=_sanitize_v2a)
     # Apply POV hint if the LLM didn't determine one (or as override).
@@ -791,8 +789,8 @@ def v2_call_b(call, chapter, n_chapters):
 
 def _v2_call_b_inner(call, chapter, n_chapters):
     idx = chapter["index"]
-    _use_shared_b = CONFIG.get("v2_prompt_cache") or CONFIG.get("v2_shared_system")
-    _task_last_b = CONFIG.get("v2_prompt_cache") or CONFIG.get("v2_task_last")
+    _use_shared_b = CONFIG.get("v2_shared_system")  # isolation flag only; hurts quality
+    _task_last_b = (CONFIG.get("v2_prompt_cache") or CONFIG.get("v2_task_last"))
     _system_b = V2_SHARED_SYSTEM if _use_shared_b else PROMPT_V2_CONTENT
     if _task_last_b:
         _user_b = f"CHAPTER TEXT:\n{chapter['text']}\n\nTASK:\n{PROMPT_V2_CONTENT}"
@@ -3144,7 +3142,7 @@ def main():
     ap.add_argument("--validate", metavar="PREVIEW_JSON",
                     help="run automated quality checks on a preview file")
     ap.add_argument("--prompt-cache", action="store_true",
-                    help="v2: chapter-first prompt layout for llama.cpp KV cache "
+                    help="v2: task-last prompt layout for llama.cpp KV cache "
                          "reuse + interleaved A/B calls (experimental)")
     ap.add_argument("--shared-system", action="store_true",
                     help="v2: use shared system prompt for A/B calls (isolation test)")
