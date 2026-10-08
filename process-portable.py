@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.4.1"
+PORTABLE_VERSION = "2.4.2"
 
 import argparse
 import difflib
@@ -2750,6 +2750,9 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         save_preview(fpath, result)
         print(f"  Preview saved (pipeline=v2)")
         return not aborted
+    # Write mode: still save the preview JSON as an audit trail.
+    save_preview(fpath, result)
+    print(f"  Preview saved (audit trail, pipeline=v2)")
     if aborted:
         print("  ABORTED — not writing partial results")
         return False
