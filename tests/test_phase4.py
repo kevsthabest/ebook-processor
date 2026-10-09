@@ -199,23 +199,96 @@ class TestReduce(unittest.TestCase):
         red = pp.v2_reduce({}, bs, {}, [_ch(1, "A")])
         self.assertEqual(len(red["triggers"]), 0)
 
-    def test_spice_75th_percentile(self):
-        bs = {i: _b(spice=s) for i, s in enumerate([0, 0, 2, 4], start=1)}
-        red = pp.v2_reduce({}, bs, {}, [_ch(i, str(i)) for i in range(1, 5)])
-        # peak=4 appears once -> ignored; max(p75=2, 0) = 2
-        self.assertEqual(red["spice_level"], 2)
-        self.assertEqual(red["spice_peak"], 4)
-        self.assertEqual(red["spice_avg_nonzero"], 3.0)
+    def test_spice_matrix_all_cells(self):
+        # All 12 matrix cells + the (none, none) -> 0 case.
+        cases = [
+            # (peak_band, freq_band) -> level; constructed via peak + frac.
+            # mild x rare/occasional -> 1
+            ([1] + [0] * 99, 100, 1),       # peak 1, 1% spicy
+            ([1] * 10 + [0] * 90, 100, 1),  # peak 1, 10% spicy
+            # mild x frequent/pervasive -> 2
+            ([1] * 20 + [0] * 80, 100, 2),
+            ([1] * 50 + [0] * 50, 100, 2),
+            # moderate x rare -> 1
+            ([3] + [0] * 99, 100, 1),
+            # moderate x occasional -> 2
+            ([3] * 10 + [0] * 90, 100, 2),
+            # moderate x frequent -> 3
+            ([2] * 20 + [0] * 80, 100, 3),
+            # moderate x pervasive -> 4
+            ([3] * 50 + [0] * 50, 100, 4),
+            # explicit x rare -> 2
+            ([5] + [0] * 99, 100, 2),
+            # explicit x occasional -> 3
+            ([5] * 10 + [0] * 90, 100, 3),
+            # explicit x frequent -> 4
+            ([4] * 20 + [0] * 80, 100, 4),
+            # explicit x pervasive -> 5
+            ([5] * 50 + [0] * 50, 100, 5),
+            # (none, none) -> 0
+            ([0] * 10, 10, 0),
+            ([], 0, 0),
+        ]
+        for spices, total, expected in cases:
+            with self.subTest(spices=spices[:3], total=total):
+                self.assertEqual(
+                    pp._spice_level_from_chapters(spices, total), expected)
 
-    def test_spice_peak_requires_two_chapters(self):
-        # Single outlier chapter doesn't set book rating (Daemon rave scene)
-        bs = {i: _b(spice=s) for i, s in enumerate([0]*72 + [4], start=1)}
-        red = pp.v2_reduce({}, bs, {}, [_ch(i, str(i)) for i in range(1, 74)])
-        self.assertEqual(red["spice_level"], 0)  # p75=0, peak ignored
-        # Two chapters at peak -> peak counts
-        bs = {i: _b(spice=s) for i, s in enumerate([0]*71 + [4, 4], start=1)}
-        red = pp.v2_reduce({}, bs, {}, [_ch(i, str(i)) for i in range(1, 74)])
-        self.assertEqual(red["spice_level"], 3)  # max(p75=0, peak-1=3)
+    def test_spice_daemon_acceptance(self):
+        # Daemon: peak 5, 2-4 spicy chapters of 73 -> level 2 (was 3).
+        for n_spicy in (2, 3, 4):
+            spices = [5] * n_spicy + [0] * (73 - n_spicy)
+            level = pp._spice_level_from_chapters(spices, 73)
+            self.assertEqual(level, 2,
+                             f"n_spicy={n_spicy} should give level 2")
+
+    def test_spice_single_explicit_chapter_not_five(self):
+        # One explicit scene in a long book is not a 5 (old peak logic
+        # would have needed 2+ chapters; the matrix handles it via frequency).
+        spices = [5] + [0] * 72
+        self.assertEqual(pp._spice_level_from_chapters(spices, 73), 2)
+
+    def test_spice_bands(self):
+        self.assertEqual(pp._spice_band_peak(0), "none")
+        self.assertEqual(pp._spice_band_peak(1), "mild")
+        self.assertEqual(pp._spice_band_peak(3), "moderate")
+        self.assertEqual(pp._spice_band_peak(5), "explicit")
+        self.assertEqual(pp._spice_band_freq(0), "none")
+        self.assertEqual(pp._spice_band_freq(0.03), "rare")
+        self.assertEqual(pp._spice_band_freq(0.10), "occasional")
+        self.assertEqual(pp._spice_band_freq(0.20), "frequent")
+        self.assertEqual(pp._spice_band_freq(0.50), "pervasive")
+
+    def test_trigger_prominence_fields(self):
+        # graphic in few chapters -> medium; mentioned everywhere -> medium
+        self.assertEqual(
+            pp._trigger_prominence("graphic", 2, 73), "medium")
+        self.assertEqual(
+            pp._trigger_prominence("mentioned", 20, 73), "medium")
+        self.assertEqual(
+            pp._trigger_prominence("on_page", 20, 73), "high")
+        self.assertEqual(
+            pp._trigger_prominence("graphic", 10, 73), "high")
+        self.assertEqual(
+            pp._trigger_prominence("mentioned", 1, 73), "low")
+        self.assertEqual(
+            pp._trigger_prominence("on_page", 1, 73), "low")
+        # Edge cases
+        self.assertEqual(pp._trigger_prominence("graphic", 0, 73), "low")
+        self.assertEqual(pp._trigger_prominence("graphic", 5, 0), "low")
+
+    def test_trigger_reduce_includes_prominence(self):
+        bs = {1: _b(self._full_triggers(murder="graphic"), spice=0),
+              2: _b(self._full_triggers(murder="graphic"), spice=0)}
+        for b in bs.values():
+            b["trigger_evidence"] = {"murder": "he killed him"}
+        red = pp.v2_reduce({}, bs, {}, [_ch(1, "A"), _ch(2, "B")])
+        self.assertEqual(len(red["triggers"]), 1)
+        t = red["triggers"][0]
+        self.assertEqual(t["chapter_count"], 2)
+        self.assertEqual(t["frequency"], 1.0)
+        # graphic in 2/2 chapters (frequent) -> high
+        self.assertEqual(t["prominence"], "high")
 
     def test_pov_threshold(self):
         roster = {}
@@ -1064,8 +1137,11 @@ class TestRemainingFixes(unittest.TestCase):
         self.assertEqual(types, ["friend"])
 
     # --- Area 2: spice ---
-    def test_spice_explicit_sex_consistency(self):
-        # explicit_sex at on_page with matching evidence -> spice >= 3
+    def test_spice_no_explicit_sex_floor(self):
+        # The old explicit_sex consistency floor is gone: spice comes only
+        # from the matrix. Triggers warn content EXISTS; spice measures
+        # PERVASIVENESS. Here explicit_sex is on_page but chapters have
+        # spice 0 and 1 -> matrix gives mild x pervasive = 2.
         triggers = {c: "none" for c in pp.TRIGGER_CATEGORIES}
         triggers["explicit_sex"] = "on_page"
         b1 = _b(triggers, spice=0)
@@ -1074,13 +1150,13 @@ class TestRemainingFixes(unittest.TestCase):
         b2["trigger_evidence"] = {"explicit_sex": "more explicit sex"}
         bs = {1: b1, 2: b2}
         red = pp.v2_reduce({}, bs, {}, [_ch(1, "A"), _ch(2, "B")])
-        self.assertGreaterEqual(red["spice_level"], 3)
+        self.assertEqual(red["spice_level"], 2)
 
-    def test_spice_peak_avg_stored(self):
+    def test_spice_peak_stored(self):
         bs = {i: _b(spice=s) for i, s in enumerate([0, 2, 4], start=1)}
         red = pp.v2_reduce({}, bs, {}, [_ch(i, str(i)) for i in range(1, 4)])
         self.assertEqual(red["spice_peak"], 4)
-        self.assertEqual(red["spice_avg_nonzero"], 3.0)
+        self.assertNotIn("spice_avg_nonzero", red)
 
     # --- Area 3: quotes ---
     def _quote_reduce(self, quotes_by_chapter, summaries=None):

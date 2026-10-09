@@ -549,6 +549,94 @@ TRIGGER_CATEGORIES = [
 ]
 _SEVERITY_ORDER = {"none": 0, "mentioned": 1, "on_page": 2, "graphic": 3}
 
+# Spice level: peak-chapter intensity x fraction-of-chapters-with-spice.
+# Principle: triggers warn that content EXISTS; spice level measures how
+# PERVASIVE it is. A single explicit scene in a 500-page book is not a 5.
+# Keep as module-level data so future tuning is a data edit, not code.
+def _spice_band_peak(peak):
+    """Peak chapter spice (0-5) -> intensity band."""
+    if peak <= 0:
+        return "none"
+    if peak == 1:
+        return "mild"
+    if peak <= 3:
+        return "moderate"
+    return "explicit"
+
+
+def _spice_band_freq(frac):
+    """Fraction of chapters with spice > 0 -> frequency band.
+
+    NOTE: cutoffs (0.06/0.15/0.35) differ from trigger prominence bands
+    (0.05/0.15) intentionally — calibrated so Daemon (2-4 spicy of 73 ch)
+    lands at spice level 2. Do not "unify" without re-running acceptance.
+    """
+    if frac <= 0:
+        return "none"
+    if frac < 0.06:
+        return "rare"
+    if frac < 0.15:
+        return "occasional"
+    if frac < 0.35:
+        return "frequent"
+    return "pervasive"
+
+
+_SPICE_MATRIX = {
+    ("mild", "rare"): 1, ("mild", "occasional"): 1,
+    ("mild", "frequent"): 2, ("mild", "pervasive"): 2,
+    ("moderate", "rare"): 1, ("moderate", "occasional"): 2,
+    ("moderate", "frequent"): 3, ("moderate", "pervasive"): 4,
+    ("explicit", "rare"): 2, ("explicit", "occasional"): 3,
+    ("explicit", "frequent"): 4, ("explicit", "pervasive"): 5,
+}
+# ("none", "none") -> 0.
+
+
+def _spice_level_from_chapters(spice_levels, total_chapters):
+    """Pure function: list of per-chapter spice levels (0-5) + total chapters
+    -> book spice level 0-5 via the intensity x frequency matrix."""
+    peak = max(spice_levels) if spice_levels else 0
+    n_spicy = sum(1 for s in spice_levels if s > 0)
+    frac = (n_spicy / total_chapters) if total_chapters else 0
+    peak_band = _spice_band_peak(peak)
+    freq_band = _spice_band_freq(frac)
+    if peak_band == "none" or freq_band == "none":
+        return 0
+    return _SPICE_MATRIX.get((peak_band, freq_band), 0)
+
+
+# Trigger prominence: severity x frequency per trigger. Additive — severity
+# is unchanged. Gives the app UI a low/medium/high signal for display.
+def _prominence_band_freq(frac):
+    """Fraction of chapters containing the trigger -> frequency band."""
+    if frac < 0.05:
+        return "rare"
+    if frac <= 0.15:
+        return "occasional"
+    return "frequent"
+
+
+_PROMINENCE_MATRIX = {
+    ("mentioned", "rare"): "low",
+    ("mentioned", "occasional"): "low",
+    ("mentioned", "frequent"): "medium",
+    ("on_page", "rare"): "low",
+    ("on_page", "occasional"): "medium",
+    ("on_page", "frequent"): "high",
+    ("graphic", "rare"): "medium",
+    ("graphic", "occasional"): "high",
+    ("graphic", "frequent"): "high",
+}
+
+
+def _trigger_prominence(severity, chapter_count, total_chapters):
+    """Pure function: severity name + chapter counts -> low/medium/high."""
+    if total_chapters <= 0 or chapter_count <= 0:
+        return "low"
+    freq_band = _prominence_band_freq(chapter_count / total_chapters)
+    return _PROMINENCE_MATRIX.get((severity, freq_band), "low")
+
 # Relationship dedupe: exclusive types resolve by precedence (lower wins).
 # Non-exclusive types are kept as extras only with evidence.
 _REL_PRECEDENCE = {"spouse": 0, "parent": 1, "child": 1, "sibling": 2,
@@ -2480,6 +2568,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
             "severity": sev_names[sev],
             "severity_claimed": sev_names[acc["sev"]],
             "chapters": acc["chapters"],
+            "chapter_count": len(acc["chapters"]),
+            "frequency": round(len(acc["chapters"]) / n, 4) if n else 0,
+            "prominence": _trigger_prominence(
+                sev_names[sev], len(acc["chapters"]), n),
             "evidence": acc["evidence"],
             "evidence_verified": bool(acc["evidence"]),
             "evidence_offered": bool(acc["evidence"]),
@@ -2489,23 +2581,12 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
     if _gated_dropped:
         print(f"  Trigger gate: dropped {_gated_dropped} unsupported claim(s)")
 
-    # --- Spice: peak, non-zero average, and max(p75, peak-1) ---
-    # Peak only counts if it appears in 2+ chapters (a single outlier
-    # chapter shouldn't set the book rating -- e.g. one rave scene in Daemon).
-    spices = sorted(b["spice_level"] for b in chapter_bs.values() if b)
+    # --- Spice: peak-chapter intensity x fraction-of-chapters (matrix) ---
+    # Triggers warn that content EXISTS; spice level measures PERVASIVENESS.
+    # A single explicit scene in a long book is not a 5.
+    spices = [b["spice_level"] for b in chapter_bs.values() if b]
     spice_peak = max(spices) if spices else 0
-    _nonzero = [s for s in spices if s > 0]
-    spice_avg_nonzero = round(sum(_nonzero) / len(_nonzero), 2) if _nonzero else 0
-    _p75 = spices[max(0, math.ceil(0.75 * len(spices)) - 1)] if spices else 0
-    _peak_count = sum(1 for s in spices if s == spice_peak)
-    _peak_adj = (spice_peak - 1) if _peak_count >= 2 else 0
-    spice_level = max(_p75, _peak_adj) if spices else 0
-    # Consistency: explicit_sex at sev>=2 means the book has explicit content
-    for _t in triggers:
-        if (_t["warning"] == "explicit_sex"
-                and _SEVERITY_ORDER.get(_t["severity"], 0) >= 2):
-            spice_level = max(spice_level, 3)
-            break
+    spice_level = _spice_level_from_chapters(spices, n)
 
     # --- POVs: named in >=2 chapters (or >=1 if fewer than 4 chapters) ---
     pov_counts = Counter()
@@ -2664,7 +2745,6 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         "triggers": triggers,
         "spice_level": spice_level,
         "spice_peak": spice_peak,
-        "spice_avg_nonzero": round(spice_avg_nonzero, 2),
         "povs": povs,
         "trope_candidates": trope_candidates,
         "trope_candidate_counts": dict(trope_counts),
@@ -4847,6 +4927,9 @@ def write_claims(work_id, result, trope_mappings=None):
                                       "severity": td.get("severity", ""),
                                       "severity_claimed": td.get("severity_claimed", ""),
                                       "chapters": td.get("chapters", []),
+                                      "chapter_count": td.get("chapter_count", 0),
+                                      "frequency": td.get("frequency", 0),
+                                      "prominence": td.get("prominence", ""),
                                       "quotes": td.get("evidence", [])}})
         if rows:
             if sb("book_trigger_claims", method="POST", data=rows) is None:
@@ -5883,6 +5966,11 @@ def save_preview(fpath, result):
     md.append(f"## Trigger Warnings ({len(result['triggers'])})")
     for t in result["triggers"]:
         line = f"- **{t['warning']}**"
+        if t.get("severity"):
+            line += f" ({t['severity']}"
+            if t.get("prominence"):
+                line += f", {t['prominence']} prominence"
+            line += ")"
         if t.get("detail"):
             line += f": {t['detail']}"
         if t.get("spoiler"):
