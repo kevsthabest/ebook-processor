@@ -20,12 +20,36 @@ import sys
 import urllib.request
 
 TRIGGER_DEFS = {
-    "suicide": "a character attempts or completes suicide on the page",
-    "sexual_violence": "a character is subjected to non-consensual sexual acts",
-    "child_abuse": "a child is physically harmed or abused",
-    "self_harm": "a character deliberately injures themselves",
-    "murder": "a character kills another character on the page",
-    "graphic_violence": "violence described in graphic, visceral detail",
+    "suicide": (
+        "Does this passage depict suicide?",
+        "A character attempts or completes suicide; expresses clear intent to kill themselves",
+        "Metaphorical use ('career suicide', 'digital suicide'); hypothetical; someone else's death",
+    ),
+    "sexual_violence": (
+        "Does this passage depict sexual violence?",
+        "Non-consensual sexual acts, assault, or coercion described or clearly implied",
+        "Consensual intimacy; romantic tension without coercion",
+    ),
+    "child_abuse": (
+        "Does this passage depict child abuse?",
+        "A child is physically harmed, sexually abused, or severely neglected",
+        "Discipline without injury; adults arguing around children",
+    ),
+    "self_harm": (
+        "Does this passage depict self-harm?",
+        "A character deliberately injures themselves (cutting, burning, etc.)",
+        "Metaphorical ('beating himself up over it'); accidental injury",
+    ),
+    "murder": (
+        "Does this passage depict murder?",
+        "A character kills another character on the page",
+        "Threats without action; deaths by accident or natural causes",
+    ),
+    "graphic_violence": (
+        "Does this passage depict graphic violence?",
+        "Violence described in visceral, bloody, or disturbing detail",
+        "Mild action violence; violence mentioned but not described",
+    ),
 }
 
 TEST_CASES = [
