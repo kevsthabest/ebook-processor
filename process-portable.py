@@ -797,7 +797,11 @@ class DecisionValidator:
             p_yes = ans.get("noul")
             if p_yes is None:
                 p_yes = ans.get("probabilities", {}).get("yes", 0)
-            return p_yes >= threshold, float(p_yes)
+            verdict = p_yes >= threshold
+            print(f"  Decision: {trigger}: P(yes)={p_yes:.2f} "
+                  f"{'≥' if verdict else '<'} {threshold:.2f} → "
+                  f"{'keep' if verdict else 'drop'}")
+            return verdict, float(p_yes)
         except Exception as e:
             print(f"  Decision model error ({trigger}): {e}; "
                   f"falling back to regex")
