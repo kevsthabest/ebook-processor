@@ -43,16 +43,13 @@ def classify(base_url, model, api_key, trigger, quote, timeout=30):
     """Returns (verdict_bool, p_yes, raw_response)."""
     q, yes_when, no_when = TRIGGER_DEFS.get(
         trigger, (f"Does this depict {trigger}?", "", ""))
-    req_body = {"state": quote}
-    if model:
-        req_body["model"] = model
+    req_body = {"state": quote, "model": model or "default"}
     payload = json.dumps({
         **req_body,
         "questions": {
             "trigger_check": {
                 "type": "noul",
-                "instructions": q,
-                "criteria": {"yes": yes_when, "no": no_when},
+                "instructions": f"{q} Yes when: {yes_when} No when: {no_when}",
             }
         },
     }).encode()
@@ -71,12 +68,14 @@ def classify(base_url, model, api_key, trigger, quote, timeout=30):
     except Exception as e:
         return None, None, f"ERROR: {e}"
 
-    # Jev-compatible response: answers -> {question_id: {label, probabilities}}
+    # Response shape: {"answers": {"trigger_check": {"type": "noul", "noul": 0.97}}}
     try:
         ans = result["answers"]["trigger_check"]
-        p_yes = ans.get("probabilities", {}).get("yes", 0)
-        label = ans.get("label", "").lower()
-        verdict = p_yes >= 0.5 if p_yes else label in ("yes", "true")
+        p_yes = ans.get("noul")
+        if p_yes is None:
+            # fallback: probabilities dict
+            p_yes = ans.get("probabilities", {}).get("yes", 0)
+        verdict = p_yes >= 0.5
         return verdict, p_yes, json.dumps(ans)
     except (KeyError, TypeError):
         return None, None, f"UNEXPECTED: {json.dumps(result)[:200]}"
