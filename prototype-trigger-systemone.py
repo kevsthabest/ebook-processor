@@ -42,9 +42,12 @@ TEST_CASES = [
 def classify(base_url, model, api_key, trigger, quote, timeout=30):
     """Returns (verdict_bool, p_yes, raw_response)."""
     definition = TRIGGER_DEFS.get(trigger, trigger)
+    req_body = {"state": quote,
+    }
+    if model:
+        req_body["model"] = model
     payload = json.dumps({
-        "model": model,
-        "state": quote,
+        **req_body,
         "questions": {
             "trigger_check": {
                 "type": "noul",
@@ -78,7 +81,8 @@ def classify(base_url, model, api_key, trigger, quote, timeout=30):
 def main():
     ap = argparse.ArgumentParser(description="Trigger classifier via /v1/systemone")
     ap.add_argument("--base-url", default="http://localhost:11434")
-    ap.add_argument("--model", default="laya")
+    ap.add_argument("--model", default="",
+                    help="Model name (empty = use already-loaded model)")
     ap.add_argument("--api-key", default="")
     ap.add_argument("--trigger", help="Trigger for single classification")
     ap.add_argument("--quote", help="Quote for single classification")
