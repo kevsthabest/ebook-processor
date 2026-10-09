@@ -904,6 +904,373 @@ class DecisionValidator:
             return None, None
 
 
+# ---------------------------------------------------------------------------
+# Cross-run learning: the pipeline gets smarter with every book processed.
+#
+# LearnedState persists four kinds of knowledge under <learn_dir>/:
+#   nicknames.json       short name -> canonical name (e.g. "pete" -> "peter")
+#   titles.json          observed title prefixes ("dr", "herr oberstleutnant")
+#   threshold_stats.json P(yes) samples per trigger, kept vs dropped
+#   series/<key>.json    character rosters keyed by author, for alias hints
+#
+# All mutations are lock-protected (safe for --jobs threads). Saves are
+# atomic (temp file + os.replace). A single shared instance is created in
+# main(); _learn() returns a disabled no-op stub when learning is off so
+# call sites never need None checks.
+# ---------------------------------------------------------------------------
+
+_LEARN_TITLE_TRUST_COUNT = 2  # distinct name-remainders before a title is trusted
+
+
+class LearnedState:
+    """Persistent cross-run learning state. Thread-safe. Degrades to no-op
+    when disabled or when the learn directory isn't writable."""
+
+    def __init__(self, learn_dir=None, enabled=True):
+        self._lock = threading.Lock()
+        self.enabled = enabled
+        if learn_dir:
+            self.dir = Path(learn_dir)
+        else:
+            self.dir = Path(os.path.expanduser("~")) / ".ebook-processor" / "learned"
+        self._writable = True
+        self._warned = False
+        # In-memory state (mirrors the JSON files).
+        self.nicknames = {}       # nkey -> {"full": nkey, "count": int, "books": [isbn]}
+        self.titles = {}          # title -> {"count": int, "rests": [str]}
+        self.threshold_stats = {}  # trigger -> {"kept": [p], "dropped": [p]}
+        self._titles_cache = None  # cached frozenset of trusted titles
+        self._new = Counter()     # fresh learnings this book (for the summary)
+        if self.enabled:
+            self._ensure_dir()
+            self._load_all()
+
+    # -- setup ----------------------------------------------------------
+    def _ensure_dir(self):
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            (self.dir / "series").mkdir(parents=True, exist_ok=True)
+        except Exception:
+            self._writable = False
+            self._warn_once(
+                f"  Learn dir not writable ({self.dir}); learning disabled "
+                "for this run")
+
+    def _warn_once(self, msg):
+        with self._lock:
+            if self._warned:
+                return
+            self._warned = True
+        print(msg)
+
+    # -- persistence ----------------------------------------------------
+    def _path(self, name):
+        return self.dir / name
+
+    def _load_json(self, name, default):
+        try:
+            p = self._path(name)
+            if p.exists():
+                with open(p, encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return default
+
+    def _save_json(self, name, data):
+        """Atomic write: temp file + os.replace. No-op when not writable."""
+        if not self._writable:
+            return False
+        try:
+            p = self._path(name)
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, p)
+            return True
+        except Exception as e:
+            self._writable = False
+            self._warn_once(f"  Learn dir write failed ({e}); learning "
+                            "disabled for this run")
+            return False
+
+    def _load_all(self):
+        with self._lock:
+            self.nicknames = self._load_json("nicknames.json", {})
+            self.titles = self._load_json("titles.json", {})
+            self.threshold_stats = self._load_json("threshold_stats.json", {})
+            self._titles_cache = None
+
+    def save(self):
+        """Persist all state. Called at end of each book."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._save_json("nicknames.json", self.nicknames)
+            self._save_json("titles.json", self.titles)
+            self._save_json("threshold_stats.json", self.threshold_stats)
+
+    # -- nicknames ------------------------------------------------------
+    def record_merge(self, short_key, full_key, isbn=None):
+        """Record that short_key merged into full_key. Called from
+        _roster_update on successful merges."""
+        if not self.enabled or not short_key or not full_key:
+            return
+        if short_key == full_key:
+            return
+        with self._lock:
+            ent = self.nicknames.get(short_key)
+            if ent is None:
+                ent = {"full": full_key, "count": 0, "books": []}
+                self.nicknames[short_key] = ent
+                self._new["nicknames"] += 1
+            elif ent["full"] != full_key:
+                # Conflicting mapping: human labels outrank automatic ones.
+                if ent.get("human"):
+                    return
+                # Keep the more-observed one.
+                if ent["count"] > 1:
+                    return
+                ent["full"] = full_key
+            ent["count"] += 1
+            if isbn and isbn not in ent["books"]:
+                ent["books"].append(isbn)
+
+    def record_token_merge(self, short_tok, full_tok, isbn=None):
+        """Record a single-token nickname, e.g. 'pete' -> 'peter'."""
+        if not self.enabled or not short_tok or not full_tok:
+            return
+        if short_tok == full_tok or len(short_tok) < 2:
+            return
+        self.record_merge("@" + short_tok, "@" + full_tok, isbn)
+
+    def nick_lookup(self, nkey):
+        """Full-key lookup: returns the learned canonical key or None."""
+        if not self.enabled or not nkey:
+            return None
+        with self._lock:
+            ent = self.nicknames.get(nkey)
+            return ent["full"] if ent else None
+
+    def token_lookup(self, tok):
+        """Single-token lookup: returns the learned full token or None."""
+        if not self.enabled or not tok:
+            return None
+        with self._lock:
+            ent = self.nicknames.get("@" + tok)
+            if ent:
+                full = ent["full"]
+                return full[1:] if full.startswith("@") else full
+            return None
+
+    def import_labels(self, path):
+        """Import hand-labeled merge pairs (from label-merges.py) as
+        human-validated nickname mappings. Returns count imported."""
+        if not self.enabled:
+            return 0
+        try:
+            with open(path, encoding="utf-8") as f:
+                labels = json.load(f)
+        except Exception as e:
+            print(f"  Could not import labels from {path}: {e}")
+            return 0
+        n = 0
+        for _key, lbl in labels.items():
+            if lbl.get("uncertain") or not lbl.get("same_person"):
+                continue
+            a = norm_name(lbl.get("a", ""))
+            b = norm_name(lbl.get("b", ""))
+            if not a or not b or a == b:
+                continue
+            # Direction: shorter -> longer (variant -> canonical).
+            short, full = (a, b) if len(a) <= len(b) else (b, a)
+            with self._lock:
+                ent = self.nicknames.get(short)
+                if ent is None:
+                    ent = {"full": full, "count": 0, "books": [],
+                           "human": True}
+                    self.nicknames[short] = ent
+                    self._new["nicknames"] += 1
+                ent["full"] = full
+                ent["count"] += 1
+                ent["human"] = True
+            n += 1
+        return n
+
+    # -- titles ---------------------------------------------------------
+    def observe_title(self, candidate, rest):
+        """Observe a potential title prefix. Trusted after
+        _LEARN_TITLE_TRUST_COUNT distinct name-remainders."""
+        if not self.enabled or not candidate or not rest:
+            return
+        candidate = candidate.lower().strip()
+        if (not candidate or candidate in _TITLES
+                or candidate in {"the", "a", "an"} or len(candidate) < 2):
+            return
+        with self._lock:
+            ent = self.titles.get(candidate)
+            if ent is None:
+                ent = {"count": 0, "rests": []}
+                self.titles[candidate] = ent
+            rest_n = rest.lower().strip()
+            if rest_n and rest_n not in ent["rests"]:
+                ent["rests"].append(rest_n)
+                ent["count"] += 1
+                if len(ent["rests"]) == _LEARN_TITLE_TRUST_COUNT:
+                    self._new["titles"] += 1
+                self._titles_cache = None  # invalidate
+
+    def trusted_titles(self):
+        """Frozenset of learned titles trusted for stripping (cached)."""
+        if not self.enabled:
+            return frozenset()
+        with self._lock:
+            if self._titles_cache is None:
+                self._titles_cache = frozenset(
+                    t for t, e in self.titles.items()
+                    if len(e.get("rests", [])) >= _LEARN_TITLE_TRUST_COUNT)
+            return self._titles_cache
+
+    # -- threshold stats ------------------------------------------------
+    def record_threshold(self, trigger, p_yes, kept):
+        """Record a decision-model score for future threshold tuning."""
+        if not self.enabled:
+            return
+        try:
+            p = float(p_yes)
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            ent = self.threshold_stats.setdefault(
+                trigger, {"kept": [], "dropped": []})
+            ent["kept" if kept else "dropped"].append(round(p, 4))
+            # Cap memory: keep the most recent 500 samples per bucket.
+            for k in ("kept", "dropped"):
+                if len(ent[k]) > 500:
+                    ent[k] = ent[k][-500:]
+            self._new["threshold_samples"] += 1
+
+    # -- series rosters -------------------------------------------------
+    @staticmethod
+    def series_key(author):
+        """Series bucket key. Currently author-based (no series metadata
+        in EPUB parsing); per-author buckets with per-book rosters."""
+        a = (author or "").strip().casefold()
+        if not a:
+            return None
+        return "author_" + re.sub(r"\W+", "_", a)[:48].strip("_")
+
+    def _series_path(self, series_key):
+        safe = re.sub(r"\W+", "_", series_key)[:64].strip("_") or "unknown"
+        return self.dir / "series" / (safe + ".json")
+
+    def load_series_hints(self, series_key):
+        """Return {nkey: canonical_nkey} alias hints from prior books in
+        the series. Empty dict when disabled/unknown."""
+        if not self.enabled or not series_key:
+            return {}
+        try:
+            p = self._series_path(series_key)
+            if not p.exists():
+                return {}
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return {}
+        hints = {}
+        for ch in data.get("characters", []):
+            canon = norm_name(ch.get("name", ""))
+            if not canon:
+                continue
+            for al in ch.get("aliases", []):
+                ak = norm_name(al)
+                if ak and ak != canon:
+                    hints.setdefault(ak, canon)
+        return hints
+
+    def save_series_roster(self, series_key, title, author, isbn, characters):
+        """Persist this book's character roster into the series bucket."""
+        if not self.enabled or not series_key:
+            return
+        try:
+            p = self._series_path(series_key)
+            data = {}
+            if p.exists():
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+        except Exception:
+            data = {}
+        data.setdefault("characters", [])
+        data.setdefault("books", [])
+        seen = {norm_name(c.get("name", "")) for c in data["characters"]}
+        added = 0
+        for c in characters or []:
+            nk = norm_name(c.get("name", ""))
+            if not nk or nk in seen:
+                continue
+            seen.add(nk)
+            aliases = sorted({a for a in (c.get("aliases") or [])
+                              if a and norm_name(a) != nk})
+            data["characters"].append({"name": c.get("name", ""),
+                                       "aliases": aliases})
+            added += 1
+        if isbn and not any(b.get("isbn") == isbn for b in data["books"]):
+            data["books"].append({"isbn": isbn, "title": title})
+        # Atomic write.
+        try:
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, p)
+        except Exception as e:
+            self._warn_once(f"  Could not save series roster ({e})")
+            return
+        if added:
+            with self._lock:
+                self._new["series_chars"] += added
+
+    # -- summary --------------------------------------------------------
+    def pop_summary(self):
+        """Return 'Learned: ...' summary of this book's fresh learnings and
+        reset the counters. Empty string when nothing was learned."""
+        with self._lock:
+            parts = []
+            n = self._new.get("nicknames", 0)
+            if n:
+                parts.append(f"{n} nickname{'s' if n != 1 else ''}")
+            t = self._new.get("titles", 0)
+            if t:
+                parts.append(f"{t} title{'s' if t != 1 else ''}")
+            s = self._new.get("threshold_samples", 0)
+            if s:
+                parts.append(f"{s} threshold sample{'s' if s != 1 else ''}")
+            sc = self._new.get("series_chars", 0)
+            if sc:
+                parts.append(f"{sc} series character{'s' if sc != 1 else ''}")
+            self._new.clear()
+        if not parts:
+            return ""
+        return "Learned: " + ", ".join(parts)
+
+
+# Module-level learning state, created in main() when --learn is on.
+# _learn() always returns a usable object (disabled stub when off), so
+# call sites never need None checks.
+_LEARNED = None
+
+
+def _learn():
+    global _LEARNED
+    if _LEARNED is None:
+        _LEARNED = LearnedState(enabled=False)
+    return _LEARNED
+
+
+def _effective_titles():
+    """Hardcoded titles plus learned trusted titles."""
+    return _TITLES | _learn().trusted_titles()
+
+
 # Module-level validator, set from --decision-model-url in main().
 # None = use regex gates (default).
 _DECISION_VALIDATOR = None
@@ -1099,6 +1466,15 @@ def _roster_update(roster, characters, chapter_idx):
             UI.viz_event(getattr(_DIAG, "viz_book_key", None),
                          '✗ Filtered: "%s" (not a person)' % name[:40])
             continue
+        # Learn title prefixes: observe leading 1-2 tokens of multi-word
+        # names. A candidate becomes trusted after 2+ distinct remainders.
+        _ln_obs = _learn()
+        if _ln_obs.enabled:
+            _ntoks = name.split()
+            if len(_ntoks) >= 3:
+                _ln_obs.observe_title(_ntoks[0], " ".join(_ntoks[1:]))
+                _ln_obs.observe_title(" ".join(_ntoks[:2]),
+                                      " ".join(_ntoks[2:]))
         alias_keys = {norm_name(a) for a in c.get("aliases", [])
                       if _is_valid_alias(a)}
         alias_keys.discard("")
@@ -1111,13 +1487,39 @@ def _roster_update(roster, characters, chapter_idx):
         if nkey in primaries:
             found = primaries[nkey]
         else:
-            # Substring/fuzzy match: "bodhi" vs "bodhi durran"
-            for pk, rk in primaries.items():
-                if _names_overlap(nkey, pk):
-                    found = rk
-                    break
-            else:
-                found = None
+            # Learned nickname lookup (cross-book learning): an exact
+            # previously-observed variant maps straight to its canonical key.
+            found = None
+            _ln = _learn()
+            if _ln.enabled:
+                _lk = _ln.nick_lookup(nkey)
+                if _lk and _lk in primaries:
+                    found = primaries[_lk]
+                if found is None:
+                    # Series hints from prior books by the same author.
+                    _sh = getattr(_DIAG, "learn_series_hints", None)
+                    if _sh:
+                        _sk = _sh.get(nkey)
+                        if _sk and _sk in primaries:
+                            found = primaries[_sk]
+                if found is None and " " not in nkey.strip():
+                    # Single-token nickname ("pete"): resolve via the learned
+                    # token map, but only when the roster has exactly one
+                    # candidate with that first token (unambiguous).
+                    _tok_full = _ln.token_lookup(nkey)
+                    if _tok_full:
+                        _cands = [rk for pk, rk in primaries.items()
+                                  if pk.split(" ")[0] == _tok_full]
+                        if len(set(_cands)) == 1:
+                            found = _cands[0]
+            if found is None:
+                # Substring/fuzzy match: "bodhi" vs "bodhi durran"
+                for pk, rk in primaries.items():
+                    if _names_overlap(nkey, pk):
+                        found = rk
+                        break
+                else:
+                    found = None
             if _generic_keys:
                 for k, e in roster.items():
                     _e_generic = ({k} | e["alias_keys"]) & _GENERIC_ALIASES
@@ -1145,6 +1547,18 @@ def _roster_update(roster, characters, chapter_idx):
         if _is_new_variant:
             UI.viz_event(getattr(_DIAG, "viz_book_key", None),
                          "→ Merged: %s → %s" % (name[:30], e["name"][:30]))
+            # Learn the nickname mapping for future books: incoming variant
+            # -> canonical roster key. Also learn single-token nicknames
+            # ("pete" -> "peter") when the variant is a lone token.
+            _ln_rec = _learn()
+            if _ln_rec.enabled:
+                _isbn = getattr(_DIAG, "learn_isbn", None)
+                _canon_key = found  # roster key of the merged-into entry
+                _ln_rec.record_merge(nkey, _canon_key, _isbn)
+                _nw = nkey.split()
+                _cw = _canon_key.split()
+                if len(_nw) == 1 and _cw and _nw[0] != _cw[0]:
+                    _ln_rec.record_token_merge(_nw[0], _cw[0], _isbn)
         e["appearances"] += 1
         e["last_seen"] = chapter_idx
         e["chapters"].add(chapter_idx)
@@ -1721,7 +2135,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
                     for _p, _ev in _judged:
                         _ev["decision_p"] = round(_p, 4)
                         _ev["decision_gate"] = "decision"
-                        if _p >= _hi:
+                        _kept_now = _p >= _hi
+                        # Record the score for cross-run threshold tuning.
+                        _learn().record_threshold(cat, _p, _kept_now)
+                        if _kept_now:
                             _kept.append((_p, _ev))
                         elif _p >= _lo:
                             _kept.append((_p, _ev))
@@ -3539,8 +3956,9 @@ def _names_overlap(a, b):
     # Bare surname vs titled/full name: strip titles, then the single remaining
     # word must equal the longer name's last word. Two multi-word names sharing
     # only a surname are siblings, not the same person.
-    sa = [w for w in aw if w.rstrip(".") not in _TITLES]
-    sb_ = [w for w in bw if w.rstrip(".") not in _TITLES]
+    _et = _effective_titles()
+    sa = [w for w in aw if w.rstrip(".") not in _et]
+    sb_ = [w for w in bw if w.rstrip(".") not in _et]
     short, long_ = sorted((sa, sb_), key=len)
     return (len(short) == 1 and len(long_) > 1 and short[0] == long_[-1]
             and len(short[0]) > 3 and short[0] not in _NAME_STOPWORDS)
@@ -4260,6 +4678,14 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         word_count = len(text.split())
 
     _book_key = str(fpath)
+    # Cross-run learning: stash per-book context for _roster_update hooks.
+    _ln_book = _learn()
+    _learn_isbn = identifiers.get("isbn") or identifiers.get("asin")
+    _DIAG.learn_isbn = _learn_isbn
+    _learn_skey = _ln_book.series_key(author) if _ln_book.enabled else None
+    _DIAG.learn_series_key = _learn_skey
+    _DIAG.learn_series_hints = (_ln_book.load_series_hints(_learn_skey)
+                                if _learn_skey else {})
     UI.status(f"  Title: {title or fpath.stem}, "
               f"Chars: {sum(len(c['text']) for c in chapters):,}")
     if identifiers.get("isbn"):
@@ -4536,6 +4962,21 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         result["dedup_merges"] = dreport
         print(f"  Dedup: {n_before} -> {len(d_chars)} characters "
               f"({len(dreport)} clusters merged)")
+
+    # Cross-run learning: persist series roster + learned state. Runs in
+    # preview/dry-run too (learning from a preview is the point).
+    _ln_end = _learn()
+    if _ln_end.enabled:
+        _skey = getattr(_DIAG, "learn_series_key", None)
+        if _skey:
+            _ln_end.save_series_roster(
+                _skey, title, author,
+                getattr(_DIAG, "learn_isbn", None),
+                result.get("characters"))
+        _ln_end.save()
+        _lsummary = _ln_end.pop_summary()
+        if _lsummary:
+            print(f"  {_lsummary}")
 
     if dry_run:
         print("  DRY RUN — nothing written")
@@ -5070,6 +5511,16 @@ def main():
                     help="v2: use shared system prompt for A/B calls (isolation test)")
     ap.add_argument("--task-last", action="store_true",
                     help="v2: put chapter text before task instructions (isolation test)")
+    ap.add_argument("--learn", dest="learn", action="store_true", default=True,
+                    help="learn nicknames/titles/thresholds across runs (default on)")
+    ap.add_argument("--no-learn", dest="learn", action="store_false",
+                    help="disable cross-run learning")
+    ap.add_argument("--learn-dir", metavar="DIR", default="",
+                    help="learning state directory "
+                         "(default ~/.ebook-processor/learned/)")
+    ap.add_argument("--import-labels", metavar="PATH", default="",
+                    help="import hand-labeled merge pairs (label-merges.py output) "
+                         "into the nickname dictionary, then continue")
     args = ap.parse_args()
 
     if args.trope_map:
@@ -5106,6 +5557,20 @@ def main():
         global _DECISION_VALIDATOR
         _DECISION_VALIDATOR = DecisionValidator(_dm_url)
         print(f"  Decision model trigger validation: {_dm_url}")
+
+    # Cross-run learning state (shared across --jobs threads).
+    global _LEARNED
+    _LEARNED = LearnedState(
+        learn_dir=args.learn_dir or None, enabled=args.learn)
+    if args.learn:
+        print(f"  Learning state: {_LEARNED.dir} "
+              f"({len(_LEARNED.nicknames)} nicknames, "
+              f"{len(_LEARNED.trusted_titles())} trusted titles)")
+    if args.import_labels:
+        n_imp = _LEARNED.import_labels(args.import_labels)
+        print(f"  Imported {n_imp} labeled merge pairs from "
+              f"{args.import_labels}")
+        _LEARNED.save()
 
     if args.llm:
         CONFIG["llm"] = args.llm
