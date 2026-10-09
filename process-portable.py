@@ -585,6 +585,104 @@ _TRIGGER_NEGATIVE_RE = {
         re.IGNORECASE),
 }
 
+# Decision-model trigger validation via Unsloth /v1/systemone.
+# Opt-in via --decision-model-url; replaces the regex gates above with a
+# dedicated decision model (e.g. Laya) that returns P(yes) for "does this
+# passage depict [trigger]?". Prototype validated 7/7 on metaphorical vs
+# literal cases that regex struggles with.
+_DECISION_TRIGGER_DEFS = {
+    "suicide": (
+        "Does this passage depict suicide?",
+        "A character attempts or completes suicide; expresses clear intent to kill themselves",
+        "Metaphorical use ('career suicide', 'digital suicide'); hypothetical; someone else's death",
+    ),
+    "sexual_violence": (
+        "Does this passage depict sexual violence?",
+        "Non-consensual sexual acts, assault, or coercion described or clearly implied",
+        "Consensual intimacy; romantic tension without coercion",
+    ),
+    "child_abuse": (
+        "Does this passage depict child abuse?",
+        "A child is physically harmed, sexually abused, or severely neglected",
+        "Discipline without injury; adults arguing around children",
+    ),
+    "self_harm": (
+        "Does this passage depict self-harm?",
+        "A character deliberately injures themselves (cutting, burning, etc.)",
+        "Metaphorical ('beating himself up over it'); accidental injury",
+    ),
+}
+# Per-trigger P(yes) thresholds, tuned from prototype runs (2026-10-09).
+# Laya rank-orders correctly but isn't calibrated to 0.5.
+_DECISION_TRIGGER_THRESHOLDS = {
+    "suicide": 0.82,
+    "sexual_violence": 0.20,
+    "child_abuse": 0.50,
+    "self_harm": 0.50,
+}
+
+
+class DecisionValidator:
+    """Validates trigger evidence via a /v1/systemone decision model.
+
+    Stateless per call (each validate() is an independent HTTP request),
+    so a single instance is safe to share across --jobs threads.
+    On any error, validate() returns (None, None) and the caller falls
+    back to the regex gates.
+    """
+
+    def __init__(self, base_url, model="default", api_key="", timeout=30):
+        base = base_url.rstrip("/")
+        if base.endswith("/v1/systemone"):
+            base = base[:-len("/v1/systemone")]
+        elif base.endswith("/v1"):
+            base = base[:-3]
+        self.endpoint = base + "/v1/systemone"
+        self.model = model or "default"
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def validate(self, trigger, quote):
+        """Returns (verdict_bool, p_yes). (None, None) on error."""
+        q, yes_when, no_when = _DECISION_TRIGGER_DEFS.get(
+            trigger, (f"Does this depict {trigger}?", "", ""))
+        threshold = _DECISION_TRIGGER_THRESHOLDS.get(trigger, 0.5)
+        payload = json.dumps({
+            "model": self.model,
+            "state": quote,
+            "questions": {
+                "trigger_check": {
+                    "type": "noul",
+                    "instructions": (
+                        f"{q} Answer YES when: {yes_when}. "
+                        f"Answer NO when: {no_when}."),
+                }
+            },
+        }).encode()
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        try:
+            req = urllib.request.Request(
+                self.endpoint, data=payload, headers=headers)
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                result = json.loads(resp.read())
+            ans = result["answers"]["trigger_check"]
+            p_yes = ans.get("noul")
+            if p_yes is None:
+                p_yes = ans.get("probabilities", {}).get("yes", 0)
+            return p_yes >= threshold, float(p_yes)
+        except Exception as e:
+            print(f"  Decision model error ({trigger}): {e}; "
+                  f"falling back to regex")
+            return None, None
+
+
+# Module-level validator, set from --decision-model-url in main().
+# None = use regex gates (default).
+_DECISION_VALIDATOR = None
+
+
 PROMPT_V2_CHARACTERS = """Analyze this book chapter and return ONLY valid JSON. No commentary, no markdown, just the JSON object.
 Keep any internal reasoning extremely brief — a complete, valid JSON object is the priority; do not let thinking crowd out the answer.
 
@@ -1367,13 +1465,25 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         # ambiguous evidence -> downgrade to 1, keep the claim.
         if sev >= 2:
             _ev_text = " ".join(e.get("quote", "") for e in acc["evidence"])
-            _neg_re = _TRIGGER_NEGATIVE_RE.get(cat)
-            _gate_re = _TRIGGER_EVIDENCE_RE.get(cat)
-            if _neg_re and _neg_re.search(_ev_text):
-                _gated_dropped += 1
-                continue
-            elif _gate_re and not _gate_re.search(_ev_text):
-                sev = 1
+            _dv_used = False
+            # Decision-model gate (opt-in via --decision-model-url).
+            if _DECISION_VALIDATOR is not None and _ev_text.strip():
+                _dv_verdict, _ = _DECISION_VALIDATOR.validate(cat, _ev_text)
+                if _dv_verdict is not None:
+                    _dv_used = True
+                    if not _dv_verdict:
+                        _gated_dropped += 1
+                        continue
+                    # else: verified, keep sev as-is
+            # Regex gates: default path, or fallback if the decision model errored.
+            if not _dv_used:
+                _neg_re = _TRIGGER_NEGATIVE_RE.get(cat)
+                _gate_re = _TRIGGER_EVIDENCE_RE.get(cat)
+                if _neg_re and _neg_re.search(_ev_text):
+                    _gated_dropped += 1
+                    continue
+                elif _gate_re and not _gate_re.search(_ev_text):
+                    sev = 1
         # Only drop single-chapter "mentioned" items as noise. A graphic or
         # on_page scene that happens once is exactly what a trigger warning
         # is for — never drop those on chapter count alone.
@@ -1391,7 +1501,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
                                                  len(acc["evidence"])),
         })
     if _gated_dropped:
-        print(f"  Trigger regex gate: dropped {_gated_dropped} unsupported claim(s)")
+        print(f"  Trigger gate: dropped {_gated_dropped} unsupported claim(s)")
 
     # --- Spice: peak, non-zero average, and max(p75, peak-1) ---
     # Peak only counts if it appears in 2+ chapters (a single outlier
@@ -4567,6 +4677,9 @@ def main():
                     help="save raw LLM output of failed chunks to preview/debug/")
     ap.add_argument("--no-viz", action="store_true",
                     help="disable the chapter visualizer panel in the Rich TUI")
+    ap.add_argument("--decision-model-url", metavar="URL", default="",
+                    help="Unsloth /v1/systemone base URL for trigger validation "
+                         "(e.g. http://127.0.0.1:8888/v1); omit for regex gates")
     ap.add_argument("--dedupe", action="store_true",
                     help="merge duplicate characters (name normalization + "
                          "embeddings) before writing; needs embed_url/embed_model")
@@ -4616,6 +4729,10 @@ def main():
         CONFIG["v2_task_last"] = True
     if args.no_viz:
         UI.set_viz_enabled(False)
+    if args.decision_model_url:
+        global _DECISION_VALIDATOR
+        _DECISION_VALIDATOR = DecisionValidator(args.decision_model_url)
+        print(f"  Decision model trigger validation: {args.decision_model_url}")
 
     if args.llm:
         CONFIG["llm"] = args.llm

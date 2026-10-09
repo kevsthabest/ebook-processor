@@ -1217,3 +1217,126 @@ class TestEvidenceAwareDedupe(unittest.TestCase):
                 _best[t] = c
         self.assertIn("friend", _best)
         self.assertIn("enemy", _best)
+
+
+class TestVisualizer(unittest.TestCase):
+    """Chapter visualizer: no-ops without Rich/TTY, state + thread safety."""
+
+    def _ui_rich(self):
+        ui = pp.PipelineUI()
+        ui.rich = True  # force the rich path to exercise state logic
+        return ui
+
+    def test_viz_noop_without_rich(self):
+        ui = pp.PipelineUI()
+        ui.rich = False
+        ui.viz_chapter("b1", "Ch 1", "Some text here. ")
+        ui.viz_characters("b1", [{"name": "Peter Sebeck"}])
+        ui.viz_event("b1", "+ New: Peter Sebeck")
+        self.assertIsNone(ui._viz)
+
+    def test_viz_noop_when_disabled(self):
+        ui = self._ui_rich()
+        ui.set_viz_enabled(False)
+        ui.viz_chapter("b1", "Ch 1", "Some text here. ")
+        ui.viz_characters("b1", [{"name": "Peter Sebeck"}])
+        ui.viz_event("b1", "+ New: Peter Sebeck")
+        self.assertIsNone(ui._viz)
+
+    def test_viz_state_accumulation(self):
+        ui = self._ui_rich()
+        ui.viz_chapter("b1", "Ch 1", "Peter Sebeck walked in. Pete followed.")
+        self.assertEqual(ui._viz["book"], "b1")
+        self.assertEqual(ui._viz["label"], "Ch 1")
+        self.assertIn("Peter Sebeck", ui._viz["text"])
+        self.assertEqual(ui._viz["names"], [])
+        ui.viz_characters("b1", [{"name": "Peter Sebeck"}, {"name": "Pete"}])
+        self.assertEqual(ui._viz["names"], ["Peter Sebeck", "Pete"])
+        ui.viz_event("b1", "+ New: Peter Sebeck")
+        ui.viz_event("b1", "→ Merged: Pete → Peter Sebeck")
+        self.assertEqual(len(ui._viz["events"]), 2)
+        # Event feed caps at 8
+        for i in range(10):
+            ui.viz_event("b1", f"event {i}")
+        self.assertEqual(len(ui._viz["events"]), 8)
+        self.assertEqual(ui._viz["events"][-1], "event 9")
+
+    def test_viz_thread_safety(self):
+        import threading
+        ui = self._ui_rich()
+        errors = []
+
+        def worker(n):
+            try:
+                for i in range(20):
+                    ui.viz_chapter(f"b{n}", f"Ch {i}", "text " * 50)
+                    ui.viz_event(f"b{n}", f"+ New: Char {n}-{i}")
+                    ui.viz_characters(f"b{n}", [{"name": f"Char {n}-{i}"}])
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertLessEqual(len(ui._viz["events"]), 8)
+
+
+class TestDecisionValidator(unittest.TestCase):
+    """Decision-model trigger validation (opt-in via --decision-model-url)."""
+
+    def _mock_validator(self, response=None, exc=None):
+        import json as _json
+        import urllib.request as _urlreq
+
+        class _FakeResp:
+            def __init__(self, data):
+                self._data = data
+            def read(self):
+                return self._data
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        orig = _urlreq.urlopen
+        def fake(req, timeout=None):
+            if exc:
+                raise exc
+            return _FakeResp(_json.dumps(response).encode())
+        _urlreq.urlopen = fake
+        self.addCleanup(setattr, _urlreq, "urlopen", orig)
+        return pp.DecisionValidator("http://127.0.0.1:8888/v1")
+
+    def test_validate_parses_noul(self):
+        dv = self._mock_validator(
+            {"answers": {"trigger_check": {"type": "noul", "noul": 0.9}}})
+        verdict, p = dv.validate("suicide", "he killed himself")
+        self.assertTrue(verdict)
+        self.assertAlmostEqual(p, 0.9)
+
+    def test_validate_threshold(self):
+        # suicide threshold is 0.82; 0.79 must not verify
+        dv = self._mock_validator(
+            {"answers": {"trigger_check": {"type": "noul", "noul": 0.79}}})
+        verdict, p = dv.validate("suicide", "digital suicide")
+        self.assertFalse(verdict)
+        self.assertAlmostEqual(p, 0.79)
+
+    def test_validate_error_falls_back(self):
+        dv = self._mock_validator(exc=ConnectionError("refused"))
+        verdict, p = dv.validate("suicide", "anything")
+        self.assertIsNone(verdict)
+        self.assertIsNone(p)
+
+    def test_url_normalization(self):
+        dv = pp.DecisionValidator("http://127.0.0.1:8888/v1")
+        self.assertEqual(dv.endpoint, "http://127.0.0.1:8888/v1/systemone")
+        dv2 = pp.DecisionValidator("http://127.0.0.1:8888/")
+        self.assertEqual(dv2.endpoint, "http://127.0.0.1:8888/v1/systemone")
+
+    def test_default_model(self):
+        dv = pp.DecisionValidator("http://x/")
+        self.assertEqual(dv.model, "default")
