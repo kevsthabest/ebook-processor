@@ -482,6 +482,9 @@ RULES:
 1. ENTITY MERGING: "Mother", "the narrator", "I" and the author's name are one person — list ONCE under the most specific name, put the rest in aliases.
 2. NEVER INVENT NAMES. If gender is ambiguous from the name alone, leave it out rather than guessing.
 3. REAL PEOPLE ONLY who appear or are directly involved in this chapter.
+   - A character is an individual person. NOT organizations, companies, ships, places, or groups.
+   - "O Palácio" (a casino), "EVA masters" (a job title), "the committee" are NOT characters — skip them.
+   - If a name could be a place or thing rather than a person, skip it unless the chapter clearly treats it as a person.
 4. EVIDENCE: best supporting sentence copied exactly from the chapter; empty string if none — never invent, never repeat.
 5. ROLE must be exactly one of: protagonist, antagonist, supporting, minor. When in doubt, supporting.
 6. pov_character is ONLY someone who narrates this chapter. Most chapters have one; some have none (null).
@@ -559,6 +562,36 @@ _ALIAS_BAN_WORDS = frozenset({
     "boyfriend", "girlfriend", "fiance", "fiancee",
 })
 
+def _is_person_like(name):
+    """Heuristic: is this name likely an individual person, not a group/place/thing?
+
+    Catches what the prompt misses: plural job titles ("EVA masters"),
+    generic groups ("the guards"). Conservative — only rejects clear non-persons.
+    """
+    if not name:
+        return False
+    nl = name.strip().lower()
+    words = nl.split()
+    # Plural group nouns: "eva masters", "the guards", "soldiers"
+    _group_words = {"masters", "guards", "soldiers", "troops", "workers", "crew",
+                    "staff", "team", "committee", "council", "board", "agents"}
+    # Use the ORIGINAL name for case check (nl is lowercased)
+    orig_words = name.strip().split()
+    if orig_words:
+        last = orig_words[-1]
+        # Lowercase plural = common noun (group), not a surname: "EVA masters" vs "John Masters"
+        if last.islower() or (last[0].islower() if last else False):
+            base = last.lower().rstrip("s")
+            _group_bases = {w.rstrip("s") for w in _group_words}
+            if base in _group_bases:
+                return False
+        # Single-word "the X" already handled; also catch "The Guards" (capitalized article + plural)
+        if len(orig_words) == 2 and orig_words[0].lower() in ("the", "a", "an"):
+            if orig_words[-1].lower().rstrip("s") in {w.rstrip("s") for w in _group_words}:
+                return False
+    return True
+
+
 def _is_valid_alias(alias):
     """Reject aliases that are generic descriptors, not identity claims.
 
@@ -610,6 +643,8 @@ def _roster_update(roster, characters, chapter_idx):
         nkey = norm_name(name)
         if not nkey:
             continue
+        if not _is_person_like(name):
+            continue  # Skip groups/organizations/places misclassified as characters
         alias_keys = {norm_name(a) for a in c.get("aliases", [])}
         alias_keys.discard("")
 
