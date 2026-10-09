@@ -1283,6 +1283,57 @@ class TestVisualizer(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertLessEqual(len(ui._viz["events"]), 8)
 
+    def test_viz_stats_and_milestone(self):
+        ui = self._ui_rich()
+        ui.viz_chapter("b1", "Ch 1", "x" * 100, chap_idx=1, chap_total=10)
+        self.assertEqual(ui._viz["chap_idx"], 1)
+        self.assertEqual(ui._viz["chap_total"], 10)
+        self.assertEqual(ui._viz["new_count"], 0)
+        # Second chapter carries run-level state across.
+        ui.viz_chapter("b1", "Ch 2", "y" * 100, chap_idx=2, chap_total=10)
+        self.assertEqual(ui._viz["chars_total"], 200)
+        for i in range(25):
+            ui.viz_event("b1", "+ New: Char %d" % i)
+        self.assertEqual(ui._viz["new_count"], 25)
+        self.assertIn(25, ui._viz["milestones"])
+        self.assertTrue(any("🎉 25 characters discovered!" in e
+                            for e in ui._viz["events"]))
+        # Spotlight holds the latest discovery.
+        self.assertEqual(ui._viz["spotlight"]["name"], "Char 24")
+        # Ticker keeps the last 12 names.
+        self.assertEqual(len(ui._viz["ticker"]), 12)
+        self.assertEqual(ui._viz["ticker"][-1], "Char 24")
+        self.assertEqual(ui._viz["ticker"][0], "Char 13")
+        # No double milestone on the 26th.
+        ui.viz_event("b1", "+ New: Char 25")
+        self.assertEqual(
+            sum("🎉" in e for e in ui._viz["events"]), 1)
+
+    def test_viz_event_kind(self):
+        self.assertEqual(pp._viz_event_kind("+ New: X"), "new")
+        self.assertEqual(pp._viz_event_kind("→ Merged: A → B"), "merged")
+        self.assertEqual(
+            pp._viz_event_kind("✗ Filtered: \"x\" (not a person)"), "filtered")
+        self.assertEqual(
+            pp._viz_event_kind("🎉 25 characters discovered!"), "milestone")
+        self.assertEqual(pp._viz_event_kind("something else"), "other")
+
+    def test_viz_typing_and_stats_helpers(self):
+        # Typing reveal is deterministic given (text, t0, now).
+        self.assertEqual(pp._viz_revealed_text("abcdef", 1000.0, 1000.0), "a")
+        long_text = "x" * 800
+        self.assertEqual(
+            len(pp._viz_revealed_text(long_text, 1000.0, 1010.0)), 300)
+        self.assertEqual(
+            pp._viz_revealed_text(long_text, 1000.0, 1100.0), long_text)
+        # Stats line: 600 chars over 60s -> 600 chars/min.
+        st = {"new_count": 7, "chap_idx": 3, "chap_total": 73,
+              "run_t0": 1000.0, "chars_total": 600}
+        line = pp._viz_stats_line(st, 1060.0)
+        self.assertIn("Characters: 7", line)
+        self.assertIn("Chapter 3/73", line)
+        self.assertIn("600 chars/min", line)
+
 
 class TestDecisionValidator(unittest.TestCase):
     """Decision-model trigger validation (opt-in via --decision-model-url)."""

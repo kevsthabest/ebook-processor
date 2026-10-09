@@ -2125,6 +2125,60 @@ except ImportError:
     _HAS_RICH = False
 
 
+_VIZ_TYPE_CPS = 30  # typing-effect reveal speed, chars/sec
+_VIZ_SPOTLIGHT_SECS = 3  # how long a new-character spotlight stays up
+_VIZ_TICKER_MAX = 12  # names kept in the scrolling ticker
+_VIZ_MILESTONE_EVERY = 25  # celebrate every N new characters
+
+
+def _viz_event_kind(msg):
+    """Classify a visualizer event for color-coding."""
+    if msg.startswith("+ New:"):
+        return "new"
+    if msg.startswith("→ Merged:"):
+        return "merged"
+    if msg.startswith("✗ Filtered:"):
+        return "filtered"
+    if msg.startswith("🎉"):
+        return "milestone"
+    return "other"
+
+
+_VIZ_EVENT_STYLES = {
+    "new": "green",
+    "merged": "yellow",
+    "filtered": "red",
+    "milestone": "bold magenta",
+    "other": "",
+}
+
+
+def _viz_revealed_text(text, t0, now, cps=_VIZ_TYPE_CPS):
+    """Typing effect: reveal text progressively, at least 1 char."""
+    n = int((now - t0) * cps)
+    return text[:max(1, n)]
+
+
+def _viz_stats_line(st, now):
+    """Plain-text stats line for the visualizer panel (no Rich markup)."""
+    elapsed_min = max((now - st.get("run_t0", now)) / 60.0, 1e-6)
+    speed = int(st.get("chars_total", 0) / elapsed_min)
+    ci = st.get("chap_idx") or "?"
+    ct = st.get("chap_total") or "?"
+    return "Characters: %d | Chapter %s/%s | %d chars/min" % (
+        st.get("new_count", 0), ci, ct, speed)
+
+
+def _viz_new_state(book_key):
+    """Fresh visualizer state dict (run-level keys included)."""
+    now = time.time()
+    return {"book": book_key, "label": "", "text": "", "names": [],
+            "events": [], "t0": now, "spotlight": None,
+            "run_t0": now, "chars_total": 0, "new_count": 0,
+            "milestones": set(), "ticker": [],
+            "chap_idx": None, "chap_total": None}
+
+
 class _VizRenderable:
     """Rich renderable for the chapter visualizer panel.
 
@@ -2184,7 +2238,7 @@ class PipelineUI:
                 self._layout = _RichLayout()
                 self._layout.split_column(
                     _RichLayout(self.progress, name="bars"),
-                    _RichLayout(_VizRenderable(self), name="viz", size=22),
+                    _RichLayout(_VizRenderable(self), name="viz", size=24),
                 )
                 renderable = self._layout
             else:
@@ -2257,19 +2311,30 @@ class PipelineUI:
                     except KeyError:
                         pass
 
-    def viz_chapter(self, book_key, chapter_label, text):
+    def viz_chapter(self, book_key, chapter_label, text, chap_idx=None,
+                    chap_total=None):
         """Start visualizing a chapter (call at the start of Call A)."""
         if not self._viz_usable():
             return
         with self._lock:
-            prev_events = self._viz["events"][-8:] if self._viz else []
+            prev = self._viz or {}
+            txt = (text or "")[:800]
             self._viz = {
                 "book": book_key,
                 "label": chapter_label or "",
-                "text": (text or "")[:800],
+                "text": txt,
                 "names": [],
-                "events": prev_events,
+                "events": prev.get("events", [])[-8:],
                 "t0": time.time(),
+                "spotlight": None,
+                # Run-level state, carried across chapters.
+                "run_t0": prev.get("run_t0") or time.time(),
+                "chars_total": prev.get("chars_total", 0) + len(txt),
+                "new_count": prev.get("new_count", 0),
+                "milestones": prev.get("milestones") or set(),
+                "ticker": prev.get("ticker") or [],
+                "chap_idx": chap_idx,
+                "chap_total": chap_total,
             }
 
     def viz_characters(self, book_key, characters):
@@ -2283,8 +2348,7 @@ class PipelineUI:
                 names.append(n)
         with self._lock:
             if self._viz is None:
-                self._viz = {"book": book_key, "label": "", "text": "",
-                             "names": [], "events": [], "t0": time.time()}
+                self._viz = _viz_new_state(book_key)
             self._viz["book"] = book_key
             self._viz["names"] = names
 
@@ -2294,43 +2358,79 @@ class PipelineUI:
             return
         with self._lock:
             if self._viz is None:
-                self._viz = {"book": book_key, "label": "", "text": "",
-                             "names": [], "events": [], "t0": time.time()}
+                self._viz = _viz_new_state(book_key)
             self._viz["book"] = book_key
             ev = self._viz["events"]
             ev.append(msg)
+            if _viz_event_kind(msg) == "new":
+                name = msg[len("+ New:"):].strip()
+                self._viz["new_count"] = self._viz.get("new_count", 0) + 1
+                self._viz["spotlight"] = {"name": name, "t": time.time()}
+                ticker = self._viz.setdefault("ticker", [])
+                ticker.append(name)
+                del ticker[:-_VIZ_TICKER_MAX]
+                n = self._viz["new_count"]
+                milestones = self._viz.setdefault("milestones", set())
+                if n % _VIZ_MILESTONE_EVERY == 0 and n not in milestones:
+                    milestones.add(n)
+                    ev.append("🎉 %d characters discovered!" % n)
             del ev[:-8]
 
     def _render_viz_panel(self):
         """Build the visualizer Panel. Called on each Live refresh."""
         with self._lock:
             st = None
-            events = []
             if self._viz is not None:
                 st = dict(self._viz)
-                events = list(st.get("events", []))
+                st["events"] = list(st.get("events", []))
+                st["ticker"] = list(st.get("ticker", []))
+                spot = st.get("spotlight")
+                st["spotlight"] = dict(spot) if spot else None
         if not st or not st.get("text"):
             return _RichPanel("[dim]— visualizer idle —[/]",
                               title="🔍 Chapter visualizer",
                               border_style="dim blue")
-        lines = st["text"].split("\n")
-        # Scan marker advances every ~0.5s through the viewport lines.
-        scan = int((time.time() - st["t0"]) * 2) % max(1, len(lines))
+        now = time.time()
+        # Typing effect: reveal text progressively (~30 chars/sec).
+        shown = _viz_revealed_text(st["text"], st["t0"], now)
+        lines = shown.split("\n")
+        view = lines[:8]
         names = sorted(set(st.get("names", ())), key=len, reverse=True)
         pat = "|".join(re.escape(nm) for nm in names) if names else None
         out = []
-        for idx, ln in enumerate(lines[:13]):
+        for idx, ln in enumerate(view):
             ln = _rich_escape(ln[:110])
             if pat:
                 ln = re.sub(r"\b(%s)\b" % pat, r"[bold yellow]\1[/]", ln,
                             flags=re.IGNORECASE)
-            marker = "[dim]▸ [/]" if idx == scan else "  "
+            # Scan marker rides the last revealed line.
+            marker = "[dim]▸ [/]" if idx == len(view) - 1 else "  "
             out.append(marker + ln)
-        body = "\n".join(out)
+        body = "[bold cyan]%s[/]\n[dim]%s[/]\n" % (
+            _rich_escape(_viz_stats_line(st, now)), "─" * 40)
+        spot = st.get("spotlight")
+        if spot and (now - spot["t"]) < _VIZ_SPOTLIGHT_SECS:
+            body += "[bold bright_green]✨ New: %s[/]\n" % _rich_escape(
+                spot["name"][:50])
+        body += "\n".join(out)
+        events = st.get("events", [])
         if events:
-            body += "\n[dim]─[/]\n" + "\n".join(
-                _rich_escape(e) for e in events[-8:])
-        title = "🔍 %s" % (st.get("label") or "chapter")
+            colored = []
+            for e in events[-5:]:
+                style = _VIZ_EVENT_STYLES.get(_viz_event_kind(e), "")
+                esc = _rich_escape(e)
+                colored.append("[%s]%s[/]" % (style, esc) if style else esc)
+            body += "\n[dim]─[/]\n" + "\n".join(colored)
+        ticker = st.get("ticker", [])
+        if ticker:
+            tick = " • ".join(ticker[-_VIZ_TICKER_MAX:])
+            body += "\n[dim]─[/]\n[dim]%s[/]" % _rich_escape(tick[:100])
+        ci = st.get("chap_idx")
+        ct = st.get("chap_total")
+        if ci and ct:
+            title = "🔍 Ch.%d/%d — %s" % (ci, ct, st.get("label") or "chapter")
+        else:
+            title = "🔍 %s" % (st.get("label") or "chapter")
         return _RichPanel(body, title=_rich_escape(title[:58]),
                           border_style="dim blue")
 
@@ -4071,7 +4171,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                 b_pool.shutdown(wait=False, cancel_futures=True)
             UI.book_done(_book_key)
             return False
-        UI.viz_chapter(_book_key, ch["label"], ch["text"])
+        UI.viz_chapter(_book_key, ch["label"], ch["text"],
+                       chap_idx=i + 1, chap_total=n)
         a, fell_back = v2_call_a(call, roster, ch, n)
         chapter_as[i] = a
         if a is None:
