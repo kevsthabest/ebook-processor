@@ -11,7 +11,8 @@ Usage:
 Controls:
     y = yes, same person (merge)
     n = no, different people (don't merge)
-    s = skip (unsure)
+    m = maybe (leaning, but not confident)
+    s = skip (come back later)
     q = quit and save
 """
 
@@ -98,10 +99,10 @@ def main():
             print(f"     {p['b']['desc'][:120]}")
 
         while True:
-            ans = input("  Same person? [y/n/s/q]: ").strip().lower()
-            if ans in ('y', 'n', 's', 'q'):
+            ans = input("  Same person? [y/n/m/s/q]: ").strip().lower()
+            if ans in ('y', 'n', 'm', 's', 'q'):
                 break
-            print("  Please enter y, n, s, or q")
+            print("  Please enter y, n, m, s, or q")
 
         if ans == 'q':
             break
@@ -112,6 +113,7 @@ def main():
             'a': p['a']['name'],
             'b': p['b']['name'],
             'same_person': ans == 'y',
+            'uncertain': ans == 'm',
             'source': p['source'],
         }
         count += 1
