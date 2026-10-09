@@ -202,10 +202,20 @@ class TestReduce(unittest.TestCase):
     def test_spice_75th_percentile(self):
         bs = {i: _b(spice=s) for i, s in enumerate([0, 0, 2, 4], start=1)}
         red = pp.v2_reduce({}, bs, {}, [_ch(i, str(i)) for i in range(1, 5)])
-        # max(p75=2, peak-1=3) = 3
-        self.assertEqual(red["spice_level"], 3)
+        # peak=4 appears once -> ignored; max(p75=2, 0) = 2
+        self.assertEqual(red["spice_level"], 2)
         self.assertEqual(red["spice_peak"], 4)
         self.assertEqual(red["spice_avg_nonzero"], 3.0)
+
+    def test_spice_peak_requires_two_chapters(self):
+        # Single outlier chapter doesn't set book rating (Daemon rave scene)
+        bs = {i: _b(spice=s) for i, s in enumerate([0]*72 + [4], start=1)}
+        red = pp.v2_reduce({}, bs, {}, [_ch(i, str(i)) for i in range(1, 74)])
+        self.assertEqual(red["spice_level"], 0)  # p75=0, peak ignored
+        # Two chapters at peak -> peak counts
+        bs = {i: _b(spice=s) for i, s in enumerate([0]*71 + [4, 4], start=1)}
+        red = pp.v2_reduce({}, bs, {}, [_ch(i, str(i)) for i in range(1, 74)])
+        self.assertEqual(red["spice_level"], 3)  # max(p75=0, peak-1=3)
 
     def test_pov_threshold(self):
         roster = {}

@@ -1382,12 +1382,16 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         print(f"  Trigger regex gate: dropped {_gated_dropped} unsupported claim(s)")
 
     # --- Spice: peak, non-zero average, and max(p75, peak-1) ---
+    # Peak only counts if it appears in 2+ chapters (a single outlier
+    # chapter shouldn't set the book rating -- e.g. one rave scene in Daemon).
     spices = sorted(b["spice_level"] for b in chapter_bs.values() if b)
     spice_peak = max(spices) if spices else 0
     _nonzero = [s for s in spices if s > 0]
-    spice_avg_nonzero = (sum(_nonzero) / len(_nonzero)) if _nonzero else 0
+    spice_avg_nonzero = round(sum(_nonzero) / len(_nonzero), 2) if _nonzero else 0
     _p75 = spices[max(0, math.ceil(0.75 * len(spices)) - 1)] if spices else 0
-    spice_level = max(_p75, spice_peak - 1) if spices else 0
+    _peak_count = sum(1 for s in spices if s == spice_peak)
+    _peak_adj = (spice_peak - 1) if _peak_count >= 2 else 0
+    spice_level = max(_p75, _peak_adj) if spices else 0
     # Consistency: explicit_sex at sev>=2 means the book has explicit content
     for _t in triggers:
         if (_t["warning"] == "explicit_sex"
