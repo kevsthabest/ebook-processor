@@ -378,6 +378,36 @@ _SKIP_UNIT_RE = re.compile(
     r"copyright|(?<![a-z])toc(?![a-z])|table.?of.?contents|dedication|acknowledg|also.?by|"
     r"about.?(the.?)?author|title.?page|(?<![a-z])cover(?![a-z])|\bnav\b", re.IGNORECASE)
 
+# Content-based front/back matter: skip units whose opening text matches.
+# Catches what filename heuristics miss (e.g. "part0001.html" that's actually a TOC).
+_FRONTMATTER_CONTENT_RE = re.compile(
+    r"copyright|all rights reserved|isbn|also\s+by\s|dedication|"
+    r"acknowledg(e?)ments|about\s+the\s+author|table\s+of\s+contents|"
+    r"^contents\s*$",
+    re.IGNORECASE)
+
+def _is_frontmatter_content(text):
+    """True if the opening looks like front/back matter.
+
+    Requires 2+ distinct signals to avoid false-positiving on prose
+    (e.g. "also by the door" in a real chapter). Checks first 2000 chars.
+    """
+    head = text[:2000].lower()
+    signals = 0
+    # "also by the author" as a full phrase is a strong signal (counts double);
+    # bare "also by" needs a second signal (avoids "also by the door" in prose)
+    if re.search(r"also\s+by\s+the\s+author", head):
+        signals += 2
+    for pat in (r"copyright", r"all rights reserved", r"isbn[\s:]*[0-9]",
+                r"\bdedication\b", r"acknowledg(e?)ments",
+                r"about\s+the\s+author", r"table\s+of\s+contents"):
+        if re.search(pat, head, re.IGNORECASE):
+            signals += 1
+    return signals >= 2
+
+# Chapter-detection fallback flag lives on _DIAG (threading.local) because
+# --jobs runs books in a ThreadPoolExecutor. See _DIAG definition above.
+
 MIN_CHAPTER_CHARS = 1500   # smaller units merge into the next one
 MAX_CHAPTER_CHARS = 16000  # ~4k tokens; must leave room in the context window
 # for the prompt + the model's thinking + JSON output. Override with
@@ -390,6 +420,32 @@ def _chapter_part(u, text, part):
             "text": text}
 
 
+def _fallback_heading_split(units):
+    """Split units on _CHAPTER_HEADING_RE when spine structure is unusable.
+
+    Used when an EPUB yields <5 units or one unit holds >60% of the text.
+    Requires each chunk >1500 chars (discards TOC lines). Returns new units.
+    """
+    out = []
+    for u in units:
+        text = u["text"]
+        matches = list(_CHAPTER_HEADING_RE.finditer(text))
+        if len(matches) < 2:
+            out.append(u)
+            continue
+        bounds = [m.start() for m in matches] + [len(text)]
+        for i in range(len(matches)):
+            chunk = text[bounds[i]:bounds[i + 1]].strip()
+            if len(chunk) > 1500:
+                label = chunk.split("\n", 1)[0].strip()[:80]
+                out.append({"spine": f"{u['spine']}#fb{i + 1}",
+                            "label": label, "text": chunk})
+        # If nothing survived the length filter, keep the original
+        if not any(o["spine"].startswith(u["spine"] + "#fb") for o in out):
+            out.append(u)
+    return out or units
+
+
 def split_chapters(units):
     """Turn raw spine units into chapter-sized units for the v2 pipeline.
 
@@ -399,8 +455,22 @@ def split_chapters(units):
       MAX_CHAPTER_CHARS) on paragraph boundaries.
     Returns [{"index", "label", "text"}] in reading order.
     """
+    _DIAG.chapter_detection_fallback = False
     max_chars = CONFIG.get("v2_max_chapter_chars", MAX_CHAPTER_CHARS)
-    kept = [u for u in units if not _SKIP_UNIT_RE.search(u["spine"])]
+    kept = [u for u in units
+            if not _SKIP_UNIT_RE.search(u["spine"])
+            and not _is_frontmatter_content(u.get("text", ""))]
+    # Fallback: if too few units survived, or one unit dominates the text
+    # (common when a converter dumps the whole book in one HTML file),
+    # split on chapter headings.
+    if kept:
+        total = sum(len(u["text"]) for u in kept)
+        biggest = max(kept, key=lambda u: len(u["text"]))
+        if len(kept) < 5 or (total and len(biggest["text"]) / total > 0.6):
+            _DIAG.chapter_detection_fallback = True
+            print("!!! CHAPTER DETECTION FALLBACK - heading-based split, "
+                  "results may be unreliable")
+            kept = _fallback_heading_split(kept)
     # Merge small units forward (label of the following, larger unit wins).
     merged = []
     pending = None
@@ -482,6 +552,9 @@ RULES:
 1. ENTITY MERGING: "Mother", "the narrator", "I" and the author's name are one person — list ONCE under the most specific name, put the rest in aliases.
 2. NEVER INVENT NAMES. If gender is ambiguous from the name alone, leave it out rather than guessing.
 3. REAL PEOPLE ONLY who appear or are directly involved in this chapter.
+   - Appearance and description must describe the character themselves, not someone they observe.
+     If the point-of-view character sees another person, do not attribute that person's looks
+     to the POV character.
    - A character is an individual person. NOT organizations, companies, ships, places, or groups.
    - "O Palácio" (a casino), "EVA masters" (a job title), "the committee" are NOT characters — skip them.
    - If a name could be a place or thing rather than a person, skip it unless the chapter clearly treats it as a person.
@@ -692,12 +765,22 @@ def _roster_update(roster, characters, chapter_idx):
         if c.get("role"):
             e["roles"][c["role"]] += 1
         if c.get("description"):
-            e["descriptions"].append(c["description"])
+            # Track (chapter, text, has_evidence) for description selection in v2_reduce.
+            # "First speaks or acts" ~= earliest chapter with evidence.
+            e["descriptions"].append(
+                (chapter_idx, c["description"], bool(c.get("evidence"))))
         if c.get("appearance"):
             e.setdefault("appearances_desc", []).append(c["appearance"])
         if c.get("status"):
             e["statuses"] = e.get("statuses", Counter())
             e["statuses"][c["status"]] += 1
+            # Track death reports with chapter for sticky-death logic (A3).
+            # Only counts if the chapter provided evidence (not just a mention).
+            if c["status"] == "dead" and c.get("evidence"):
+                e.setdefault("death_reports", []).append(chapter_idx)
+        # Track per-chapter evidence presence for sticky-death "acted later" check.
+        if c.get("evidence"):
+            e.setdefault("chapter_evidence", set()).add(chapter_idx)
         if c.get("evidence") and not e.get("evidence"):
             e["evidence"] = c["evidence"]  # first verified evidence wins
 
@@ -1006,6 +1089,25 @@ def _ground_entities(characters, relationships, chapters):
             "relationships_total": len(relationships)}
 
 
+# Safety: minor indicators and sexualized terms for appearance filtering.
+# Conservative: when in doubt, blank the appearance field.
+_MINOR_RE = re.compile(
+    r"\b(child|children|teen(?:ager)?|boy|girl|kid|youth|juvenile|adolescent|"
+    r"toddler|baby|infant|minor|youngster|preteen)\b", re.IGNORECASE)
+_SEXUALIZED_TERMS = frozenset({
+    "sexy", "voluptuous", "curvy", "busty", "seductive", "sensual", "erotic",
+    "arousing", "lustful", "provocative", "sultry", "titillating", "shapely",
+    "cleavage", "thong", "lingerie",
+})
+_SEXUALIZED_RE = re.compile(
+    r"\b(" + "|".join(sorted(_SEXUALIZED_TERMS)) + r")\b", re.IGNORECASE)
+
+def _is_minor(role, description):
+    """True if role/description indicates a child/teen. Word-boundary match."""
+    text = f"{role or ''} {description or ''}"
+    return bool(_MINOR_RE.search(text))
+
+
 def v2_reduce(chapter_as, chapter_bs, roster, chapters):
     """Deterministic reduce over per-chapter v2 results. Pure code, no LLM.
 
@@ -1026,12 +1128,41 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         if not ((_is_proper(e["name"]) and n_ch >= min_ch) or n_ch >= 3):
             continue
         role = e["roles"].most_common(1)[0][0] if e["roles"] else None
-        desc = max(e["descriptions"], key=len) if e["descriptions"] else ""
+        # Description: prefer earliest evidence-backed (character speaks/acts),
+        # then longest. Falls back to longest overall if none have evidence.
+        _descs = e.get("descriptions", [])  # [(chapter_idx, text, has_evidence)]
+        # Handle legacy plain-string format (shouldn't occur, but be safe)
+        _descs = [d if isinstance(d, tuple) else (0, d, False) for d in _descs]
+        if _descs:
+            _with_ev = [d for d in _descs if d[2]]
+            if _with_ev:
+                # Earliest evidence-backed (first speaks/acts), then longest
+                _pool_sorted = sorted(_with_ev, key=lambda x: (x[0], -len(x[1])))
+                desc = _pool_sorted[0][1]
+            else:
+                # No evidence: longest overall
+                desc = max(_descs, key=lambda x: len(x[1]))[1]
+        else:
+            desc = ""
         ev = e.get("evidence", "")
         _statuses = e.get("statuses") or Counter()
         _status = _statuses.most_common(1)[0][0] if _statuses else "unknown"
+        # Sticky death: once reported dead with evidence, stays dead unless
+        # the character acts on the page in a later chapter.
+        _death_reports = e.get("death_reports", [])
+        if _death_reports:
+            _first_death = min(_death_reports)
+            _acted_later = any(
+                idx > _first_death for idx in e.get("chapter_evidence", set()))
+            if not _acted_later:
+                _status = "dead"
         _appearances = e.get("appearances_desc") or []
         _appearance = max(_appearances, key=len) if _appearances else ""
+        # Minor protection: blank appearance for minors; drop sexualized text.
+        if _is_minor(role, desc):
+            _appearance = ""
+        elif _appearance and _SEXUALIZED_RE.search(_appearance):
+            _appearance = ""
         # First appearance: lowest chapter index (1-based, matches --chunks numbering)
         _chapters_sorted = sorted(e.get("chapters", set()))
         characters.append({
@@ -1312,6 +1443,20 @@ def _sanitize_v2_gate(r):
     return {"verdicts": verdicts}
 
 
+# Genre/setting labels that are not tropes. Dropped via _tnorm match.
+_TROPE_DENYLIST = frozenset({
+    "techno-thriller", "technothriller", "dystopia", "dystopian", "conspiracy",
+    "thriller", "sci-fi", "scifi", "science fiction", "fantasy", "romance",
+    "mystery", "horror", "comedy", "drama", "adventure", "action",
+    "cyberpunk", "steampunk", "space opera", "urban fantasy", "dark fantasy",
+    "paranormal", "historical fiction", "literary fiction", "crime",
+    "detective", "noir", "western", "war story",
+})
+
+def _is_denylisted_trope(name):
+    return _tnorm(name) in _TROPE_DENYLIST
+
+
 def v2_trope_gate(call, chapter_summaries, candidates, candidate_counts):
     """Confirm/deny trope candidates against chapter summaries (one LLM call).
 
@@ -1345,14 +1490,15 @@ def v2_trope_gate(call, chapter_summaries, candidates, candidate_counts):
                 if name not in confirmed:
                     confirmed.append(name)
                     n_ch = candidate_counts.get(key, 1)
-                    conf[name] = round(min(0.9, 0.55 + 0.1 * n_ch), 2)
+                    conf[_tnorm(name)] = round(min(0.9, 0.55 + 0.1 * n_ch), 2)
     return confirmed, conf
 
 
 # --- v2 chapter extraction for non-EPUB (single-text) books ---
 _CHAPTER_HEADING_RE = re.compile(
-    r"(?m)^[ \t]*(chapter\s+\d+|chapter\s+[ivxlc]+|part\s+\d+|"
-    r"prologue|epilogue)[ \t]*$", re.IGNORECASE)
+    r"(?m)^[ \t]*((?:chapter|part|book|section)\s+(?:\d+|[ivxlc]+|one|two|"
+    r"three|four|five|six|seven|eight|nine|ten)\b[^\n]{0,60}|prologue|"
+    r"epilogue|interlude)[ \t]*$", re.IGNORECASE)
 
 
 def _prose_chapters(text):
@@ -2329,6 +2475,10 @@ def cmd_push_preview(preview_path):
     if result.get("aborted"):
         print(f"  Skipping {title}: preview is marked ABORTED (partial results)")
         return
+    if result.get("chapter_detection") == "fallback":
+        print(f"  Skipping {title}: chapter detection used FALLBACK splitting "
+              f"(unreliable chapters) — re-run from a clean EPUB")
+        return
     print(f"  Pushing: {title}")
     # Resolve work (create if needed).
     identifiers = {}
@@ -2891,7 +3041,9 @@ def write_claims(work_id, result, trope_mappings=None):
             else:
                 wrote["tropes"] = len(rows)
 
-    # Unmapped tropes -> trope_proposals (with book provenance)
+    # Unmapped tropes -> trope_proposals (with book provenance).
+    # Drop sub-threshold: only propose if confidence meets the bar.
+    _PROP_MIN_CONF = 0.7
     if unmatched:
         seen_prop = sb("trope_proposals", params="?select=name_key&limit=1000") or []
         seen_keys = {r["name_key"] for r in seen_prop}
@@ -2899,6 +3051,11 @@ def write_claims(work_id, result, trope_mappings=None):
         for t in unmatched:
             key = _tnorm(t)
             if key in seen_keys:
+                continue
+            # Skip denylisted and low-confidence
+            if _is_denylisted_trope(t):
+                continue
+            if conf_t.get(key, 0.7) < _PROP_MIN_CONF:
                 continue
             seen_keys.add(key)
             row = {"name": t, "name_key": key,
@@ -3302,6 +3459,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if suffix == ".epub":
         units, title, author, identifiers = extract_epub_units(fpath)
         chapters = split_chapters(units)
+        _chap_fallback = getattr(_DIAG, "chapter_detection_fallback", False)
         word_count = sum(len(u["text"].split()) for u in units)
     else:
         extracted = read_ebook(fpath)
@@ -3309,6 +3467,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             return False
         text, title, author, identifiers = extracted
         chapters = _prose_chapters(text)
+        _chap_fallback = getattr(_DIAG, "chapter_detection_fallback", False)
         word_count = len(text.split())
 
     _book_key = str(fpath)
@@ -3475,7 +3634,12 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                         seen_ch.add(key)
                         trope_chapters.setdefault(key, []).append(idx)
             red["trope_chapters"] = trope_chapters
+        _denied = 0
         for c in red["trope_candidates"]:
+            # Drop genre/setting labels (not tropes)
+            if _is_denylisted_trope(c):
+                _denied += 1
+                continue
             n_ch = counts.get(_tnorm(c), 1)
             if n_ch >= auto_min:
                 auto.append(c)
@@ -3484,10 +3648,11 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             else:
                 dropped += 1
         print(f"  Tropes: {len(auto)} auto ({auto_min}+ ch), {len(gated)} to gate, "
-              f"{dropped} single-ch dropped...", end=" ", flush=True)
+              f"{dropped} single-ch dropped, {_denied} denylisted...", end=" ", flush=True)
         for c in auto:
             tropes.append(c)
-            trope_conf[c] = round(min(0.9, 0.55 + 0.1 * counts.get(_tnorm(c), auto_min)), 2)
+            trope_conf[_tnorm(c)] = round(
+                min(0.9, 0.55 + 0.1 * counts.get(_tnorm(c), auto_min)), 2)
         if gated:
             g_tropes, g_conf = v2_trope_gate(
                 call, red["chapter_summaries"], gated, counts)
@@ -3521,6 +3686,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "trope_candidate_counts": red.get("trope_candidate_counts", {}),
         "trope_catalog_map": red.get("trope_catalog_map", {}),
         "trope_chapters": red.get("trope_chapters", {}),
+        "chapter_detection": "fallback" if _chap_fallback else "spine",
     }
     v = red["verification"]
     if v["evidence_checked"]:

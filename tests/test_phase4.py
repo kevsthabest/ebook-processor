@@ -308,7 +308,7 @@ class TestTropeGate(unittest.TestCase):
             fake_call, summaries, ["Found Family", "Love Triangle", "Slow Burn"],
             counts)
         self.assertEqual(confirmed, ["Found Family"])
-        self.assertEqual(conf["Found Family"], 0.75)  # 0.55 + 0.1*2
+        self.assertEqual(conf[pp._tnorm("Found Family")], 0.75)  # 0.55 + 0.1*2
 
     def test_gate_empty_candidates(self):
         confirmed, conf = pp.v2_trope_gate(lambda *a: "{}", [], [], Counter())
@@ -702,3 +702,189 @@ class TestAliasValidation(unittest.TestCase):
         pp._roster_update(roster, [{"name": "Jon Ross", "aliases": ["Pete"]}], 1)
         # Two separate roster entries (no merge on weak alias)
         self.assertEqual(len(roster), 2)
+
+
+class TestAreaA(unittest.TestCase):
+    def _roster_with(self, entries):
+        """Build a roster from [(chapter_idx, char_dict), ...]."""
+        roster = {}
+        for idx, c in entries:
+            pp._roster_update(roster, [c], idx)
+        return roster
+
+    def _reduce_chars(self, roster, n_chapters=5):
+        chapters = [{"index": i, "label": f"Ch {i}", "text": "x" * 2000}
+                    for i in range(1, n_chapters + 1)]
+        red = pp.v2_reduce({}, {}, roster, chapters)
+        return {c["name"]: c for c in red["characters"]}
+
+    def test_sticky_death(self):
+        # Reported dead ch2 with evidence, never acts again -> dead
+        roster = self._roster_with([
+            (1, {"name": "Bob", "status": "alive", "evidence": "Bob walked in."}),
+            (2, {"name": "Bob", "status": "dead", "evidence": "Bob was killed."}),
+            (3, {"name": "Bob", "status": "alive"}),  # no evidence = just mentioned
+        ])
+        chars = self._reduce_chars(roster)
+        self.assertEqual(chars["Bob"]["status"], "dead")
+
+    def test_sticky_death_cleared_by_action(self):
+        # Dead ch2, but acts on page ch4 with evidence -> not dead
+        roster = self._roster_with([
+            (1, {"name": "Bob", "status": "alive", "evidence": "Bob walked in."}),
+            (2, {"name": "Bob", "status": "dead", "evidence": "Bob was killed."}),
+            (4, {"name": "Bob", "status": "alive", "evidence": "Bob stood up, alive."}),
+        ])
+        chars = self._reduce_chars(roster)
+        self.assertNotEqual(chars["Bob"]["status"], "dead")
+
+    def test_minor_appearance_blanked(self):
+        roster = self._roster_with([
+            (1, {"name": "Timmy", "role": "minor",
+                 "description": "a young boy of ten",
+                 "appearance": "blond hair, blue eyes",
+                 "evidence": "Timmy ran."}),
+        ])
+        chars = self._reduce_chars(roster)
+        self.assertEqual(chars["Timmy"]["appearance"], "")
+
+    def test_sexualized_appearance_blanked(self):
+        roster = self._roster_with([
+            (1, {"name": "Jane", "role": "supporting",
+                 "description": "a woman",
+                 "appearance": "voluptuous figure in a tight dress",
+                 "evidence": "Jane entered."}),
+        ])
+        chars = self._reduce_chars(roster)
+        self.assertEqual(chars["Jane"]["appearance"], "")
+
+    def test_adult_appearance_kept(self):
+        roster = self._roster_with([
+            (1, {"name": "Jane", "role": "supporting",
+                 "description": "a woman",
+                 "appearance": "tall, dark hair",
+                 "evidence": "Jane entered."}),
+        ])
+        chars = self._reduce_chars(roster)
+        self.assertEqual(chars["Jane"]["appearance"], "tall, dark hair")
+
+    def test_description_prefers_earliest_evidence(self):
+        roster = self._roster_with([
+            (1, {"name": "Bob", "description": "short",
+                 "evidence": "Bob spoke."}),
+            (2, {"name": "Bob",
+                 "description": "a much longer description of Bob here",
+                 "evidence": "Bob acted again."}),
+            (3, {"name": "Bob",
+                 "description": "the longest description of all, but no evidence"}),
+        ])
+        chars = self._reduce_chars(roster)
+        # Earliest evidence-backed wins over longer later ones
+        self.assertEqual(chars["Bob"]["description"], "short")
+
+    def test_description_falls_back_to_longest(self):
+        roster = self._roster_with([
+            (1, {"name": "Bob", "description": "short"}),
+            (2, {"name": "Bob", "description": "a longer description here"}),
+        ])
+        chars = self._reduce_chars(roster)
+        self.assertEqual(chars["Bob"]["description"], "a longer description here")
+
+
+class TestAreaB(unittest.TestCase):
+    def test_frontmatter_content_filter(self):
+        units = [
+            {"spine": "part0001.html", "label": "Copyright",
+             "text": "Copyright 2020 by Author. All rights reserved. ISBN 123-456."},
+            {"spine": "part0002.html", "label": "Chapter 1",
+             "text": "It was a dark night. " * 200},
+            {"spine": "part0003.html", "label": "Also By",
+             "text": "Also by the author: Book One, Book Two. " * 50},
+        ]
+        result = pp.split_chapters(units)
+        labels = [c["label"] for c in result]
+        # Only Chapter 1 survives (others are frontmatter by content)
+        self.assertTrue(any("Chapter 1" in lb for lb in labels))
+        self.assertFalse(any("Copyright" in lb or "Also By" in lb for lb in labels))
+
+    def test_fallback_trigger_few_units(self):
+        # 2 units (fewer than 5) with chapter headings -> fallback splits
+        ch_text = ""
+        for i in range(1, 7):
+            ch_text += f"\nChapter {i}\n" + ("Story text here. " * 200) + "\n"
+        units = [
+            {"spine": "part0001.html", "label": "Part 1", "text": ch_text[:len(ch_text)//2]},
+            {"spine": "part0002.html", "label": "Part 2", "text": ch_text[len(ch_text)//2:]},
+        ]
+        result = pp.split_chapters(units)
+        self.assertTrue(getattr(pp._DIAG, 'chapter_detection_fallback', False))
+        # Should have split into chapter-ish units
+        self.assertGreater(len(result), 2)
+
+    def test_fallback_trigger_dominant_unit(self):
+        # One unit holds >60% of text -> fallback
+        big = "\nChapter One\n" + ("Text. " * 1000) + "\nChapter Two\n" + ("More. " * 1000)
+        units = [
+            {"spine": "a.html", "label": "A", "text": "short " * 100},
+            {"spine": "b.html", "label": "B", "text": "short " * 100},
+            {"spine": "c.html", "label": "C", "text": "short " * 100},
+            {"spine": "d.html", "label": "D", "text": "short " * 100},
+            {"spine": "e.html", "label": "E", "text": "short " * 100},
+            {"spine": "big.html", "label": "Big", "text": big},
+        ]
+        result = pp.split_chapters(units)
+        self.assertTrue(getattr(pp._DIAG, 'chapter_detection_fallback', False))
+
+    def test_no_fallback_normal(self):
+        units = [
+            {"spine": f"ch{i:02d}.html", "label": f"Chapter {i}",
+             "text": f"Chapter {i} content. " * 300}
+            for i in range(1, 8)
+        ]
+        result = pp.split_chapters(units)
+        self.assertFalse(getattr(pp._DIAG, 'chapter_detection_fallback', False))
+        self.assertEqual(len(result), 7)
+
+    def test_heading_re_with_title(self):
+        # "Chapter 1: The Beginning" should match
+        m = pp._CHAPTER_HEADING_RE.search("Chapter 1: The Beginning")
+        self.assertIsNotNone(m)
+        m = pp._CHAPTER_HEADING_RE.search("PART II - The Journey")
+        self.assertIsNotNone(m)
+        m = pp._CHAPTER_HEADING_RE.search("Prologue")
+        self.assertIsNotNone(m)
+        # TOC-like short lines are matched by RE but filtered by length in split
+        m = pp._CHAPTER_HEADING_RE.search("chapter 3")
+        self.assertIsNotNone(m)
+
+    def test_heading_re_number_words(self):
+        m = pp._CHAPTER_HEADING_RE.search("Chapter Three")
+        self.assertIsNotNone(m)
+        m = pp._CHAPTER_HEADING_RE.search("Section IV: Revelations")
+        self.assertIsNotNone(m)
+
+
+class TestAreaC(unittest.TestCase):
+    def test_trope_conf_tnorm_key(self):
+        # trope_conf must be keyed by _tnorm for readers (save_preview, write_claims)
+        c = "Enemies to Lovers"
+        key = pp._tnorm(c)
+        self.assertEqual(key, "enemies to lovers")
+        # Simulate what process_file_v2 now writes
+        trope_conf = {pp._tnorm(c): 0.85}
+        # Readers use _tnorm lookup
+        self.assertEqual(trope_conf.get(pp._tnorm(c)), 0.85)
+        self.assertEqual(trope_conf.get(pp._tnorm("ENEMIES TO LOVERS")), 0.85)
+
+    def test_denylist(self):
+        self.assertTrue(pp._is_denylisted_trope("techno-thriller"))
+        self.assertTrue(pp._is_denylisted_trope("Techno-Thriller"))
+        self.assertTrue(pp._is_denylisted_trope("sci-fi"))
+        self.assertTrue(pp._is_denylisted_trope("dystopia"))
+        self.assertFalse(pp._is_denylisted_trope("enemies to lovers"))
+        self.assertFalse(pp._is_denylisted_trope("chosen one"))
+
+    def test_denylist_tnorm_variants(self):
+        # Underscores/spacing variants still match
+        self.assertTrue(pp._is_denylisted_trope("science_fiction"))
+        self.assertTrue(pp._is_denylisted_trope("Science Fiction"))
