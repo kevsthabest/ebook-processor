@@ -259,6 +259,55 @@ class TestReduce(unittest.TestCase):
         self.assertEqual(pp._spice_band_freq(0.20), "frequent")
         self.assertEqual(pp._spice_band_freq(0.50), "pervasive")
 
+    def test_spice_mixed_intensity_regression(self):
+        # P0-1: one explicit chapter + many mild chapters must NOT be 5.
+        # Frequency counts chapters AT the peak intensity (spice>=4), not
+        # just any spice. 1/100 explicit -> rare -> explicit x rare = 2.
+        spices = [5] + [1] * 40 + [0] * 59
+        self.assertEqual(pp._spice_level_from_chapters(spices, 100), 2)
+
+    def test_spice_mixed_intensity_moderate(self):
+        # Peak moderate (3): frequency counts spice>=2, ignoring mild (1s).
+        # 2 chapters at 3, 30 chapters at 1 -> 2/100 moderate -> rare -> 1.
+        spices = [3] * 2 + [1] * 30 + [0] * 68
+        self.assertEqual(pp._spice_level_from_chapters(spices, 100), 1)
+
+    def test_spice_incomplete_extraction(self):
+        # P0-2: 73 chapters, only 30 successful, 2 spicy of 30.
+        # Denominator is 30 (successful), not 73 (total).
+        # 2/30 = 0.067 -> occasional -> explicit x occasional = 3.
+        spices = [5] * 2 + [0] * 28
+        self.assertEqual(pp._spice_level_from_chapters(spices, 30), 3)
+
+    def test_spice_boundary_fractions(self):
+        # Exact boundary values for _spice_band_freq.
+        self.assertEqual(pp._spice_band_freq(0.06), "occasional")  # not rare
+        self.assertEqual(pp._spice_band_freq(0.059), "rare")
+        self.assertEqual(pp._spice_band_freq(0.15), "frequent")  # not occasional
+        self.assertEqual(pp._spice_band_freq(0.149), "occasional")
+        self.assertEqual(pp._spice_band_freq(0.35), "pervasive")  # not frequent
+        self.assertEqual(pp._spice_band_freq(0.349), "frequent")
+
+    def test_spice_invalid_inputs(self):
+        # Empty list, zero chapters -> 0.
+        self.assertEqual(pp._spice_level_from_chapters([], 0), 0)
+        self.assertEqual(pp._spice_level_from_chapters([], 100), 0)
+        self.assertEqual(pp._spice_level_from_chapters([3, 4], 0), 0)
+        # Out-of-range values are clamped: 7->5, -1->0.
+        # [7, -1] clamps to [5, 0]: peak explicit, 1/2 at peak -> pervasive -> 5.
+        self.assertEqual(pp._spice_level_from_chapters([7, -1], 2), 5)
+        # All negative -> clamped to 0 -> none -> 0.
+        self.assertEqual(pp._spice_level_from_chapters([-3, -1], 2), 0)
+
+    def test_spice_daemon_acceptance_still_passes(self):
+        # Daemon: peak 5, 2-4 spicy chapters of 73 -> level 2.
+        # With P0-1 fix: counts chapters with spice>=4 (all are 5s).
+        for n_spicy in (2, 3, 4):
+            spices = [5] * n_spicy + [0] * (73 - n_spicy)
+            level = pp._spice_level_from_chapters(spices, 73)
+            self.assertEqual(level, 2,
+                             f"n_spicy={n_spicy} should give level 2")
+
     def test_trigger_prominence_fields(self):
         # graphic in few chapters -> medium; mentioned everywhere -> medium
         self.assertEqual(
@@ -288,6 +337,45 @@ class TestReduce(unittest.TestCase):
         self.assertEqual(t["chapter_count"], 2)
         self.assertEqual(t["frequency"], 1.0)
         # graphic in 2/2 chapters (frequent) -> high
+        self.assertEqual(t["prominence"], "high")
+
+    def test_coverage_warning_low(self):
+        # P0-2: <50% successful chapters -> coverage_warning True.
+        # 4 chapters, only 1 successful (bs has 1 entry, 3 are None).
+        bs = {1: _b(spice=5)}
+        chapters = [_ch(i, str(i)) for i in range(1, 5)]
+        # chapter_bs needs entries for all; None = failed.
+        full_bs = {1: bs[1], 2: None, 3: None, 4: None}
+        red = pp.v2_reduce({}, full_bs, {}, chapters)
+        self.assertTrue(red["coverage_warning"])
+        self.assertEqual(red["chapters_successful"], 1)
+        self.assertEqual(red["chapters_total"], 4)
+
+    def test_coverage_warning_ok(self):
+        # >=50% successful -> no warning.
+        bs = {1: _b(spice=5), 2: _b(spice=0), 3: _b(spice=0)}
+        chapters = [_ch(i, str(i)) for i in range(1, 5)]
+        full_bs = {1: bs[1], 2: bs[2], 3: bs[3], 4: None}
+        red = pp.v2_reduce({}, full_bs, {}, chapters)
+        self.assertFalse(red["coverage_warning"])
+        self.assertEqual(red["chapters_successful"], 3)
+
+    def test_trigger_prominence_uses_successful_denominator(self):
+        # P0-2: trigger in 2 chapters, but only 4 of 10 succeeded.
+        # 2/4 = 0.5 -> frequent (not 2/10 = 0.2 -> occasional).
+        bs = {1: _b(self._full_triggers(murder="on_page"), spice=0),
+              2: _b(self._full_triggers(murder="on_page"), spice=0),
+              3: _b(spice=0),
+              4: _b(spice=0)}
+        for i in (1, 2):
+            bs[i]["trigger_evidence"] = {"murder": "he killed him"}
+        chapters = [_ch(i, str(i)) for i in range(1, 11)]
+        full_bs = {i: bs.get(i) for i in range(1, 11)}  # 6 are None
+        red = pp.v2_reduce({}, full_bs, {}, chapters)
+        t = red["triggers"][0]
+        self.assertEqual(t["chapter_count"], 2)
+        self.assertEqual(t["frequency"], 0.5)  # 2/4 successful, not 2/10
+        # on_page x frequent -> high
         self.assertEqual(t["prominence"], "high")
 
     def test_pov_threshold(self):

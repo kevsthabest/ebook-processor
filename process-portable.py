@@ -549,9 +549,10 @@ TRIGGER_CATEGORIES = [
 ]
 _SEVERITY_ORDER = {"none": 0, "mentioned": 1, "on_page": 2, "graphic": 3}
 
-# Spice level: peak-chapter intensity x fraction-of-chapters-with-spice.
+# Spice level: peak-chapter intensity x fraction-of-chapters-at-that-intensity.
 # Principle: triggers warn that content EXISTS; spice level measures how
-# PERVASIVE it is. A single explicit scene in a 500-page book is not a 5.
+# PERVASIVE it is *at the peak intensity*. A single explicit scene in a
+# 500-page book is not a 5, even if many chapters have mild content.
 # Keep as module-level data so future tuning is a data edit, not code.
 def _spice_band_peak(peak):
     """Peak chapter spice (0-5) -> intensity band."""
@@ -593,15 +594,43 @@ _SPICE_MATRIX = {
 # ("none", "none") -> 0.
 
 
-def _spice_level_from_chapters(spice_levels, total_chapters):
-    """Pure function: list of per-chapter spice levels (0-5) + total chapters
-    -> book spice level 0-5 via the intensity x frequency matrix."""
+# Minimum chapter spice to count toward frequency for each peak band.
+# Frequency measures chapters AT the peak intensity, not just any spice.
+# ("mild" peak -> count spice>=1; "moderate" -> spice>=2; "explicit" -> spice>=4)
+_PEAK_BAND_MIN_SPICE = {"mild": 1, "moderate": 2, "explicit": 4}
+
+
+def _spice_level_from_chapters(spice_levels, successful_chapters):
+    """Pure function: list of per-chapter spice levels (0-5) + count of
+    successfully processed chapters -> book spice level 0-5 via the
+    intensity x frequency matrix.
+
+    Book-level spice answers "how intense AND how prevalent is the spicy
+    content?" — NOT simply "how spicy is the content?" A book with one
+    explicit scene gets a low rating even though explicit content exists;
+    the `explicit_sex` trigger (independent of this rating) records that
+    explicit content occurs at all.
+
+    Frequency counts chapters at or above the peak intensity band:
+    - peak "mild"     -> chapters with spice >= 1
+    - peak "moderate" -> chapters with spice >= 2
+    - peak "explicit" -> chapters with spice >= 4
+
+    `successful_chapters` is the denominator (not total chapters), so
+    failed extractions don't silently dilute the frequency. Out-of-range
+    spice values are clamped to 0-5.
+    """
+    # Clamp out-of-range values (defensive: bad model output shouldn't skew).
+    spice_levels = [max(0, min(5, s)) for s in spice_levels]
     peak = max(spice_levels) if spice_levels else 0
-    n_spicy = sum(1 for s in spice_levels if s > 0)
-    frac = (n_spicy / total_chapters) if total_chapters else 0
     peak_band = _spice_band_peak(peak)
+    if peak_band == "none":
+        return 0
+    min_spice = _PEAK_BAND_MIN_SPICE[peak_band]
+    n_at_peak = sum(1 for s in spice_levels if s >= min_spice)
+    frac = (n_at_peak / successful_chapters) if successful_chapters else 0
     freq_band = _spice_band_freq(frac)
-    if peak_band == "none" or freq_band == "none":
+    if freq_band == "none":
         return 0
     return _SPICE_MATRIX.get((peak_band, freq_band), 0)
 
@@ -630,11 +659,15 @@ _PROMINENCE_MATRIX = {
 }
 
 
-def _trigger_prominence(severity, chapter_count, total_chapters):
-    """Pure function: severity name + chapter counts -> low/medium/high."""
-    if total_chapters <= 0 or chapter_count <= 0:
+def _trigger_prominence(severity, chapter_count, successful_chapters):
+    """Pure function: severity name + chapter counts -> low/medium/high.
+
+    `successful_chapters` is the denominator (not total chapters), so
+    failed extractions don't silently dilute the frequency.
+    """
+    if successful_chapters <= 0 or chapter_count <= 0:
         return "low"
-    freq_band = _prominence_band_freq(chapter_count / total_chapters)
+    freq_band = _prominence_band_freq(chapter_count / successful_chapters)
     return _PROMINENCE_MATRIX.get((severity, freq_band), "low")
 
 # Relationship dedupe: exclusive types resolve by precedence (lower wins).
@@ -2324,6 +2357,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
     n = len(chapters)
     idx_to_label = {c["index"]: c["label"] for c in chapters}
     _label_to_text = {c["label"]: c.get("text", "") for c in chapters}
+    # Extraction coverage: chapters with successful Call B results. Failed
+    # chapters are NOT treated as "no content" — frequency denominators use
+    # n_successful, and low coverage sets a warning flag on the result.
+    n_successful_b = sum(1 for b in chapter_bs.values() if b)
+    coverage_warning = (n_successful_b / n < 0.5) if n else True
 
     # --- Characters: from the roster (aliases already merged) ---
     # Keep only characters with a proper name OR 3+ chapter appearances.
@@ -2569,9 +2607,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
             "severity_claimed": sev_names[acc["sev"]],
             "chapters": acc["chapters"],
             "chapter_count": len(acc["chapters"]),
-            "frequency": round(len(acc["chapters"]) / n, 4) if n else 0,
+            "frequency": round(len(acc["chapters"]) / n_successful_b, 4) if n_successful_b else 0,
             "prominence": _trigger_prominence(
-                sev_names[sev], len(acc["chapters"]), n),
+                sev_names[sev], len(acc["chapters"]), n_successful_b),
             "evidence": acc["evidence"],
             "evidence_verified": bool(acc["evidence"]),
             "evidence_offered": bool(acc["evidence"]),
@@ -2581,12 +2619,13 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
     if _gated_dropped:
         print(f"  Trigger gate: dropped {_gated_dropped} unsupported claim(s)")
 
-    # --- Spice: peak-chapter intensity x fraction-of-chapters (matrix) ---
-    # Triggers warn that content EXISTS; spice level measures PERVASIVENESS.
-    # A single explicit scene in a long book is not a 5.
+    # --- Spice: peak-chapter intensity x fraction-at-that-intensity (matrix) ---
+    # Triggers warn that content EXISTS; spice level measures PERVASIVENESS
+    # at the peak intensity. A single explicit scene in a long book is not
+    # a 5, even if many chapters have mild content.
     spices = [b["spice_level"] for b in chapter_bs.values() if b]
     spice_peak = max(spices) if spices else 0
-    spice_level = _spice_level_from_chapters(spices, n)
+    spice_level = _spice_level_from_chapters(spices, n_successful_b)
 
     # --- POVs: named in >=2 chapters (or >=1 if fewer than 4 chapters) ---
     pov_counts = Counter()
@@ -2745,6 +2784,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         "triggers": triggers,
         "spice_level": spice_level,
         "spice_peak": spice_peak,
+        "coverage_warning": coverage_warning,
+        "chapters_successful": n_successful_b,
+        "chapters_total": n,
         "povs": povs,
         "trope_candidates": trope_candidates,
         "trope_candidate_counts": dict(trope_counts),
@@ -5469,13 +5511,15 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                     [ch for _, ch in indexed])
 
     # Trope confirmation: frequency tiers, LLM gate only for the borderline.
-    # - 5+ chapters: auto-confirm (a recurring pattern is a trope).
-    # - 2-4 chapters: LLM gate judges against summaries.
-    # - 1 chapter: drop (not a book-level trope).
+    # Thresholds scale with book length (5% of chapters, min 3):
+    # - >= auto_min chapters: auto-confirm (a recurring pattern is a trope).
+    # - 2 to auto_min-1 chapters: LLM gate judges against summaries.
+    # - 1 chapter: drop in long books (not a book-level trope).
     tropes, trope_conf = [], {}
     if not dry_run and red["trope_candidates"]:
         counts = red["trope_candidate_counts"]
-        # Scale thresholds with book length.
+        # Scale thresholds with book length: 5% of chapters, min 3.
+        # (e.g. 73-chapter book -> 3; 100-chapter book -> 5.)
         auto_min = max(3, n // 20)  # 5% of chapters, min 3
         drop_single = n >= 20  # only drop single-chapter tropes in long books
         auto, gated, dropped = [], [], 0
