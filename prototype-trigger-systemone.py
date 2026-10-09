@@ -41,9 +41,9 @@ TEST_CASES = [
 
 def classify(base_url, model, api_key, trigger, quote, timeout=30):
     """Returns (verdict_bool, p_yes, raw_response)."""
-    definition = TRIGGER_DEFS.get(trigger, trigger)
-    req_body = {"state": quote,
-    }
+    q, yes_when, no_when = TRIGGER_DEFS.get(
+        trigger, (f"Does this depict {trigger}?", "", ""))
+    req_body = {"state": quote}
     if model:
         req_body["model"] = model
     payload = json.dumps({
@@ -51,7 +51,8 @@ def classify(base_url, model, api_key, trigger, quote, timeout=30):
         "questions": {
             "trigger_check": {
                 "type": "noul",
-                "instructions": f"Does this passage depict {definition}?",
+                "instructions": q,
+                "criteria": {"yes": yes_when, "no": no_when},
             }
         },
     }).encode()
