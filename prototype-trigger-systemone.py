@@ -58,8 +58,11 @@ def classify(base_url, model, api_key, trigger, quote, timeout=30):
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    base = base_url.rstrip('/')
+    if base.endswith('/v1'):
+        base = base[:-3]
     req = urllib.request.Request(
-        f"{base_url.rstrip('/')}/v1/systemone", data=payload, headers=headers
+        f"{base}/v1/systemone", data=payload, headers=headers
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
