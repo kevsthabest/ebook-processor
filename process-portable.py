@@ -810,6 +810,7 @@ def resolve_decision_model(provider, url_override="", config=None, env=None):
     environ = env if env is not None else os.environ
     if provider == "openrouter":
         api_key = (cfg.get("openrouter_api_key", "") or
+                   cfg.get("openrouter_key", "") or
                    environ.get("OPENROUTER_API_KEY", ""))
         if not api_key:
             raise ValueError(
