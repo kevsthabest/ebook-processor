@@ -1030,6 +1030,88 @@ def _rel_confidence_ascii(relationships):
             f"low: {counts.get('low', 0)}")
 
 
+def _matrix_snapshot_data(chapter_as, chapter_bs):
+    """Running aggregates for the live matrix viz panel. Pure function.
+
+    Returns (char_freq, spice_peak, spice_counts, rel_count):
+    - char_freq: {display_name: chapters_seen_in} (Call A characters)
+    - spice_peak: max spice_level seen so far (Call B), 0 if none
+    - spice_counts: {1: chapters>=1, 2: chapters>=2, 4: chapters>=4}
+    - rel_count: total relationships across Call A results so far
+    """
+    seen_names = {}  # norm_name -> display name (first-seen wins)
+    char_freq = Counter()
+    rel_count = 0
+    for idx in sorted(chapter_as or {}):
+        a = chapter_as[idx]
+        if not isinstance(a, dict):
+            continue
+        in_chapter = set()
+        for c in a.get("characters", []) or []:
+            nm = (c.get("name") or "").strip() if isinstance(c, dict) else ""
+            if not nm:
+                continue
+            nk = norm_name(nm)
+            if nk and nk not in seen_names:
+                seen_names[nk] = nm
+            if nk:
+                in_chapter.add(nk)
+        for nk in in_chapter:
+            char_freq[seen_names[nk]] += 1
+        rels = a.get("relationships", []) or []
+        rel_count += sum(1 for r in rels if isinstance(r, dict))
+    spice_levels = [b.get("spice_level", 0) for b in (chapter_bs or {}).values()
+                    if isinstance(b, dict)]
+    spice_peak = max(spice_levels) if spice_levels else 0
+    spice_counts = {1: sum(1 for s in spice_levels if s >= 1),
+                    2: sum(1 for s in spice_levels if s >= 2),
+                    4: sum(1 for s in spice_levels if s >= 4)}
+    return dict(char_freq), spice_peak, spice_counts, rel_count
+
+
+def _matrix_panel_lines(mx):
+    """Compact Rich-markup matrix snapshot for the viz panel. Pure.
+
+    3 lines, no Rich dependency (only uses markup strings; escaping of
+    '[' in names is done inline so this works without Rich installed).
+    """
+    mx = mx or {}
+    char_freq = mx.get("char_freq") or {}
+    top = sorted(char_freq.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    if top:
+        chars = ", ".join("%s (%d)" % (str(n).replace("[", "\\["), c)
+                          for n, c in top)
+    else:
+        chars = "\u2014"
+    sc = mx.get("spice_counts") or {}
+    return "\n".join([
+        "[dim]Top chars:[/] %s" % chars,
+        "[dim]Spice:[/] peak=%d | ch\u22651: %d, \u22652: %d, \u22654: %d"
+        % (mx.get("spice_peak") or 0, sc.get(1, 0), sc.get(2, 0),
+           sc.get(4, 0)),
+        "[dim]Rels:[/] %d" % (mx.get("rel_count") or 0),
+    ])
+
+
+def _matrix_panel_block(mx, show):
+    """Full matrix block for the viz panel, or '' when not shown. Pure."""
+    if not (mx and show):
+        return ""
+    return "\n[dim]\u2500[/]\n" + _matrix_panel_lines(mx)
+
+
+def _push_matrix_viz_ui(chapter_as, chapter_bs):
+    """Push running matrix aggregates to the Rich viz panel (--show-matrices).
+
+    Module-level so the hook sites in process_file_v2 stay one-liners.
+    No-op unless --show-matrices is set.
+    """
+    if not CONFIG.get("show_matrices"):
+        return
+    cf, sp, sc, rc = _matrix_snapshot_data(chapter_as, chapter_bs)
+    UI.update_matrix_data(cf, sp, sc, rc)
+
+
 def _filter_principals(characters, relationships, min_frequency=0.20):
     """Filter to principal characters. Returns
     (principals, minors, filtered_relationships).
@@ -3837,9 +3919,11 @@ class PipelineUI:
             # Live is never started).
             if self._viz_enabled:
                 self._layout = _RichLayout()
+                # +2 rows when matrix viz is on (separator + 3 lines - 1 for border math)
+                viz_size = 26 if getattr(self, '_show_matrices', False) else 24
                 self._layout.split_column(
                     _RichLayout(self.progress, name="bars"),
-                    _RichLayout(_VizRenderable(self), name="viz", size=24),
+                    _RichLayout(_VizRenderable(self), name="viz", size=viz_size),
                 )
                 renderable = self._layout
             else:
@@ -3938,6 +4022,9 @@ class PipelineUI:
                 "chap_total": chap_total,
                 "chap_t0": time.time(),
                 "chap_chars": len(txt),
+                # Live matrix snapshot (--show-matrices), carried over so the
+                # panel doesn't flicker to empty between chapters.
+                "matrix": prev.get("matrix"),
             }
 
     def viz_characters(self, book_key, characters):
@@ -3978,6 +4065,25 @@ class PipelineUI:
                     milestones.add(n)
                     ev.append("🎉 %d characters discovered!" % n)
             del ev[:-8]
+
+    def update_matrix_data(self, char_freq, spice_peak, spice_counts,
+                           rel_count):
+        """Store a live matrix snapshot for the viz panel (--show-matrices).
+
+        Called per chapter from process_file_v2; the Rich Live refresh
+        renders it at 4fps. Thread-safe; no-op when the viz is unusable.
+        """
+        if not self._viz_usable():
+            return
+        with self._lock:
+            if self._viz is None:
+                self._viz = _viz_new_state(None)
+            self._viz["matrix"] = {
+                "char_freq": dict(char_freq or {}),
+                "spice_peak": spice_peak or 0,
+                "spice_counts": dict(spice_counts or {}),
+                "rel_count": rel_count or 0,
+            }
 
     def _render_viz_panel(self):
         """Build the visualizer Panel. Called on each Live refresh."""
@@ -4028,6 +4134,10 @@ class PipelineUI:
         if ticker:
             tick = " • ".join(ticker[-_VIZ_TICKER_MAX:])
             body += "\n[dim]─[/]\n[dim]%s[/]" % _rich_escape(tick[:100])
+        # Live matrix snapshot (--show-matrices): top characters, spice,
+        # relationship count. Rendered at the panel's 4fps refresh.
+        body += _matrix_panel_block(st.get("matrix"),
+                                    CONFIG.get("show_matrices", False))
         ci = st.get("chap_idx")
         ct = st.get("chap_total")
         if ci and ct:
@@ -6112,6 +6222,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             else:
                 b_ok += 1
             UI.advance(_book_key)  # B unit (A already advanced above)
+        _push_matrix_viz_ui(chapter_as, chapter_bs)
     if interleave:
         done_count = 0
         for fut in as_completed(b_futs):
@@ -6130,6 +6241,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             else:
                 b_ok += 1
             UI.advance(_book_key)
+            _push_matrix_viz_ui(chapter_as, chapter_bs)
         b_pool.shutdown()
 
     # Pass 2: Call B parallel (independent per chapter; skipped if interleaved).
@@ -6155,6 +6267,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                     else:
                         b_ok += 1
                     UI.advance(_book_key)
+                    _push_matrix_viz_ui(chapter_as, chapter_bs)
         else:
             UI.set_phase(_book_key, "content")
             for i, ch in indexed:
@@ -6165,6 +6278,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                 else:
                     b_ok += 1
                 UI.advance(_book_key)
+                _push_matrix_viz_ui(chapter_as, chapter_bs)
 
     failed = a_failed + b_failed
     aborted = (a_ok == 0 and b_ok == 0) or failed / max(2 * n, 1) > MAX_FAILED_CHUNK_RATIO
@@ -7125,6 +7239,7 @@ def main():
         CONFIG["min_frequency"] = args.min_frequency
     if args.show_matrices:
         CONFIG["show_matrices"] = True
+        UI._show_matrices = True
     if args.llm:
         CONFIG["llm"] = args.llm
     if args.full:

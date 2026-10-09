@@ -3089,3 +3089,210 @@ class TestMatrixViz(unittest.TestCase):
         self.assertIn("Spice matrix", out)
         self.assertIn("Relationship confidence", out)
         self.assertIn("spice_level", red)
+
+
+class TestMatrixLiveViz(unittest.TestCase):
+    """Live matrix data in the Rich viz panel (--show-matrices)."""
+
+    def _ui_rich(self):
+        ui = pp.PipelineUI()
+        ui.rich = True  # force the rich path to exercise state logic
+        return ui
+
+    def _a(self, chars, rels=0):
+        """Fake Call A result: chars = [names], rels = count."""
+        return {"characters": [{"name": n} for n in chars],
+                "relationships": [{"from": "x", "to": "y", "type": "friend"}
+                                  for _ in range(rels)]}
+
+    def _bs(self, spice):
+        return {"spice_level": spice}
+
+    # -- _matrix_snapshot_data -------------------------------------------
+
+    def test_snapshot_empty(self):
+        cf, sp, sc, rc = pp._matrix_snapshot_data({}, {})
+        self.assertEqual(cf, {})
+        self.assertEqual(sp, 0)
+        self.assertEqual(sc, {1: 0, 2: 0, 4: 0})
+        self.assertEqual(rc, 0)
+
+    def test_snapshot_none_inputs(self):
+        cf, sp, sc, rc = pp._matrix_snapshot_data(None, None)
+        self.assertEqual(cf, {})
+        self.assertEqual(rc, 0)
+
+    def test_snapshot_aggregates(self):
+        chapter_as = {0: self._a(["Alice", "Bob"], rels=2),
+                      1: self._a(["Alice", "Zed"], rels=1),
+                      2: None}  # failed chapter skipped
+        chapter_bs = {0: self._bs(4), 1: self._bs(1)}
+        cf, sp, sc, rc = pp._matrix_snapshot_data(chapter_as, chapter_bs)
+        self.assertEqual(cf, {"Alice": 2, "Bob": 1, "Zed": 1})
+        self.assertEqual(sp, 4)
+        self.assertEqual(sc, {1: 2, 2: 1, 4: 1})
+        self.assertEqual(rc, 3)
+
+    def test_snapshot_name_normalization(self):
+        # "alice" and "Alice" count as one character (first-seen display).
+        chapter_as = {0: self._a(["Alice"]), 1: self._a(["alice"])}
+        cf, _, _, _ = pp._matrix_snapshot_data(chapter_as, {})
+        self.assertEqual(cf, {"Alice": 2})
+
+    def test_snapshot_counts_chapter_not_mentions(self):
+        # Same character twice in one chapter counts once.
+        chapter_as = {0: self._a(["Alice", "Alice"])}
+        cf, _, _, _ = pp._matrix_snapshot_data(chapter_as, {})
+        self.assertEqual(cf, {"Alice": 1})
+
+    # -- _matrix_panel_lines / _matrix_panel_block ----------------------
+
+    def _mx(self):
+        return {"char_freq": {"Alice": 12, "Bob": 10, "Zed": 8},
+                "spice_peak": 4,
+                "spice_counts": {1: 8, 2: 3, 4: 1},
+                "rel_count": 23}
+
+    def test_panel_lines_format(self):
+        out = pp._matrix_panel_lines(self._mx())
+        self.assertIn("Top chars:", out)
+        self.assertIn("Alice (12)", out)
+        self.assertIn("Bob (10)", out)
+        self.assertIn("Spice:", out)
+        self.assertIn("peak=4", out)
+        self.assertIn("Rels:", out)
+        self.assertIn("23", out)
+        # Exactly 3 lines.
+        self.assertEqual(len(out.split("\n")), 3)
+
+    def test_panel_lines_top5_truncation(self):
+        mx = {"char_freq": {f"C{i}": 10 - i for i in range(8)},
+              "spice_peak": 0, "spice_counts": {}, "rel_count": 0}
+        out = pp._matrix_panel_lines(mx)
+        self.assertIn("C0 (10)", out)
+        self.assertIn("C4 (6)", out)
+        self.assertNotIn("C5", out)
+
+    def test_panel_lines_empty(self):
+        out = pp._matrix_panel_lines(None)
+        self.assertIn("Top chars:", out)
+        self.assertIn("peak=0", out)
+        self.assertIn("Rels:", out)
+
+    def test_panel_lines_escapes_brackets(self):
+        mx = {"char_freq": {"Al[i]ce": 3}, "spice_peak": 0,
+              "spice_counts": {}, "rel_count": 0}
+        out = pp._matrix_panel_lines(mx)
+        self.assertIn("Al\\[i]ce", out)
+
+    def test_panel_block_shown(self):
+        out = pp._matrix_panel_block(self._mx(), True)
+        self.assertIn("Top chars:", out)
+        self.assertIn("Spice:", out)
+
+    def test_panel_block_hidden_without_flag(self):
+        self.assertEqual(pp._matrix_panel_block(self._mx(), False), "")
+
+    def test_panel_block_hidden_without_data(self):
+        self.assertEqual(pp._matrix_panel_block(None, True), "")
+
+    # -- UI.update_matrix_data ------------------------------------------
+
+    def test_update_matrix_data_stores(self):
+        ui = self._ui_rich()
+        ui.viz_chapter("b1", "Ch 1", "Some text here. ")
+        ui.update_matrix_data({"Alice": 5}, 4, {1: 8, 2: 3, 4: 1}, 23)
+        mx = ui._viz["matrix"]
+        self.assertEqual(mx["char_freq"], {"Alice": 5})
+        self.assertEqual(mx["spice_peak"], 4)
+        self.assertEqual(mx["spice_counts"], {1: 8, 2: 3, 4: 1})
+        self.assertEqual(mx["rel_count"], 23)
+
+    def test_update_matrix_data_noop_without_rich(self):
+        ui = pp.PipelineUI()
+        ui.rich = False
+        ui.update_matrix_data({"Alice": 5}, 4, {}, 1)
+        self.assertIsNone(ui._viz)
+
+    def test_update_matrix_data_copies_inputs(self):
+        ui = self._ui_rich()
+        cf = {"Alice": 5}
+        ui.update_matrix_data(cf, 0, {}, 0)
+        cf["Alice"] = 99  # mutating caller dict must not affect stored
+        self.assertEqual(ui._viz["matrix"]["char_freq"], {"Alice": 5})
+
+    def test_matrix_carried_across_chapters(self):
+        ui = self._ui_rich()
+        ui.viz_chapter("b1", "Ch 1", "Some text here. ")
+        ui.update_matrix_data({"Alice": 5}, 4, {1: 8, 2: 3, 4: 1}, 23)
+        ui.viz_chapter("b1", "Ch 2", "More text here. ")
+        # Carried over (not flickering to empty during the LLM call).
+        self.assertEqual(ui._viz["matrix"]["rel_count"], 23)
+
+    def test_update_matrix_data_thread_safe(self):
+        import threading
+        ui = self._ui_rich()
+        errors = []
+
+        def worker(n):
+            try:
+                for i in range(20):
+                    ui.update_matrix_data({f"C{n}": i}, n, {}, i)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(n,))
+                   for n in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertIn("matrix", ui._viz)
+
+    # -- _push_matrix_viz_ui --------------------------------------------
+
+    def test_push_noop_unless_flag_set(self):
+        old = pp.CONFIG.get("show_matrices")
+        pp.CONFIG["show_matrices"] = False
+        pushed = []
+
+        class _FakeUI:
+            def update_matrix_data(self, *a):
+                pushed.append(a)
+
+        old_ui, pp.UI = pp.UI, _FakeUI()
+        try:
+            pp._push_matrix_viz_ui({0: self._a(["Alice"])}, {})
+        finally:
+            pp.UI = old_ui
+            if old is None:
+                pp.CONFIG.pop("show_matrices", None)
+            else:
+                pp.CONFIG["show_matrices"] = old
+        self.assertEqual(pushed, [])
+
+    def test_push_calls_ui_when_flag_set(self):
+        old = pp.CONFIG.get("show_matrices")
+        pp.CONFIG["show_matrices"] = True
+        pushed = []
+
+        class _FakeUI:
+            def update_matrix_data(self, *a):
+                pushed.append(a)
+
+        old_ui, pp.UI = pp.UI, _FakeUI()
+        try:
+            pp._push_matrix_viz_ui({0: self._a(["Alice", "Bob"], rels=1)},
+                                   {0: self._bs(3)})
+        finally:
+            pp.UI = old_ui
+            if old is None:
+                pp.CONFIG.pop("show_matrices", None)
+            else:
+                pp.CONFIG["show_matrices"] = old
+        self.assertEqual(len(pushed), 1)
+        cf, sp, sc, rc = pushed[0]
+        self.assertEqual(cf, {"Alice": 1, "Bob": 1})
+        self.assertEqual(sp, 3)
+        self.assertEqual(rc, 1)
