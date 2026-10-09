@@ -52,6 +52,16 @@ TRIGGER_DEFS = {
     ),
 }
 
+# Per-trigger decision thresholds (tuned from prototype runs)
+TRIGGER_THRESHOLDS = {
+    "suicide": 0.82,
+    "sexual_violence": 0.20,
+    "child_abuse": 0.50,
+    "self_harm": 0.50,
+    "murder": 0.50,
+    "graphic_violence": 0.50,
+}
+
 TEST_CASES = [
     ("suicide", "He tied the rope around his neck and kicked the chair away.", True),
     ("suicide", "He told her he would kill himself if she left.", True),
@@ -67,6 +77,7 @@ def classify(base_url, model, api_key, trigger, quote, timeout=30):
     """Returns (verdict_bool, p_yes, raw_response)."""
     q, yes_when, no_when = TRIGGER_DEFS.get(
         trigger, (f"Does this depict {trigger}?", "", ""))
+    threshold = TRIGGER_THRESHOLDS.get(trigger, 0.5)
     req_body = {"state": quote, "model": model or "default"}
     payload = json.dumps({
         **req_body,
@@ -99,7 +110,7 @@ def classify(base_url, model, api_key, trigger, quote, timeout=30):
         if p_yes is None:
             # fallback: probabilities dict
             p_yes = ans.get("probabilities", {}).get("yes", 0)
-        verdict = p_yes >= 0.5
+        verdict = p_yes >= threshold
         return verdict, p_yes, json.dumps(ans)
     except (KeyError, TypeError):
         return None, None, f"UNEXPECTED: {json.dumps(result)[:200]}"
