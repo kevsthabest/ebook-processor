@@ -2664,3 +2664,327 @@ class TestManualAlias(unittest.TestCase):
             ln.record_alias("Loki", "")  # empty canonical
             ln.record_alias("Loki", "Loki")  # same name
             self.assertEqual(len(ln.nicknames), 0)
+
+
+class TestRelationshipValidation(unittest.TestCase):
+    """Jev validation for family-type relationships (spouse/parent/child/sibling)."""
+
+    def _make_chapter_a(self, relationships):
+        return {"characters": [], "relationships": relationships,
+                "task_status": {"identity": "ok"}}
+
+    def _rel(self, frm, to, rtype, evidence=""):
+        return {"from": frm, "to": to, "type": rtype, "evidence": evidence}
+
+    def setUp(self):
+        # Save and reset module globals.
+        self._old_validator = pp._DECISION_VALIDATOR
+        self._old_config_principals = pp.CONFIG.get("principals_only", True)
+        pp._dm_budget_reset()
+
+    def tearDown(self):
+        pp._DECISION_VALIDATOR = self._old_validator
+        pp.CONFIG["principals_only"] = self._old_config_principals
+        pp._dm_budget_reset()
+
+    def test_high_p_keeps_spouse(self):
+        class FakeValidator:
+            model = "fake"
+            def validate_relationship(self, frm, to, rtype, quote, context=""):
+                return True, 0.9
+        pp._DECISION_VALIDATOR = FakeValidator()
+        chs = [_ch(1, "A"), _ch(2, "B")]
+        chapter_as = {1: self._make_chapter_a(
+            [self._rel("Alice", "Bob", "spouse", "my wife Alice")])}
+        red = pp.v2_reduce(chapter_as, {}, {}, chs)
+        rels = [r for r in red["relationships"] if r["type"] == "spouse"]
+        self.assertEqual(len(rels), 1)
+        self.assertEqual(rels[0]["validation_p"], 0.9)
+
+    def test_low_p_downgrades_to_other(self):
+        class FakeValidator:
+            model = "fake"
+            def validate_relationship(self, frm, to, rtype, quote, context=""):
+                return False, 0.3
+        pp._DECISION_VALIDATOR = FakeValidator()
+        chs = [_ch(1, "A"), _ch(2, "B")]
+        chapter_as = {1: self._make_chapter_a(
+            [self._rel("Alice", "Bob", "spouse", "his mistress Alice")])}
+        # Write mode (preview=False): downgrades.
+        red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
+        self.assertEqual(len(red["relationships"]), 1)
+        self.assertEqual(red["relationships"][0]["type"], "other")
+        self.assertEqual(red["relationships"][0]["validation_p"], 0.3)
+        self.assertEqual(red["relationships"][0]["validation_note"], "downgraded")
+
+    def test_low_p_preview_keeps_type(self):
+        class FakeValidator:
+            model = "fake"
+            def validate_relationship(self, frm, to, rtype, quote, context=""):
+                return False, 0.3
+        pp._DECISION_VALIDATOR = FakeValidator()
+        chs = [_ch(1, "A"), _ch(2, "B")]
+        chapter_as = {1: self._make_chapter_a(
+            [self._rel("Alice", "Bob", "spouse", "his mistress Alice")])}
+        # Preview mode: records score but does NOT downgrade.
+        red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=True)
+        self.assertEqual(len(red["relationships"]), 1)
+        self.assertEqual(red["relationships"][0]["type"], "spouse")
+        self.assertEqual(red["relationships"][0]["validation_p"], 0.3)
+
+    def test_no_evidence_downgrades_without_call(self):
+        calls = []
+        class FakeValidator:
+            model = "fake"
+            def validate_relationship(self, frm, to, rtype, quote, context=""):
+                calls.append((frm, to, rtype))
+                return True, 0.95
+        pp._DECISION_VALIDATOR = FakeValidator()
+        chs = [_ch(1, "A"), _ch(2, "B")]
+        chapter_as = {1: self._make_chapter_a(
+            [self._rel("Alice", "Bob", "spouse", "")])}  # no evidence
+        red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
+        self.assertEqual(len(calls), 0)  # no API call made
+        self.assertEqual(red["relationships"][0]["type"], "other")
+        self.assertEqual(red["relationships"][0]["validation_note"], "no_evidence")
+
+    def test_non_family_not_validated(self):
+        calls = []
+        class FakeValidator:
+            model = "fake"
+            def validate_relationship(self, frm, to, rtype, quote, context=""):
+                calls.append((frm, to, rtype))
+                return False, 0.1
+        pp._DECISION_VALIDATOR = FakeValidator()
+        chs = [_ch(1, "A"), _ch(2, "B")]
+        chapter_as = {1: self._make_chapter_a(
+            [self._rel("Alice", "Bob", "friend", "good friends")])}
+        red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
+        self.assertEqual(len(calls), 0)  # friend is not validated
+        self.assertEqual(red["relationships"][0]["type"], "friend")
+        self.assertNotIn("validation_p", red["relationships"][0])
+
+    def test_validator_error_keeps_type(self):
+        class FakeValidator:
+            model = "fake"
+            def validate_relationship(self, frm, to, rtype, quote, context=""):
+                return None, None  # error
+        pp._DECISION_VALIDATOR = FakeValidator()
+        chs = [_ch(1, "A"), _ch(2, "B")]
+        chapter_as = {1: self._make_chapter_a(
+            [self._rel("Alice", "Bob", "spouse", "my wife")])}
+        red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
+        # Fail open: keep original type on validator error.
+        self.assertEqual(red["relationships"][0]["type"], "spouse")
+        self.assertEqual(red["relationships"][0]["validation_note"],
+                         "validator_error")
+
+    def test_no_validator_leaves_as_is(self):
+        pp._DECISION_VALIDATOR = None
+        chs = [_ch(1, "A"), _ch(2, "B")]
+        chapter_as = {1: self._make_chapter_a(
+            [self._rel("Alice", "Bob", "spouse", "my wife")])}
+        red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
+        self.assertEqual(red["relationships"][0]["type"], "spouse")
+        self.assertNotIn("validation_p", red["relationships"][0])
+
+
+class TestSeriesDetection(unittest.TestCase):
+    """Series name/position detection from flags, EPUB, filename, Open Library."""
+
+    def setUp(self):
+        self._old_overrides = {
+            k: pp.CONFIG.get(k) for k in
+            ("series_override", "series_position_override")}
+
+    def tearDown(self):
+        for k, v in self._old_overrides.items():
+            if v is None:
+                pp.CONFIG.pop(k, None)
+            else:
+                pp.CONFIG[k] = v
+
+    def test_filename_bracket_pattern(self):
+        name, pos = pp._parse_series_from_filename("[Daemon 02] - Freedom.epub")
+        self.assertEqual(name, "Daemon")
+        self.assertEqual(pos, 2.0)
+
+    def test_filename_paren_pattern(self):
+        name, pos = pp._parse_series_from_filename("(Daemon #2) - Freedom.epub")
+        self.assertEqual(name, "Daemon")
+        self.assertEqual(pos, 2.0)
+
+    def test_filename_decimal_position(self):
+        name, pos = pp._parse_series_from_filename("[Series 1.5] - Novella.epub")
+        self.assertEqual(name, "Series")
+        self.assertEqual(pos, 1.5)
+
+    def test_filename_no_match(self):
+        name, pos = pp._parse_series_from_filename("Just A Book.epub")
+        self.assertIsNone(name)
+        self.assertIsNone(pos)
+
+    def test_flag_overrides_all(self):
+        pp.CONFIG["series_override"] = "MySeries"
+        pp.CONFIG["series_position_override"] = 3.0
+        identifiers = {"series": "EpubSeries", "series_index": 1.0}
+        name, pos, src = pp._detect_series(
+            "[EpubSeries 01] - Book.epub", identifiers, "Book", "Author")
+        self.assertEqual(name, "MySeries")
+        self.assertEqual(pos, 3.0)
+        self.assertEqual(src, "flag")
+
+    def test_epub_metadata_second_priority(self):
+        identifiers = {"series": "EpubSeries", "series_index": 1.0}
+        name, pos, src = pp._detect_series(
+            "[Other 05] - Book.epub", identifiers, "Book", "Author")
+        self.assertEqual(name, "EpubSeries")
+        self.assertEqual(pos, 1.0)
+        self.assertEqual(src, "epub")
+
+    def test_filename_third_priority(self):
+        identifiers = {}
+        # No network: Open Library lookup would fail gracefully, but to keep
+        # the test hermetic we only assert filename parsing via _detect_series
+        # with a title that won't match (empty author short-circuits).
+        name, pos, src = pp._detect_series(
+            "[Daemon 02] - Freedom.epub", identifiers, "", "")
+        # Empty title -> OL lookup returns (None, None) without network.
+        self.assertEqual(name, "Daemon")
+        self.assertEqual(pos, 2.0)
+        self.assertEqual(src, "filename")
+
+    def test_no_series_anywhere(self):
+        identifiers = {}
+        name, pos, src = pp._detect_series("Just A Book.epub", identifiers, "", "")
+        self.assertIsNone(name)
+        self.assertIsNone(pos)
+        self.assertEqual(src, "none")
+
+    def test_series_name_key(self):
+        self.assertEqual(pp.LearnedState.series_name_key("Daemon"), "daemon")
+        self.assertEqual(pp.LearnedState.series_name_key("  The Expanse  "),
+                         "the_expanse")
+        self.assertIsNone(pp.LearnedState.series_name_key(""))
+        self.assertIsNone(pp.LearnedState.series_name_key(None))
+
+    def test_series_roster_roundtrip(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ln = pp.LearnedState(learn_dir=td, enabled=True)
+            key = ln.series_name_key("Daemon")
+            chars = [{"name": "Brian Gragg", "aliases": ["Loki"]},
+                     {"name": "Matthew Sobol", "aliases": []}]
+            ln.save_series_name_roster(key, "Freedom", "Daniel Suarez",
+                                       "9781615871100", 2.0, chars)
+            # Path format: series/{normalized}/roster.json
+            p = ln._named_series_path(key)
+            self.assertTrue(str(p).endswith("series/daemon/roster.json"))
+            self.assertTrue(p.exists())
+            hints = ln.load_series_name_hints(key)
+            self.assertEqual(hints.get("loki"), "brian gragg")
+
+    def test_series_roster_dedupes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ln = pp.LearnedState(learn_dir=td, enabled=True)
+            key = ln.series_name_key("Daemon")
+            chars = [{"name": "Brian Gragg", "aliases": []}]
+            ln.save_series_name_roster(key, "Daemon", "Daniel Suarez",
+                                       "isbn1", 1.0, chars)
+            ln.save_series_name_roster(key, "Freedom", "Daniel Suarez",
+                                       "isbn2", 2.0, chars)  # same char
+            hints = ln.load_series_name_hints(key)
+            # No aliases, so no hints — but only one character entry.
+            import json
+            with open(ln._named_series_path(key), encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(len(data["characters"]), 1)
+            self.assertEqual(len(data["books"]), 2)
+
+
+class TestPrincipalFilter(unittest.TestCase):
+    """Principal-character filter: POV, frequency, or well-connected."""
+
+    def _char(self, name, frequency=0.0, is_pov=False):
+        return {"name": name, "frequency": frequency, "is_pov": is_pov,
+                "role": "supporting"}
+
+    def _rel(self, frm, to):
+        return {"from": frm, "to": to, "type": "friend"}
+
+    def test_high_frequency_is_principal(self):
+        # 25% chapters -> principal.
+        chars = [self._char("Alice", frequency=0.25)]
+        princs, minors, rels = pp._filter_principals(chars, [])
+        self.assertEqual(len(princs), 1)
+        self.assertEqual(len(minors), 0)
+
+    def test_low_frequency_is_minor(self):
+        # 5% chapters, not POV, 1 relationship -> minor.
+        chars = [self._char("Alice", frequency=0.25),
+                 self._char("Bob", frequency=0.05)]
+        rels_in = [self._rel("Alice", "Bob")]
+        princs, minors, rels = pp._filter_principals(chars, rels_in)
+        self.assertEqual({c["name"] for c in princs}, {"Alice"})
+        self.assertEqual({c["name"] for c in minors}, {"Bob"})
+
+    def test_pov_override(self):
+        # POV in 2% of chapters -> still principal.
+        chars = [self._char("Alice", frequency=0.02, is_pov=True),
+                 self._char("Bob", frequency=0.05)]
+        princs, minors, rels = pp._filter_principals(chars, [])
+        self.assertEqual({c["name"] for c in princs}, {"Alice"})
+        self.assertEqual({c["name"] for c in minors}, {"Bob"})
+
+    def test_well_connected_promoted(self):
+        # Charlie at 5% but connected to 3 principals -> promoted.
+        chars = [self._char("A", frequency=0.3),
+                 self._char("B", frequency=0.3),
+                 self._char("C", frequency=0.3),
+                 self._char("Charlie", frequency=0.05)]
+        rels_in = [self._rel("Charlie", "A"), self._rel("Charlie", "B"),
+                   self._rel("Charlie", "C")]
+        princs, minors, rels = pp._filter_principals(chars, rels_in)
+        self.assertIn("Charlie", {c["name"] for c in princs})
+        self.assertEqual(len(minors), 0)
+
+    def test_poorly_connected_stays_minor(self):
+        # Dave at 5% with only 2 principal connections -> minor.
+        chars = [self._char("A", frequency=0.3),
+                 self._char("B", frequency=0.3),
+                 self._char("Dave", frequency=0.05)]
+        rels_in = [self._rel("Dave", "A"), self._rel("Dave", "B")]
+        princs, minors, rels = pp._filter_principals(chars, rels_in)
+        self.assertEqual({c["name"] for c in princs}, {"A", "B"})
+        self.assertEqual({c["name"] for c in minors}, {"Dave"})
+
+    def test_relationship_both_endpoints_must_be_principal(self):
+        chars = [self._char("Alice", frequency=0.3),
+                 self._char("Bob", frequency=0.05)]
+        rels_in = [self._rel("Alice", "Bob")]
+        princs, minors, rels = pp._filter_principals(chars, rels_in)
+        # Alice principal, Bob minor -> relationship dropped.
+        self.assertEqual(len(rels), 0)
+
+    def test_relationship_between_principals_kept(self):
+        chars = [self._char("Alice", frequency=0.3),
+                 self._char("Bob", frequency=0.25)]
+        rels_in = [self._rel("Alice", "Bob")]
+        princs, minors, rels = pp._filter_principals(chars, rels_in)
+        self.assertEqual(len(rels), 1)
+
+    def test_custom_min_frequency(self):
+        chars = [self._char("Alice", frequency=0.15)]
+        # Default 0.20 -> minor.
+        _, minors, _ = pp._filter_principals(chars, [], min_frequency=0.20)
+        self.assertEqual(len(minors), 1)
+        # Custom 0.10 -> principal.
+        princs, minors, _ = pp._filter_principals(chars, [], min_frequency=0.10)
+        self.assertEqual(len(princs), 1)
+
+    def test_empty_inputs(self):
+        princs, minors, rels = pp._filter_principals([], [])
+        self.assertEqual((princs, minors, rels), ([], [], []))
+        princs, minors, rels = pp._filter_principals(None, None)
+        self.assertEqual((princs, minors, rels), ([], [], []))

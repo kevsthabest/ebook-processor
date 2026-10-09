@@ -233,6 +233,7 @@ def read_opf(z):
 
     title = author = None
     identifiers = []
+    series = series_index = None
     manifest, spine = {}, []
     for e in root.iter():
         name = _local(e.tag)
@@ -242,6 +243,19 @@ def read_opf(z):
             author = e.text.strip()
         elif name == "identifier" and (e.text or "").strip():
             identifiers.append(e.text.strip())
+        elif name == "meta":
+            # Calibre series metadata: <meta name="calibre:series"
+            # content="Daemon"/> and calibre:series_index.
+            _mname = (e.attrib.get("name") or "").strip()
+            _mcontent = (e.attrib.get("content") or "").strip()
+            if _mname == "calibre:series" and _mcontent and series is None:
+                series = _mcontent
+            elif _mname == "calibre:series_index" and _mcontent \
+                    and series_index is None:
+                try:
+                    series_index = float(_mcontent)
+                except ValueError:
+                    pass
         elif name == "item" and "id" in e.attrib and "href" in e.attrib:
             manifest[e.attrib["id"]] = (e.attrib["href"], e.attrib.get("properties", ""))
         elif name == "itemref" and "idref" in e.attrib:
@@ -256,7 +270,9 @@ def read_opf(z):
         if "nav" in props.split():
             continue
         names.append(posixpath.normpath(posixpath.join(opf_dir, unquote(href.split("#")[0]))))
-    return (names or None), title, author, {"raw": identifiers}
+    return (names or None), title, author, {"raw": identifiers,
+                                           "series": series,
+                                           "series_index": series_index}
 
 
 def _clean_isbn(s):
@@ -273,9 +289,11 @@ def _clean_isbn(s):
     return None
 
 
-def _pick_identifiers(raw_list):
-    """Return {'isbn': <13-digit or None>, 'asin': <str or None>, 'raw': [...]}."""
-    out = {"isbn": None, "asin": None, "raw": list(raw_list or [])}
+def _pick_identifiers(raw_list, series=None, series_index=None):
+    """Return {'isbn': <13-digit or None>, 'asin': <str or None>, 'raw': [...],
+    'series': <str or None>, 'series_index': <float or None>}."""
+    out = {"isbn": None, "asin": None, "raw": list(raw_list or []),
+           "series": series, "series_index": series_index}
     for r in out["raw"]:
         isbn = _clean_isbn(r)
         if isbn and not out["isbn"]:
@@ -378,6 +396,92 @@ def _handle_missing_isbn(fpath):
     return False
 
 
+# --- Series detection ---
+# Priority: 1. --series/--series-position flags
+#            2. EPUB calibre:series / calibre:series_index metadata
+#            3. Filename pattern: [Series 02] - Title  or  (Series #2)
+#            4. Open Library work record (best-effort)
+_SERIES_FILENAME_RES = (
+    re.compile(r"^\[(.+?)\s+(\d+(?:\.\d+)?)\]\s*[-–:]\s*"),
+    re.compile(r"^\((.+?)\s+#(\d+(?:\.\d+)?)\)"),
+)
+
+
+def _parse_series_from_filename(fname):
+    """Extract (series_name, position) from a filename stem.
+
+    Handles '[Daemon 02] - Freedom' and '(Daemon #2) - Freedom'.
+    Returns (None, None) when no pattern matches.
+    """
+    stem = fname.stem if hasattr(fname, "stem") else str(fname).rsplit(".", 1)[0]
+    for rx in _SERIES_FILENAME_RES:
+        m = rx.match(stem.strip())
+        if m:
+            name = m.group(1).strip()
+            try:
+                pos = float(m.group(2))
+            except ValueError:
+                pos = None
+            if name:
+                return name, pos
+    return None, None
+
+
+def _lookup_series_openlibrary(title, author):
+    """Best-effort series lookup via Open Library. Returns
+    (series_name_or_None, position_or_None). Any failure returns (None, None);
+    series data in Open Library is sparse, so this is a last resort."""
+    if not title:
+        return None, None
+    try:
+        q = (f"https://openlibrary.org/search.json?title={quote(title or '', safe='')}"
+             f"&author={quote(author or '', safe='')}"
+             f"&fields=title,series&limit=1")
+        req = urllib.request.Request(q, headers={"User-Agent": "ebook-processor/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+        docs = data.get("docs") or []
+        if not docs:
+            return None, None
+        series = docs[0].get("series") or []
+        if not series:
+            return None, None
+        # series entries look like "Daemon, 2" or just "Daemon".
+        first = str(series[0]).strip()
+        m = re.match(r"^(.*?)[,:\s]+(\d+(?:\.\d+)?)$", first)
+        if m:
+            return m.group(1).strip() or None, float(m.group(2))
+        return first or None, None
+    except Exception:
+        return None, None
+
+
+def _detect_series(fpath, identifiers, title, author):
+    """Detect (series_name, position, source) by priority.
+
+    Sources: 'flag' > 'epub' > 'filename' > 'openlibrary' > 'none'.
+    identifiers may carry 'series'/'series_index' from EPUB calibre metadata.
+    """
+    # 1. CLI flags.
+    flag_name = (CONFIG.get("series_override") or "").strip()
+    if flag_name:
+        flag_pos = CONFIG.get("series_position_override")
+        return flag_name, flag_pos, "flag"
+    # 2. EPUB calibre metadata.
+    epub_series = (identifiers.get("series") or "").strip() if identifiers else ""
+    if epub_series:
+        epub_pos = identifiers.get("series_index")
+        return epub_series, epub_pos, "epub"
+    # 3. Filename pattern.
+    fn_series, fn_pos = _parse_series_from_filename(fpath.name if hasattr(fpath, "name") else fpath)
+    if fn_series:
+        return fn_series, fn_pos, "filename"
+    # 4. Open Library (best-effort, may be slow — shares the 10s timeout).
+    ol_series, ol_pos = _lookup_series_openlibrary(title, author)
+    if ol_series:
+        return ol_series, ol_pos, "openlibrary"
+    return None, None, "none"
+
 def extract_mobi_identifiers(path):
     """Read ISBN (EXTH 104) / ASIN (EXTH 113) from a MOBI/AZW3 header. Stdlib."""
     ids = {"isbn": None, "asin": None, "raw": []}
@@ -456,7 +560,9 @@ def extract_epub_units(epub_path):
                     units.append({"spine": fname, "label": label, "text": text})
             except Exception as e:
                 print(f"  Warning: {fname}: {e}")
-    return units, title, author, _pick_identifiers(opf_ids["raw"])
+    return units, title, author, _pick_identifiers(opf_ids["raw"],
+                                                 series=opf_ids.get("series"),
+                                                 series_index=opf_ids.get("series_index"))
 
 
 def extract_epub_text(epub_path):
@@ -850,6 +956,60 @@ def _rel_confidence(n_quotes, n_cooccur, rtype):
     ev_band = _rel_evidence_band(n_quotes, n_cooccur)
     type_band = _rel_type_band(rtype)
     return _REL_CONFIDENCE.get((ev_band, type_band), "low")
+
+
+def _filter_principals(characters, relationships, min_frequency=0.20):
+    """Filter to principal characters. Returns
+    (principals, minors, filtered_relationships).
+
+    A character is a principal if ANY of:
+    - is_pov is True, OR
+    - frequency >= min_frequency (default 0.20 = 20% of chapters), OR
+    - has 3+ relationships with other principals (2 iterative passes:
+      pass 1 finds frequency/POV principals, pass 2-3 promote well-connected
+      characters, so a connector between principals isn't dropped).
+
+    Relationships are kept only when BOTH endpoints are principals.
+    Pure function: no I/O, no LLM.
+    """
+    char_by_norm = {}
+    for c in characters or []:
+        nk = norm_name(c.get("name", ""))
+        if nk and nk not in char_by_norm:
+            char_by_norm[nk] = c
+
+    # Pass 1: POV or frequency.
+    principals = set()
+    for nk, c in char_by_norm.items():
+        if c.get("is_pov"):
+            principals.add(nk)
+        elif (c.get("frequency") or 0) >= min_frequency:
+            principals.add(nk)
+
+    # Passes 2-3: 3+ relationships with principals (iterative promotion).
+    adj = {}
+    for r in relationships or []:
+        a = norm_name(r.get("from", ""))
+        b = norm_name(r.get("to", ""))
+        if a and b and a != b:
+            adj.setdefault(a, set()).add(b)
+            adj.setdefault(b, set()).add(a)
+    for _ in range(2):
+        newly = {nk for nk in char_by_norm
+                 if nk not in principals
+                 and sum(1 for nb in adj.get(nk, ()) if nb in principals) >= 3}
+        if not newly:
+            break
+        principals.update(newly)
+
+    principal_chars = [c for c in (characters or [])
+                       if norm_name(c.get("name", "")) in principals]
+    minor_chars = [c for c in (characters or [])
+                   if norm_name(c.get("name", "")) not in principals]
+    filtered_rels = [r for r in (relationships or [])
+                     if norm_name(r.get("from", "")) in principals
+                     and norm_name(r.get("to", "")) in principals]
+    return principal_chars, minor_chars, filtered_rels
 
 # Relationship dedupe: exclusive types resolve by precedence (lower wins).
 # Non-exclusive types are kept as extras only with evidence.
@@ -1300,6 +1460,38 @@ class DecisionValidator:
               f"{'merge' if merged else 'keep separate'}")
         return merged, p_yes
 
+    def validate_relationship(self, from_name, to_name, rel_type, quote,
+                              context=""):
+        """Judge whether a quote supports a family relationship claim.
+
+        Used for high-stakes types (spouse/parent/child/sibling) where a
+        wrong label is embarrassing. Returns (verdict_bool, p_yes).
+        (None, None) on any error, in which case the caller keeps the
+        original type (fail open: a validator outage shouldn't rewrite data).
+        """
+        _instructions = (
+            f"Given the quote, is {from_name} the {rel_type} of {to_name}? "
+            f"Answer YES when: the quote directly states or clearly implies "
+            f"this {rel_type} relationship (e.g. 'my wife', 'his mother', "
+            f"'her brother'). "
+            f"Answer NO when: the quote is ambiguous, describes a different "
+            f"relationship (friend, lover, mistress, colleague, enemy), or "
+            f"does not support the claimed {rel_type} relationship."
+        )
+        _state = f"Quote:\n{quote}"
+        if context:
+            _state = f"Context:\n{context}\n\nQuote:\n{quote}"
+        p_yes = self._ask_noul("relationship_check", _instructions, _state,
+                               label=f"rel_{rel_type}")
+        if p_yes is None:
+            return None, None
+        verdict = p_yes >= _REL_VALIDATION_THRESHOLD
+        print(f"  Relationship validation: {from_name[:30]} -> "
+              f"{to_name[:30]} ({rel_type}): P(yes)={p_yes:.2f} "
+              f"{'≥' if verdict else '<'} {_REL_VALIDATION_THRESHOLD:.2f} → "
+              f"{'keep' if verdict else 'downgrade to other'}")
+        return verdict, p_yes
+
 
 # ---------------------------------------------------------------------------
 # Cross-run learning: the pipeline gets smarter with every book processed.
@@ -1644,6 +1836,90 @@ class LearnedState:
             os.replace(tmp, p)
         except Exception as e:
             self._warn_once(f"  Could not save series roster ({e})")
+            return
+        if added:
+            with self._lock:
+                self._new["series_chars"] += added
+
+    @staticmethod
+    def series_name_key(series_name):
+        """Bucket key for a named series (e.g. 'Daemon'). Distinct from the
+        author-based series_key(); used for cross-book character continuity
+        within a detected series."""
+        s = (series_name or "").strip().casefold()
+        if not s:
+            return None
+        return re.sub(r"\W+", "_", s)[:48].strip("_") or None
+
+    def _named_series_path(self, series_key):
+        """Path: <learn_dir>/series/{normalized}/roster.json"""
+        safe = re.sub(r"\W+", "_", series_key)[:64].strip("_") or "unknown"
+        return self.dir / "series" / safe / "roster.json"
+
+    def load_series_name_hints(self, series_key):
+        """Return {nkey: canonical_nkey} alias hints from prior books in the
+        named series. Empty dict when disabled/unknown."""
+        if not self.enabled or not series_key:
+            return {}
+        try:
+            p = self._named_series_path(series_key)
+            if not p.exists():
+                return {}
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return {}
+        hints = {}
+        for ch in data.get("characters", []):
+            canon = norm_name(ch.get("name", ""))
+            if not canon:
+                continue
+            for al in ch.get("aliases", []):
+                ak = norm_name(al)
+                if ak and ak != canon:
+                    hints.setdefault(ak, canon)
+        return hints
+
+    def save_series_name_roster(self, series_key, title, author, isbn,
+                                series_position, characters):
+        """Persist this book's roster into the named-series bucket."""
+        if not self.enabled or not series_key:
+            return
+        try:
+            p = self._named_series_path(series_key)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            data = {}
+            if p.exists():
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+        except Exception:
+            data = {}
+        data.setdefault("characters", [])
+        data.setdefault("books", [])
+        data["series"] = series_key
+        seen = {norm_name(c.get("name", "")) for c in data["characters"]}
+        added = 0
+        for c in characters or []:
+            nk = norm_name(c.get("name", ""))
+            if not nk or nk in seen:
+                continue
+            seen.add(nk)
+            aliases = sorted({a for a in (c.get("aliases") or [])
+                              if a and norm_name(a) != nk})
+            data["characters"].append({"name": c.get("name", ""),
+                                       "aliases": aliases})
+            added += 1
+        if isbn and not any(b.get("isbn") == isbn for b in data["books"]):
+            data["books"].append({"isbn": isbn, "title": title,
+                                  "position": series_position})
+        # Atomic write.
+        try:
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, p)
+        except Exception as e:
+            self._warn_once(f"  Could not save named-series roster ({e})")
             return
         if added:
             with self._lock:
@@ -2403,10 +2679,13 @@ def post_pass_merge(roster, validator=None):
             _sig = _merge_pair_signal(ka, kb)
             if _sig:
                 _cands.append((_sig, ka, kb))
-    # Strongest signals first; cap total decision-model calls.
+    # Strongest signals first; cap total decision-model calls via the shared
+    # per-book budget (relationship validation later draws from the same pool).
     _cands.sort(key=lambda x: -x[0])
-    _over_cap = _cands[_MERGE_TIER3_CAP:]
-    _cands = _cands[:_MERGE_TIER3_CAP]
+    _in_budget, _over_cap = [], []
+    for _c in _cands:
+        (_in_budget if _dm_budget_claim(1) else _over_cap).append(_c)
+    _cands = _in_budget
     # Pairs beyond the cap are listed for manual review, not silently dropped.
     for _sig, ka, kb in _over_cap:
         if ka not in roster or kb not in roster:
@@ -2552,11 +2831,14 @@ def _is_minor(role, description):
     return bool(_MINOR_RE.search(text))
 
 
-def v2_reduce(chapter_as, chapter_bs, roster, chapters):
+def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False):
     """Deterministic reduce over per-chapter v2 results. Pure code, no LLM.
 
     chapter_as/bs: {chapter_index: result or None}. Returns a result dict
     shaped for write_claims()/save_preview()/resolve_work()/dedupe_characters().
+
+    preview: when True, decision-model validation scores are recorded but
+    low-confidence family relationships are NOT downgraded (audit only).
     """
     n = len(chapters)
     idx_to_label = {c["index"]: c["label"] for c in chapters}
@@ -2720,6 +3002,42 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         _co = len(_pair_chapters.get(_pk, set()))
         # 1 chapter = 1, ~20% of book = 5
         rel["importance"] = max(1, min(5, round(1 + 4 * _co / max(1, _n_chapters * 0.2))))
+
+    # --- Family relationship validation (decision model) ---
+    # High-stakes types (spouse/parent/child/sibling): the claim is judged
+    # against its evidence quote. Low P or no evidence -> downgrade to
+    # "other" (the relationship exists; we're just unsure of the type).
+    # In preview mode the score is recorded but the type is NOT changed.
+    # Draws from the shared per-book decision-model budget (merges first).
+    for rel in relationships:
+        _rt = rel.get("type", "")
+        if _rt not in _REL_FAMILY_TYPES:
+            continue
+        _ev = (rel.get("evidence") or "").strip()
+        if not _ev:
+            # No evidence: downgrade without spending a decision-model call.
+            rel["validation_p"] = None
+            rel["validation_note"] = "no_evidence"
+            if not preview:
+                rel["type"] = "other"
+            continue
+        if _DECISION_VALIDATOR is None:
+            continue  # no validator configured; leave as-is
+        if not _dm_budget_claim(1):
+            rel["validation_note"] = "budget_exhausted"
+            continue
+        _v, _p = _DECISION_VALIDATOR.validate_relationship(
+            rel["from"], rel["to"], _rt, _ev)
+        if _p is None:
+            # Validator error: fail open, keep the original type.
+            rel["validation_note"] = "validator_error"
+            continue
+        rel["validation_p"] = round(_p, 4)
+        rel["validation_model"] = _DECISION_VALIDATOR.model
+        if not _v:
+            rel["validation_note"] = "downgraded"
+            if not preview:
+                rel["type"] = "other"
 
     # --- Triggers: max severity per category, chapter counts, top evidence ---
     trig_acc = {c: {"sev": 0, "chapters": [], "evidence": []}
@@ -4667,6 +4985,37 @@ _COMMON_NICKNAMES = {
 _MERGE_P_YES_THRESHOLD = 0.85
 # Safety cap on Tier 3 decision-model calls per book.
 _MERGE_TIER3_CAP = 50
+# Decision-model relationship validation threshold (family types only).
+# Lower than the merge threshold: a wrong relationship type is embarrassing
+# but doesn't corrupt the roster permanently.
+_REL_VALIDATION_THRESHOLD = 0.70
+# Family relationship types validated by the decision model. High-stakes:
+# being wrong about spouse/parent/child/sibling is worse than being wrong
+# about friend/enemy/colleague.
+_REL_FAMILY_TYPES = frozenset({"spouse", "parent", "child", "sibling"})
+
+# Shared decision-model call budget per book (merges + relationship
+# validation draw from the same pool; merges run first so they get priority).
+_DM_BUDGET_LOCK = threading.Lock()
+_DM_BUDGET_USED = 0
+
+
+def _dm_budget_reset():
+    """Reset the per-book decision-model call budget. Call at book start."""
+    global _DM_BUDGET_USED
+    with _DM_BUDGET_LOCK:
+        _DM_BUDGET_USED = 0
+
+
+def _dm_budget_claim(n=1):
+    """Claim n decision-model calls from the shared per-book budget.
+    Returns True if claimed, False if the budget is exhausted."""
+    global _DM_BUDGET_USED
+    with _DM_BUDGET_LOCK:
+        if _DM_BUDGET_USED + n > _MERGE_TIER3_CAP:
+            return False
+        _DM_BUDGET_USED += n
+        return True
 
 
 def _strip_merge_noise(nkey):
@@ -5287,10 +5636,16 @@ def write_claims(work_id, result, trope_mappings=None):
         if r is None:
             errors += 1
 
-    # POVs, quotes -> book_meta.data (merge with existing)
+    # POVs, quotes, series -> book_meta.data (merge with existing)
     meta_updates = {}
     if result.get("povs"):
         meta_updates["povs"] = result["povs"]
+    if result.get("series_name"):
+        meta_updates["series_name"] = result["series_name"]
+    if result.get("series_position") is not None:
+        meta_updates["series_position"] = result["series_position"]
+    if result.get("series_source"):
+        meta_updates["series_source"] = result["series_source"]
     quotes = [{"text": q["text"], "chapter": q.get("chapter", "")}
               for q in result.get("quotes", []) if q.get("text")]
     if quotes:
@@ -5571,6 +5926,16 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     _isbn, _isbn_source = _resolve_book_isbn(identifiers, title, author)
     if _isbn_source == "none" and not _handle_missing_isbn(fpath):
         return False
+    # Reset the per-book decision-model call budget (merges + relationship
+    # validation share it; merges run first).
+    _dm_budget_reset()
+    # Series detection: --series flag > EPUB calibre metadata > filename
+    # pattern > Open Library. Used for cross-book character continuity.
+    _series_name, _series_pos, _series_source = _detect_series(
+        fpath, identifiers, title, author)
+    if _series_name:
+        _pos_str = f" #{_series_pos:g}" if _series_pos is not None else ""
+        UI.status(f"  Series: {_series_name}{_pos_str} (from {_series_source})")
     # Cross-run learning: stash per-book context for _roster_update hooks.
     _ln_book = _learn()
     _learn_isbn = identifiers.get("isbn") or identifiers.get("asin")
@@ -5579,8 +5944,18 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     _DIAG.book_author = author
     _learn_skey = _ln_book.series_key(author) if _ln_book.enabled else None
     _DIAG.learn_series_key = _learn_skey
-    _DIAG.learn_series_hints = (_ln_book.load_series_hints(_learn_skey)
-                                if _learn_skey else {})
+    _learn_hints = (_ln_book.load_series_hints(_learn_skey)
+                    if _learn_skey else {})
+    # Series-specific roster (in addition to author roster): when the series
+    # is known, prior books in the same series contribute alias hints.
+    _learn_series_name_key = (_ln_book.series_name_key(_series_name)
+                              if (_ln_book.enabled and _series_name) else None)
+    _DIAG.learn_series_name_key = _learn_series_name_key
+    if _learn_series_name_key:
+        _series_hints = _ln_book.load_series_name_hints(_learn_series_name_key)
+        # Series hints win on conflict (more specific than author-level).
+        _learn_hints = {**_learn_hints, **_series_hints}
+    _DIAG.learn_series_hints = _learn_hints
     UI.status(f"  Title: {title or fpath.stem}, "
               f"Chars: {sum(len(c['text']) for c in chapters):,}")
     if identifiers.get("isbn"):
@@ -5727,7 +6102,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
 
     # Deterministic reduce (no LLM).
     red = v2_reduce(chapter_as, chapter_bs, roster,
-                    [ch for _, ch in indexed])
+                    [ch for _, ch in indexed], preview=preview)
 
     # Trope confirmation: frequency tiers, LLM gate only for the borderline.
     # Thresholds scale with book length (5% of chapters, min 3):
@@ -5794,6 +6169,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "file": fpath.name, "title": title or fpath.stem, "author": author,
         "isbn": identifiers.get("isbn"), "asin": identifiers.get("asin"),
         "isbn_source": _isbn_source,  # "flag" | "epub" | "openlibrary" | "none"
+        "series_name": _series_name, "series_position": _series_pos,
+        "series_source": _series_source,  # "flag"|"epub"|"filename"|"openlibrary"|"none"
         "word_count": word_count, "reading_time_mins": reading_mins,
         "chunks": n, "chunks_failed": a_failed,
         "pipeline": "v2",
@@ -5874,6 +6251,24 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         print(f"  Dedup: {n_before} -> {len(d_chars)} characters "
               f"({len(dreport)} clusters merged)")
 
+    # Principal filter (default on): keep only significant characters.
+    # Non-principals are preserved in result["minor_characters"] for
+    # reference; only principals go to Supabase. The series roster below
+    # still receives the FULL list (a minor here may recur later).
+    _full_characters = result["characters"]
+    _full_relationships = result["relationships"]
+    result["minor_characters"] = []
+    if CONFIG.get("principals_only", True):
+        _min_freq = CONFIG.get("min_frequency", 0.20)
+        _princs, _minors, _prels = _filter_principals(
+            _full_characters, _full_relationships, _min_freq)
+        result["characters"] = _princs
+        result["relationships"] = _prels
+        result["minor_characters"] = _minors
+        print(f"  Principals: {len(_princs)}/{len(_full_characters)} characters, "
+              f"{len(_prels)}/{len(_full_relationships)} relationships "
+              f"(min_frequency={_min_freq})")
+
     # Cross-run learning: persist series roster + learned state. Runs in
     # preview/dry-run too (learning from a preview is the point).
     _ln_end = _learn()
@@ -5883,7 +6278,15 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             _ln_end.save_series_roster(
                 _skey, title, author,
                 getattr(_DIAG, "learn_isbn", None),
-                result.get("characters"))
+                _full_characters)
+        # Named-series roster (in addition to author roster): cross-book
+        # character continuity within a detected series.
+        _snkey = getattr(_DIAG, "learn_series_name_key", None)
+        if _snkey:
+            _ln_end.save_series_name_roster(
+                _snkey, title, author,
+                getattr(_DIAG, "learn_isbn", None),
+                _series_pos, _full_characters)
         _ln_end.save()
         _lsummary = _ln_end.pop_summary()
         if _lsummary:
@@ -5932,6 +6335,8 @@ def process_file(fpath, dry_run=False, preview=False):
     _isbn, _isbn_source = _resolve_book_isbn(identifiers, title, author)
     if _isbn_source == "none" and not _handle_missing_isbn(fpath):
         return False
+    _series_name, _series_pos, _series_source = _detect_series(
+        fpath, identifiers, title, author)
     if identifiers.get("isbn"):
         print(f"  ISBN: {identifiers['isbn']}")
     elif identifiers.get("asin"):
@@ -6088,6 +6493,8 @@ def process_file(fpath, dry_run=False, preview=False):
         "file": fpath.name, "title": title or fpath.stem, "author": author,
         "isbn": identifiers.get("isbn"), "asin": identifiers.get("asin"),
         "isbn_source": _isbn_source,  # "flag" | "epub" | "openlibrary" | "none"
+        "series_name": _series_name, "series_position": _series_pos,
+        "series_source": _series_source,
         "word_count": word_count, "reading_time_mins": reading_mins,
         "chunks": n, "chunks_failed": failed,
         "tropes": tropes, "trope_confidence": trope_conf,
@@ -6157,6 +6564,20 @@ def process_file(fpath, dry_run=False, preview=False):
               f"({len(dreport)} clusters merged)")
         for m in dreport:
             print(f"    = {m['canonical']} <- {', '.join(m['merged'])}")
+
+    # Principal filter (default on): keep only significant characters.
+    # Non-principals are preserved in result["minor_characters"] for reference.
+    result["minor_characters"] = []
+    if CONFIG.get("principals_only", True):
+        _min_freq = CONFIG.get("min_frequency", 0.20)
+        _princs, _minors, _prels = _filter_principals(
+            result["characters"], result["relationships"], _min_freq)
+        print(f"  Principals: {len(_princs)}/{len(result['characters'])} characters, "
+              f"{len(_prels)}/{len(result['relationships'])} relationships "
+              f"(min_frequency={_min_freq})")
+        result["characters"] = _princs
+        result["relationships"] = _prels
+        result["minor_characters"] = _minors
     if is_anth:
         print(f"  Anthology with {len(stories)} stories")
     if failed:
@@ -6214,6 +6635,13 @@ def save_preview(fpath, result):
         md.append(f"**ASIN:** {result['asin']} (no ISBN in file)")
     else:
         md.append("**ISBN:** not found — work matched by title/author only")
+    if result.get("series_name"):
+        _spos = result.get("series_position")
+        _spos_str = f" #{_spos:g}" if _spos is not None else ""
+        _ssrc = result.get("series_source", "")
+        _ssrc_tag = {"flag": " (--series override)", "epub": " (EPUB metadata)",
+                     "filename": " (filename)", "openlibrary": " (Open Library)"}.get(_ssrc, "")
+        md.append(f"**Series:** {result['series_name']}{_spos_str}{_ssrc_tag}")
     how = result.get("work_resolution", "?")
     if how == "new":
         md.append("**Work:** NO MATCH — new work would be created")
@@ -6271,11 +6699,24 @@ def save_preview(fpath, result):
         elif c.get("evidence_offered"):
             md.append("> *offered evidence failed verification — dropped*")
         md.append("")
+    _minors = result.get("minor_characters") or []
+    if _minors:
+        md.append(f"## Minor characters ({len(_minors)}) — below principal threshold")
+        for c in _minors:
+            md.append(f"- {c['name']} ({c.get('role') or 'unknown'})")
+        md.append("")
     if result["relationships"]:
         md.append(f"## Relationships ({len(result['relationships'])})")
         for r in result["relationships"]:
             _conf = r.get("confidence", "")
             _conf_str = f" ({_conf} confidence)" if _conf else ""
+            _vp = r.get("validation_p")
+            if _vp is not None:
+                _conf_str += f" [validated P={_vp:.2f}]"
+            elif r.get("validation_note") == "downgraded":
+                _conf_str += " [downgraded: low validation]"
+            elif r.get("validation_note") == "no_evidence":
+                _conf_str += " [downgraded: no evidence]"
             md.append(f"- {r['from']} → {r['to']}: {r['type']}{_conf_str}")
         md.append("")
     if result["quotes"]:
@@ -6414,6 +6855,21 @@ def main():
     ap.add_argument("--alias", metavar="A=B", action="append", default=[],
                     help="manual character alias: 'Loki=Brian Gragg' merges them. "
                          "Repeatable. Stored as human-validated, applies cross-book.")
+    ap.add_argument("--series", metavar="NAME", default="",
+                    help="override series name for this book (e.g. 'Daemon'); "
+                         "takes priority over EPUB metadata, filename, and lookup")
+    ap.add_argument("--series-position", metavar="N", type=float, default=None,
+                    help="override series position (e.g. 2 or 2.5)")
+    ap.add_argument("--principals-only", dest="principals_only",
+                    action="store_true", default=True,
+                    help="write only principal characters to Supabase "
+                         "(default on; minors kept in preview JSON)")
+    ap.add_argument("--no-principals-only", dest="principals_only",
+                    action="store_false",
+                    help="disable the principal filter; write all characters")
+    ap.add_argument("--min-frequency", metavar="F", type=float, default=0.20,
+                    help="minimum chapter frequency for principal status "
+                         "(default 0.20)")
     ap.add_argument("--allow-no-isbn", action="store_true",
                     help="process books without ISBN instead of skipping them "
                          "(default is to skip with a message)")
@@ -6567,6 +7023,16 @@ def main():
         CONFIG["allow_no_isbn"] = True
     if args.rename_no_isbn:
         CONFIG["rename_no_isbn"] = True
+    if args.series:
+        CONFIG["series_override"] = args.series.strip()
+        print(f"Series override: {CONFIG['series_override']}")
+    if args.series_position is not None:
+        CONFIG["series_position_override"] = args.series_position
+        print(f"Series position override: {args.series_position:g}")
+    if not args.principals_only:
+        CONFIG["principals_only"] = False
+    if args.min_frequency != 0.20:
+        CONFIG["min_frequency"] = args.min_frequency
     if args.llm:
         CONFIG["llm"] = args.llm
     if args.full:
