@@ -771,7 +771,10 @@ def _roster_update(roster, characters, chapter_idx):
         if not nkey:
             continue
         if not _is_person_like(name):
-            continue  # Skip groups/organizations/places misclassified as characters
+            # Skip groups/organizations/places misclassified as characters
+            UI.viz_event(getattr(_DIAG, "viz_book_key", None),
+                         '✗ Filtered: "%s" (not a person)' % name[:40])
+            continue
         alias_keys = {norm_name(a) for a in c.get("aliases", [])
                       if _is_valid_alias(a)}
         alias_keys.discard("")
@@ -808,7 +811,16 @@ def _roster_update(roster, characters, chapter_idx):
                             "roles": Counter(), "descriptions": []}
             found = nkey
             primaries[nkey] = nkey
+            UI.viz_event(getattr(_DIAG, "viz_book_key", None),
+                         "+ New: %s" % name[:40])
+            _is_new_variant = False
+        else:
+            # Log only genuinely new name variants (not routine re-appearances).
+            _is_new_variant = nkey not in roster[found].get("primary_keys", set())
         e = roster[found]
+        if _is_new_variant:
+            UI.viz_event(getattr(_DIAG, "viz_book_key", None),
+                         "→ Merged: %s → %s" % (name[:30], e["name"][:30]))
         e["appearances"] += 1
         e["last_seen"] = chapter_idx
         e["chapters"].add(chapter_idx)
@@ -1869,16 +1881,34 @@ try:
     from rich.table import Table as _RichTable
     from rich import box as _rich_box
     from rich.markup import escape as _rich_escape
+    from rich.panel import Panel as _RichPanel
+    from rich.layout import Layout as _RichLayout
+    from rich.live import Live as _RichLive
     _HAS_RICH = True
 except ImportError:
     _HAS_RICH = False
+
+
+class _VizRenderable:
+    """Rich renderable for the chapter visualizer panel.
+
+    Reads live state from the owning PipelineUI on each refresh. The scan
+    marker position is derived from wall-clock time, so it animates with the
+    Live's regular refresh cycle (no timer thread needed).
+    """
+    def __init__(self, ui):
+        self._ui = ui
+
+    def __rich_console__(self, console, options):
+        yield self._ui._render_viz_panel()
 
 
 class PipelineUI:
     """Terminal UI for the pipeline.
 
     Rich mode: live progress bars (one per book, thread-safe for --jobs),
-    status messages above the bars, summary tables on completion.
+    a chapter visualizer panel below the bars, status messages above,
+    summary tables on completion.
     Fallback: plain prints, same information, no dependencies.
     """
     def __init__(self):
@@ -1888,9 +1918,21 @@ class PipelineUI:
         self.tasks = {}  # book_key -> task_id
         self._labels = {}  # book_key -> base label (unescaped)
         self._lock = threading.Lock()
+        # Chapter visualizer: single panel, most recently active book.
+        self._viz_enabled = True  # flipped by --no-viz
+        self._viz = None  # {book, label, text, names, events, t0}
+        self._live = None
+        self._layout = None
+
+    def set_viz_enabled(self, enabled):
+        """Enable/disable the chapter visualizer panel (--no-viz)."""
+        self._viz_enabled = bool(enabled)
+
+    def _viz_usable(self):
+        return self.rich and self._viz_enabled
 
     def start(self):
-        if self.rich and self.progress is None:
+        if self.rich and self._live is None:
             self.progress = _RichProgress(
                 _RichText("[bold cyan]{task.description}"),
                 _RichBar(bar_width=30),
@@ -1899,14 +1941,35 @@ class PipelineUI:
                 console=self.console,
                 transient=False,
             )
-            self.progress.start()
+            # Single Live drives both the progress bars and the visualizer
+            # panel (Progress is rendered as a layout child; its internal
+            # Live is never started).
+            if self._viz_enabled:
+                self._layout = _RichLayout()
+                self._layout.split_column(
+                    _RichLayout(self.progress, name="bars"),
+                    _RichLayout(_VizRenderable(self), name="viz", size=22),
+                )
+                renderable = self._layout
+            else:
+                renderable = self.progress
+            self._live = _RichLive(renderable, console=self.console,
+                                   refresh_per_second=4, transient=False)
+            self._live.start()
 
     def stop(self):
-        if self.progress:
-            self.progress.stop()
-            self.progress = None
-            self.tasks = {}
-            self._labels = {}
+        if self._live:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+            self._live = None
+            self._layout = None
+        self.progress = None
+        self.tasks = {}
+        self._labels = {}
+        with self._lock:
+            self._viz = None
 
     def book_start(self, book_key, label, total):
         """Register a book; returns nothing. total = work units."""
@@ -1957,6 +2020,83 @@ class PipelineUI:
                         self.progress.remove_task(tid)
                     except KeyError:
                         pass
+
+    def viz_chapter(self, book_key, chapter_label, text):
+        """Start visualizing a chapter (call at the start of Call A)."""
+        if not self._viz_usable():
+            return
+        with self._lock:
+            prev_events = self._viz["events"][-8:] if self._viz else []
+            self._viz = {
+                "book": book_key,
+                "label": chapter_label or "",
+                "text": (text or "")[:800],
+                "names": [],
+                "events": prev_events,
+                "t0": time.time(),
+            }
+
+    def viz_characters(self, book_key, characters):
+        """Highlight identified names after Call A returns."""
+        if not self._viz_usable():
+            return
+        names = []
+        for c in (characters or []):
+            n = (c.get("name") or "").strip()
+            if n:
+                names.append(n)
+        with self._lock:
+            if self._viz is None:
+                self._viz = {"book": book_key, "label": "", "text": "",
+                             "names": [], "events": [], "t0": time.time()}
+            self._viz["book"] = book_key
+            self._viz["names"] = names
+
+    def viz_event(self, book_key, msg):
+        """Append a line to the roster event feed."""
+        if not self._viz_usable():
+            return
+        with self._lock:
+            if self._viz is None:
+                self._viz = {"book": book_key, "label": "", "text": "",
+                             "names": [], "events": [], "t0": time.time()}
+            self._viz["book"] = book_key
+            ev = self._viz["events"]
+            ev.append(msg)
+            del ev[:-8]
+
+    def _render_viz_panel(self):
+        """Build the visualizer Panel. Called on each Live refresh."""
+        with self._lock:
+            st = None
+            events = []
+            if self._viz is not None:
+                st = dict(self._viz)
+                events = list(st.get("events", []))
+        if not st or not st.get("text"):
+            return _RichPanel("[dim]— visualizer idle —[/]",
+                              title="🔍 Chapter visualizer",
+                              border_style="dim blue")
+        lines = st["text"].split("\n")
+        # Scan marker advances every ~0.5s through the viewport lines.
+        scan = int((time.time() - st["t0"]) * 2) % max(1, len(lines))
+        names = sorted(set(st.get("names", ())), key=len, reverse=True)
+        pat = "|".join(re.escape(nm) for nm in names) if names else None
+        out = []
+        for idx, ln in enumerate(lines[:13]):
+            ln = _rich_escape(ln[:110])
+            if pat:
+                ln = re.sub(r"\b(%s)\b" % pat, r"[bold yellow]\1[/]", ln,
+                            flags=re.IGNORECASE)
+            marker = "[dim]▸ [/]" if idx == scan else "  "
+            out.append(marker + ln)
+        body = "\n".join(out)
+        if events:
+            body += "\n[dim]─[/]\n" + "\n".join(
+                _rich_escape(e) for e in events[-8:])
+        title = "🔍 %s" % (st.get("label") or "chapter")
+        return _RichPanel(body, title=_rich_escape(title[:58]),
+                          border_style="dim blue")
 
     def summary(self, title, rows):
         """Print a summary table. rows = [(metric, value), ...]."""
@@ -3687,6 +3827,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if interleave:
         b_pool = ThreadPoolExecutor(max_workers=batch_size)
     UI.set_phase(_book_key, "characters")
+    _DIAG.viz_book_key = _book_key  # for viz_event in _roster_update
     for i, ch in indexed:
         if _CANCEL.is_set():
             UI.status(f"  Cancelled during chapter {i}/{n}")
@@ -3694,6 +3835,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                 b_pool.shutdown(wait=False, cancel_futures=True)
             UI.book_done(_book_key)
             return False
+        UI.viz_chapter(_book_key, ch["label"], ch["text"])
         a, fell_back = v2_call_a(call, roster, ch, n)
         chapter_as[i] = a
         if a is None:
@@ -3702,6 +3844,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             a_ok += 1
             if fell_back:
                 a_fallback += 1
+        UI.viz_characters(_book_key, a.get("characters", []) if a else [])
         UI.advance(_book_key)
         if interleave:
             b_futs[b_pool.submit(v2_call_b, call, ch, n)] = i
@@ -4422,6 +4565,8 @@ def main():
                          "(chapter-level map/reduce with character roster)")
     ap.add_argument("--debug", action="store_true",
                     help="save raw LLM output of failed chunks to preview/debug/")
+    ap.add_argument("--no-viz", action="store_true",
+                    help="disable the chapter visualizer panel in the Rich TUI")
     ap.add_argument("--dedupe", action="store_true",
                     help="merge duplicate characters (name normalization + "
                          "embeddings) before writing; needs embed_url/embed_model")
@@ -4469,6 +4614,8 @@ def main():
         CONFIG["v2_shared_system"] = True
     if args.task_last:
         CONFIG["v2_task_last"] = True
+    if args.no_viz:
+        UI.set_viz_enabled(False)
 
     if args.llm:
         CONFIG["llm"] = args.llm
