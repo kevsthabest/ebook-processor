@@ -86,6 +86,7 @@ DEFAULT_CONFIG = {
     "supabase_url": "",
     "supabase_key": "",
     "openrouter_key": "",
+    "openrouter_api_key": "",  # decision-model key for provider 'openrouter' (or OPENROUTER_API_KEY env)
     "ollama_host": "http://localhost:11434",
     "ollama_model": "qwen2.5:7b-instruct",
     "import_dir": str(SCRIPT_DIR / "import"),
@@ -787,6 +788,45 @@ def _extract_quote_context(chapter_text, quote, window=300):
     return norm_text[start:end]
 
 
+# ---------------------------------------------------------------------------
+# Decision-model providers: local Unsloth server vs hosted OpenRouter.
+# ---------------------------------------------------------------------------
+DECISION_MODEL_PROVIDERS = ("local", "openrouter")
+OPENROUTER_SYSTEMONE_URL = "https://openrouter.ai/api/v1/systemone"
+# Pinned Jev release; never the "latest" alias (silent upstream changes
+# would shift scores and invalidate tuned thresholds).
+OPENROUTER_DECISION_MODEL = "typesafe/jev-1.13"
+OPENROUTER_ATTRIBUTION_TITLE = "ebook-processor"
+
+
+def resolve_decision_model(provider, url_override="", config=None, env=None):
+    """Resolve decision-model connection details for the given provider.
+
+    Returns (endpoint, model, api_key, extra_headers). Raises ValueError
+    with a human-readable message when the provider cannot be configured
+    (e.g. missing API key). The key is never logged or printed.
+    """
+    cfg = config or {}
+    environ = env if env is not None else os.environ
+    if provider == "openrouter":
+        api_key = (cfg.get("openrouter_api_key", "") or
+                   environ.get("OPENROUTER_API_KEY", ""))
+        if not api_key:
+            raise ValueError(
+                "decision-model provider 'openrouter' needs an API key: "
+                "set \"openrouter_api_key\" in config.json or the "
+                "OPENROUTER_API_KEY environment variable")
+        return (OPENROUTER_SYSTEMONE_URL, OPENROUTER_DECISION_MODEL,
+                api_key, {"X-Title": OPENROUTER_ATTRIBUTION_TITLE})
+    # local (default): Unsloth /v1/systemone, e.g. Laya
+    base_url = url_override or cfg.get("openai_base_url", "") or ""
+    if not base_url:
+        raise ValueError(
+            "decision-model provider 'local' needs a base URL: pass "
+            "--decision-model-url or set \"openai_base_url\" in config.json")
+    return (base_url, "default", "", {})
+
+
 class DecisionValidator:
     """Validates trigger evidence via a /v1/systemone decision model.
 
@@ -796,7 +836,8 @@ class DecisionValidator:
     back to the regex gates.
     """
 
-    def __init__(self, base_url, model="default", api_key="", timeout=30):
+    def __init__(self, base_url, model="default", api_key="", timeout=30,
+                 extra_headers=None):
         base = base_url.rstrip("/")
         if base.endswith("/v1/systemone"):
             base = base[:-len("/v1/systemone")]
@@ -805,6 +846,7 @@ class DecisionValidator:
         self.endpoint = base + "/v1/systemone"
         self.model = model or "default"
         self.api_key = api_key
+        self.extra_headers = dict(extra_headers or {})
         self.timeout = timeout
         self._lock = threading.Lock()
         self._consec_errors = 0
@@ -868,6 +910,7 @@ class DecisionValidator:
             },
         }).encode()
         headers = {"Content-Type": "application/json"}
+        headers.update(self.extra_headers)
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         try:
@@ -5492,6 +5535,12 @@ def main():
     ap.add_argument("--decision-model", action="store_true",
                     help="enable decision-model trigger validation using the "
                          "configured openai_base_url (same Unsloth server)")
+    ap.add_argument("--decision-model-provider",
+                    choices=["local", "openrouter"], default="local",
+                    help="decision-model backend: 'local' Unsloth server "
+                         "(default) or 'openrouter' hosted Jev (needs "
+                         "openrouter_api_key in config.json or "
+                         "OPENROUTER_API_KEY env)")
     ap.add_argument("--dedupe", action="store_true",
                     help="merge duplicate characters (name normalization + "
                          "embeddings) before writing; needs embed_url/embed_model")
@@ -5551,12 +5600,29 @@ def main():
         CONFIG["v2_task_last"] = True
     if args.no_viz:
         UI.set_viz_enabled(False)
-    _dm_url = args.decision_model_url or (CONFIG.get("openai_base_url", "")
-                                           if args.decision_model else "")
-    if _dm_url:
+    _dm_enabled = bool(args.decision_model or args.decision_model_url
+                       or args.decision_model_provider == "openrouter")
+    if _dm_enabled and args.decision_model_provider == "openrouter" \
+            and args.decision_model_url:
+        print("  Warning: --decision-model-url is ignored with provider "
+              "'openrouter' (endpoint is fixed)")
+    if _dm_enabled:
+        try:
+            _dm_endpoint, _dm_model, _dm_key, _dm_headers = \
+                resolve_decision_model(
+                    args.decision_model_provider,
+                    args.decision_model_url, CONFIG)
+        except ValueError as e:
+            print(f"  Error: {e}")
+            return
         global _DECISION_VALIDATOR
-        _DECISION_VALIDATOR = DecisionValidator(_dm_url)
-        print(f"  Decision model trigger validation: {_dm_url}")
+        _DECISION_VALIDATOR = DecisionValidator(
+            _dm_endpoint, model=_dm_model, api_key=_dm_key,
+            extra_headers=_dm_headers)
+        # Never print the API key.
+        print(f"  Decision model trigger validation: "
+              f"provider={args.decision_model_provider} "
+              f"endpoint={_dm_endpoint} model={_dm_model}")
 
     # Cross-run learning state (shared across --jobs threads).
     global _LEARNED

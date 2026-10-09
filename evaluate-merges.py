@@ -10,10 +10,38 @@ Reports accuracy, precision, recall, and per-threshold analysis.
 
 import argparse
 import json
+import os
+import sys
 import urllib.request
 
 
-def ask_same_person(base_url, model, api_key, name_a, name_b, timeout=30):
+OPENROUTER_SYSTEMONE_BASE = "https://openrouter.ai/api/v1"
+# Pinned Jev release; never the "latest" alias.
+OPENROUTER_DECISION_MODEL = "typesafe/jev-1.13"
+OPENROUTER_ATTRIBUTION_TITLE = "ebook-processor"
+
+
+def resolve_provider(provider, base_url, model, api_key):
+    """Resolve decision-model connection details.
+
+    Returns (base_url, model, api_key, extra_headers). Raises ValueError
+    when the openrouter provider lacks an API key; the key is never logged.
+    """
+    if provider == "openrouter":
+        key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        if not key:
+            raise ValueError(
+                "provider 'openrouter' needs an API key: pass --api-key "
+                "or set OPENROUTER_API_KEY")
+        return (OPENROUTER_SYSTEMONE_BASE,
+                model or OPENROUTER_DECISION_MODEL,
+                key,
+                {"X-Title": OPENROUTER_ATTRIBUTION_TITLE})
+    return (base_url, model, api_key, {})
+
+
+def ask_same_person(base_url, model, api_key, name_a, name_b, timeout=30,
+                    extra_headers=None):
     payload = json.dumps({
         "model": model or "default",
         "state": f"Character A: {name_a}\nCharacter B: {name_b}",
@@ -33,6 +61,7 @@ def ask_same_person(base_url, model, api_key, name_a, name_b, timeout=30):
         },
     }).encode()
     headers = {"Content-Type": "application/json"}
+    headers.update(extra_headers or {})
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     base = base_url.rstrip('/')
@@ -59,22 +88,35 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--labels', required=True)
     ap.add_argument('--base-url', default='http://127.0.0.1:8888/v1')
+    ap.add_argument('--provider', choices=['local', 'openrouter'],
+                    default='local',
+                    help="decision-model backend: 'local' Unsloth server "
+                         "(default) or 'openrouter' hosted Jev")
     ap.add_argument('--model', default='')
-    ap.add_argument('--api-key', default='')
+    ap.add_argument('--api-key', default='',
+                    help='API key override (or OPENROUTER_API_KEY env)')
     ap.add_argument('--threshold', type=float, default=0.5)
     args = ap.parse_args()
+
+    try:
+        base_url, model, api_key, extra_headers = resolve_provider(
+            args.provider, args.base_url, args.model, args.api_key)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(2)
 
     labels = json.load(open(args.labels, encoding='utf-8'))
     # Skip uncertain labels for evaluation
     pairs = [(k, v) for k, v in labels.items() if not v.get('uncertain')]
-    print(f"Evaluating {len(pairs)} labeled pairs (threshold={args.threshold})\n")
+    print(f"Evaluating {len(pairs)} labeled pairs (threshold={args.threshold}) "
+          f"provider={args.provider} model={model or 'default'}\n")
 
     results = []
     for i, (key, lbl) in enumerate(pairs):
         expected = lbl['same_person']
         p_yes = ask_same_person(
-            args.base_url, args.model, args.api_key,
-            lbl['a'], lbl['b'])
+            base_url, model, api_key,
+            lbl['a'], lbl['b'], extra_headers=extra_headers)
         if p_yes is None:
             continue
         predicted = p_yes >= args.threshold

@@ -16,8 +16,33 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import urllib.request
+
+OPENROUTER_SYSTEMONE_BASE = "https://openrouter.ai/api/v1"
+# Pinned Jev release; never the "latest" alias.
+OPENROUTER_DECISION_MODEL = "typesafe/jev-1.13"
+OPENROUTER_ATTRIBUTION_TITLE = "ebook-processor"
+
+
+def resolve_provider(provider, base_url, model, api_key):
+    """Resolve decision-model connection details.
+
+    Returns (base_url, model, api_key, extra_headers). Raises ValueError
+    when the openrouter provider lacks an API key; the key is never logged.
+    """
+    if provider == "openrouter":
+        key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        if not key:
+            raise ValueError(
+                "provider 'openrouter' needs an API key: pass --api-key "
+                "or set OPENROUTER_API_KEY")
+        return (OPENROUTER_SYSTEMONE_BASE,
+                model or OPENROUTER_DECISION_MODEL,
+                key,
+                {"X-Title": OPENROUTER_ATTRIBUTION_TITLE})
+    return (base_url, model, api_key, {})
 
 TRIGGER_DEFS = {
     "suicide": (
@@ -73,7 +98,8 @@ TEST_CASES = [
 ]
 
 
-def classify(base_url, model, api_key, trigger, quote, timeout=30):
+def classify(base_url, model, api_key, trigger, quote, timeout=30,
+             extra_headers=None):
     """Returns (verdict_bool, p_yes, raw_response)."""
     q, yes_when, no_when = TRIGGER_DEFS.get(
         trigger, (f"Does this depict {trigger}?", "", ""))
@@ -89,6 +115,7 @@ def classify(base_url, model, api_key, trigger, quote, timeout=30):
         },
     }).encode()
     headers = {"Content-Type": "application/json"}
+    headers.update(extra_headers or {})
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     base = base_url.rstrip('/')
@@ -119,26 +146,40 @@ def classify(base_url, model, api_key, trigger, quote, timeout=30):
 def main():
     ap = argparse.ArgumentParser(description="Trigger classifier via /v1/systemone")
     ap.add_argument("--base-url", default="http://localhost:11434")
+    ap.add_argument("--provider", choices=["local", "openrouter"],
+                    default="local",
+                    help="decision-model backend: 'local' Unsloth server "
+                         "(default) or 'openrouter' hosted Jev")
     ap.add_argument("--model", default="",
                     help="Model name (empty = use already-loaded model)")
-    ap.add_argument("--api-key", default="")
+    ap.add_argument("--api-key", default="",
+                    help="API key override (or OPENROUTER_API_KEY env)")
     ap.add_argument("--trigger", help="Trigger for single classification")
     ap.add_argument("--quote", help="Quote for single classification")
     ap.add_argument("--threshold", type=float, default=0.5)
     args = ap.parse_args()
 
+    try:
+        base_url, model, api_key, extra_headers = resolve_provider(
+            args.provider, args.base_url, args.model, args.api_key)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(2)
+
     if args.trigger and args.quote:
         verdict, p_yes, raw = classify(
-            args.base_url, args.model, args.api_key, args.trigger, args.quote)
+            base_url, model, api_key, args.trigger, args.quote,
+            extra_headers=extra_headers)
         p_str = f"{p_yes:.2f}" if p_yes is not None else "?"
         print(f"Verdict: {verdict} (P(yes)={p_str})")
         return
 
-    print(f"Model: {args.model} @ {args.base_url}\n")
+    print(f"Model: {model} @ {base_url} (provider={args.provider})\n")
     correct = 0
     for trigger, quote, expected in TEST_CASES:
         verdict, p_yes, raw = classify(
-            args.base_url, args.model, args.api_key, trigger, quote)
+            base_url, model, api_key, trigger, quote,
+            extra_headers=extra_headers)
         ok = "✓" if verdict == expected else "✗"
         if verdict == expected:
             correct += 1

@@ -1584,3 +1584,268 @@ class TestExtractQuoteContext(unittest.TestCase):
         # Quote with collapsed whitespace should still match
         ctx = pp._extract_quote_context(text, "line one line two")
         self.assertIn("line", ctx)
+
+
+class TestLearnedState(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        # Fresh enabled instance per test (isolated learn dir).
+        self.ls = pp.LearnedState(learn_dir=self.tmp, enabled=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_disabled_is_noop(self):
+        ls = pp.LearnedState(enabled=False)
+        ls.record_merge("pete", "peter", "isbn1")
+        self.assertIsNone(ls.nick_lookup("pete"))
+        ls.record_threshold("murder", 0.9, True)
+        self.assertEqual(ls.threshold_stats, {})
+        self.assertEqual(ls.trusted_titles(), frozenset())
+        self.assertEqual(ls.pop_summary(), "")
+
+    def test_nickname_record_and_lookup(self):
+        self.ls.record_merge("pete sebeck", "peter sebeck", "isbn1")
+        self.assertEqual(self.ls.nick_lookup("pete sebeck"), "peter sebeck")
+        self.assertIsNone(self.ls.nick_lookup("unknown name"))
+        # Count increments on repeat; books deduped.
+        self.ls.record_merge("pete sebeck", "peter sebeck", "isbn1")
+        self.ls.record_merge("pete sebeck", "peter sebeck", "isbn2")
+        ent = self.ls.nicknames["pete sebeck"]
+        self.assertEqual(ent["count"], 3)
+        self.assertEqual(sorted(ent["books"]), ["isbn1", "isbn2"])
+
+    def test_token_merge(self):
+        self.ls.record_token_merge("pete", "peter", "isbn1")
+        self.assertEqual(self.ls.token_lookup("pete"), "peter")
+        self.assertIsNone(self.ls.token_lookup("bob"))
+        # Too-short tokens are ignored.
+        self.ls.record_token_merge("x", "xavier")
+        self.assertIsNone(self.ls.token_lookup("x"))
+
+    def test_title_trust_threshold(self):
+        # One observation: not trusted.
+        self.ls.observe_title("herr", "oberstleutnant heinrich boerner")
+        self.assertEqual(self.ls.trusted_titles(), frozenset())
+        # Two distinct remainders: trusted.
+        self.ls.observe_title("herr", "oberstleutnant schmidt")
+        self.assertIn("herr", self.ls.trusted_titles())
+        # Same remainder twice doesn't count twice.
+        self.ls.observe_title("herr", "oberstleutnant schmidt")
+        self.assertEqual(len(self.ls.titles["herr"]["rests"]), 2)
+
+    def test_title_ignores_known_and_stopwords(self):
+        self.ls.observe_title("dr", "jane smith")
+        self.ls.observe_title("the", "daemon")
+        self.assertNotIn("dr", self.ls.titles)
+        self.assertNotIn("the", self.ls.titles)
+
+    def test_threshold_stats(self):
+        self.ls.record_threshold("murder", 0.46, False)
+        self.ls.record_threshold("murder", 0.72, True)
+        ent = self.ls.threshold_stats["murder"]
+        self.assertEqual(ent["dropped"], [0.46])
+        self.assertEqual(ent["kept"], [0.72])
+
+    def test_save_and_reload(self):
+        self.ls.record_merge("pete", "peter", "isbn1")
+        self.ls.record_threshold("murder", 0.5, True)
+        self.ls.save()
+        ls2 = pp.LearnedState(learn_dir=self.tmp, enabled=True)
+        self.assertEqual(ls2.nick_lookup("pete"), "peter")
+        self.assertEqual(ls2.threshold_stats["murder"]["kept"], [0.5])
+
+    def test_unwritable_dir_degrades(self):
+        ls = pp.LearnedState(learn_dir="/proc/definitely-not-here", enabled=True)
+        # Should not raise; in-memory learning still works, persistence skipped.
+        ls.record_merge("pete", "peter")
+        self.assertEqual(ls.nick_lookup("pete"), "peter")
+        ls.save()  # must not raise
+
+    def test_series_key(self):
+        self.assertEqual(pp.LearnedState.series_key("Daniel Suarez"),
+                         "author_daniel_suarez")
+        self.assertIsNone(pp.LearnedState.series_key(""))
+        self.assertIsNone(pp.LearnedState.series_key(None))
+
+    def test_series_roster_roundtrip(self):
+        chars = [{"name": "Peter Sebeck", "aliases": ["Pete", "Detective Sebeck"]}]
+        self.ls.save_series_roster("author_daniel_suarez", "Daemon",
+                                   "Daniel Suarez", "isbn1", chars)
+        hints = self.ls.load_series_hints("author_daniel_suarez")
+        self.assertEqual(hints.get("pete"), "peter sebeck")
+        self.assertEqual(hints.get("detective sebeck"), "peter sebeck")
+        # Unknown series -> empty.
+        self.assertEqual(self.ls.load_series_hints("author_nobody"), {})
+
+    def test_import_labels(self):
+        import tempfile, json, os
+        labels = {
+            "a|||b": {"a": "Pete Sebeck", "b": "Peter Sebeck",
+                      "same_person": True, "source": "alias"},
+            "c|||d": {"a": "Foo", "b": "Bar",
+                      "same_person": False, "source": "similar"},
+            "e|||f": {"a": "Maybe", "b": "Perhaps",
+                      "same_person": True, "uncertain": True,
+                      "source": "alias"},
+        }
+        p = os.path.join(self.tmp, "labels.json")
+        with open(p, "w") as f:
+            json.dump(labels, f)
+        n = self.ls.import_labels(p)
+        self.assertEqual(n, 1)
+        self.assertEqual(self.ls.nick_lookup("pete sebeck"), "peter sebeck")
+
+    def test_pop_summary(self):
+        self.ls.record_merge("pete", "peter")
+        self.ls.record_threshold("murder", 0.5, True)
+        s = self.ls.pop_summary()
+        self.assertIn("1 nickname", s)
+        self.assertIn("1 threshold sample", s)
+        # Second call: counters reset.
+        self.assertEqual(self.ls.pop_summary(), "")
+
+    def test_effective_titles_includes_learned(self):
+        # Disabled global state -> only hardcoded titles.
+        self.assertIn("dr", pp._effective_titles())
+        self.assertNotIn("herr", pp._effective_titles())
+
+    def test_thread_safety_smoke(self):
+        import threading
+        errs = []
+
+        def hammer():
+            try:
+                for i in range(50):
+                    self.ls.record_merge(f"nick{i % 5}", f"full{i % 5}")
+                    self.ls.record_threshold("murder", 0.5, True)
+                    self.ls.nick_lookup("nick1")
+                    self.ls.trusted_titles()
+            except Exception as e:
+                errs.append(e)
+
+        threads = [threading.Thread(target=hammer) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errs, [])
+
+
+class TestDecisionModelProvider(unittest.TestCase):
+    """Provider selection for decision models (local vs OpenRouter)."""
+
+    def test_local_uses_url_override(self):
+        endpoint, model, key, headers = pp.resolve_decision_model(
+            "local", "http://x:1/v1", {})
+        self.assertEqual(endpoint, "http://x:1/v1")
+        self.assertEqual(model, "default")
+        self.assertEqual(key, "")
+        self.assertEqual(headers, {})
+
+    def test_local_falls_back_to_config(self):
+        endpoint, model, key, headers = pp.resolve_decision_model(
+            "local", "", {"openai_base_url": "http://cfg:2/v1"})
+        self.assertEqual(endpoint, "http://cfg:2/v1")
+
+    def test_local_missing_url_raises(self):
+        with self.assertRaises(ValueError):
+            pp.resolve_decision_model("local", "", {})
+
+    def test_openrouter_endpoint_and_pinned_model(self):
+        endpoint, model, key, headers = pp.resolve_decision_model(
+            "openrouter", "", {"openrouter_api_key": "sk-test"}, env={})
+        self.assertEqual(endpoint, "https://openrouter.ai/api/v1/systemone")
+        self.assertEqual(model, "typesafe/jev-1.13")
+        self.assertNotIn("latest", model)
+        self.assertEqual(key, "sk-test")
+
+    def test_openrouter_model_is_pinned_constant(self):
+        # Guard against accidentally switching to the moving "latest" alias.
+        self.assertEqual(pp.OPENROUTER_DECISION_MODEL, "typesafe/jev-1.13")
+
+    def test_openrouter_key_from_env(self):
+        endpoint, model, key, headers = pp.resolve_decision_model(
+            "openrouter", "", {}, env={"OPENROUTER_API_KEY": "sk-env"})
+        self.assertEqual(key, "sk-env")
+
+    def test_openrouter_config_key_preferred_over_env(self):
+        _, _, key, _ = pp.resolve_decision_model(
+            "openrouter", "",
+            {"openrouter_api_key": "sk-cfg"},
+            env={"OPENROUTER_API_KEY": "sk-env"})
+        self.assertEqual(key, "sk-cfg")
+
+    def test_openrouter_missing_key_raises_gracefully(self):
+        with self.assertRaises(ValueError) as ctx:
+            pp.resolve_decision_model("openrouter", "", {}, env={})
+        msg = str(ctx.exception)
+        self.assertIn("OPENROUTER_API_KEY", msg)
+        self.assertIn("openrouter_api_key", msg)
+
+    def test_openrouter_attribution_header(self):
+        _, _, _, headers = pp.resolve_decision_model(
+            "openrouter", "", {"openrouter_api_key": "sk-test"}, env={})
+        self.assertEqual(headers.get("X-Title"), "ebook-processor")
+
+    def test_resolver_never_prints_key(self):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pp.resolve_decision_model(
+                "openrouter", "",
+                {"openrouter_api_key": "sk-super-secret-123"}, env={})
+        self.assertNotIn("sk-super-secret-123", buf.getvalue())
+
+    def _capture_headers(self, **dv_kwargs):
+        import json as _json
+        import urllib.request as _urlreq
+        captured = {}
+
+        class _FakeResp:
+            def read(self):
+                return _json.dumps(
+                    {"answers": {"trigger_check":
+                                 {"type": "noul", "noul": 0.9}}}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        orig = _urlreq.urlopen
+
+        def fake(req, timeout=None):
+            for k, v in req.header_items():
+                captured[k.lower()] = v
+            return _FakeResp()
+
+        _urlreq.urlopen = fake
+        self.addCleanup(setattr, _urlreq, "urlopen", orig)
+        dv = pp.DecisionValidator("http://x/v1", **dv_kwargs)
+        dv.validate("suicide", "he killed himself")
+        return captured
+
+    def test_validator_sends_extra_headers(self):
+        captured = self._capture_headers(
+            extra_headers={"X-Title": "ebook-processor"})
+        self.assertEqual(captured.get("x-title"), "ebook-processor")
+        self.assertNotIn("authorization", captured)
+
+    def test_validator_auth_header_bearer(self):
+        captured = self._capture_headers(api_key="sk-test")
+        self.assertEqual(captured.get("authorization"), "Bearer sk-test")
+
+    def test_validator_openrouter_endpoint_normalization(self):
+        # Full /v1/systemone URL must round-trip to itself.
+        dv = pp.DecisionValidator("https://openrouter.ai/api/v1/systemone",
+                                  model="typesafe/jev-1.13",
+                                  api_key="sk-test",
+                                  extra_headers={"X-Title": "ebook-processor"})
+        self.assertEqual(dv.endpoint,
+                         "https://openrouter.ai/api/v1/systemone")
+        self.assertEqual(dv.model, "typesafe/jev-1.13")
