@@ -3023,11 +3023,15 @@ def _viz_stats_line(st, now):
     """Plain-text stats line for the visualizer panel (no Rich markup)."""
     elapsed_min = max((now - st.get("run_t0", now)) / 60.0, 1e-6)
     speed = int(st.get("chars_total", 0) / elapsed_min)
-    toks = speed / 60.0 / 4.0  # ~4 chars/token for English
+    avg_toks = speed / 60.0 / 4.0  # ~4 chars/token for English
+    # Recent speed: current chapter only.
+    chap_elapsed = max(now - st.get("chap_t0", now), 1e-6)
+    chap_speed = int(st.get("chap_chars", 0) / chap_elapsed * 60.0)
+    cur_toks = chap_speed / 60.0 / 4.0
     ci = st.get("chap_idx") or "?"
     ct = st.get("chap_total") or "?"
-    return "Characters: %d | Chapter %s/%s | %d chars/min (%.1f tok/s)" % (
-        st.get("new_count", 0), ci, ct, speed, toks)
+    return "Characters: %d | Chapter %s/%s | %.1f tok/s (avg %.1f tok/s)" % (
+        st.get("new_count", 0), ci, ct, cur_toks, avg_toks)
 
 
 def _viz_new_state(book_key):
@@ -3196,6 +3200,8 @@ class PipelineUI:
                 "ticker": prev.get("ticker") or [],
                 "chap_idx": chap_idx,
                 "chap_total": chap_total,
+                "chap_t0": time.time(),
+                "chap_chars": len(txt),
             }
 
     def viz_characters(self, book_key, characters):

@@ -1326,13 +1326,14 @@ class TestVisualizer(unittest.TestCase):
             len(pp._viz_revealed_text(long_text, 1000.0, 1010.0)), 300)
         self.assertEqual(
             pp._viz_revealed_text(long_text, 1000.0, 1100.0), long_text)
-        # Stats line: 600 chars over 60s -> 600 chars/min.
+        # Stats line: 600 chars over 60s -> 2.5 tok/s avg.
         st = {"new_count": 7, "chap_idx": 3, "chap_total": 73,
-              "run_t0": 1000.0, "chars_total": 600}
+              "run_t0": 1000.0, "chars_total": 600,
+              "chap_t0": 1000.0, "chap_chars": 600}
         line = pp._viz_stats_line(st, 1060.0)
         self.assertIn("Characters: 7", line)
         self.assertIn("Chapter 3/73", line)
-        self.assertIn("600 chars/min", line)
+        self.assertIn("2.5 tok/s", line)
 
 
 class TestDecisionValidator(unittest.TestCase):
