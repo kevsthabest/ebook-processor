@@ -761,6 +761,96 @@ def _trigger_prominence(severity, chapter_count, successful_chapters):
     freq_band = _prominence_band_freq(chapter_count / successful_chapters)
     return _PROMINENCE_MATRIX.get((severity, freq_band), "low")
 
+
+# Character importance: frequency x mentions -> deterministic role.
+# Replaces LLM-assigned roles which are unreliable (minor characters get
+# promoted, leads get demoted). The role answers "how central is this
+# character to the book?" based on observed data, not model opinion.
+def _char_freq_band(frac):
+    """Fraction of chapters the character appears in -> frequency band."""
+    if frac <= 0:
+        return "none"
+    if frac < 0.10:
+        return "rare"
+    if frac < 0.30:
+        return "occasional"
+    return "frequent"
+
+
+def _char_deterministic_role(chapter_count, successful_chapters, is_pov,
+                             role_llm=None):
+    """Pure function: observed data -> protagonist/supporting/minor.
+
+    Rules:
+    - POV characters are always protagonist (they narrate the book).
+    - frequent (30%+ of chapters) -> protagonist
+    - occasional (10-30%) -> supporting
+    - rare (<10%) -> minor
+
+    If the LLM said "antagonist" and the deterministic role is protagonist
+    or supporting, preserve "antagonist" (it's a useful subtype, not a
+    different importance level).
+    """
+    if is_pov:
+        return "protagonist"
+    frac = (chapter_count / successful_chapters) if successful_chapters else 0
+    band = _char_freq_band(frac)
+    if band == "frequent":
+        det = "protagonist"
+    elif band == "occasional":
+        det = "supporting"
+    else:
+        det = "minor"
+    # Preserve antagonist subtype from LLM when importance is high enough.
+    if role_llm == "antagonist" and det in ("protagonist", "supporting"):
+        return "antagonist"
+    return det
+
+
+# Relationship confidence: evidence x type specificity -> high/medium/low.
+# Every relationship gets a confidence score so the app can distinguish
+# well-evidenced relationships from LLM guesses.
+def _rel_evidence_band(n_quotes, n_cooccur):
+    """Number of supporting quotes + co-occurrence chapters -> band."""
+    if n_quotes >= 2:
+        return "strong"
+    if n_quotes == 1 or n_cooccur >= 3:
+        return "moderate"
+    return "weak"
+
+
+_REL_SPECIFIC_TYPES = {"spouse", "parent", "child", "sibling"}
+_REL_VAGUE_TYPES = {"other", "colleague", "neighbor"}
+
+
+def _rel_type_band(rtype):
+    """Relationship type -> specificity band."""
+    if rtype in _REL_SPECIFIC_TYPES:
+        return "specific"
+    if rtype in _REL_VAGUE_TYPES:
+        return "vague"
+    return "moderate"  # friend, enemy, mentor, romantic, rival, ally
+
+
+_REL_CONFIDENCE = {
+    ("strong", "specific"): "high",
+    ("strong", "moderate"): "high",
+    ("strong", "vague"): "medium",
+    ("moderate", "specific"): "high",
+    ("moderate", "moderate"): "medium",
+    ("moderate", "vague"): "low",
+    ("weak", "specific"): "medium",
+    ("weak", "moderate"): "low",
+    ("weak", "vague"): "low",
+}
+
+
+def _rel_confidence(n_quotes, n_cooccur, rtype):
+    """Pure function: evidence + type -> high/medium/low confidence."""
+    ev_band = _rel_evidence_band(n_quotes, n_cooccur)
+    type_band = _rel_type_band(rtype)
+    return _REL_CONFIDENCE.get((ev_band, type_band), "low")
+
 # Relationship dedupe: exclusive types resolve by precedence (lower wins).
 # Non-exclusive types are kept as extras only with evidence.
 _REL_PRECEDENCE = {"spouse": 0, "parent": 1, "child": 1, "sibling": 2,
@@ -1318,6 +1408,29 @@ class LearnedState:
             self._save_json("threshold_stats.json", self.threshold_stats)
 
     # -- nicknames ------------------------------------------------------
+    def record_alias(self, alias_name, canonical_name):
+        """Record a human-validated alias (from --alias flag). Cross-book:
+        applies to all future books. Human aliases outrank everything."""
+        if not self.enabled or not alias_name or not canonical_name:
+            return
+        short = norm_name(alias_name)
+        full = norm_name(canonical_name)
+        if not short or not full or short == full:
+            return
+        with self._lock:
+            ent = self.nicknames.get(short)
+            if ent is None:
+                ent = {"full": full, "count": 0, "books": [],
+                       "human": True, "manual": True}
+                self.nicknames[short] = ent
+                self._new["nicknames"] += 1
+            else:
+                # Manual alias always wins (it's a fact about the universe).
+                ent["full"] = full
+                ent["human"] = True
+                ent["manual"] = True
+            ent["count"] += 1
+
     def record_merge(self, short_key, full_key, isbn=None):
         """Record that short_key merged into full_key. Called from
         _roster_update on successful merges."""
@@ -2454,6 +2567,18 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
     n_successful_b = sum(1 for b in chapter_bs.values() if b)
     coverage_warning = (n_successful_b / n < 0.5) if n else True
 
+    # --- POVs: named in >=2 chapters (or >=1 if fewer than 4 chapters) ---
+    # (Computed here because character importance needs is_pov.)
+    pov_counts = Counter()
+    for idx in sorted(chapter_as):
+        a = chapter_as[idx]
+        if a and a.get("pov_character"):
+            pov_counts[_roster_canonical(roster, a["pov_character"])] += 1
+    # Require POV in at least max(2, 10%) of chapters (filters one-off misfires).
+    _pov_threshold = max(2, n // 10) if n >= 4 else 1
+    povs = sorted(p for p, c in pov_counts.items() if c >= _pov_threshold)
+    _pov_set = {p.lower() for p in povs}
+
     # --- Characters: from the roster (aliases already merged) ---
     # Keep only characters with a proper name OR 3+ chapter appearances.
     # (Filters the long tail of generic one-off mentions.)
@@ -2502,11 +2627,18 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
             _appearance = ""
         # First appearance: lowest chapter index (1-based, matches --chunks numbering)
         _chapters_sorted = sorted(e.get("chapters", set()))
+        # Deterministic role from observed data (replaces unreliable LLM roles).
+        _role_llm = role  # original LLM assignment, kept for comparison
+        _is_pov = e["name"].lower() in _pov_set
+        _det_role = _char_deterministic_role(n_ch, n_successful_b, _is_pov,
+                                             _role_llm)
+        _freq = round(n_ch / n_successful_b, 4) if n_successful_b else 0
         characters.append({
             "name": e["name"],
             "aliases": sorted(e["aliases"]),
             "unresolved_mentions": sorted(e.get("unresolved_mentions", set())),
-            "role": role,
+            "role": _det_role,
+            "role_llm": _role_llm,
             "description": desc,
             "appearance": _appearance,
             "status": _status,
@@ -2516,6 +2648,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
             "evidence_offered": bool(ev),
             "appearances": e["appearances"],
             "chapters_present": n_ch,
+            "chapter_count": n_ch,
+            "mention_count": e["appearances"],
+            "frequency": _freq,
+            "is_pov": _is_pov,
             "confidence": _v2_char_confidence(e["appearances"], bool(ev)),
         })
 
@@ -2546,39 +2682,35 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
             })
 
     relationships = []
+    _CONF_RANK = {"high": 0, "medium": 1, "low": 2}
+    _TYPE_SPEC_RANK = {"specific": 0, "moderate": 1, "vague": 2}
     for _pair_key, cands in _pair_cands.items():
-        # Best candidate per exclusive type (prefer evidence, then earliest)
-        _best = {}
+        # Score each candidate by confidence; keep only the best per pair.
+        _scored = []
         for c in cands:
             t = c["type"]
-            if t not in _REL_PRECEDENCE:
-                if t not in _REL_NONEXCLUSIVE:
-                    print(f"  Dropping unknown relationship type: {t!r}")
+            if t not in _REL_PRECEDENCE and t not in _REL_NONEXCLUSIVE:
+                print(f"  Dropping unknown relationship type: {t!r}")
                 continue
-            cur = _best.get(t)
-            if (cur is None
-                    or (bool(c["evidence"]) and not bool(cur["evidence"]))
-                    or (bool(c["evidence"]) == bool(cur["evidence"])
-                        and c["_idx"] < cur["_idx"])):
-                _best[t] = c
-        # Winner: highest precedence; tie-break by evidence then earliest chapter
-        if _best:
-            _wt = min(_best,
-                      key=lambda t: (_REL_PRECEDENCE[t],
-                                    0 if _best[t]["evidence"] else 1,
-                                    _best[t]["_idx"]))
-            _w = _best[_wt]
-            relationships.append({k: v for k, v in _w.items()
-                                  if not k.startswith("_")})
-        # Non-exclusive extras: one per type, only with evidence
-        _seen_extra = set()
-        for c in sorted(cands, key=lambda c: (0 if c["evidence"] else 1,
-                                              c["_idx"])):
-            t = c["type"]
-            if t in _REL_NONEXCLUSIVE and t not in _seen_extra and c["evidence"]:
-                _seen_extra.add(t)
-                relationships.append({k: v for k, v in c.items()
-                                      if not k.startswith("_")})
+            _n_quotes = sum(1 for cc in cands
+                            if cc["type"] == t and cc.get("evidence"))
+            _co = len(_pair_chapters.get(_pair_key, set()))
+            _conf = _rel_confidence(_n_quotes, _co, t)
+            _scored.append((_CONF_RANK[_conf],
+                            _TYPE_SPEC_RANK[_rel_type_band(t)],
+                            0 if c.get("evidence") else 1,
+                            c["_idx"], _conf, _n_quotes, _co, c))
+        if not _scored:
+            continue
+        # Best: highest confidence, then most specific type, then evidence,
+        # then earliest chapter.
+        _scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        _, _, _, _, _conf, _nq, _co, _w = _scored[0]
+        _rel = {k: v for k, v in _w.items() if not k.startswith("_")}
+        _rel["confidence"] = _conf
+        _rel["evidence_count"] = _nq
+        _rel["cooccurrence_count"] = _co
+        relationships.append(_rel)
 
     # --- Relationship importance: 1-5 from chapter co-occurrence ---
     # More chapters together = more important. Scaled to book length.
@@ -2718,17 +2850,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
     spice_peak = max(spices) if spices else 0
     spice_level = _spice_level_from_chapters(spices, n_successful_b)
 
-    # --- POVs: named in >=2 chapters (or >=1 if fewer than 4 chapters) ---
-    pov_counts = Counter()
-    for idx in sorted(chapter_as):
-        a = chapter_as[idx]
-        if a and a.get("pov_character"):
-            pov_counts[_roster_canonical(roster, a["pov_character"])] += 1
-    # Require POV in at least max(2, 10%) of chapters (filters one-off misfires).
-    threshold = max(2, n // 10) if n >= 4 else 1
-    povs = sorted(p for p, c in pov_counts.items() if c >= threshold)
-
     # --- Trope candidates: union across chapters (gate runs separately) ---
+    # (POVs computed earlier, before the characters section.)
     # Map to catalog IDs via embeddings when available, so paraphrases
     # ("enemies to lovers" vs "enemies-to-lovers dynamic") collapse before
     # tiering. Falls back to text normalization if embeddings unavailable.
@@ -6151,7 +6274,9 @@ def save_preview(fpath, result):
     if result["relationships"]:
         md.append(f"## Relationships ({len(result['relationships'])})")
         for r in result["relationships"]:
-            md.append(f"- {r['from']} → {r['to']}: {r['type']}")
+            _conf = r.get("confidence", "")
+            _conf_str = f" ({_conf} confidence)" if _conf else ""
+            md.append(f"- {r['from']} → {r['to']}: {r['type']}{_conf_str}")
         md.append("")
     if result["quotes"]:
         md.append(f"## Quotes ({len(result['quotes'])})")
@@ -6286,6 +6411,9 @@ def main():
                     help="override ISBN for work resolution (e.g. when the EPUB "
                          "has no ISBN in its metadata); takes priority over EPUB "
                          "metadata and auto-lookup")
+    ap.add_argument("--alias", metavar="A=B", action="append", default=[],
+                    help="manual character alias: 'Loki=Brian Gragg' merges them. "
+                         "Repeatable. Stored as human-validated, applies cross-book.")
     ap.add_argument("--allow-no-isbn", action="store_true",
                     help="process books without ISBN instead of skipping them "
                          "(default is to skip with a message)")
@@ -6412,6 +6540,22 @@ def main():
         print(f"  Imported {n_imp} labeled merge pairs from "
               f"{args.import_labels}")
         _LEARNED.save()
+    if args.alias:
+        n_alias = 0
+        for spec in args.alias:
+            if "=" not in spec:
+                print(f"  WARNING: --alias '{spec}' ignored (use A=B format)")
+                continue
+            a, b = spec.split("=", 1)
+            a, b = a.strip(), b.strip()
+            if not a or not b:
+                print(f"  WARNING: --alias '{spec}' ignored (empty name)")
+                continue
+            _LEARNED.record_alias(a, b)
+            n_alias += 1
+            print(f"  Alias: {a} = {b}")
+        if n_alias:
+            _LEARNED.save()
 
     if args.isbn:
         _cleaned = _clean_isbn(args.isbn)

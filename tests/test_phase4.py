@@ -1208,13 +1208,19 @@ class TestRemainingFixes(unittest.TestCase):
         self.assertEqual(rels[0]["importance"], 5)
 
     def test_nonexclusive_extra_with_evidence(self):
-        # mentor kept alongside friend when it has evidence
+        # New behavior: one relationship per pair (highest confidence wins).
+        # friend (ch1) vs mentor (ch2), both 1 quote -> tie on confidence,
+        # tie on specificity -> earliest chapter wins.
         rels = self._rel_reduce({
             1: [("Alice", "Bob", "friend", "they hung out")],
             2: [("Alice", "Bob", "mentor", "she taught him")],
         })
         types = sorted(r["type"] for r in rels)
-        self.assertEqual(types, ["friend", "mentor"])
+        self.assertEqual(types, ["friend"])
+        # Winner carries confidence metadata.
+        self.assertIn("confidence", rels[0])
+        self.assertIn("evidence_count", rels[0])
+        self.assertIn("cooccurrence_count", rels[0])
 
     def test_nonexclusive_extra_without_evidence_dropped(self):
         rels = self._rel_reduce({
@@ -2529,3 +2535,132 @@ class TestIsbnHandling(unittest.TestCase):
         self.assertIsNone(pp._clean_isbn(""))
         self.assertIsNone(pp._clean_isbn(None))
         self.assertIsNone(pp._clean_isbn("123"))
+
+
+class TestCharacterImportance(unittest.TestCase):
+    """Deterministic character roles from observed data (not LLM opinion)."""
+
+    def test_pov_always_protagonist(self):
+        # POV characters are protagonist regardless of frequency.
+        self.assertEqual(
+            pp._char_deterministic_role(1, 73, True), "protagonist")
+        self.assertEqual(
+            pp._char_deterministic_role(0, 73, True), "protagonist")
+
+    def test_frequent_is_protagonist(self):
+        # 40% of chapters (29/73) -> protagonist.
+        self.assertEqual(
+            pp._char_deterministic_role(29, 73, False), "protagonist")
+        # Exactly 30% boundary.
+        self.assertEqual(
+            pp._char_deterministic_role(30, 100, False), "protagonist")
+
+    def test_occasional_is_supporting(self):
+        # 15% of chapters -> supporting.
+        self.assertEqual(
+            pp._char_deterministic_role(11, 73, False), "supporting")
+
+    def test_rare_is_minor(self):
+        # 5% of chapters (4/73) -> minor.
+        self.assertEqual(
+            pp._char_deterministic_role(4, 73, False), "minor")
+        # Single appearance -> minor.
+        self.assertEqual(
+            pp._char_deterministic_role(1, 73, False), "minor")
+
+    def test_antagonist_preserved(self):
+        # LLM said antagonist + deterministic protagonist -> antagonist.
+        self.assertEqual(
+            pp._char_deterministic_role(30, 73, False, "antagonist"),
+            "antagonist")
+        # LLM said antagonist + deterministic minor -> minor (too minor).
+        self.assertEqual(
+            pp._char_deterministic_role(2, 73, False, "antagonist"),
+            "minor")
+
+    def test_freq_band_boundaries(self):
+        self.assertEqual(pp._char_freq_band(0), "none")
+        self.assertEqual(pp._char_freq_band(0.05), "rare")
+        self.assertEqual(pp._char_freq_band(0.10), "occasional")
+        self.assertEqual(pp._char_freq_band(0.29), "occasional")
+        self.assertEqual(pp._char_freq_band(0.30), "frequent")
+        self.assertEqual(pp._char_freq_band(1.0), "frequent")
+
+
+class TestRelationshipConfidence(unittest.TestCase):
+    """Relationship confidence: evidence x type specificity."""
+
+    def test_strong_specific_is_high(self):
+        # 2 quotes + spouse -> high.
+        self.assertEqual(pp._rel_confidence(2, 1, "spouse"), "high")
+        self.assertEqual(pp._rel_confidence(3, 5, "parent"), "high")
+
+    def test_weak_vague_is_low(self):
+        # 0 quotes, 1 co-occurrence + other -> low.
+        self.assertEqual(pp._rel_confidence(0, 1, "other"), "low")
+        self.assertEqual(pp._rel_confidence(0, 2, "colleague"), "low")
+
+    def test_moderate_combinations(self):
+        # 1 quote + friend (moderate type) -> medium.
+        self.assertEqual(pp._rel_confidence(1, 1, "friend"), "medium")
+        # 0 quotes + 3 co-occurrences + enemy -> medium.
+        self.assertEqual(pp._rel_confidence(0, 3, "enemy"), "medium")
+        # 2 quotes + colleague (vague) -> medium.
+        self.assertEqual(pp._rel_confidence(2, 1, "colleague"), "medium")
+
+    def test_weak_specific_is_medium(self):
+        # 0 quotes + spouse -> medium (specific type saves it).
+        self.assertEqual(pp._rel_confidence(0, 1, "spouse"), "medium")
+
+    def test_evidence_band(self):
+        self.assertEqual(pp._rel_evidence_band(2, 0), "strong")
+        self.assertEqual(pp._rel_evidence_band(1, 0), "moderate")
+        self.assertEqual(pp._rel_evidence_band(0, 3), "moderate")
+        self.assertEqual(pp._rel_evidence_band(0, 2), "weak")
+
+    def test_type_band(self):
+        self.assertEqual(pp._rel_type_band("spouse"), "specific")
+        self.assertEqual(pp._rel_type_band("parent"), "specific")
+        self.assertEqual(pp._rel_type_band("other"), "vague")
+        self.assertEqual(pp._rel_type_band("colleague"), "vague")
+        self.assertEqual(pp._rel_type_band("friend"), "moderate")
+        self.assertEqual(pp._rel_type_band("enemy"), "moderate")
+        self.assertEqual(pp._rel_type_band("mentor"), "moderate")
+
+
+class TestManualAlias(unittest.TestCase):
+    """--alias flag: human-validated cross-book aliases."""
+
+    def test_record_alias(self):
+        ln = pp.LearnedState(enabled=False)
+        # Disabled stub is no-op; use enabled with temp dir.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ln = pp.LearnedState(learn_dir=td, enabled=True)
+            ln.record_alias("Loki", "Brian Gragg")
+            # Normalized lookup works.
+            self.assertEqual(ln.nick_lookup("loki"), "brian gragg")
+            # Marked as human + manual.
+            ent = ln.nicknames["loki"]
+            self.assertTrue(ent.get("human"))
+            self.assertTrue(ent.get("manual"))
+
+    def test_alias_outranks_automatic(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ln = pp.LearnedState(learn_dir=td, enabled=True)
+            # Automatic merge first.
+            ln.record_merge("loki", "loki stormbringer", "isbn1")
+            self.assertEqual(ln.nick_lookup("loki"), "loki stormbringer")
+            # Manual alias overwrites.
+            ln.record_alias("Loki", "Brian Gragg")
+            self.assertEqual(ln.nick_lookup("loki"), "brian gragg")
+
+    def test_alias_invalid_inputs(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ln = pp.LearnedState(learn_dir=td, enabled=True)
+            ln.record_alias("", "Brian Gragg")  # empty alias
+            ln.record_alias("Loki", "")  # empty canonical
+            ln.record_alias("Loki", "Loki")  # same name
+            self.assertEqual(len(ln.nicknames), 0)
