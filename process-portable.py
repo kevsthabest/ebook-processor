@@ -287,6 +287,97 @@ def _pick_identifiers(raw_list):
     return out
 
 
+def _lookup_isbn_openlibrary(title, author):
+    """Look up an ISBN via Open Library search API. Returns cleaned ISBN-13 or None.
+
+    Only returns a result on a confident match: the first result's title must
+    match (normalized) the given title, tolerating series prefixes like
+    "[Series 02] - Title". Network call wrapped in try/except —
+    any failure returns None (caller falls through to skip behavior).
+    """
+    if not title:
+        return None
+    try:
+        q = (f"https://openlibrary.org/search.json?title={quote(title or '', safe='')}"
+             f"&author={quote(author or '', safe='')}"
+             f"&fields=title,isbn&limit=1")
+        req = urllib.request.Request(q, headers={"User-Agent": "ebook-processor/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+        docs = data.get("docs") or []
+        if not docs:
+            return None
+        doc = docs[0]
+        # Confident match: normalized titles agree, tolerating a series
+        # prefix like "[Daemon 02] - " on the local title.
+        ol_title = _tnorm(doc.get("title") or "")
+        local_title = _tnorm(title)
+        local_bare = re.sub(r"^\[.*?\]\s*[-–:]\s*", "", local_title).strip()
+        if not ol_title or ol_title not in (local_title, local_bare):
+            # Also accept when the OL title appears as a whole word-phrase
+            # within the local title (handles "Freedom" vs "[Daemon 02] - FreedomTM").
+            if not (len(ol_title) > 3 and ol_title in local_title):
+                return None
+        for raw in doc.get("isbn") or []:
+            cleaned = _clean_isbn(raw)
+            if cleaned:
+                return cleaned
+        return None
+    except Exception:
+        return None
+
+
+def _resolve_book_isbn(identifiers, title, author):
+    """Resolve the book's ISBN by priority. Mutates identifiers in place.
+
+    Priority:
+      1. --isbn flag (CONFIG["isbn_override"]) -> source "flag"
+      2. EPUB metadata (identifiers["isbn"])   -> source "epub"
+      3. Open Library auto-lookup              -> source "openlibrary"
+      4. none                                  -> source "none"
+
+    Returns (isbn_or_None, source). When found via flag or Open Library,
+    identifiers["isbn"] is set so downstream work resolution uses it.
+    """
+    override = CONFIG.get("isbn_override", "")
+    if override:
+        identifiers["isbn"] = override
+        return override, "flag"
+    if identifiers.get("isbn"):
+        return identifiers["isbn"], "epub"
+    # Auto-lookup before giving up.
+    auto = _lookup_isbn_openlibrary(title, author)
+    if auto:
+        identifiers["isbn"] = auto
+        print(f"  Auto-resolved ISBN {auto} via Open Library")
+        return auto, "openlibrary"
+    return None, "none"
+
+
+def _handle_missing_isbn(fpath):
+    """Print skip/warning for a book with no ISBN. Returns True if processing
+    may continue (i.e. --allow-no-isbn), False if the book should be skipped."""
+    if CONFIG.get("allow_no_isbn"):
+        print("")
+        print("  \u26a0 WARNING: No ISBN found (metadata, --isbn, and Open Library lookup all failed).")
+        print("    Work will be matched by title/author only, which may create duplicates.")
+        print("")
+        return True
+    print(f"  \u23ed Skipping '{fpath.name}': no ISBN found. "
+          f"Use --isbn to override or --allow-no-isbn to process anyway.")
+    if CONFIG.get("rename_no_isbn"):
+        try:
+            new_name = fpath.parent / f"NO-ISBN-{fpath.name}"
+            if not new_name.exists():
+                fpath.rename(new_name)
+                print(f"  Renamed to '{new_name.name}'")
+            else:
+                print(f"  Rename skipped: '{new_name.name}' already exists")
+        except Exception as e:
+            print(f"  Rename failed: {e}")
+    return False
+
+
 def extract_mobi_identifiers(path):
     """Read ISBN (EXTH 104) / ASIN (EXTH 113) from a MOBI/AZW3 header. Stdlib."""
     ids = {"isbn": None, "asin": None, "raw": []}
@@ -5352,6 +5443,11 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         word_count = len(text.split())
 
     _book_key = str(fpath)
+    # ISBN resolution: --isbn flag > EPUB metadata > Open Library lookup.
+    # Default is to skip books with no ISBN (see --allow-no-isbn).
+    _isbn, _isbn_source = _resolve_book_isbn(identifiers, title, author)
+    if _isbn_source == "none" and not _handle_missing_isbn(fpath):
+        return False
     # Cross-run learning: stash per-book context for _roster_update hooks.
     _ln_book = _learn()
     _learn_isbn = identifiers.get("isbn") or identifiers.get("asin")
@@ -5574,6 +5670,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     result = {
         "file": fpath.name, "title": title or fpath.stem, "author": author,
         "isbn": identifiers.get("isbn"), "asin": identifiers.get("asin"),
+        "isbn_source": _isbn_source,  # "flag" | "epub" | "openlibrary" | "none"
         "word_count": word_count, "reading_time_mins": reading_mins,
         "chunks": n, "chunks_failed": a_failed,
         "pipeline": "v2",
@@ -5707,6 +5804,11 @@ def process_file(fpath, dry_run=False, preview=False):
     text, title, author, identifiers = extracted
 
     UI.status(f"  Title: {title or fpath.stem}, Chars: {len(text):,}")
+    # ISBN resolution: --isbn flag > EPUB metadata > Open Library lookup.
+    # Default is to skip books with no ISBN (see --allow-no-isbn).
+    _isbn, _isbn_source = _resolve_book_isbn(identifiers, title, author)
+    if _isbn_source == "none" and not _handle_missing_isbn(fpath):
+        return False
     if identifiers.get("isbn"):
         print(f"  ISBN: {identifiers['isbn']}")
     elif identifiers.get("asin"):
@@ -5862,6 +5964,7 @@ def process_file(fpath, dry_run=False, preview=False):
     result = {
         "file": fpath.name, "title": title or fpath.stem, "author": author,
         "isbn": identifiers.get("isbn"), "asin": identifiers.get("asin"),
+        "isbn_source": _isbn_source,  # "flag" | "epub" | "openlibrary" | "none"
         "word_count": word_count, "reading_time_mins": reading_mins,
         "chunks": n, "chunks_failed": failed,
         "tropes": tropes, "trope_confidence": trope_conf,
@@ -5980,11 +6083,14 @@ def save_preview(fpath, result):
     md.append(f"**Spice:** {'🌶️' * result['spice_level'] or 'None'} ({result['spice_level']}/5)")
     md.append(f"**POVs:** {', '.join(result['povs']) or 'Unknown'}")
     if result.get("isbn"):
-        md.append(f"**ISBN:** {result['isbn']}")
+        _src = result.get("isbn_source", "")
+        _tag = {"flag": " (from --isbn override)",
+                "openlibrary": " (auto-resolved via Open Library)"}.get(_src, "")
+        md.append(f"**ISBN:** {result['isbn']}{_tag}")
     elif result.get("asin"):
         md.append(f"**ASIN:** {result['asin']} (no ISBN in file)")
     else:
-        md.append("**ISBN:** not found in file")
+        md.append("**ISBN:** not found — work matched by title/author only")
     how = result.get("work_resolution", "?")
     if how == "new":
         md.append("**Work:** NO MATCH — new work would be created")
@@ -6176,6 +6282,16 @@ def main():
                         help="process at most N books from the import folder (e.g. --max-books 3)")
     ap.add_argument("--file", metavar="EBOOK", default=None,
                     help="process a single ebook file instead of the import folder")
+    ap.add_argument("--isbn", metavar="ISBN", default="",
+                    help="override ISBN for work resolution (e.g. when the EPUB "
+                         "has no ISBN in its metadata); takes priority over EPUB "
+                         "metadata and auto-lookup")
+    ap.add_argument("--allow-no-isbn", action="store_true",
+                    help="process books without ISBN instead of skipping them "
+                         "(default is to skip with a message)")
+    ap.add_argument("--rename-no-isbn", action="store_true",
+                    help="rename skipped no-ISBN EPUBs to NO-ISBN-{original}.epub "
+                         "so they are visible in the folder (never deletes)")
     ap.add_argument("--jobs", type=int, default=None,
                     help="process N books in parallel, splitting --batch slots across them (e.g. --jobs 2)")
     ap.add_argument("--chunks", default=None,
@@ -6297,6 +6413,16 @@ def main():
               f"{args.import_labels}")
         _LEARNED.save()
 
+    if args.isbn:
+        _cleaned = _clean_isbn(args.isbn)
+        if not _cleaned:
+            sys.exit(f"ERROR: --isbn '{args.isbn}' is not a valid ISBN-10/13")
+        CONFIG["isbn_override"] = _cleaned
+        print(f"ISBN override: {_cleaned}")
+    if args.allow_no_isbn:
+        CONFIG["allow_no_isbn"] = True
+    if args.rename_no_isbn:
+        CONFIG["rename_no_isbn"] = True
     if args.llm:
         CONFIG["llm"] = args.llm
     if args.full:

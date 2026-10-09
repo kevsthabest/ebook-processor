@@ -2302,3 +2302,230 @@ class TestHybridMerge(unittest.TestCase):
         self.assertEqual(len(possible), 1)
         self.assertAlmostEqual(possible[0]["p_yes"], 0.60)
         self.assertIn("below threshold", possible[0]["reason"])
+
+
+class TestIsbnHandling(unittest.TestCase):
+    """--isbn override, Open Library auto-lookup, skip/allow-no-isbn behavior."""
+
+    def setUp(self):
+        # Save CONFIG keys we touch.
+        self._saved = {k: pp.CONFIG.get(k) for k in
+                       ("isbn_override", "allow_no_isbn", "rename_no_isbn")}
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                pp.CONFIG.pop(k, None)
+            else:
+                pp.CONFIG[k] = v
+
+    def _ids(self, isbn=None):
+        return {"isbn": isbn, "asin": None, "raw": []}
+
+    # --isbn flag priority (highest)
+    def test_isbn_flag_overrides_epub(self):
+        pp.CONFIG["isbn_override"] = "9781615871100"
+        ids = self._ids(isbn="9780000000000")
+        isbn, src = pp._resolve_book_isbn(ids, "Freedom", "Daniel Suarez")
+        self.assertEqual(isbn, "9781615871100")
+        self.assertEqual(src, "flag")
+        self.assertEqual(ids["isbn"], "9781615871100")
+
+    def test_isbn_flag_used_when_epub_has_none(self):
+        pp.CONFIG["isbn_override"] = "9781615871100"
+        ids = self._ids(isbn=None)
+        isbn, src = pp._resolve_book_isbn(ids, "Freedom", "Daniel Suarez")
+        self.assertEqual(isbn, "9781615871100")
+        self.assertEqual(src, "flag")
+
+    # EPUB metadata priority (second)
+    def test_isbn_epub_metadata(self):
+        pp.CONFIG.pop("isbn_override", None)
+        ids = self._ids(isbn="9781101007518")
+        # Stub out network lookup so we know EPUB won without a network call.
+        orig = pp._lookup_isbn_openlibrary
+        def _fail(t, a):
+            raise AssertionError("network should not be called")
+        pp._lookup_isbn_openlibrary = _fail
+        try:
+            isbn, src = pp._resolve_book_isbn(ids, "Daemon", "Daniel Suarez")
+        finally:
+            pp._lookup_isbn_openlibrary = orig
+        self.assertEqual(isbn, "9781101007518")
+        self.assertEqual(src, "epub")
+
+    # Open Library auto-lookup (third)
+    def test_isbn_openlibrary_lookup(self):
+        pp.CONFIG.pop("isbn_override", None)
+        ids = self._ids(isbn=None)
+        orig = pp._lookup_isbn_openlibrary
+        pp._lookup_isbn_openlibrary = lambda t, a: "9781615871100"
+        try:
+            isbn, src = pp._resolve_book_isbn(ids, "Freedom", "Daniel Suarez")
+        finally:
+            pp._lookup_isbn_openlibrary = orig
+        self.assertEqual(isbn, "9781615871100")
+        self.assertEqual(src, "openlibrary")
+        self.assertEqual(ids["isbn"], "9781615871100")
+
+    def test_isbn_none_when_all_fail(self):
+        pp.CONFIG.pop("isbn_override", None)
+        orig = pp._lookup_isbn_openlibrary
+        pp._lookup_isbn_openlibrary = lambda t, a: None
+        try:
+            isbn, src = pp._resolve_book_isbn(
+                self._ids(isbn=None), "Unknown Book", "Nobody")
+        finally:
+            pp._lookup_isbn_openlibrary = orig
+        self.assertIsNone(isbn)
+        self.assertEqual(src, "none")
+
+    # _lookup_isbn_openlibrary: exact title match
+    def test_openlibrary_exact_match(self):
+        import json as _json
+        import urllib.request as _urlreq
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self):
+                return _json.dumps({
+                    "docs": [{"title": "Freedom",
+                              "isbn": ["9781615871100"]}]}).encode()
+
+        orig = _urlreq.urlopen
+        _urlreq.urlopen = lambda req, timeout=10: _Resp()
+        try:
+            got = pp._lookup_isbn_openlibrary("Freedom", "Daniel Suarez")
+        finally:
+            _urlreq.urlopen = orig
+        self.assertEqual(got, "9781615871100")
+
+    def test_openlibrary_series_prefix_tolerated(self):
+        import json as _json
+        import urllib.request as _urlreq
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self):
+                return _json.dumps({
+                    "docs": [{"title": "Freedom",
+                              "isbn": ["978-1-61587-110-0"]}]}).encode()
+
+        orig = _urlreq.urlopen
+        _urlreq.urlopen = lambda req, timeout=10: _Resp()
+        try:
+            got = pp._lookup_isbn_openlibrary("[Daemon 02] - Freedom",
+                                              "Daniel Suarez")
+        finally:
+            _urlreq.urlopen = orig
+        self.assertEqual(got, "9781615871100")
+
+    def test_openlibrary_title_mismatch_rejected(self):
+        import json as _json
+        import urllib.request as _urlreq
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self):
+                return _json.dumps({
+                    "docs": [{"title": "Something Else Entirely",
+                              "isbn": ["9780000000000"]}]}).encode()
+
+        orig = _urlreq.urlopen
+        _urlreq.urlopen = lambda req, timeout=10: _Resp()
+        try:
+            got = pp._lookup_isbn_openlibrary("Freedom", "Daniel Suarez")
+        finally:
+            _urlreq.urlopen = orig
+        self.assertIsNone(got)
+
+    def test_openlibrary_network_error_returns_none(self):
+        import urllib.request as _urlreq
+        orig = _urlreq.urlopen
+        def _boom(req, timeout=10):
+            raise ConnectionError("offline")
+        _urlreq.urlopen = _boom
+        try:
+            got = pp._lookup_isbn_openlibrary("Freedom", "Daniel Suarez")
+        finally:
+            _urlreq.urlopen = orig
+        self.assertIsNone(got)
+
+    def test_openlibrary_no_title_returns_none(self):
+        self.assertIsNone(pp._lookup_isbn_openlibrary("", "Daniel Suarez"))
+        self.assertIsNone(pp._lookup_isbn_openlibrary(None, "Daniel Suarez"))
+
+    # Skip vs allow-no-isbn
+    def test_missing_isbn_skips_by_default(self):
+        import io
+        from contextlib import redirect_stdout
+        pp.CONFIG.pop("allow_no_isbn", None)
+        pp.CONFIG.pop("rename_no_isbn", None)
+        fpath = Path("/tmp/noisbn-book.epub")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cont = pp._handle_missing_isbn(fpath)
+        self.assertFalse(cont)
+        self.assertIn("Skipping", buf.getvalue())
+        self.assertIn("--isbn", buf.getvalue())
+
+    def test_missing_isbn_allowed_with_flag(self):
+        import io
+        from contextlib import redirect_stdout
+        pp.CONFIG["allow_no_isbn"] = True
+        fpath = Path("/tmp/noisbn-book.epub")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cont = pp._handle_missing_isbn(fpath)
+        self.assertTrue(cont)
+        self.assertIn("WARNING", buf.getvalue())
+
+    def test_rename_no_isbn(self):
+        import io
+        import tempfile, os
+        from contextlib import redirect_stdout
+        pp.CONFIG.pop("allow_no_isbn", None)
+        pp.CONFIG["rename_no_isbn"] = True
+        with tempfile.TemporaryDirectory() as td:
+            fpath = Path(td) / "test-book.epub"
+            fpath.write_bytes(b"fake")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cont = pp._handle_missing_isbn(fpath)
+            self.assertFalse(cont)
+            self.assertFalse(fpath.exists())
+            self.assertTrue((Path(td) / "NO-ISBN-test-book.epub").exists())
+            self.assertIn("Renamed", buf.getvalue())
+
+    def test_rename_no_isbn_no_delete_on_collision(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        pp.CONFIG.pop("allow_no_isbn", None)
+        pp.CONFIG["rename_no_isbn"] = True
+        with tempfile.TemporaryDirectory() as td:
+            fpath = Path(td) / "test-book.epub"
+            fpath.write_bytes(b"fake")
+            (Path(td) / "NO-ISBN-test-book.epub").write_bytes(b"existing")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cont = pp._handle_missing_isbn(fpath)
+            self.assertFalse(cont)
+            # Original still there; existing target untouched.
+            self.assertTrue(fpath.exists())
+
+    # _clean_isbn validation for --isbn
+    def test_clean_isbn_valid(self):
+        self.assertEqual(pp._clean_isbn("9781615871100"), "9781615871100")
+        self.assertEqual(pp._clean_isbn("978-1-61587-110-0"), "9781615871100")
+        # ISBN-10 -> ISBN-13 conversion (check digit recomputed).
+        self.assertEqual(pp._clean_isbn("1615871101"), "9781615871100")
+
+    def test_clean_isbn_invalid(self):
+        self.assertIsNone(pp._clean_isbn("garbage"))
+        self.assertIsNone(pp._clean_isbn(""))
+        self.assertIsNone(pp._clean_isbn(None))
+        self.assertIsNone(pp._clean_isbn("123"))
