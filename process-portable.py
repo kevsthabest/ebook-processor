@@ -548,6 +548,43 @@ TRIGGER_CATEGORIES = [
 ]
 _SEVERITY_ORDER = {"none": 0, "mentioned": 1, "on_page": 2, "graphic": 3}
 
+# Relationship dedupe: exclusive types resolve by precedence (lower wins).
+# Non-exclusive types are kept as extras only with evidence.
+_REL_PRECEDENCE = {"spouse": 0, "parent": 1, "child": 1, "sibling": 2,
+                   "romantic": 3, "friend": 4, "colleague": 4, "enemy": 5}
+_REL_NONEXCLUSIVE = {"mentor", "rival", "ally", "neighbor", "other"}
+
+# Regex evidence gates for high-severity trigger claims. The evidence quote
+# must contain supporting language, not just mention the topic. Catches
+# false positives like "digital suicide" or a consensual dance tagged as
+# sexual violence. Applied at sev>=2 in v2_reduce.
+_TRIGGER_EVIDENCE_RE = {
+    "suicide": re.compile(
+        r"suicid|kill(ed)? (him|her|them)self|took (his|her|their) own life|"
+        r"hanged (him|her|them)self", re.IGNORECASE),
+    "sexual_violence": re.compile(
+        r"rap(e|ed|ing)|forced|assault|coerc|non-consensual|"
+        r"against (his|her|their) will", re.IGNORECASE),
+    "child_abuse": re.compile(
+        r"child|kid|boy|girl|minor", re.IGNORECASE),
+    "self_harm": re.compile(
+        r"cut (him|her|them)self|self-harm|self-injur", re.IGNORECASE),
+}
+
+# Negative patterns: hypothetical/hedged/metaphorical language meaning the
+# evidence does NOT depict a real event, even if a positive pattern matched.
+# Checked before the positive gate; a match downgrades to severity 1.
+_TRIGGER_NEGATIVE_RE = {
+    # Specific false-positive phrases only. A broad hypothetical-word list was
+    # tried and removed 2026-10-08: it matched "would"/"from" in unrelated
+    # clauses and dropped legitimate triggers (false negatives are worse).
+    "suicide": re.compile(
+        r"hitting (him|her|them)self"          # hyperbole, not self-harm
+        r"|would be suicide"                   # metaphorical ("that job would be suicide")
+        r"|committing digital",                 # "digital suicide" metaphor
+        re.IGNORECASE),
+}
+
 PROMPT_V2_CHARACTERS = """Analyze this book chapter and return ONLY valid JSON. No commentary, no markdown, just the JSON object.
 Keep any internal reasoning extremely brief — a complete, valid JSON object is the priority; do not let thinking crowd out the answer.
 
@@ -1212,9 +1249,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
             "confidence": _v2_char_confidence(e["appearances"], bool(ev)),
         })
 
-    # --- Relationships: canonical-remap, dedupe by (from, to, type) ---
-    seen_rel, relationships = set(), []
-    _pair_chapters = {}  # (from.lower, to.lower) -> set of chapter indices
+    # --- Relationships: canonical-remap, self-guard, unordered-pair dedupe ---
+    # Exclusive types resolve by precedence; non-exclusive kept as extras w/ evidence.
+    _pair_cands = {}    # unordered (a, b) -> list of candidate dicts
+    _pair_chapters = {}  # unordered (a, b) -> set of chapter indices
     for idx in sorted(chapter_as):
         a = chapter_as[idx]
         if not a:
@@ -1222,37 +1260,61 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         for r in a["relationships"]:
             frm = _roster_canonical(roster, r["from"])
             to = _roster_canonical(roster, r["to"])
-            rtype = r["type"]
-            # Track chapter co-occurrence for importance (before dedup/contra).
-            _pair_key = (frm.lower(), to.lower())
-            _pair_chapters.setdefault(_pair_key, set()).add(idx)
-            # Drop contradictions: parent/child are directional, only one per pair.
-            # (A parent of B) contradicts (A child of B) and (B parent of A).
-            # Exclude the identical key so repeats don't trigger the contra check.
-            if rtype in ("parent", "child"):
-                contra_keys = {
-                    (frm, to, "parent"), (frm, to, "child"),
-                    (to, frm, "parent"), (to, frm, "child"),
-                } - {(frm, to, rtype)}
-                if contra_keys & seen_rel:
-                    continue
-            key = (frm, to, rtype)
-            if key in seen_rel:
+            # Self-relationship guard (after canonicalisation)
+            if norm_name(frm) == norm_name(to):
                 continue
-            seen_rel.add(key)
-            relationships.append({
+            rtype = r["type"]
+            _pair_key = tuple(sorted([frm.lower(), to.lower()]))
+            _pair_chapters.setdefault(_pair_key, set()).add(idx)
+            _pair_cands.setdefault(_pair_key, []).append({
                 "from": frm, "to": to, "type": rtype,
                 "evidence": r.get("evidence", ""),
                 "evidence_verified": bool(r.get("evidence")),
                 "evidence_offered": bool(r.get("evidence")),
                 "chapter": idx_to_label.get(idx, ""),
+                "_idx": idx,
             })
+
+    relationships = []
+    for _pair_key, cands in _pair_cands.items():
+        # Best candidate per exclusive type (prefer evidence, then earliest)
+        _best = {}
+        for c in cands:
+            t = c["type"]
+            if t not in _REL_PRECEDENCE:
+                if t not in _REL_NONEXCLUSIVE:
+                    print(f"  Dropping unknown relationship type: {t!r}")
+                continue
+            cur = _best.get(t)
+            if (cur is None
+                    or (bool(c["evidence"]) and not bool(cur["evidence"]))
+                    or (bool(c["evidence"]) == bool(cur["evidence"])
+                        and c["_idx"] < cur["_idx"])):
+                _best[t] = c
+        # Winner: highest precedence; tie-break by evidence then earliest chapter
+        if _best:
+            _wt = min(_best,
+                      key=lambda t: (_REL_PRECEDENCE[t],
+                                    0 if _best[t]["evidence"] else 1,
+                                    _best[t]["_idx"]))
+            _w = _best[_wt]
+            relationships.append({k: v for k, v in _w.items()
+                                  if not k.startswith("_")})
+        # Non-exclusive extras: one per type, only with evidence
+        _seen_extra = set()
+        for c in sorted(cands, key=lambda c: (0 if c["evidence"] else 1,
+                                              c["_idx"])):
+            t = c["type"]
+            if t in _REL_NONEXCLUSIVE and t not in _seen_extra and c["evidence"]:
+                _seen_extra.add(t)
+                relationships.append({k: v for k, v in c.items()
+                                      if not k.startswith("_")})
 
     # --- Relationship importance: 1-5 from chapter co-occurrence ---
     # More chapters together = more important. Scaled to book length.
     _n_chapters = max(1, len(chapters))
     for rel in relationships:
-        _pk = (rel["from"].lower(), rel["to"].lower())
+        _pk = tuple(sorted([rel["from"].lower(), rel["to"].lower()]))
         _co = len(_pair_chapters.get(_pk, set()))
         # 1 chapter = 1, ~20% of book = 5
         rel["importance"] = max(1, min(5, round(1 + 4 * _co / max(1, _n_chapters * 0.2))))
@@ -1276,6 +1338,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
                                             "chapter": idx_to_label.get(idx, "")})
     sev_names = ["none", "mentioned", "on_page", "graphic"]
     triggers = []
+    _gated_dropped = 0
     for cat in TRIGGER_CATEGORIES:
         acc = trig_acc[cat]
         if acc["sev"] == 0:
@@ -1285,6 +1348,20 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         sev = acc["sev"]
         if sev >= 2 and not acc["evidence"]:
             sev = 1
+        # Regex evidence gates (before chapter-count, so downgrades filter).
+        # Conservative: false negatives are worse than false positives for
+        # content warnings. Negative patterns (hypothetical/hedged/metaphorical)
+        # mean a clear false positive -> drop. Missing positive patterns mean
+        # ambiguous evidence -> downgrade to 1, keep the claim.
+        if sev >= 2:
+            _ev_text = " ".join(e.get("quote", "") for e in acc["evidence"])
+            _neg_re = _TRIGGER_NEGATIVE_RE.get(cat)
+            _gate_re = _TRIGGER_EVIDENCE_RE.get(cat)
+            if _neg_re and _neg_re.search(_ev_text):
+                _gated_dropped += 1
+                continue
+            elif _gate_re and not _gate_re.search(_ev_text):
+                sev = 1
         # Only drop single-chapter "mentioned" items as noise. A graphic or
         # on_page scene that happens once is exactly what a trigger warning
         # is for — never drop those on chapter count alone.
@@ -1301,10 +1378,22 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
             "confidence": _v2_trigger_confidence(sev, len(acc["chapters"]),
                                                  len(acc["evidence"])),
         })
+    if _gated_dropped:
+        print(f"  Trigger regex gate: dropped {_gated_dropped} unsupported claim(s)")
 
-    # --- Spice: 75th percentile across chapters ---
+    # --- Spice: peak, non-zero average, and max(p75, peak-1) ---
     spices = sorted(b["spice_level"] for b in chapter_bs.values() if b)
-    spice_level = spices[max(0, math.ceil(0.75 * len(spices)) - 1)] if spices else 0
+    spice_peak = max(spices) if spices else 0
+    _nonzero = [s for s in spices if s > 0]
+    spice_avg_nonzero = (sum(_nonzero) / len(_nonzero)) if _nonzero else 0
+    _p75 = spices[max(0, math.ceil(0.75 * len(spices)) - 1)] if spices else 0
+    spice_level = max(_p75, spice_peak - 1) if spices else 0
+    # Consistency: explicit_sex at sev>=2 means the book has explicit content
+    for _t in triggers:
+        if (_t["warning"] == "explicit_sex"
+                and _SEVERITY_ORDER.get(_t["severity"], 0) >= 2):
+            spice_level = max(spice_level, 3)
+            break
 
     # --- POVs: named in >=2 chapters (or >=1 if fewer than 4 chapters) ---
     pov_counts = Counter()
@@ -1397,14 +1486,50 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
     red_catalog_map = {k: v for k, v in catalog_map.items() if v}
     # red_trope_chapters was built in the recount loop above (empty if skipped).
 
-    # --- Quotes: verified, spread across chapters ---
-    all_quotes = []
+    # --- Quotes: filtered, ranked by length * distinctiveness, top 5-8 ---
+    def _qtokens(s):
+        return set((s or "").lower().split())
+
+    _cand_quotes = []
     for idx in sorted(chapter_bs):
         b = chapter_bs[idx]
-        if b:
-            for q in b["quotes"]:
-                all_quotes.append({**q, "chapter": idx_to_label.get(idx, "")})
-    quotes = _spread_quotes(all_quotes)
+        if not b:
+            continue
+        _ch_label = idx_to_label.get(idx, "")
+        _sum_tokens = _qtokens(b.get("summary", ""))
+        for q in b["quotes"]:
+            _text = q.get("text", "")
+            # Drop short quotes
+            if len(_text) < 40:
+                continue
+            # Drop quotes without speaker attribution
+            if not q.get("speaker"):
+                continue
+            _qt = _qtokens(_text)
+            # Drop quotes that mostly restate the chapter summary
+            if _qt and _sum_tokens:
+                if len(_qt & _sum_tokens) / len(_qt) > 0.6:
+                    continue
+            _cand_quotes.append({**q, "chapter": _ch_label, "_tokens": _qt})
+
+    # Rank by (length * distinctiveness); distinctiveness = 1 - max token
+    # overlap with any other candidate quote.
+    _scored = []
+    for i, q in enumerate(_cand_quotes):
+        _qt = q["_tokens"]
+        _max_ov = 0.0
+        for j, o in enumerate(_cand_quotes):
+            if i == j:
+                continue
+            _ot = o["_tokens"]
+            if _qt and _ot:
+                _max_ov = max(_max_ov, len(_qt & _ot) / len(_qt))
+        _distinct = 1.0 - _max_ov
+        _scored.append((len(q.get("text", "")) * _distinct, q))
+    _scored.sort(key=lambda x: -x[0])
+    _qlimit = 8 if len(_scored) > 20 else 5
+    quotes = [{k: v for k, v in q.items() if not k.startswith("_")}
+              for _, q in _scored[:_qlimit]]
 
     # --- Chapter summaries ---
     chapter_summaries = [{"index": c["index"], "label": c["label"],
@@ -1426,6 +1551,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         "relationships": relationships,
         "triggers": triggers,
         "spice_level": spice_level,
+        "spice_peak": spice_peak,
+        "spice_avg_nonzero": round(spice_avg_nonzero, 2),
         "povs": povs,
         "trope_candidates": trope_candidates,
         "trope_candidate_counts": dict(trope_counts),

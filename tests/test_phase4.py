@@ -202,7 +202,10 @@ class TestReduce(unittest.TestCase):
     def test_spice_75th_percentile(self):
         bs = {i: _b(spice=s) for i, s in enumerate([0, 0, 2, 4], start=1)}
         red = pp.v2_reduce({}, bs, {}, [_ch(i, str(i)) for i in range(1, 5)])
-        self.assertEqual(red["spice_level"], 2)  # sorted [0,0,2,4], idx ceil(.75*4)-1=2
+        # max(p75=2, peak-1=3) = 3
+        self.assertEqual(red["spice_level"], 3)
+        self.assertEqual(red["spice_peak"], 4)
+        self.assertEqual(red["spice_avg_nonzero"], 3.0)
 
     def test_pov_threshold(self):
         roster = {}
@@ -934,3 +937,230 @@ class TestClaudeReviewFixes(unittest.TestCase):
         pp._roster_update(roster, [
             {"name": "The Narrator", "aliases": []}], 1)
         self.assertEqual(len(roster), 1)
+
+
+class TestTriggerNegativeGate(unittest.TestCase):
+    def _trig_reduce(self, cat, severity, quotes, n_chapters=2):
+        """Run v2_reduce with a single trigger category."""
+        triggers = {c: "none" for c in pp.TRIGGER_CATEGORIES}
+        triggers[cat] = severity
+        bs = {}
+        for i in range(1, n_chapters + 1):
+            b = _b(triggers, spice=0)
+            b["trigger_evidence"] = {cat: quotes[0]} if quotes else {}
+            # spread quotes across chapters if multiple
+            if len(quotes) > 1 and i <= len(quotes):
+                b["trigger_evidence"] = {cat: quotes[i - 1]}
+            bs[i] = b
+        chs = [_ch(i, f"Ch{i}") for i in range(1, n_chapters + 1)]
+        red = pp.v2_reduce({}, bs, {}, chs)
+        return [t for t in red["triggers"] if t["warning"] == cat]
+
+    def test_suicide_hypothetical_kept(self):
+        # "afraid she might kill herself" is a genuine concern -> kept
+        # (the overbroad hypothetical-word filter was removed 2026-10-08)
+        res = self._trig_reduce("suicide", "on_page",
+                                ["He was afraid she might kill herself"])
+        self.assertEqual(len(res), 1)
+
+    def test_suicide_metaphor_dropped(self):
+        res = self._trig_reduce("suicide", "graphic",
+                                ["It would be suicide to go in there alone"])
+        self.assertEqual(len(res), 0)
+
+    def test_suicide_digital_dropped(self):
+        res = self._trig_reduce("suicide", "on_page",
+                                ["She was committing digital suicide with that post"])
+        self.assertEqual(len(res), 0)
+
+    def test_suicide_real_kept(self):
+        res = self._trig_reduce("suicide", "graphic",
+                                ["He took his own life last winter"])
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["severity"], "graphic")
+
+    def test_suicide_ambiguous_downgraded(self):
+        # Evidence has no suicide language but isn't contradicted ->
+        # conservative downgrade to mentioned, claim kept (2 chapters)
+        res = self._trig_reduce("suicide", "on_page",
+                                ["They walked to the store together"])
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["severity"], "mentioned")
+        self.assertEqual(res[0]["severity_claimed"], "on_page")
+
+    def test_suicide_single_chapter_hypothetical_kept(self):
+        # "might kill himself" is ambiguous -> kept (conservative for warnings)
+        # The overbroad hypothetical-word filter was removed 2026-10-08.
+        res = self._trig_reduce("suicide", "on_page",
+                                ["He might kill himself"], n_chapters=1)
+        self.assertEqual(len(res), 1)
+
+
+class TestRemainingFixes(unittest.TestCase):
+    # --- Area 1: self-relationship guard + unordered dedupe ---
+    def _rel_reduce(self, rels_by_chapter):
+        """rel_by_chapter: {idx: [(from, to, type, evidence)]}"""
+        chapter_as = {}
+        for idx, rels in rels_by_chapter.items():
+            chapter_as[idx] = {"relationships": [
+                {"from": f, "to": t, "type": ty, "evidence": ev}
+                for f, t, ty, ev in rels]}
+        chs = [_ch(i, f"Ch{i}") for i in sorted(rels_by_chapter)]
+        red = pp.v2_reduce(chapter_as, {}, {}, chs)
+        return red["relationships"]
+
+    def test_self_relationship_dropped(self):
+        rels = self._rel_reduce({1: [("Alice", "Alice", "friend", "ev")]})
+        self.assertEqual(len(rels), 0)
+
+    def test_self_relationship_case_insensitive(self):
+        rels = self._rel_reduce({1: [("Alice", "alice", "friend", "ev")]})
+        self.assertEqual(len(rels), 0)
+
+    def test_unordered_dedupe_precedence(self):
+        # spouse beats friend regardless of direction
+        rels = self._rel_reduce({
+            1: [("Alice", "Bob", "friend", "they hung out")],
+            2: [("Bob", "Alice", "spouse", "they married")],
+        })
+        self.assertEqual(len(rels), 1)
+        self.assertEqual(rels[0]["type"], "spouse")
+
+    def test_unordered_dedupe_same_type(self):
+        # Same pair, same type, different directions -> one relationship
+        rels = self._rel_reduce({
+            1: [("Alice", "Bob", "friend", "ev1")],
+            2: [("Bob", "Alice", "friend", "ev2")],
+        })
+        self.assertEqual(len(rels), 1)
+        # Importance reflects both chapters (2/2 chapters = max importance)
+        self.assertEqual(rels[0]["importance"], 5)
+
+    def test_nonexclusive_extra_with_evidence(self):
+        # mentor kept alongside friend when it has evidence
+        rels = self._rel_reduce({
+            1: [("Alice", "Bob", "friend", "they hung out")],
+            2: [("Alice", "Bob", "mentor", "she taught him")],
+        })
+        types = sorted(r["type"] for r in rels)
+        self.assertEqual(types, ["friend", "mentor"])
+
+    def test_nonexclusive_extra_without_evidence_dropped(self):
+        rels = self._rel_reduce({
+            1: [("Alice", "Bob", "friend", "they hung out")],
+            2: [("Alice", "Bob", "mentor", "")],
+        })
+        types = [r["type"] for r in rels]
+        self.assertEqual(types, ["friend"])
+
+    # --- Area 2: spice ---
+    def test_spice_explicit_sex_consistency(self):
+        # explicit_sex at on_page with matching evidence -> spice >= 3
+        triggers = {c: "none" for c in pp.TRIGGER_CATEGORIES}
+        triggers["explicit_sex"] = "on_page"
+        b1 = _b(triggers, spice=0)
+        b1["trigger_evidence"] = {"explicit_sex": "they had explicit sex"}
+        b2 = _b(triggers, spice=1)
+        b2["trigger_evidence"] = {"explicit_sex": "more explicit sex"}
+        bs = {1: b1, 2: b2}
+        red = pp.v2_reduce({}, bs, {}, [_ch(1, "A"), _ch(2, "B")])
+        self.assertGreaterEqual(red["spice_level"], 3)
+
+    def test_spice_peak_avg_stored(self):
+        bs = {i: _b(spice=s) for i, s in enumerate([0, 2, 4], start=1)}
+        red = pp.v2_reduce({}, bs, {}, [_ch(i, str(i)) for i in range(1, 4)])
+        self.assertEqual(red["spice_peak"], 4)
+        self.assertEqual(red["spice_avg_nonzero"], 3.0)
+
+    # --- Area 3: quotes ---
+    def _quote_reduce(self, quotes_by_chapter, summaries=None):
+        bs = {}
+        for idx, quotes in quotes_by_chapter.items():
+            b = _b(quotes=quotes)
+            if summaries and idx in summaries:
+                b["summary"] = summaries[idx]
+            bs[idx] = b
+        chs = [_ch(i, f"Ch{i}") for i in sorted(quotes_by_chapter)]
+        return pp.v2_reduce({}, bs, {}, chs)["quotes"]
+
+    def test_quote_length_filter(self):
+        quotes = [
+            {"text": "Short.", "speaker": "Alice", "spoiler": False},
+            {"text": "This is a much longer quote that definitely exceeds forty characters.", "speaker": "Bob", "spoiler": False},
+        ]
+        res = self._quote_reduce({1: quotes})
+        texts = [q["text"] for q in res]
+        self.assertNotIn("Short.", texts)
+        self.assertEqual(len(texts), 1)
+
+    def test_quote_speaker_required(self):
+        quotes = [
+            {"text": "This quote has no speaker and is long enough to pass length.", "speaker": None, "spoiler": False},
+            {"text": "This quote has a speaker and is also long enough to pass.", "speaker": "Alice", "spoiler": False},
+        ]
+        res = self._quote_reduce({1: quotes})
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["speaker"], "Alice")
+
+    def test_quote_summary_overlap_dropped(self):
+        quotes = [
+            {"text": "The dragon burned the village to ashes that night.", "speaker": "Alice", "spoiler": False},
+        ]
+        summaries = {1: "The dragon burned the village to ashes that night. Everyone fled."}
+        res = self._quote_reduce({1: quotes}, summaries)
+        self.assertEqual(len(res), 0)
+
+    def test_quote_limit(self):
+        # 25 candidates -> keep 8
+        quotes = [
+            {"text": f"Quote number {i:02d} with enough length to pass the filter here.", "speaker": f"Spk{i}", "spoiler": False}
+            for i in range(25)
+        ]
+        res = self._quote_reduce({1: quotes})
+        self.assertEqual(len(res), 8)
+
+
+class TestTriggerGates(unittest.TestCase):
+    def _gate(self, cat, evidence):
+        # Replicates the gate logic in v2_reduce
+        import re
+        pos = pp._TRIGGER_EVIDENCE_RE.get(cat)
+        neg = pp._TRIGGER_NEGATIVE_RE.get(cat)
+        if neg and neg.search(evidence):
+            return "drop"
+        if pos and pos.search(evidence):
+            return "keep"
+        return "downgrade"
+
+    def test_suicide_real_threat_kept(self):
+        # "would" must NOT kill this — Advisor's false-negative case
+        self.assertEqual(
+            self._gate("suicide", "He told her he would kill himself if she left"),
+            "keep")
+
+    def test_suicide_from_clause_kept(self):
+        # "from" must NOT kill this
+        self.assertEqual(
+            self._gate("suicide", "He walked away from the building and took his own life"),
+            "keep")
+
+    def test_suicide_hyperbole_dropped(self):
+        self.assertEqual(
+            self._gate("suicide", "He was hitting himself over the mistake"),
+            "drop")
+
+    def test_suicide_metaphor_dropped(self):
+        self.assertEqual(
+            self._gate("suicide", "Taking that job would be suicide"),
+            "drop")
+
+    def test_suicide_digital_dropped(self):
+        self.assertEqual(
+            self._gate("suicide", "He was committing digital suicide by deleting everything"),
+            "drop")
+
+    def test_suicide_ambiguous_downgraded(self):
+        # No positive or negative match → downgrade, not drop
+        self.assertEqual(
+            self._gate("suicide", "They talked about death late into the night"),
+            "downgrade")
