@@ -4149,9 +4149,19 @@ def _process_one(args):
     return ok
 
 
-def run_once(dry_run, preview, max_books=None):
-    files = sorted(p for p in IMPORT_DIR.iterdir()
-                   if p.is_file() and p.suffix.lower() in (".epub", ".mobi", ".azw3"))
+def run_once(dry_run, preview, max_books=None, file=None):
+    if file:
+        p = Path(file)
+        if not p.is_file():
+            print(f"File not found: {file}")
+            return 1
+        if p.suffix.lower() not in (".epub", ".mobi", ".azw3"):
+            print(f"Unsupported format: {p.suffix} (need .epub, .mobi, or .azw3)")
+            return 1
+        files = [p]
+    else:
+        files = sorted(p for p in IMPORT_DIR.iterdir()
+                       if p.is_file() and p.suffix.lower() in (".epub", ".mobi", ".azw3"))
     if max_books and len(files) > max_books:
         print(f"Limiting to {max_books} of {len(files)} books (--max-books)")
         files = files[:max_books]
@@ -4221,6 +4231,8 @@ def main():
     ap.add_argument("--batch", type=int, default=None, help="parallel LLM requests (e.g. --batch 4)")
     ap.add_argument("--max-books", type=int, default=None,
                         help="process at most N books from the import folder (e.g. --max-books 3)")
+    ap.add_argument("--file", metavar="EBOOK", default=None,
+                    help="process a single ebook file instead of the import folder")
     ap.add_argument("--jobs", type=int, default=None,
                     help="process N books in parallel, splitting --batch slots across them (e.g. --jobs 2)")
     ap.add_argument("--chunks", default=None,
@@ -4317,12 +4329,12 @@ def main():
         print(f"Watching {IMPORT_DIR}... (Ctrl+C to stop)")
         try:
             while True:
-                run_once(args.dry_run, args.preview, args.max_books)
+                run_once(args.dry_run, args.preview, args.max_books, args.file)
                 time.sleep(60)
         except KeyboardInterrupt:
             print("\nStopped.")
     else:
-        sys.exit(1 if run_once(args.dry_run, args.preview, args.max_books) else 0)
+        sys.exit(1 if run_once(args.dry_run, args.preview, args.max_books, args.file) else 0)
 
 
 if __name__ == "__main__":
