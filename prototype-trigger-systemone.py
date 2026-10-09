@@ -73,8 +73,7 @@ def classify(base_url, model, api_key, trigger, quote, timeout=30):
         "questions": {
             "trigger_check": {
                 "type": "noul",
-                "instructions": q,
-                "criteria": {"yes": yes_when, "no": no_when},
+                "instructions": f"{q} Answer YES when: {yes_when}. Answer NO when: {no_when}.",
             }
         },
     }).encode()
