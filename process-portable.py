@@ -4680,6 +4680,9 @@ def main():
     ap.add_argument("--decision-model-url", metavar="URL", default="",
                     help="Unsloth /v1/systemone base URL for trigger validation "
                          "(e.g. http://127.0.0.1:8888/v1); omit for regex gates")
+    ap.add_argument("--decision-model", action="store_true",
+                    help="enable decision-model trigger validation using the "
+                         "configured openai_base_url (same Unsloth server)")
     ap.add_argument("--dedupe", action="store_true",
                     help="merge duplicate characters (name normalization + "
                          "embeddings) before writing; needs embed_url/embed_model")
@@ -4729,10 +4732,12 @@ def main():
         CONFIG["v2_task_last"] = True
     if args.no_viz:
         UI.set_viz_enabled(False)
-    if args.decision_model_url:
+    _dm_url = args.decision_model_url or (CONFIG.get("openai_base_url", "")
+                                           if args.decision_model else "")
+    if _dm_url:
         global _DECISION_VALIDATOR
-        _DECISION_VALIDATOR = DecisionValidator(args.decision_model_url)
-        print(f"  Decision model trigger validation: {args.decision_model_url}")
+        _DECISION_VALIDATOR = DecisionValidator(_dm_url)
+        print(f"  Decision model trigger validation: {_dm_url}")
 
     if args.llm:
         CONFIG["llm"] = args.llm
