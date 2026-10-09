@@ -611,6 +611,111 @@ _DECISION_TRIGGER_DEFS = {
         "A character deliberately injures themselves (cutting, burning, etc.)",
         "Metaphorical ('beating himself up over it'); accidental injury",
     ),
+    "addiction": (
+        "Does this passage depict addiction?",
+        "A character shows compulsive drug, alcohol, gambling, or other addictive behavior; withdrawal or cravings described",
+        "Casual or social drinking/drug use without compulsion; a single use with no pattern",
+    ),
+    "bullying": (
+        "Does this passage depict bullying?",
+        "A character is harassed, intimidated, or humiliated by someone with a power advantage over them",
+        "Mutual arguments; workplace criticism; a one-off insult without a power imbalance",
+    ),
+    "cheating": (
+        "Does this passage depict cheating?",
+        "A character cheats at a game, exam, contest, or system (hacking, rigging, using forbidden aids)",
+        "Relationship infidelity (that's infidelity); fair play; winning by skill",
+    ),
+    "death_of_loved_one": (
+        "Does this passage depict the death of a loved one?",
+        "A character the POV cares about dies on the page or the death is a present emotional event",
+        "A stranger's death; a historical death mentioned in passing; someone else's grief the character doesn't share",
+    ),
+    "domestic_abuse": (
+        "Does this passage depict domestic abuse?",
+        "A partner or family member physically harms, threatens, or coercively controls another household member",
+        "An unhappy or cold marriage without abuse; arguments without threats or violence",
+    ),
+    "explicit_sex": (
+        "Does this passage depict explicit sexual content?",
+        "Sexual acts described in explicit anatomical or pornographic detail",
+        "Romantic intimacy without explicit detail; innuendo; fade-to-black; kissing",
+    ),
+    "graphic_violence": (
+        "Does this passage depict graphic violence?",
+        "Violence described in visceral, bloody, or disturbing detail (wounds, gore, suffering)",
+        "Mild action violence; violence mentioned but not described; cartoonish violence",
+    ),
+    "infidelity": (
+        "Does this passage depict infidelity?",
+        "A character in a committed relationship has a romantic or sexual affair with someone else",
+        "Cheating at games or systems (that's cheating); flirting without acting; a breakup before the new relationship",
+    ),
+    "kidnapping_captivity": (
+        "Does this passage depict kidnapping or captivity?",
+        "A character is abducted, held against their will, or imprisoned",
+        "Voluntary confinement; being grounded; a character choosing to stay somewhere",
+    ),
+    "medical_trauma": (
+        "Does this passage depict medical trauma?",
+        "Graphic medical procedures, severe illness, surgery, or hospital suffering described in disturbing detail",
+        "A routine doctor visit; illness mentioned without detail; recovery described calmly",
+    ),
+    "miscarriage_pregnancy_loss": (
+        "Does this passage depict miscarriage or pregnancy loss?",
+        "A character loses a pregnancy through miscarriage, stillbirth, or abortion depicted on the page",
+        "A successful birth; pregnancy mentioned without loss; fear of loss that doesn't happen",
+    ),
+    "murder": (
+        "Does this passage depict murder?",
+        "A character kills another character on the page, or a killing is described in present detail",
+        "Threats without action; deaths by accident or natural causes",
+    ),
+    "non_consent": (
+        "Does this passage depict non-consensual acts (non-sexual)?",
+        "A character is drugged, coerced, or forced into a non-sexual act against their will (forced ingestion, coercion, manipulation)",
+        "Sexual non-consent (that's sexual_violence); persuasion without coercion; voluntary acts",
+    ),
+    "stalking": (
+        "Does this passage depict stalking?",
+        "A character obsessively follows, watches, or harasses another person who has not consented to the attention",
+        "A chance encounter; surveillance as part of a job (detective, security); mutual interest",
+    ),
+    "substance_abuse": (
+        "Does this passage depict substance abuse?",
+        "A character abuses drugs or alcohol to a harmful degree; intoxication driving behavior; overdose",
+        "Social drinking; a single drink; prescribed medication used correctly (that's medical, not abuse)",
+    ),
+    "torture": (
+        "Does this passage depict torture?",
+        "A character deliberately inflicts severe pain or suffering on a captive victim, physically or psychologically",
+        "A fair fight; punishment without prolonged suffering; threats of torture not carried out",
+    ),
+    "war": (
+        "Does this passage depict war?",
+        "Armed conflict between organized armed groups, battles, or war zones described as present events",
+        "A single fight; a historical war mentioned in passing; military characters in peacetime",
+    ),
+    "animal_harm": (
+        "Does this passage depict harm to animals?",
+        "An animal is injured, killed, or abused on the page",
+        "Hunting mentioned in passing; a pet's natural death described gently",
+    ),
+    "eating_disorder": (
+        "Does this passage depict disordered eating?",
+        "A character engages in restrictive eating, purging, or obsessive food behaviors described in detail",
+        "Dieting mentioned casually; a character skipping a meal",
+    ),
+    "homophobia": (
+        "Does this passage depict homophobia?",
+        "A character is targeted with slurs, discrimination, or violence because of their sexuality",
+        "A character's sexuality mentioned neutrally; bigotry discussed abstractly without a depicted incident",
+    ),
+    "racism": (
+        "Does this passage depict racism?",
+        "A character faces racial slurs, discrimination, or racial violence",
+        "A diverse cast without depicted bigotry; historical setting without a depicted incident",
+    ),
 }
 # Per-trigger P(yes) thresholds, tuned from prototype runs (2026-10-09).
 # Laya rank-orders correctly but isn't calibrated to 0.5.
@@ -619,6 +724,27 @@ _DECISION_TRIGGER_THRESHOLDS = {
     "sexual_violence": 0.20,
     "child_abuse": 0.50,
     "self_harm": 0.50,
+    "addiction": 0.50,
+    "bullying": 0.50,
+    "cheating": 0.50,
+    "death_of_loved_one": 0.50,
+    "domestic_abuse": 0.50,
+    "explicit_sex": 0.50,
+    "graphic_violence": 0.50,
+    "infidelity": 0.50,
+    "kidnapping_captivity": 0.50,
+    "medical_trauma": 0.50,
+    "miscarriage_pregnancy_loss": 0.50,
+    "murder": 0.50,
+    "non_consent": 0.50,
+    "stalking": 0.50,
+    "substance_abuse": 0.50,
+    "torture": 0.50,
+    "war": 0.50,
+    "animal_harm": 0.50,
+    "eating_disorder": 0.50,
+    "homophobia": 0.50,
+    "racism": 0.50,
 }
 
 
