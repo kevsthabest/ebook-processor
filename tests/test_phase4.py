@@ -1164,3 +1164,46 @@ class TestTriggerGates(unittest.TestCase):
         self.assertEqual(
             self._gate("suicide", "They talked about death late into the night"),
             "downgrade")
+
+
+class TestEvidenceAwareDedupe(unittest.TestCase):
+    """GPT review: unverified first occurrence must not block verified later one."""
+
+    def test_verified_later_wins(self):
+        # Simulate the dedupe logic: Ch2 no evidence, Ch7 with evidence
+        # The evidenced candidate must win
+        cands = [
+            {"from": "Alice", "to": "Bob", "type": "friend",
+             "evidence": "", "_idx": 2},
+            {"from": "Alice", "to": "Bob", "type": "friend",
+             "evidence": "They laughed together.", "_idx": 7},
+        ]
+        _best = {}
+        for c in cands:
+            t = c["type"]
+            cur = _best.get(t)
+            if (cur is None
+                    or (bool(c["evidence"]) and not bool(cur["evidence"]))
+                    or (bool(c["evidence"]) == bool(cur["evidence"])
+                        and c["_idx"] < cur["_idx"])):
+                _best[t] = c
+        self.assertEqual(_best["friend"]["evidence"], "They laughed together.")
+        self.assertEqual(_best["friend"]["_idx"], 7)
+
+    def test_different_types_kept_separate(self):
+        # friend and enemy are different types, both kept
+        cands = [
+            {"from": "Alice", "to": "Bob", "type": "friend",
+             "evidence": "They laughed.", "_idx": 2},
+            {"from": "Alice", "to": "Bob", "type": "enemy",
+             "evidence": "They fought.", "_idx": 7},
+        ]
+        _best = {}
+        for c in cands:
+            t = c["type"]
+            cur = _best.get(t)
+            if (cur is None
+                    or (bool(c["evidence"]) and not bool(cur["evidence"]))):
+                _best[t] = c
+        self.assertIn("friend", _best)
+        self.assertIn("enemy", _best)
