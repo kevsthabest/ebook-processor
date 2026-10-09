@@ -1391,3 +1391,196 @@ class TestDecisionValidator(unittest.TestCase):
     def test_default_model(self):
         dv = pp.DecisionValidator("http://x/")
         self.assertEqual(dv.model, "default")
+
+    def test_hi_lo_thresholds_derived(self):
+        # hi = base, lo = hi - 0.15 floored at 0.10
+        self.assertEqual(pp._DECISION_TRIGGER_THRESHOLDS_HI["suicide"], 0.82)
+        self.assertEqual(pp._DECISION_TRIGGER_THRESHOLDS_LO["suicide"], 0.67)
+        self.assertEqual(pp._DECISION_TRIGGER_THRESHOLDS_LO["sexual_violence"], 0.10)  # 0.20-0.15 floored
+        # Keys match the base dict
+        self.assertEqual(set(pp._DECISION_TRIGGER_THRESHOLDS_HI),
+                         set(pp._DECISION_TRIGGER_THRESHOLDS))
+        self.assertEqual(set(pp._DECISION_TRIGGER_THRESHOLDS_LO),
+                         set(pp._DECISION_TRIGGER_THRESHOLDS))
+
+    def test_missing_score_is_error_not_zero(self):
+        # Missing noul AND missing probabilities.yes must fall back,
+        # not silently score 0.
+        dv = self._mock_validator(
+            {"answers": {"trigger_check": {"type": "noul"}}})
+        verdict, p = dv.validate("suicide", "anything")
+        self.assertIsNone(verdict)
+        self.assertIsNone(p)
+
+    def test_non_numeric_score_is_error(self):
+        dv = self._mock_validator(
+            {"answers": {"trigger_check": {"type": "noul", "noul": "high"}}})
+        verdict, p = dv.validate("suicide", "anything")
+        self.assertIsNone(verdict)
+        self.assertIsNone(p)
+
+    def test_out_of_range_score_is_error(self):
+        dv = self._mock_validator(
+            {"answers": {"trigger_check": {"type": "noul", "noul": 1.5}}})
+        verdict, p = dv.validate("suicide", "anything")
+        self.assertIsNone(verdict)
+        self.assertIsNone(p)
+
+    def test_nan_score_is_error(self):
+        import math
+        dv = self._mock_validator(
+            {"answers": {"trigger_check": {"type": "noul", "noul": float("nan")}}})
+        # nan can't survive JSON round-trip, so call the validation inline
+        # by patching the parsed value instead
+        import json as _json
+        import urllib.request as _urlreq
+
+        class _FakeResp:
+            def read(self):
+                return b'{"answers": {"trigger_check": {"type": "noul", "noul": NaN}}}'
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        orig = _urlreq.urlopen
+        _urlreq.urlopen = lambda req, timeout=None: _FakeResp()
+        self.addCleanup(setattr, _urlreq, "urlopen", orig)
+        # json.loads accepts NaN by default; the validator must reject it
+        verdict, p = dv.validate("suicide", "anything")
+        self.assertIsNone(verdict)
+        self.assertIsNone(p)
+
+    def test_circuit_breaker_disables_after_3_errors(self):
+        dv = self._mock_validator(exc=ConnectionError("refused"))
+        for _ in range(3):
+            verdict, p = dv.validate("suicide", "anything")
+            self.assertIsNone(verdict)
+        self.assertTrue(dv.disabled)
+        # Further calls short-circuit without hitting the network
+        verdict, p = dv.validate("suicide", "anything")
+        self.assertIsNone(verdict)
+        self.assertIsNone(p)
+
+    def test_circuit_breaker_resets_on_success(self):
+        import json as _json
+        import urllib.request as _urlreq
+
+        calls = {"n": 0}
+
+        class _FakeResp:
+            def __init__(self, data):
+                self._data = data
+            def read(self):
+                return self._data
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        orig = _urlreq.urlopen
+
+        def fake(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise ConnectionError("refused")
+            return _FakeResp(_json.dumps(
+                {"answers": {"trigger_check": {"type": "noul", "noul": 0.9}}}
+            ).encode())
+
+        _urlreq.urlopen = fake
+        self.addCleanup(setattr, _urlreq, "urlopen", orig)
+        dv = pp.DecisionValidator("http://127.0.0.1:8888/v1")
+        dv.validate("suicide", "x")  # error 1
+        dv.validate("suicide", "x")  # error 2
+        self.assertFalse(dv.disabled)
+        verdict, p = dv.validate("suicide", "x")  # success resets
+        self.assertTrue(verdict)
+        self.assertFalse(dv.disabled)
+
+    def test_context_included_in_state(self):
+        import json as _json
+        import urllib.request as _urlreq
+
+        seen = {}
+
+        class _FakeResp:
+            def read(self):
+                return _json.dumps(
+                    {"answers": {"trigger_check": {"type": "noul", "noul": 0.9}}}
+                ).encode()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        orig = _urlreq.urlopen
+
+        def fake(req, timeout=None):
+            seen["payload"] = _json.loads(req.data.decode())
+            return _FakeResp()
+
+        _urlreq.urlopen = fake
+        self.addCleanup(setattr, _urlreq, "urlopen", orig)
+        dv = pp.DecisionValidator("http://127.0.0.1:8888/v1")
+        dv.validate("suicide", "the quote", context="surrounding text here")
+        state = seen["payload"]["state"]
+        self.assertIn("surrounding text here", state)
+        self.assertIn("the quote", state)
+
+    def test_no_context_sends_bare_quote(self):
+        import json as _json
+        import urllib.request as _urlreq
+
+        seen = {}
+
+        class _FakeResp:
+            def read(self):
+                return _json.dumps(
+                    {"answers": {"trigger_check": {"type": "noul", "noul": 0.9}}}
+                ).encode()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        orig = _urlreq.urlopen
+
+        def fake(req, timeout=None):
+            seen["payload"] = _json.loads(req.data.decode())
+            return _FakeResp()
+
+        _urlreq.urlopen = fake
+        self.addCleanup(setattr, _urlreq, "urlopen", orig)
+        dv = pp.DecisionValidator("http://127.0.0.1:8888/v1")
+        dv.validate("suicide", "just the quote")
+        self.assertEqual(seen["payload"]["state"], "just the quote")
+
+
+class TestExtractQuoteContext(unittest.TestCase):
+    """_extract_quote_context: windowed context around evidence quotes."""
+
+    def test_exact_match(self):
+        text = "A" * 500 + "the target quote here" + "B" * 500
+        ctx = pp._extract_quote_context(text, "the target quote here", window=100)
+        self.assertIn("the target quote here", ctx)
+        self.assertLessEqual(len(ctx), 100 + len("the target quote here") + 100 + 1)
+
+    def test_quote_at_start(self):
+        text = "the quote" + "x" * 1000
+        ctx = pp._extract_quote_context(text, "the quote", window=300)
+        self.assertTrue(ctx.startswith("the quote"))
+
+    def test_quote_not_found(self):
+        ctx = pp._extract_quote_context("some chapter text", "missing quote")
+        self.assertEqual(ctx, "")
+
+    def test_empty_inputs(self):
+        self.assertEqual(pp._extract_quote_context("", "quote"), "")
+        self.assertEqual(pp._extract_quote_context("text", ""), "")
+
+    def test_whitespace_normalized_fallback(self):
+        text = "line one\nline two\nline three"
+        # Quote with collapsed whitespace should still match
+        ctx = pp._extract_quote_context(text, "line one line two")
+        self.assertIn("line", ctx)

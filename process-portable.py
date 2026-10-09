@@ -747,6 +747,45 @@ _DECISION_TRIGGER_THRESHOLDS = {
     "racism": 0.50,
 }
 
+# Two-tier thresholds for per-quote judging.
+#   hi: P(yes) >= hi -> keep quote at full claimed severity
+#   lo: lo <= P(yes) < hi -> keep quote but downgrade trigger to "mentioned"
+#   P(yes) < lo -> discard the quote; drop the category only if no quote survives
+# Derived from the base thresholds (lo = hi - 0.15, floored at 0.10) so that
+# retuning the base threshold retunes both tiers together.
+_DECISION_TRIGGER_THRESHOLDS_HI = dict(_DECISION_TRIGGER_THRESHOLDS)
+_DECISION_TRIGGER_THRESHOLDS_LO = {
+    k: max(0.10, round(v - 0.15, 2))
+    for k, v in _DECISION_TRIGGER_THRESHOLDS.items()
+}
+
+
+def _extract_quote_context(chapter_text, quote, window=300):
+    """Return ~window chars of context on each side of quote in chapter text.
+
+    Used to give the decision model surrounding context for a bare evidence
+    quote. Returns "" if the quote can't be located.
+    """
+    if not chapter_text or not quote:
+        return ""
+    idx = chapter_text.find(quote)
+    if idx >= 0:
+        start = max(0, idx - window)
+        end = min(len(chapter_text), idx + len(quote) + window)
+        return chapter_text[start:end]
+    # Fallback: normalize whitespace and retry (LLM quotes sometimes
+    # collapse newlines).
+    norm_text = re.sub(r"\s+", " ", chapter_text)
+    norm_quote = re.sub(r"\s+", " ", quote).strip()
+    if not norm_quote:
+        return ""
+    idx = norm_text.find(norm_quote)
+    if idx < 0:
+        return ""
+    start = max(0, idx - window)
+    end = min(len(norm_text), idx + len(norm_quote) + window)
+    return norm_text[start:end]
+
 
 class DecisionValidator:
     """Validates trigger evidence via a /v1/systemone decision model.
@@ -767,15 +806,58 @@ class DecisionValidator:
         self.model = model or "default"
         self.api_key = api_key
         self.timeout = timeout
+        self._lock = threading.Lock()
+        self._consec_errors = 0
+        self._disabled = False
+        self._disable_warned = False
 
-    def validate(self, trigger, quote):
-        """Returns (verdict_bool, p_yes). (None, None) on error."""
+    def _record_success(self):
+        with self._lock:
+            self._consec_errors = 0
+
+    def _record_error(self):
+        """Record an error. Returns True if this tripped the circuit breaker."""
+        with self._lock:
+            self._consec_errors += 1
+            if self._consec_errors >= 3 and not self._disabled:
+                self._disabled = True
+                return True
+            return False
+
+    def _note_disabled(self):
+        """Print the circuit-breaker warning once (thread-safe)."""
+        with self._lock:
+            if self._disable_warned:
+                return
+            self._disable_warned = True
+        print("  Decision model disabled after 3 consecutive errors; "
+              "falling back to regex for remainder of run")
+
+    @property
+    def disabled(self):
+        with self._lock:
+            return self._disabled
+
+    def validate(self, trigger, quote, context=""):
+        """Judge one evidence quote. Returns (verdict_bool, p_yes).
+
+        verdict_bool uses the hi threshold (True = keep at full severity);
+        the caller applies the hi/lo tiers per quote. (None, None) on any
+        error, in which case the caller falls back to the regex gates.
+        """
+        with self._lock:
+            if self._disabled:
+                return None, None
         q, yes_when, no_when = _DECISION_TRIGGER_DEFS.get(
             trigger, (f"Does this depict {trigger}?", "", ""))
-        threshold = _DECISION_TRIGGER_THRESHOLDS.get(trigger, 0.5)
+        hi = _DECISION_TRIGGER_THRESHOLDS_HI.get(trigger, 0.5)
+        if context:
+            _state = f"Context:\n{context}\n\nQuote to judge:\n{quote}"
+        else:
+            _state = quote
         payload = json.dumps({
             "model": self.model,
-            "state": quote,
+            "state": _state,
             "questions": {
                 "trigger_check": {
                     "type": "noul",
@@ -796,13 +878,27 @@ class DecisionValidator:
             ans = result["answers"]["trigger_check"]
             p_yes = ans.get("noul")
             if p_yes is None:
-                p_yes = ans.get("probabilities", {}).get("yes", 0)
-            verdict = p_yes >= threshold
+                p_yes = ans.get("probabilities", {}).get("yes")
+            # Strict score validation: a missing/malformed score is an
+            # error (falls back to regex), never a silent negative.
+            if p_yes is None:
+                raise ValueError("response missing 'noul' score")
+            if isinstance(p_yes, bool) or not isinstance(p_yes, (int, float)):
+                raise ValueError(f"non-numeric noul score: {p_yes!r}")
+            if math.isnan(p_yes) or math.isinf(p_yes):
+                raise ValueError(f"non-finite noul score: {p_yes}")
+            if not 0 <= p_yes <= 1:
+                raise ValueError(f"noul score out of range [0,1]: {p_yes}")
+            verdict = p_yes >= hi
             print(f"  Decision: {trigger}: P(yes)={p_yes:.2f} "
-                  f"{'≥' if verdict else '<'} {threshold:.2f} → "
-                  f"{'keep' if verdict else 'drop'}")
+                  f"{'≥' if verdict else '<'} {hi:.2f} → "
+                  f"{'keep' if verdict else 'drop/downgrade'}")
+            self._record_success()
             return verdict, float(p_yes)
         except Exception as e:
+            _tripped = self._record_error()
+            if _tripped:
+                self._note_disabled()
             print(f"  Decision model error ({trigger}): {e}; "
                   f"falling back to regex")
             return None, None
@@ -1423,6 +1519,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
     """
     n = len(chapters)
     idx_to_label = {c["index"]: c["label"] for c in chapters}
+    _label_to_text = {c["label"]: c.get("text", "") for c in chapters}
 
     # --- Characters: from the roster (aliases already merged) ---
     # Keep only characters with a proper name OR 3+ chapter appearances.
@@ -1596,17 +1693,53 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         if sev >= 2:
             _ev_text = " ".join(e.get("quote", "") for e in acc["evidence"])
             _dv_used = False
-            # Decision-model gate (opt-in via --decision-model-url).
+            # Decision-model gate (opt-in via --decision-model).
+            # Per-quote judging with hi/lo tiers:
+            #   P >= hi -> keep quote at claimed severity
+            #   lo <= P < hi -> keep quote, downgrade trigger to "mentioned"
+            #   P < lo -> discard the quote
+            # The category is dropped only if no quote survives. Top 3
+            # surviving quotes by P(yes) are kept as evidence.
             if _DECISION_VALIDATOR is not None and _ev_text.strip():
-                _dv_verdict, _ = _DECISION_VALIDATOR.validate(cat, _ev_text)
-                if _dv_verdict is not None:
+                _hi = _DECISION_TRIGGER_THRESHOLDS_HI.get(cat, 0.5)
+                _lo = _DECISION_TRIGGER_THRESHOLDS_LO.get(cat, 0.35)
+                _judged = []  # (p_yes, evidence_entry), scored, ungated
+                _dv_error = False
+                for _ev in acc["evidence"]:
+                    _q = _ev.get("quote", "")
+                    _ctx = _extract_quote_context(
+                        _label_to_text.get(_ev.get("chapter", ""), ""), _q)
+                    _v, _p = _DECISION_VALIDATOR.validate(cat, _q, _ctx)
+                    if _v is None:
+                        _dv_error = True
+                        break
+                    _judged.append((_p, _ev))
+                if not _dv_error:
                     _dv_used = True
-                    if not _dv_verdict:
+                    _kept = []  # (p_yes, evidence_entry)
+                    _downgrade = False
+                    for _p, _ev in _judged:
+                        _ev["decision_p"] = round(_p, 4)
+                        _ev["decision_gate"] = "decision"
+                        if _p >= _hi:
+                            _kept.append((_p, _ev))
+                        elif _p >= _lo:
+                            _kept.append((_p, _ev))
+                            _downgrade = True
+                        # else: discard this quote's evidence
+                    if not _kept:
                         _gated_dropped += 1
                         continue
-                    # else: verified, keep sev as-is
+                    if _downgrade:
+                        sev = 1
+                    _kept.sort(key=lambda x: -x[0])
+                    acc["evidence"] = [_ev for _, _ev in _kept[:3]]
             # Regex gates: default path, or fallback if the decision model errored.
             if not _dv_used:
+                _was_dv = (_DECISION_VALIDATOR is not None
+                           and _ev_text.strip())
+                for _ev in acc["evidence"]:
+                    _ev["decision_gate"] = "fallback" if _was_dv else "regex"
                 _neg_re = _TRIGGER_NEGATIVE_RE.get(cat)
                 _gate_re = _TRIGGER_EVIDENCE_RE.get(cat)
                 if _neg_re and _neg_re.search(_ev_text):
@@ -1619,6 +1752,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         # is for — never drop those on chapter count alone.
         if len(acc["chapters"]) < 2 and sev < 2:
             continue
+        # Stamp any evidence that never went through a gate (sev was already
+        # "mentioned", so no gate ran).
+        for _ev in acc["evidence"]:
+            _ev.setdefault("decision_gate", "none")
         triggers.append({
             "warning": cat,
             "severity": sev_names[sev],
