@@ -808,6 +808,7 @@ class TestAreaB(unittest.TestCase):
         self.assertFalse(any("Copyright" in lb or "Also By" in lb for lb in labels))
 
     def test_fallback_trigger_few_units(self):
+        pp._DIAG.chapter_detection_fallback = False  # reset (as process_file_v2 does)
         # 2 units (fewer than 5) with chapter headings -> fallback splits
         ch_text = ""
         for i in range(1, 7):
@@ -822,6 +823,7 @@ class TestAreaB(unittest.TestCase):
         self.assertGreater(len(result), 2)
 
     def test_fallback_trigger_dominant_unit(self):
+        pp._DIAG.chapter_detection_fallback = False  # reset (as process_file_v2 does)
         # One unit holds >60% of text -> fallback
         big = "\nChapter One\n" + ("Text. " * 1000) + "\nChapter Two\n" + ("More. " * 1000)
         units = [
@@ -836,6 +838,7 @@ class TestAreaB(unittest.TestCase):
         self.assertTrue(getattr(pp._DIAG, 'chapter_detection_fallback', False))
 
     def test_no_fallback_normal(self):
+        pp._DIAG.chapter_detection_fallback = False  # reset (as process_file_v2 does)
         units = [
             {"spine": f"ch{i:02d}.html", "label": f"Chapter {i}",
              "text": f"Chapter {i} content. " * 300}

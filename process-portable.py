@@ -466,7 +466,6 @@ def split_chapters(units):
       MAX_CHAPTER_CHARS) on paragraph boundaries.
     Returns [{"index", "label", "text"}] in reading order.
     """
-    _DIAG.chapter_detection_fallback = False
     max_chars = CONFIG.get("v2_max_chapter_chars", MAX_CHAPTER_CHARS)
     kept = [u for u in units
             if not _SKIP_UNIT_RE.search(u["spine"])
@@ -3497,6 +3496,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     suffix = fpath.suffix.lower()
 
     if suffix == ".epub":
+        _DIAG.chapter_detection_fallback = False  # reset per book
         units, title, author, identifiers = extract_epub_units(fpath)
         chapters = split_chapters(units)
         _chap_fallback = getattr(_DIAG, "chapter_detection_fallback", False)
@@ -3506,6 +3506,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         if extracted is None:
             return False
         text, title, author, identifiers = extracted
+        _DIAG.chapter_detection_fallback = False  # reset per book (_prose_chapters may set it)
         chapters = _prose_chapters(text)
         _chap_fallback = getattr(_DIAG, "chapter_detection_fallback", False)
         word_count = len(text.split())
