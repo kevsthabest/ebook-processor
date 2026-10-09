@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive character merge labeler.
+r"""Interactive character merge labeler.
 
 Presents candidate character pairs from a preview JSON and lets you
 approve/deny whether they're the same person. Saves labels for use
@@ -28,7 +28,7 @@ def load_pairs(json_path, max_pairs=100):
     seen = set()
 
     def add_pair(a_name, a_desc, b_name, b_desc, source):
-        key = tuple(sorted([a_name.lower(), b_name.lower()]))
+        key = "|||".join(sorted([a_name.lower(), b_name.lower()]))
         if key in seen or a_name.lower() == b_name.lower():
             return
         seen.add(key)
@@ -81,14 +81,14 @@ def main():
     pairs = load_pairs(args.json, args.max_pairs)
     # Skip already-labeled
     pairs = [p for p in pairs
-             if tuple(sorted([p['a']['name'].lower(),
-                              p['b']['name'].lower()])) not in labels]
+             if "|||".join(sorted([p['a']['name'].lower(),
+                                   p['b']['name'].lower()])) not in labels]
     print(f"{len(pairs)} unlabeled pairs to review\n")
 
     count = 0
     for p in pairs:
-        key = tuple(sorted([p['a']['name'].lower(),
-                            p['b']['name'].lower()]))
+        key = "|||".join(sorted([p['a']['name'].lower(),
+                                 p['b']['name'].lower()]))
         print(f"\n--- Pair {count+1}/{len(pairs)} [{p['source']}] ---")
         print(f"  A: {p['a']['name']}")
         if p['a']['desc']:
