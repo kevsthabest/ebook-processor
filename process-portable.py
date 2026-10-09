@@ -424,26 +424,37 @@ def _fallback_heading_split(units):
     """Split units on _CHAPTER_HEADING_RE when spine structure is unusable.
 
     Used when an EPUB yields <5 units or one unit holds >60% of the text.
-    Requires each chunk >1500 chars (discards TOC lines). Returns new units.
+    Returns (new_units, found_headings). Keeps all chunks (including short
+    ones and pre-heading text); the merge-forward logic in split_chapters
+    handles small units. Only skips TOC-like chunks (many short lines).
     """
     out = []
+    found = False
     for u in units:
         text = u["text"]
         matches = list(_CHAPTER_HEADING_RE.finditer(text))
         if len(matches) < 2:
             out.append(u)
             continue
+        found = True
         bounds = [m.start() for m in matches] + [len(text)]
+        # Keep text before first heading (don't silently delete it)
+        pre = text[:bounds[0]].strip()
+        if pre and len(pre) > 200:
+            out.append({"spine": f"{u['spine']}#fb0",
+                        "label": "Pre-heading", "text": pre})
         for i in range(len(matches)):
             chunk = text[bounds[i]:bounds[i + 1]].strip()
-            if len(chunk) > 1500:
-                label = chunk.split("\n", 1)[0].strip()[:80]
-                out.append({"spine": f"{u['spine']}#fb{i + 1}",
-                            "label": label, "text": chunk})
-        # If nothing survived the length filter, keep the original
-        if not any(o["spine"].startswith(u["spine"] + "#fb") for o in out):
-            out.append(u)
-    return out or units
+            if not chunk:
+                continue
+            # Skip TOC-like chunks: many short lines, little prose
+            lines = chunk.split("\n")
+            if len(lines) > 10 and sum(len(l) for l in lines) / len(lines) < 40:
+                continue
+            label = chunk.split("\n", 1)[0].strip()[:80]
+            out.append({"spine": f"{u['spine']}#fb{i + 1}",
+                        "label": label, "text": chunk})
+    return out, found
 
 
 def split_chapters(units):
@@ -467,10 +478,14 @@ def split_chapters(units):
         total = sum(len(u["text"]) for u in kept)
         biggest = max(kept, key=lambda u: len(u["text"]))
         if len(kept) < 5 or (total and len(biggest["text"]) / total > 0.6):
-            _DIAG.chapter_detection_fallback = True
-            print("!!! CHAPTER DETECTION FALLBACK - heading-based split, "
-                  "results may be unreliable")
-            kept = _fallback_heading_split(kept)
+            # Only flag as fallback if heading split actually found structure.
+            # Short books with clean spines shouldn't be penalized.
+            new_kept, found = _fallback_heading_split(kept)
+            if found:
+                _DIAG.chapter_detection_fallback = True
+                print("!!! CHAPTER DETECTION FALLBACK - heading-based split, "
+                      "results may be unreliable")
+                kept = new_kept
     # Merge small units forward (label of the following, larger unit wins).
     merged = []
     pending = None
@@ -621,11 +636,10 @@ PROMPT_V2_CONTENT = PROMPT_V2_CONTENT.replace(
 # are recorded for display but never trigger a merge — the model lists
 # distinct people as "aliases" too often.
 _GENERIC_ALIASES = {"i", "me", "my", "mine", "myself",
-                    "the narrator", "narrator",
-                    "my husband", "the husband", "husband",
-                    "my wife", "the wife", "wife",
-                    "my mother", "my father", "mom", "dad",
-                    "mother", "father"}
+                    "the narrator", "narrator"}
+# Note: "wife", "husband", "mother", "father" etc. were removed 2026-10-08.
+# Merging on relationship words across characters caused false merges
+# (e.g. two characters both listing "wife" as an alias).
 
 
 # Words that are relationships/descriptors, not names. Never valid as aliases.
@@ -687,6 +701,10 @@ def _is_valid_alias(alias):
     _honorifics = {"mr", "mrs", "ms", "miss", "dr", "prof"}
     if len(words) == 2 and words[0].rstrip(".") in _honorifics:
         return False
+    # Possessive pronoun + ban-word: "his wife", "her son", "my mother"
+    _poss = {"his", "her", "my", "their", "our", "your", "its"}
+    if len(words) == 2 and words[0] in _poss and words[1] in _ALIAS_BAN_WORDS:
+        return False
     # Relationship/descriptor words (exact match or as the only meaningful word)
     if len(words) == 1 and words[0] in _ALIAS_BAN_WORDS:
         return False
@@ -718,8 +736,14 @@ def _roster_update(roster, characters, chapter_idx):
             continue
         if not _is_person_like(name):
             continue  # Skip groups/organizations/places misclassified as characters
-        alias_keys = {norm_name(a) for a in c.get("aliases", [])}
+        alias_keys = {norm_name(a) for a in c.get("aliases", [])
+                      if _is_valid_alias(a)}
         alias_keys.discard("")
+        # Generic-merge uses raw aliases: "the narrator" is rejected as a display
+        # alias but must still trigger first-person merging.
+        _generic_keys = {norm_name(a) for a in c.get("aliases", [])} & _GENERIC_ALIASES
+        _generic_keys.add(nkey)  # primary name may itself be generic ("I", "Narrator")
+        _generic_keys &= _GENERIC_ALIASES
 
         if nkey in primaries:
             found = primaries[nkey]
@@ -731,16 +755,18 @@ def _roster_update(roster, characters, chapter_idx):
                     break
             else:
                 found = None
-            generic_keys = ({nkey} | alias_keys) & _GENERIC_ALIASES
-            if generic_keys:
+            if _generic_keys:
                 for k, e in roster.items():
-                    if generic_keys & (e["alias_keys"] & _GENERIC_ALIASES):
+                    _e_generic = ({k} | e["alias_keys"]) & _GENERIC_ALIASES
+                    # Also check stored generic keys from when entry was created
+                    _e_generic |= e.get("_generic_keys", set())
+                    if _generic_keys & _e_generic:
                         found = k
                         break
 
         if found is None:
             roster[nkey] = {"name": name, "aliases": set(), "alias_keys": {nkey},
-                            "primary_keys": {nkey},
+                            "primary_keys": {nkey}, "_generic_keys": _generic_keys,
                             "appearances": 0, "last_seen": chapter_idx,
                             "chapters": set(),
                             "roles": Counter(), "descriptions": []}
@@ -778,9 +804,10 @@ def _roster_update(roster, characters, chapter_idx):
             # Only counts if the chapter provided evidence (not just a mention).
             if c["status"] == "dead" and c.get("evidence"):
                 e.setdefault("death_reports", []).append(chapter_idx)
-        # Track per-chapter evidence presence for sticky-death "acted later" check.
-        if c.get("evidence"):
-            e.setdefault("chapter_evidence", set()).add(chapter_idx)
+            # Track "alive" reports with evidence: a dead character merely mentioned
+            # doesn't count as acting. Only status="alive" + evidence clears death.
+            if c["status"] == "alive" and c.get("evidence"):
+                e.setdefault("alive_reports", set()).add(chapter_idx)
         if c.get("evidence") and not e.get("evidence"):
             e["evidence"] = c["evidence"]  # first verified evidence wins
 
@@ -1093,7 +1120,11 @@ def _ground_entities(characters, relationships, chapters):
 # Conservative: when in doubt, blank the appearance field.
 _MINOR_RE = re.compile(
     r"\b(child|children|teen(?:ager)?|boy|girl|kid|youth|juvenile|adolescent|"
-    r"toddler|baby|infant|minor|youngster|preteen)\b", re.IGNORECASE)
+    r"toddler|baby|infant|minor|youngster|preteen)\b|"
+    r"\b(?:[1-9]|1[0-7])[- ]year[- ]old\b|"
+    r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen)[- ]year[- ]old\b",
+    re.IGNORECASE)
 _SEXUALIZED_TERMS = frozenset({
     "sexy", "voluptuous", "curvy", "busty", "seductive", "sensual", "erotic",
     "arousing", "lustful", "provocative", "sultry", "titillating", "shapely",
@@ -1153,7 +1184,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
         if _death_reports:
             _first_death = min(_death_reports)
             _acted_later = any(
-                idx > _first_death for idx in e.get("chapter_evidence", set()))
+                idx > _first_death for idx in e.get("alive_reports", set()))
             if not _acted_later:
                 _status = "dead"
         _appearances = e.get("appearances_desc") or []
@@ -1193,19 +1224,20 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters):
             frm = _roster_canonical(roster, r["from"])
             to = _roster_canonical(roster, r["to"])
             rtype = r["type"]
+            # Track chapter co-occurrence for importance (before dedup/contra).
+            _pair_key = (frm.lower(), to.lower())
+            _pair_chapters.setdefault(_pair_key, set()).add(idx)
             # Drop contradictions: parent/child are directional, only one per pair.
             # (A parent of B) contradicts (A child of B) and (B parent of A).
+            # Exclude the identical key so repeats don't trigger the contra check.
             if rtype in ("parent", "child"):
                 contra_keys = {
                     (frm, to, "parent"), (frm, to, "child"),
                     (to, frm, "parent"), (to, frm, "child"),
-                }
+                } - {(frm, to, rtype)}
                 if contra_keys & seen_rel:
                     continue
             key = (frm, to, rtype)
-            # Track chapter co-occurrence for importance (before dedup).
-            _pair_key = (frm.lower(), to.lower())
-            _pair_chapters.setdefault(_pair_key, set()).add(idx)
             if key in seen_rel:
                 continue
             seen_rel.add(key)
@@ -1445,8 +1477,9 @@ def _sanitize_v2_gate(r):
 
 # Genre/setting labels that are not tropes. Dropped via _tnorm match.
 _TROPE_DENYLIST = frozenset({
-    "techno-thriller", "technothriller", "dystopia", "dystopian", "conspiracy",
-    "thriller", "sci-fi", "scifi", "science fiction", "fantasy", "romance",
+    "techno-thriller", "technothriller", "techno thriller", "dystopia", "dystopian",
+    "conspiracy", "thriller", "sci-fi", "scifi", "sci fi", "science fiction",
+    "science-fiction", "fantasy", "romance",
     "mystery", "horror", "comedy", "drama", "adventure", "action",
     "cyberpunk", "steampunk", "space opera", "urban fantasy", "dark fantasy",
     "paranormal", "historical fiction", "literary fiction", "crime",
@@ -1454,7 +1487,10 @@ _TROPE_DENYLIST = frozenset({
 })
 
 def _is_denylisted_trope(name):
-    return _tnorm(name) in _TROPE_DENYLIST
+    # Normalize hyphens to spaces: "sci-fi" -> "sci fi" matches "science fiction" variants
+    key = _tnorm(name).replace("-", " ")
+    key = " ".join(key.split())  # collapse double spaces from hyphen replacement
+    return key in _TROPE_DENYLIST or _tnorm(name) in _TROPE_DENYLIST
 
 
 def v2_trope_gate(call, chapter_summaries, candidates, candidate_counts):
@@ -1518,6 +1554,10 @@ def _prose_chapters(text):
                 units.append({"spine": f"part{i + 1}", "label": label,
                               "text": chunk})
     else:
+        # Fixed-size split: no chapter structure found. Flag as fallback.
+        _DIAG.chapter_detection_fallback = True
+        print("!!! CHAPTER DETECTION FALLBACK - fixed-size split, "
+              "results may be unreliable")
         target = 30000
         cur, clen = [], 0
         for p in text.split("\n\n"):
@@ -4140,13 +4180,18 @@ def _process_one(args):
             print(f"  Error processing {f.name}: {e}")
             traceback.print_exc()
         ok = False
-    if not dry_run and not preview:
+    if not dry_run and not preview and not _is_single_file_run(f):
         try:
             safe_move(f, DONE_DIR if ok else FAILED_DIR)
         except Exception as e:
             with _PRINT_LOCK:
                 print(f"  Could not move {f.name}: {e}")
     return ok
+
+
+def _is_single_file_run(f):
+    """True if this file was passed via --file (don't move it after processing)."""
+    return getattr(_DIAG, "single_file", None) is not None and Path(f) == Path(_DIAG.single_file)
 
 
 def run_once(dry_run, preview, max_books=None, file=None):
@@ -4159,7 +4204,9 @@ def run_once(dry_run, preview, max_books=None, file=None):
             print(f"Unsupported format: {p.suffix} (need .epub, .mobi, or .azw3)")
             return 1
         files = [p]
+        _DIAG.single_file = str(p)
     else:
+        _DIAG.single_file = None
         files = sorted(p for p in IMPORT_DIR.iterdir()
                        if p.is_file() and p.suffix.lower() in (".epub", ".mobi", ".azw3"))
     if max_books and len(files) > max_books:

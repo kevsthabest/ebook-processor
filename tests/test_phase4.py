@@ -888,3 +888,46 @@ class TestAreaC(unittest.TestCase):
         # Underscores/spacing variants still match
         self.assertTrue(pp._is_denylisted_trope("science_fiction"))
         self.assertTrue(pp._is_denylisted_trope("Science Fiction"))
+
+
+class TestClaudeReviewFixes(unittest.TestCase):
+    def test_alias_keys_filtered(self):
+        # Bug 1: invalid aliases must not feed merge keys
+        roster = {}
+        pp._roster_update(roster, [
+            {"name": "Peter Sebeck", "aliases": ["wife", "Pete"]}
+        ], 0)
+        e = list(roster.values())[0]
+        self.assertNotIn(pp.norm_name("wife"), e["alias_keys"])
+        # "Pete" is valid and should be in keys
+        self.assertIn(pp.norm_name("Pete"), e["alias_keys"])
+
+    def test_wife_no_cross_merge(self):
+        # Two characters both listing "wife" must NOT merge
+        roster = {}
+        pp._roster_update(roster, [{"name": "Peter Sebeck", "aliases": ["wife"]}], 0)
+        pp._roster_update(roster, [{"name": "John Smith", "aliases": ["wife"]}], 1)
+        self.assertEqual(len(roster), 2)
+
+    def test_possessive_pronoun_alias(self):
+        self.assertFalse(pp._is_valid_alias("his wife"))
+        self.assertFalse(pp._is_valid_alias("her son"))
+        self.assertFalse(pp._is_valid_alias("my mother"))
+
+    def test_minor_age_pattern(self):
+        self.assertTrue(pp._MINOR_RE.search("seven-year-old boy"))
+        self.assertTrue(pp._MINOR_RE.search("16-year-old girl"))
+
+    def test_trope_denylist_hyphen(self):
+        self.assertTrue(pp._is_denylisted_trope("sci fi"))
+        self.assertTrue(pp._is_denylisted_trope("science-fiction"))
+        self.assertTrue(pp._is_denylisted_trope("SCI-FI"))
+
+    def test_narrator_still_merges(self):
+        # "the narrator" rejected as display alias but still merges
+        roster = {}
+        pp._roster_update(roster, [
+            {"name": "Shirley Jackson", "aliases": ["the narrator"]}], 0)
+        pp._roster_update(roster, [
+            {"name": "The Narrator", "aliases": []}], 1)
+        self.assertEqual(len(roster), 1)
