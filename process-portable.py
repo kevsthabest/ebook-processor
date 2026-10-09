@@ -797,6 +797,27 @@ _SPICE_MATRIX = {
 _PEAK_BAND_MIN_SPICE = {"mild": 1, "moderate": 2, "explicit": 4}
 
 
+def _spice_band_detail(spice_levels, successful_chapters):
+    """Pure function: per-chapter spice levels -> (peak_band, freq_band, level).
+
+    Same computation as _spice_level_from_chapters but also returns the
+    matrix coordinates, for visualization (--show-matrices).
+    """
+    # Clamp out-of-range values (defensive: bad model output shouldn't skew).
+    spice_levels = [max(0, min(5, s)) for s in spice_levels]
+    peak = max(spice_levels) if spice_levels else 0
+    peak_band = _spice_band_peak(peak)
+    if peak_band == "none":
+        return ("none", "none", 0)
+    min_spice = _PEAK_BAND_MIN_SPICE[peak_band]
+    n_at_peak = sum(1 for s in spice_levels if s >= min_spice)
+    frac = (n_at_peak / successful_chapters) if successful_chapters else 0
+    freq_band = _spice_band_freq(frac)
+    if freq_band == "none":
+        return (peak_band, "none", 0)
+    return (peak_band, freq_band, _SPICE_MATRIX.get((peak_band, freq_band), 0))
+
+
 def _spice_level_from_chapters(spice_levels, successful_chapters):
     """Pure function: list of per-chapter spice levels (0-5) + count of
     successfully processed chapters -> book spice level 0-5 via the
@@ -817,19 +838,7 @@ def _spice_level_from_chapters(spice_levels, successful_chapters):
     failed extractions don't silently dilute the frequency. Out-of-range
     spice values are clamped to 0-5.
     """
-    # Clamp out-of-range values (defensive: bad model output shouldn't skew).
-    spice_levels = [max(0, min(5, s)) for s in spice_levels]
-    peak = max(spice_levels) if spice_levels else 0
-    peak_band = _spice_band_peak(peak)
-    if peak_band == "none":
-        return 0
-    min_spice = _PEAK_BAND_MIN_SPICE[peak_band]
-    n_at_peak = sum(1 for s in spice_levels if s >= min_spice)
-    frac = (n_at_peak / successful_chapters) if successful_chapters else 0
-    freq_band = _spice_band_freq(frac)
-    if freq_band == "none":
-        return 0
-    return _SPICE_MATRIX.get((peak_band, freq_band), 0)
+    return _spice_band_detail(spice_levels, successful_chapters)[2]
 
 
 # Trigger prominence: severity x frequency per trigger. Additive — severity
@@ -956,6 +965,69 @@ def _rel_confidence(n_quotes, n_cooccur, rtype):
     ev_band = _rel_evidence_band(n_quotes, n_cooccur)
     type_band = _rel_type_band(rtype)
     return _REL_CONFIDENCE.get((ev_band, type_band), "low")
+
+
+# ASCII matrix visualizations for --show-matrices (terminal display during
+# processing). All pure functions returning strings — no I/O, no ANSI codes
+# (Windows PowerShell compatible). Active cells are marked with >> <<.
+_SPICE_VIZ_ROWS = ["mild", "moderate", "explicit"]
+_SPICE_VIZ_COLS = ["rare", "occasional", "frequent", "pervasive"]
+
+
+def _spice_matrix_ascii(peak_band, freq_band, level):
+    """ASCII spice matrix with the book's position highlighted.
+
+    peak_band/freq_band come from _spice_band_detail(). Handles "none"
+    bands (no spicy content) gracefully — no highlight, just the grid.
+    """
+    lines = ["Spice matrix (peak intensity x frequency):"]
+    lines.append(" " * 14 + "".join(f"{c:^12}" for c in _SPICE_VIZ_COLS))
+    for r in _SPICE_VIZ_ROWS:
+        cells = []
+        for c in _SPICE_VIZ_COLS:
+            v = _SPICE_MATRIX.get((r, c), 0)
+            if r == peak_band and c == freq_band:
+                cells.append(f">>{v}<<".center(12))
+            else:
+                cells.append(str(v).center(12))
+        label = f">>{r}<<" if r == peak_band else f"  {r}"
+        lines.append(f"{label:<14}" + "".join(cells))
+    if peak_band in ("none",) or freq_band in ("none",):
+        lines.append("  -> Book spice: 0 (no spicy content detected)")
+    else:
+        lines.append(f"  -> Book spice: {level} "
+                     f"(peak={peak_band}, freq={freq_band})")
+    return "\n".join(lines)
+
+
+def _char_importance_ascii(principals, minors, max_rows=20):
+    """ASCII table of principal characters sorted by chapter frequency."""
+    principals = principals or []
+    minors = minors or []
+    lines = [f"Character importance "
+             f"({len(principals)} principals, {len(minors)} minor):"]
+    lines.append(f"  {'Name':<24}{'Freq':>7}  {'Role':<12}  POV")
+    _sorted = sorted(principals, key=lambda c: -(c.get("frequency") or 0))
+    for c in _sorted[:max_rows]:
+        _freq = c.get("frequency") or 0
+        _pov = "*" if c.get("is_pov") else ""
+        _name = str(c.get("name", "?"))[:24]
+        _role = str(c.get("role", "?"))[:12]
+        lines.append(f"  {_name:<24}{_freq:>6.0%}  {_role:<12}  {_pov}")
+    if len(_sorted) > max_rows:
+        lines.append(f"  ... and {len(_sorted) - max_rows} more")
+    return "\n".join(lines)
+
+
+def _rel_confidence_ascii(relationships):
+    """ASCII distribution of relationship confidence levels."""
+    counts = Counter()
+    for r in relationships or []:
+        counts[r.get("confidence", "low")] += 1
+    return ("Relationship confidence:\n"
+            f"  high: {counts.get('high', 0)}, "
+            f"medium: {counts.get('medium', 0)}, "
+            f"low: {counts.get('low', 0)}")
 
 
 def _filter_principals(characters, relationships, min_frequency=0.20):
@@ -2831,7 +2903,8 @@ def _is_minor(role, description):
     return bool(_MINOR_RE.search(text))
 
 
-def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False):
+def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
+              show_matrices=False):
     """Deterministic reduce over per-chapter v2 results. Pure code, no LLM.
 
     chapter_as/bs: {chapter_index: result or None}. Returns a result dict
@@ -2839,6 +2912,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False):
 
     preview: when True, decision-model validation scores are recorded but
     low-confidence family relationships are NOT downgraded (audit only).
+
+    show_matrices: when True, print ASCII matrix visualizations (spice,
+    relationship confidence) to the terminal during processing.
     """
     n = len(chapters)
     idx_to_label = {c["index"]: c["label"] for c in chapters}
@@ -3039,6 +3115,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False):
             if not preview:
                 rel["type"] = "other"
 
+    if show_matrices:
+        print(_rel_confidence_ascii(relationships))
+
     # --- Triggers: max severity per category, chapter counts, top evidence ---
     trig_acc = {c: {"sev": 0, "chapters": [], "evidence": []}
                 for c in TRIGGER_CATEGORIES}
@@ -3167,6 +3246,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False):
     spices = [b["spice_level"] for b in chapter_bs.values() if b]
     spice_peak = max(spices) if spices else 0
     spice_level = _spice_level_from_chapters(spices, n_successful_b)
+    if show_matrices:
+        _sb_peak, _sb_freq, _ = _spice_band_detail(spices, n_successful_b)
+        print(_spice_matrix_ascii(_sb_peak, _sb_freq, spice_level))
 
     # --- Trope candidates: union across chapters (gate runs separately) ---
     # (POVs computed earlier, before the characters section.)
@@ -6102,7 +6184,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
 
     # Deterministic reduce (no LLM).
     red = v2_reduce(chapter_as, chapter_bs, roster,
-                    [ch for _, ch in indexed], preview=preview)
+                    [ch for _, ch in indexed], preview=preview,
+                    show_matrices=CONFIG.get("show_matrices", False))
 
     # Trope confirmation: frequency tiers, LLM gate only for the borderline.
     # Thresholds scale with book length (5% of chapters, min 3):
@@ -6268,6 +6351,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         print(f"  Principals: {len(_princs)}/{len(_full_characters)} characters, "
               f"{len(_prels)}/{len(_full_relationships)} relationships "
               f"(min_frequency={_min_freq})")
+        if CONFIG.get("show_matrices"):
+            print(_char_importance_ascii(_princs, _minors))
 
     # Cross-run learning: persist series roster + learned state. Runs in
     # preview/dry-run too (learning from a preview is the point).
@@ -6575,6 +6660,8 @@ def process_file(fpath, dry_run=False, preview=False):
         print(f"  Principals: {len(_princs)}/{len(result['characters'])} characters, "
               f"{len(_prels)}/{len(result['relationships'])} relationships "
               f"(min_frequency={_min_freq})")
+        if CONFIG.get("show_matrices"):
+            print(_char_importance_ascii(_princs, _minors))
         result["characters"] = _princs
         result["relationships"] = _prels
         result["minor_characters"] = _minors
@@ -6839,6 +6926,9 @@ def main():
     ap = argparse.ArgumentParser(description="Extract tropes/triggers/characters from ebooks.")
     ap.add_argument("--dry-run", action="store_true", help="extract only; write and move nothing")
     ap.add_argument("--preview", action="store_true", help="save preview files; write and move nothing")
+    ap.add_argument("--show-matrices", action="store_true",
+                    help="print ASCII matrix visualizations (spice, character "
+                         "importance, relationship confidence) during processing")
     ap.add_argument("--watch", action="store_true", help="rescan the import folder every 60s")
     ap.add_argument("--llm", choices=["ollama", "openrouter", "openai"], help="override config llm")
     ap.add_argument("--sample", type=int, default=None, help="process every Nth chunk (e.g. --sample 3)")
@@ -7033,6 +7123,8 @@ def main():
         CONFIG["principals_only"] = False
     if args.min_frequency != 0.20:
         CONFIG["min_frequency"] = args.min_frequency
+    if args.show_matrices:
+        CONFIG["show_matrices"] = True
     if args.llm:
         CONFIG["llm"] = args.llm
     if args.full:

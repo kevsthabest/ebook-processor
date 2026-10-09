@@ -2988,3 +2988,104 @@ class TestPrincipalFilter(unittest.TestCase):
         self.assertEqual((princs, minors, rels), ([], [], []))
         princs, minors, rels = pp._filter_principals(None, None)
         self.assertEqual((princs, minors, rels), ([], [], []))
+
+
+class TestMatrixViz(unittest.TestCase):
+    def test_spice_band_detail_matches_level(self):
+        # Detail returns the same level as _spice_level_from_chapters.
+        levels = [0, 0, 1, 2, 4, 0, 5, 3]
+        peak_band, freq_band, level = pp._spice_band_detail(levels, 8)
+        self.assertEqual(level, pp._spice_level_from_chapters(levels, 8))
+        self.assertEqual(peak_band, "explicit")
+        self.assertIn(freq_band, ("rare", "occasional", "frequent", "pervasive"))
+
+    def test_spice_band_detail_no_spice(self):
+        peak_band, freq_band, level = pp._spice_band_detail([0, 0, 0], 3)
+        self.assertEqual((peak_band, freq_band, level), ("none", "none", 0))
+
+    def test_spice_band_detail_empty(self):
+        peak_band, freq_band, level = pp._spice_band_detail([], 0)
+        self.assertEqual((peak_band, freq_band, level), ("none", "none", 0))
+
+    def test_spice_matrix_ascii_highlights_active_cell(self):
+        out = pp._spice_matrix_ascii("explicit", "frequent", 4)
+        self.assertIn(">>explicit<<", out)
+        self.assertIn(">>4<<", out)
+        self.assertIn("Book spice: 4", out)
+        self.assertIn("peak=explicit", out)
+        self.assertIn("freq=frequent", out)
+
+    def test_spice_matrix_ascii_no_spice(self):
+        out = pp._spice_matrix_ascii("none", "none", 0)
+        self.assertNotIn(">>", out)
+        self.assertIn("no spicy content", out)
+        self.assertIn("Book spice: 0", out)
+
+    def test_spice_matrix_ascii_all_cells_present(self):
+        out = pp._spice_matrix_ascii("mild", "rare", 1)
+        # All 12 matrix values should appear.
+        for v in ("1", "2", "3", "4", "5"):
+            self.assertIn(v, out)
+
+    def test_char_importance_ascii_basic(self):
+        princs = [
+            {"name": "Alice", "frequency": 0.45, "role": "protagonist",
+             "is_pov": True},
+            {"name": "Bob", "frequency": 0.22, "role": "supporting",
+             "is_pov": False},
+        ]
+        minors = [{"name": "Zed", "frequency": 0.05, "role": "minor"}]
+        out = pp._char_importance_ascii(princs, minors)
+        self.assertIn("2 principals, 1 minor", out)
+        self.assertIn("Alice", out)
+        self.assertIn("45%", out)
+        self.assertIn("*", out)  # POV marker
+        # Sorted by frequency desc: Alice before Bob.
+        self.assertLess(out.index("Alice"), out.index("Bob"))
+
+    def test_char_importance_ascii_empty(self):
+        out = pp._char_importance_ascii([], [])
+        self.assertIn("0 principals, 0 minor", out)
+
+    def test_char_importance_ascii_none_inputs(self):
+        out = pp._char_importance_ascii(None, None)
+        self.assertIn("0 principals, 0 minor", out)
+
+    def test_char_importance_ascii_truncates(self):
+        princs = [{"name": f"Char{i:02d}", "frequency": 0.5 - i * 0.01,
+                   "role": "protagonist"} for i in range(25)]
+        out = pp._char_importance_ascii(princs, [], max_rows=20)
+        self.assertIn("... and 5 more", out)
+        self.assertNotIn("Char24", out)
+
+    def test_rel_confidence_ascii_distribution(self):
+        rels = ([{"confidence": "high"}] * 12
+                + [{"confidence": "medium"}] * 8
+                + [{"confidence": "low"}] * 3)
+        out = pp._rel_confidence_ascii(rels)
+        self.assertIn("high: 12", out)
+        self.assertIn("medium: 8", out)
+        self.assertIn("low: 3", out)
+
+    def test_rel_confidence_ascii_empty(self):
+        out = pp._rel_confidence_ascii([])
+        self.assertIn("high: 0", out)
+        self.assertIn("medium: 0", out)
+        self.assertIn("low: 0", out)
+
+    def test_rel_confidence_ascii_none(self):
+        out = pp._rel_confidence_ascii(None)
+        self.assertIn("high: 0", out)
+
+    def test_v2_reduce_accepts_show_matrices(self):
+        # show_matrices=True doesn't break reduce; prints are harmless.
+        bs = {1: _b(spice=2)}
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            red = pp.v2_reduce({}, bs, {}, [_ch(1, "A")],
+                               show_matrices=True)
+        out = buf.getvalue()
+        self.assertIn("Spice matrix", out)
+        self.assertIn("Relationship confidence", out)
+        self.assertIn("spice_level", red)
