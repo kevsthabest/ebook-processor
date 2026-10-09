@@ -881,32 +881,23 @@ class DecisionValidator:
         with self._lock:
             return self._disabled
 
-    def validate(self, trigger, quote, context=""):
-        """Judge one evidence quote. Returns (verdict_bool, p_yes).
+    def _ask_noul(self, question_key, instructions, state, label="decision"):
+        """Ask one noul question. Returns p_yes (float) or None on any error.
 
-        verdict_bool uses the hi threshold (True = keep at full severity);
-        the caller applies the hi/lo tiers per quote. (None, None) on any
-        error, in which case the caller falls back to the regex gates.
+        Applies strict score validation and the circuit breaker. Never raises;
+        a missing/malformed score is an error (caller falls back), never a
+        silent negative.
         """
         with self._lock:
             if self._disabled:
-                return None, None
-        q, yes_when, no_when = _DECISION_TRIGGER_DEFS.get(
-            trigger, (f"Does this depict {trigger}?", "", ""))
-        hi = _DECISION_TRIGGER_THRESHOLDS_HI.get(trigger, 0.5)
-        if context:
-            _state = f"Context:\n{context}\n\nQuote to judge:\n{quote}"
-        else:
-            _state = quote
+                return None
         payload = json.dumps({
             "model": self.model,
-            "state": _state,
+            "state": state,
             "questions": {
-                "trigger_check": {
+                question_key: {
                     "type": "noul",
-                    "instructions": (
-                        f"{q} Answer YES when: {yes_when}. "
-                        f"Answer NO when: {no_when}."),
+                    "instructions": instructions,
                 }
             },
         }).encode()
@@ -919,7 +910,7 @@ class DecisionValidator:
                 self.endpoint, data=payload, headers=headers)
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 result = json.loads(resp.read())
-            ans = result["answers"]["trigger_check"]
+            ans = result["answers"][question_key]
             p_yes = ans.get("noul")
             if p_yes is None:
                 p_yes = ans.get("probabilities", {}).get("yes")
@@ -933,19 +924,79 @@ class DecisionValidator:
                 raise ValueError(f"non-finite noul score: {p_yes}")
             if not 0 <= p_yes <= 1:
                 raise ValueError(f"noul score out of range [0,1]: {p_yes}")
-            verdict = p_yes >= hi
-            print(f"  Decision: {trigger}: P(yes)={p_yes:.2f} "
-                  f"{'≥' if verdict else '<'} {hi:.2f} → "
-                  f"{'keep' if verdict else 'drop/downgrade'}")
             self._record_success()
-            return verdict, float(p_yes)
+            return float(p_yes)
         except Exception as e:
             _tripped = self._record_error()
             if _tripped:
                 self._note_disabled()
-            print(f"  Decision model error ({trigger}): {e}; "
+            print(f"  Decision model error ({label}): {e}; "
                   f"falling back to regex")
+            return None
+
+    def validate(self, trigger, quote, context=""):
+        """Judge one evidence quote. Returns (verdict_bool, p_yes).
+
+        verdict_bool uses the hi threshold (True = keep at full severity);
+        the caller applies the hi/lo tiers per quote. (None, None) on any
+        error, in which case the caller falls back to the regex gates.
+        """
+        q, yes_when, no_when = _DECISION_TRIGGER_DEFS.get(
+            trigger, (f"Does this depict {trigger}?", "", ""))
+        hi = _DECISION_TRIGGER_THRESHOLDS_HI.get(trigger, 0.5)
+        if context:
+            _state = f"Context:\n{context}\n\nQuote to judge:\n{quote}"
+        else:
+            _state = quote
+        _instructions = (f"{q} Answer YES when: {yes_when}. "
+                         f"Answer NO when: {no_when}.")
+        p_yes = self._ask_noul("trigger_check", _instructions, _state,
+                               label=trigger)
+        if p_yes is None:
             return None, None
+        verdict = p_yes >= hi
+        print(f"  Decision: {trigger}: P(yes)={p_yes:.2f} "
+              f"{'≥' if verdict else '<'} {hi:.2f} → "
+              f"{'keep' if verdict else 'drop/downgrade'}")
+        return verdict, p_yes
+
+    def ask_same_person(self, name_a, desc_a, ev_a, name_b, desc_b, ev_b):
+        """Tier 3 merge judgment: do these two roster entries refer to the
+        same person? Returns (merged_bool, p_yes). (None, None) on any
+        error, in which case the caller keeps them separate.
+
+        merged_bool uses _MERGE_P_YES_THRESHOLD (deliberately high: a false
+        merge corrupts the roster permanently).
+        """
+        _parts = [f"Character A: {name_a}"]
+        if desc_a:
+            _parts.append(f"Description A: {desc_a[:600]}")
+        if ev_a:
+            _parts.append(f"Evidence A: {ev_a[:300]}")
+        _parts.append(f"Character B: {name_b}")
+        if desc_b:
+            _parts.append(f"Description B: {desc_b[:600]}")
+        if ev_b:
+            _parts.append(f"Evidence B: {ev_b[:300]}")
+        _instructions = (
+            "Are these two character entries referring to the same person? "
+            "Answer YES when: the names are variants of each other (nickname, "
+            "shortened form, title + name matching a fuller name, minor "
+            "spelling differences) AND the descriptions are compatible. "
+            "Answer NO when: different first names, different people sharing "
+            "a surname (siblings, parent/child), incompatible descriptions "
+            "or roles, or insufficient evidence they are the same individual."
+        )
+        p_yes = self._ask_noul("same_person", _instructions,
+                               "\n".join(_parts), label="merge")
+        if p_yes is None:
+            return None, None
+        merged = p_yes >= _MERGE_P_YES_THRESHOLD
+        print(f"  Merge decision: {name_a[:40]} vs {name_b[:40]}: "
+              f"P(yes)={p_yes:.2f} {'≥' if merged else '<'} "
+              f"{_MERGE_P_YES_THRESHOLD:.2f} → "
+              f"{'merge' if merged else 'keep separate'}")
+        return merged, p_yes
 
 
 # ---------------------------------------------------------------------------
@@ -1491,19 +1542,33 @@ def _roster_update(roster, characters, chapter_idx):
 
     Merge rules, in order:
     1. Incoming primary name matches a known PRIMARY -> merge.
-    2. Incoming name or alias is a GENERIC reference ("i", "the narrator",
+    2. Learned nickname / series hint / token lookup -> merge.
+    3. Tiered deterministic merge (_merge_tier): Tier 1 hard NO (same-chapter
+       co-occurrence), Tier 2 YES (titles, spelling, nicknames, unambiguous
+       subsequence). Ambiguous pairs are left for post_pass_merge (Tier 3).
+    4. Incoming name or alias is a GENERIC reference ("i", "the narrator",
        ...) matching an entry's generic alias -> merge.
     Proper-name aliases never trigger a merge (they're recorded, not trusted).
+    The book's author is never a character (author filter).
     """
     primaries = {}
     for k, e in roster.items():
         for pk in e.get("primary_keys", {k}):
             primaries[pk] = k
+    # Tier 1 bookkeeping: nkeys listed as separate characters in THIS chapter.
+    _chapter_keys = {norm_name(c.get("name", "")) for c in characters}
+    _chapter_keys.discard("")
+    _book_author = getattr(_DIAG, "book_author", None)
 
     for c in characters:
         name = c.get("name", "")
         nkey = norm_name(name)
         if not nkey:
+            continue
+        if _book_author and _is_author_name(name, _book_author):
+            # The author is not a character ("About the Author" pages etc.).
+            UI.viz_event(getattr(_DIAG, "viz_book_key", None),
+                         '✗ Filtered: "%s" (book author)' % name[:40])
             continue
         if not _is_person_like(name):
             # Skip groups/organizations/places misclassified as characters
@@ -1557,9 +1622,16 @@ def _roster_update(roster, characters, chapter_idx):
                         if len(set(_cands)) == 1:
                             found = _cands[0]
             if found is None:
-                # Substring/fuzzy match: "bodhi" vs "bodhi durran"
+                # Tiered deterministic merge (replaces the old _names_overlap
+                # substring heuristic): Tier 1 hard NO for same-chapter
+                # co-occurrence, Tier 2 YES for titles/spelling/nicknames/
+                # unambiguous subsequence. "ambiguous" pairs are left as
+                # separate entries for post_pass_merge (Tier 3).
+                _pkeys = set(primaries.keys())
                 for pk, rk in primaries.items():
-                    if _names_overlap(nkey, pk):
+                    _tier = _merge_tier(nkey, pk, chapter_keys=_chapter_keys,
+                                        roster_keys=_pkeys)
+                    if _tier == "yes":
                         found = rk
                         break
                 else:
@@ -1866,6 +1938,192 @@ def _roster_canonical(roster, name):
         if nkey == k or nkey in e["alias_keys"]:
             return e["name"]
     return name
+
+
+def _merge_roster_entries(roster, keep_key, drop_key):
+    """Fold drop_key's roster entry into keep_key's. Mutates roster.
+
+    Combines aliases, appearances, chapters, descriptions, and evidence.
+    The display name prefers the cleaner (fewer noise tokens) variant.
+    """
+    if keep_key == drop_key or drop_key not in roster or keep_key not in roster:
+        return
+    ke, de = roster[keep_key], roster[drop_key]
+    ke["alias_keys"] |= de.get("alias_keys", set())
+    ke["primary_keys"] |= de.get("primary_keys", set())
+    ke["aliases"] |= de.get("aliases", set())
+    ke["appearances"] = ke.get("appearances", 0) + de.get("appearances", 0)
+    ke["chapters"] |= de.get("chapters", set())
+    ke["roles"] += de.get("roles", Counter())
+    for d in de.get("descriptions", []):
+        if d not in ke["descriptions"]:
+            ke["descriptions"].append(d)
+    if len(de.get("evidence", "")) > len(ke.get("evidence", "")):
+        ke["evidence"] = de["evidence"]
+    for attr in ("statuses",):
+        if de.get(attr):
+            ke.setdefault(attr, Counter()).update(de[attr])
+    for attr in ("death_reports", "alive_reports", "unresolved_mentions"):
+        if de.get(attr):
+            ke.setdefault(attr, set()).update(de[attr])
+    for attr in ("appearances_desc",):
+        if de.get(attr):
+            ke.setdefault(attr, []).extend(
+                x for x in de[attr] if x not in ke.get(attr, []))
+    # Display name: prefer the cleaner variant (fewer noise tokens), then
+    # the one with more appearances.
+    _keep_toks = _strip_merge_noise(keep_key)
+    _drop_toks = _strip_merge_noise(drop_key)
+    if (len(_drop_toks) < len(_keep_toks) and _drop_toks
+            and de.get("name")):
+        ke["name"] = de["name"]
+    # Merge generic-key bookkeeping so first-person resolution still works.
+    ke["_generic_keys"] = ke.get("_generic_keys", set()) | de.get(
+        "_generic_keys", set())
+    del roster[drop_key]
+
+
+def _roster_best_desc(entry):
+    """Best description text for a roster entry (same policy as v2_reduce:
+    earliest evidence-backed, then longest)."""
+    _descs = entry.get("descriptions", [])
+    _descs = [d if isinstance(d, tuple) else (0, d, False) for d in _descs]
+    if not _descs:
+        return ""
+    _with_ev = [d for d in _descs if len(d) > 2 and d[2]]
+    if _with_ev:
+        return sorted(_with_ev, key=lambda x: (x[0], -len(x[1])))[0][1]
+    return max(_descs, key=lambda x: len(x[1]))[1]
+
+
+def _merge_pair_signal(ka, kb):
+    """Similarity signal strength for a Tier 3 candidate pair (0 = none).
+    Counts shared non-title tokens; substring matches count too."""
+    sa = set(_strip_merge_noise(ka)) - _NAME_STOPWORDS
+    sb = set(_strip_merge_noise(kb)) - _NAME_STOPWORDS
+    if not sa or not sb:
+        return 0
+    _shared = len(sa & sb)
+    if _shared:
+        return _shared
+    # Substring signal on the joined stripped names.
+    ja, jb = " ".join(sorted(sa)), " ".join(sorted(sb))
+    if ja and jb and (ja in jb or jb in ja):
+        return 1
+    return 0
+
+
+def post_pass_merge(roster, validator=None):
+    """Post-chapter merge pass over the roster. Tier 1/2 deterministic first
+    (converging loop), then Tier 3 via the decision model for ambiguous pairs
+    with a similarity signal.
+
+    Returns (n_merged, possible_merges) where possible_merges is a list of
+    {"name_a", "name_b", "p_yes", "reason"} for manual review. Pairs are left
+    separate (never force-merged) when the model is unavailable or unsure.
+    """
+    possible_merges = []
+    n_merged = 0
+    _ln = _learn()
+    _isbn = getattr(_DIAG, "learn_isbn", None)
+
+    def _record(keep_key, drop_key):
+        if _ln.enabled:
+            _ln.record_merge(drop_key, keep_key, _isbn)
+            _dw = drop_key.split()
+            _cw = keep_key.split()
+            if len(_dw) == 1 and _cw and _dw[0] != _cw[0]:
+                _ln.record_token_merge(_dw[0], _cw[0], _isbn)
+
+    # Tier 1/2: converge deterministic merges.
+    _changed = True
+    while _changed:
+        _changed = False
+        _keys = list(roster.keys())
+        _rkeys = set(_keys)
+        for i, ka in enumerate(_keys):
+            if ka not in roster:
+                continue
+            for kb in _keys[i + 1:]:
+                if kb not in roster:
+                    continue
+                ea, eb = roster[ka], roster[kb]
+                _tier = _merge_tier(
+                    ka, kb, a_chapters=ea.get("chapters"),
+                    b_chapters=eb.get("chapters"), roster_keys=_rkeys)
+                if _tier == "yes":
+                    # Keep the entry with more appearances (more evidence).
+                    keep, drop = (ka, kb) if ea.get("appearances", 0) >= \
+                        eb.get("appearances", 0) else (kb, ka)
+                    _merge_roster_entries(roster, keep, drop)
+                    _record(keep, drop)
+                    n_merged += 1
+                    _changed = True
+                    break
+            if _changed:
+                break
+
+    # Tier 3: ambiguous pairs with a similarity signal.
+    _keys = list(roster.keys())
+    _cands = []  # (signal, ka, kb)
+    for i, ka in enumerate(_keys):
+        for kb in _keys[i + 1:]:
+            ea, eb = roster[ka], roster[kb]
+            _tier = _merge_tier(
+                ka, kb, a_chapters=ea.get("chapters"),
+                b_chapters=eb.get("chapters"),
+                roster_keys=set(_keys))
+            if _tier != "ambiguous":
+                continue
+            _sig = _merge_pair_signal(ka, kb)
+            if _sig:
+                _cands.append((_sig, ka, kb))
+    # Strongest signals first; cap total decision-model calls.
+    _cands.sort(key=lambda x: -x[0])
+    _over_cap = _cands[_MERGE_TIER3_CAP:]
+    _cands = _cands[:_MERGE_TIER3_CAP]
+    # Pairs beyond the cap are listed for manual review, not silently dropped.
+    for _sig, ka, kb in _over_cap:
+        if ka not in roster or kb not in roster:
+            continue
+        ea, eb = roster[ka], roster[kb]
+        possible_merges.append({
+            "name_a": ea.get("name", ka), "name_b": eb.get("name", kb),
+            "p_yes": None, "reason": "unresolved (Tier 3 cap reached)"})
+
+    _dm_off = validator is None or getattr(validator, "disabled", False)
+    for _sig, ka, kb in _cands:
+        if ka not in roster or kb not in roster:
+            continue  # merged by an earlier Tier 3 decision
+        ea, eb = roster[ka], roster[kb]
+        _na, _nb = ea.get("name", ka), eb.get("name", kb)
+        if _dm_off:
+            possible_merges.append({
+                "name_a": _na, "name_b": _nb, "p_yes": None,
+                "reason": "unresolved (decision model disabled)"})
+            continue
+        _merged, _p = validator.ask_same_person(
+            _na, _roster_best_desc(ea), ea.get("evidence", ""),
+            _nb, _roster_best_desc(eb), eb.get("evidence", ""))
+        if _merged is None:
+            possible_merges.append({
+                "name_a": _na, "name_b": _nb, "p_yes": None,
+                "reason": "decision model error"})
+            if getattr(validator, "disabled", False):
+                _dm_off = True  # circuit breaker tripped; rest are unresolved
+            continue
+        if _merged:
+            keep, drop = (ka, kb) if ea.get("appearances", 0) >= \
+                eb.get("appearances", 0) else (kb, ka)
+            _merge_roster_entries(roster, keep, drop)
+            _record(keep, drop)
+            n_merged += 1
+        else:
+            possible_merges.append({
+                "name_a": _na, "name_b": _nb,
+                "p_yes": round(_p, 4) if _p is not None else None,
+                "reason": f"below threshold ({_MERGE_P_YES_THRESHOLD})"})
+    return n_merged, possible_merges
 
 
 def _v2_char_confidence(appearances, has_verified_evidence):
@@ -2765,10 +3023,11 @@ def _viz_stats_line(st, now):
     """Plain-text stats line for the visualizer panel (no Rich markup)."""
     elapsed_min = max((now - st.get("run_t0", now)) / 60.0, 1e-6)
     speed = int(st.get("chars_total", 0) / elapsed_min)
+    toks = speed / 60.0 / 4.0  # ~4 chars/token for English
     ci = st.get("chap_idx") or "?"
     ct = st.get("chap_total") or "?"
-    return "Characters: %d | Chapter %s/%s | %d chars/min" % (
-        st.get("new_count", 0), ci, ct, speed)
+    return "Characters: %d | Chapter %s/%s | %d chars/min (%.1f tok/s)" % (
+        st.get("new_count", 0), ci, ct, speed, toks)
 
 
 def _viz_new_state(book_key):
@@ -4008,6 +4267,246 @@ def _names_overlap(a, b):
             and len(short[0]) > 3 and short[0] not in _NAME_STOPWORDS)
 
 
+# ---------------------------------------------------------------------------
+# Hybrid character merge: deterministic tiers + decision-model fallback.
+#
+# Tier 1 (hard NO): the two names were listed as separate characters in the
+#   same chapter -> different people, never merge.
+# Tier 2 (deterministic YES): title/contextual-prefix stripping, exact match,
+#   spelling variants, known nicknames, unambiguous multi-token subsequence.
+#   Single-token-to-multi-token is NEVER automatic (the surname-family trap).
+# Tier 3 (ambiguous): deferred to post_pass_merge(), which asks the decision
+#   model with both characters' descriptions as evidence.
+# ---------------------------------------------------------------------------
+
+# Contextual prefixes that don't change identity ("the late Matthew Sobol"
+# is still Matthew Sobol).
+_CONTEXTUAL_PREFIXES = frozenset({"the late", "late", "official"})
+
+# Professional titles/ranks beyond _TITLES, stripped before merge comparison.
+# Only leading tokens are stripped, and only when the remainder still matches.
+_PROFESSIONAL_TITLES = frozenset({
+    "agent", "special agent", "detective", "officer", "deputy", "sheriff",
+    "chief", "director", "commissioner", "inspector", "constable", "marshal",
+    "president", "vice president", "senator", "congressman", "mayor",
+    "governor", "judge", "justice", "attorney", "prosecutor", "ambassador",
+    "secretary", "minister",
+    "private", "corporal", "staff sergeant", "master sergeant",
+    "warrant officer", "ensign", "admiral",
+    "doctor", "nurse", "surgeon", "dean",
+    "herr", "frau", "oberstleutnant", "oberst", "hauptmann", "leutnant",
+    "father", "reverend", "pastor", "rabbi", "bishop", "priest",
+})
+
+# Well-established nickname -> full first name. Used only when surnames match
+# exactly, so a wrong entry can't merge strangers.
+_COMMON_NICKNAMES = {
+    "pete": "peter", "mike": "michael", "jim": "james", "jimmy": "james",
+    "bob": "robert", "bobby": "robert", "rob": "robert",
+    "bill": "william", "billy": "william", "will": "william", "liam": "william",
+    "dave": "david", "steve": "steven", "dan": "daniel", "danny": "daniel",
+    "matt": "matthew", "chris": "christopher",
+    "nick": "nicholas", "alex": "alexander",
+    "ben": "benjamin", "charlie": "charles", "chuck": "charles",
+    "chaz": "charles", "tom": "thomas", "tommy": "thomas",
+    "rick": "richard", "ricky": "richard", "joe": "joseph", "joey": "joseph",
+    "sam": "samuel", "tony": "anthony", "jack": "john", "johnny": "john",
+    "josh": "joshua", "greg": "gregory", "jeff": "jeffrey",
+    "ken": "kenneth", "larry": "lawrence", "ron": "ronald",
+    "phil": "philip", "tim": "timothy", "ed": "edward", "eddie": "edward",
+    "ted": "theodore", "liz": "elizabeth", "beth": "elizabeth",
+    "betty": "elizabeth", "kate": "katherine", "katie": "katherine",
+    "jen": "jennifer", "jenny": "jennifer", "jess": "jessica",
+    "becky": "rebecca", "sue": "susan", "nat": "natalie",
+}
+
+# Decision-model merge threshold (Tier 3). Deliberately high: a false merge
+# corrupts the roster permanently, a missed merge just leaves a duplicate.
+_MERGE_P_YES_THRESHOLD = 0.85
+# Safety cap on Tier 3 decision-model calls per book.
+_MERGE_TIER3_CAP = 50
+
+
+def _strip_merge_noise(nkey):
+    """Strip titles, contextual prefixes, and middle initials from a
+    normalized name key. Returns a token list for merge comparison."""
+    toks = (nkey or "").split()
+    # Leading contextual prefixes ("the late", "official").
+    for pref in ("the late", "late", "official"):
+        pp = pref.split()
+        if toks[:len(pp)] == pp:
+            toks = toks[len(pp):]
+            break
+    # Leading titles (longest match first for multi-word titles like
+    # "special agent"). Repeats: "special agent" then "agent" can't stack.
+    titles = _effective_titles() | _PROFESSIONAL_TITLES
+    changed = True
+    while changed and toks:
+        changed = False
+        for t in sorted(titles, key=len, reverse=True):
+            tp = t.split()
+            if toks[:len(tp)] == tp:
+                toks = toks[len(tp):]
+                changed = True
+                break
+    # Middle initials ("matthew a. sobol" -> ["matthew", "sobol"]). Never
+    # strip the only token.
+    if len(toks) > 1:
+        toks = [t for t in toks
+                if not (len(t.rstrip(".")) == 1 and t.rstrip(".").isalpha())]
+    return toks
+
+
+def _levenshtein(a, b):
+    """Edit distance (iterative, O(min(m,n)) space)."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _is_spelling_variant(ta, tb):
+    """Conservative spelling-variant check for two tokens (e.g. 'joseph' vs
+    'josef', 'mosely' vs 'mosley'). Requires a shared 3+ char prefix and
+    edit distance <= 2. Never a hard-NO signal on its own."""
+    if ta == tb:
+        return True
+    if abs(len(ta) - len(tb)) > 1:
+        return False
+    if min(len(ta), len(tb)) < 4:
+        return False
+    _pre = 0
+    for ca, cb in zip(ta, tb):
+        if ca != cb:
+            break
+        _pre += 1
+    if _pre < 3:
+        return False
+    return _levenshtein(ta, tb) <= 2
+
+
+def _is_contig_subseq(short, long_):
+    """True if short is a contiguous subsequence of long_ (token lists)."""
+    n = len(short)
+    if n > len(long_):
+        return False
+    return any(long_[i:i + n] == short for i in range(len(long_) - n + 1))
+
+
+def _merge_subseq_unambiguous(short, a_key, b_key, roster_keys):
+    """True if no OTHER roster key contains the token subsequence short.
+    Returns False when roster_keys is unavailable (can't verify)."""
+    if not roster_keys or len(short) < 2:
+        return False
+    for rk in roster_keys:
+        if rk == a_key or rk == b_key:
+            continue
+        if _is_contig_subseq(short, _strip_merge_noise(rk)):
+            return False
+    return True
+
+
+def _nick_pair(fa, fb):
+    """True if fa/fb are a known nickname pair (either direction)."""
+    return fa != fb and (_COMMON_NICKNAMES.get(fa) == fb or
+                         _COMMON_NICKNAMES.get(fb) == fa)
+
+
+def _merge_tier(a_key, b_key, chapter_keys=None, a_chapters=None,
+                b_chapters=None, roster_keys=None):
+    """Tiered merge decision between two normalized name keys.
+
+    Returns 'yes' (Tier 2 deterministic), 'no' (Tier 1 hard cannot-link),
+    or 'ambiguous' (defer to Tier 3 decision model).
+
+    Tier 2 is checked BEFORE Tier 1: when stripping makes the names
+    identical (title/spelling/nickname), that's Call A inconsistency, not
+    two people -- even in the same chapter.
+
+    chapter_keys: nkeys listed as separate characters in the current chapter
+        (Tier 1 during _roster_update).
+    a_chapters/b_chapters: chapter-index sets of the two roster entries
+        (Tier 1 during post_pass_merge).
+    roster_keys: all roster primary keys (for the unambiguous-subsequence
+        check).
+    """
+    if not a_key or not b_key:
+        return "ambiguous"
+    if a_key == b_key:
+        return "yes"
+    # Tier 2: deterministic YES rules (beat Tier 1).
+    sa = _strip_merge_noise(a_key)
+    sb = _strip_merge_noise(b_key)
+    if sa and sa == sb:
+        return "yes"
+    if len(sa) == len(sb) and len(sa) >= 2:
+        # Spelling variant: one differing token pair ("joseph"/"josef").
+        _diffs = [(x, y) for x, y in zip(sa, sb) if x != y]
+        if len(_diffs) == 1 and _is_spelling_variant(*_diffs[0]):
+            return "yes"
+        # Nickname: known pair on the first token, rest identical.
+        if sa[1:] == sb[1:] and _nick_pair(sa[0], sb[0]):
+            return "yes"
+        # Unambiguous multi-token subsequence.
+        short, long_ = (sa, sb) if len(sa) <= len(sb) else (sb, sa)
+        if len(short) >= 2 and _is_contig_subseq(short, long_):
+            if _merge_subseq_unambiguous(short, a_key, b_key, roster_keys):
+                return "yes"
+    # Tier 1: listed as separate characters in the same chapter -> hard NO.
+    if chapter_keys is not None:
+        if b_key in chapter_keys and b_key != a_key:
+            return "no"
+    elif a_chapters is not None and b_chapters is not None:
+        if a_chapters & b_chapters:
+            return "no"
+    # Surname-family trap: same surname, incompatible first names -> hard NO.
+    # (The prototype's #1 false-merge source; the decision model still gets
+    # these wrong sometimes, so they never reach Tier 3.)
+    if len(sa) >= 2 and len(sb) >= 2 and sa[-1] == sb[-1]:
+        fa, fb = sa[0], sb[0]
+        if (fa != fb and len(fa) >= 3 and len(fb) >= 3
+                and not _nick_pair(fa, fb)
+                and not _is_spelling_variant(fa, fb)
+                and len(fa) > 1 and len(fb) > 1):
+            return "no"
+    return "ambiguous"
+
+
+def _is_author_name(name, author):
+    """True if a character name matches the book's author (any common form).
+    Prevents 'Daniel Suarez' the author from becoming a character."""
+    if not name or not author:
+        return False
+    nk = norm_name(name)
+    ak = norm_name(author)
+    if not nk or not ak:
+        return False
+    if nk == ak:
+        return True
+    # "Last, First" form -> "first last" (check the character name).
+    if "," in name:
+        _parts = [p.strip() for p in name.split(",")]
+        if len(_parts) == 2:
+            _rev = norm_name(f"{_parts[1]} {_parts[0]}")
+            if _rev == ak:
+                return True
+    # Author surname alone as a character name ("suarez" for Daniel Suarez).
+    _atok = ak.split()
+    if len(_atok) >= 2 and nk == _atok[-1] and len(nk) > 3:
+        return True
+    return False
+
+
 def _tnorm(t):
     """Trope dedup key: lowercase, underscores -> spaces, tidy spaces."""
     return re.sub(r"\s+", " ", (t or "").lower().replace("_", " ")).strip()
@@ -4726,6 +5225,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     _ln_book = _learn()
     _learn_isbn = identifiers.get("isbn") or identifiers.get("asin")
     _DIAG.learn_isbn = _learn_isbn
+    # Author filter: the book's author is never a character.
+    _DIAG.book_author = author
     _learn_skey = _ln_book.series_key(author) if _ln_book.enabled else None
     _DIAG.learn_series_key = _learn_skey
     _DIAG.learn_series_hints = (_ln_book.load_series_hints(_learn_skey)
@@ -4863,6 +5364,17 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if aborted:
         print(f"  {failed}/{2 * n} calls failed; not writing partial results")
 
+    # Post-pass character merge (Tier 1/2 deterministic + Tier 3 decision
+    # model). Runs after all chapters, before the reduce, so v2_reduce sees
+    # the final merged roster and relationships canonical-remap correctly.
+    _pp_merged, _pp_possible = post_pass_merge(
+        roster, validator=_DECISION_VALIDATOR)
+    if _pp_merged:
+        print(f"  Post-pass merge: {_pp_merged} roster entries merged")
+    if _pp_possible:
+        print(f"  Post-pass merge: {len(_pp_possible)} ambiguous pairs "
+              f"left for review")
+
     # Deterministic reduce (no LLM).
     red = v2_reduce(chapter_as, chapter_bs, roster,
                     [ch for _, ch in indexed])
@@ -4949,6 +5461,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "trope_candidate_counts": red.get("trope_candidate_counts", {}),
         "trope_catalog_map": red.get("trope_catalog_map", {}),
         "trope_chapters": red.get("trope_chapters", {}),
+        "possible_merges": _pp_possible,
+        "post_pass_merged": _pp_merged,
         "chapter_detection": "fallback" if _chap_fallback else "spine",
     }
     v = red["verification"]
@@ -5373,6 +5887,12 @@ def save_preview(fpath, result):
         md.append(f"## Dedup merges ({len(result['dedup_merges'])})")
         for m in result["dedup_merges"]:
             md.append(f"- {m['canonical']} <- {', '.join(m['merged'])}")
+        md.append("")
+    if result.get("possible_merges"):
+        md.append(f"## Possible merges for review ({len(result['possible_merges'])})")
+        for m in result["possible_merges"]:
+            _p = f" P(yes)={m['p_yes']:.2f}" if m.get("p_yes") is not None else ""
+            md.append(f"- {m['name_a']} vs {m['name_b']}{_p} ({m['reason']})")
         md.append("")
     md.append(f"## Characters ({len(result['characters'])})")
     for c in result["characters"]:

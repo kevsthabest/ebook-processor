@@ -1849,3 +1849,291 @@ class TestDecisionModelProvider(unittest.TestCase):
         self.assertEqual(dv.endpoint,
                          "https://openrouter.ai/api/v1/systemone")
         self.assertEqual(dv.model, "typesafe/jev-1.13")
+
+
+class TestHybridMerge(unittest.TestCase):
+    """Hybrid deterministic + decision-model character merge."""
+
+    # -- Tier 2 helpers -------------------------------------------------
+    def test_strip_titles(self):
+        self.assertEqual(pp._strip_merge_noise("special agent neal decker"),
+                         ["neal", "decker"])
+        self.assertEqual(pp._strip_merge_noise("agent roy merritt"),
+                         ["roy", "merritt"])
+        self.assertEqual(pp._strip_merge_noise("detective peter sebeck"),
+                         ["peter", "sebeck"])
+
+    def test_strip_contextual_prefix(self):
+        self.assertEqual(pp._strip_merge_noise("the late matthew sobol"),
+                         ["matthew", "sobol"])
+        self.assertEqual(pp._strip_merge_noise("official brian gragg"),
+                         ["brian", "gragg"])
+
+    def test_strip_middle_initial(self):
+        self.assertEqual(pp._strip_merge_noise("matthew a. sobol"),
+                         ["matthew", "sobol"])
+        self.assertEqual(pp._strip_merge_noise("matthew a sobol"),
+                         ["matthew", "sobol"])
+
+    def test_spelling_variant(self):
+        self.assertTrue(pp._is_spelling_variant("joseph", "josef"))
+        self.assertTrue(pp._is_spelling_variant("mosely", "mosley"))
+        self.assertTrue(pp._is_spelling_variant("sebeck", "sebeckx"))
+        self.assertFalse(pp._is_spelling_variant("chris", "peter"))
+        self.assertFalse(pp._is_spelling_variant("sebeck", "sebickson"))
+
+    def test_levenshtein(self):
+        self.assertEqual(pp._levenshtein("joseph", "josef"), 2)
+        self.assertEqual(pp._levenshtein("abc", "abc"), 0)
+        self.assertEqual(pp._levenshtein("", "abc"), 3)
+
+    # -- Tier decisions --------------------------------------------------
+    def test_tier2_title_strip(self):
+        self.assertEqual(
+            pp._merge_tier("special agent neal decker", "neal decker"), "yes")
+        self.assertEqual(
+            pp._merge_tier("agent roy merritt", "roy merritt"), "yes")
+
+    def test_tier2_contextual_prefix(self):
+        self.assertEqual(
+            pp._merge_tier("the late matthew sobol", "matthew sobol"), "yes")
+
+    def test_tier2_middle_initial(self):
+        self.assertEqual(
+            pp._merge_tier("matthew a. sobol", "matthew sobol"), "yes")
+
+    def test_tier2_spelling_variant(self):
+        self.assertEqual(
+            pp._merge_tier("joseph pavlos", "josef pavlos"), "yes")
+
+    def test_tier2_nickname(self):
+        self.assertEqual(
+            pp._merge_tier("pete sebeck", "peter sebeck"), "yes")
+
+    def test_single_token_never_auto(self):
+        # The surname-family trap: single-token -> multi-token is NEVER
+        # automatic, even when unambiguous.
+        self.assertEqual(
+            pp._merge_tier("sebeck", "peter sebeck",
+                           roster_keys={"peter sebeck"}),
+            "ambiguous")
+        self.assertEqual(pp._merge_tier("mosely", "charles mosely"), "ambiguous")
+
+    def test_family_trap_hard_no(self):
+        self.assertEqual(
+            pp._merge_tier("chris sebeck", "peter sebeck"), "no")
+        self.assertEqual(
+            pp._merge_tier("laura sebeck", "peter sebeck"), "no")
+
+    def test_tier2_beats_tier1(self):
+        # Same chapter, but stripping makes them identical -> still merge
+        # (Call A title inconsistency, not two people).
+        self.assertEqual(
+            pp._merge_tier("special agent neal decker", "neal decker",
+                           chapter_keys={"neal decker",
+                                         "special agent neal decker"}),
+            "yes")
+
+    def test_tier1_same_chapter(self):
+        self.assertEqual(
+            pp._merge_tier("chris sebeck", "peter sebeck",
+                           chapter_keys={"chris sebeck", "peter sebeck"}),
+            "no")
+
+    def test_tier1_postpass_chapter_sets(self):
+        self.assertEqual(
+            pp._merge_tier("chris sebeck", "peter sebeck",
+                           a_chapters={1, 2}, b_chapters={2, 3}), "no")
+        self.assertEqual(
+            pp._merge_tier("chris sebeck", "peter sebeck",
+                           a_chapters={1}, b_chapters={3}), "no")  # family trap
+
+    def test_ambiguous_by_default(self):
+        self.assertEqual(
+            pp._merge_tier("jon ross", "jason heider"), "ambiguous")
+
+    # -- Author filter ---------------------------------------------------
+    def test_is_author_name(self):
+        self.assertTrue(pp._is_author_name("Daniel Suarez", "Daniel Suarez"))
+        self.assertTrue(pp._is_author_name("daniel suarez", "Daniel Suarez"))
+        self.assertTrue(pp._is_author_name("Suarez, Daniel", "Daniel Suarez"))
+        self.assertFalse(pp._is_author_name("Peter Sebeck", "Daniel Suarez"))
+        self.assertFalse(pp._is_author_name("", "Daniel Suarez"))
+
+    def test_roster_update_skips_author(self):
+        roster = {}
+        pp._DIAG.book_author = "Daniel Suarez"
+        self.addCleanup(setattr, pp._DIAG, "book_author", None)
+        chars = [{"name": "Daniel Suarez", "aliases": [],
+                  "role": "supporting", "description": "the author",
+                  "appearance": "", "status": "alive", "evidence": ""},
+                 {"name": "Peter Sebeck", "aliases": [],
+                  "role": "protagonist", "description": "detective",
+                  "appearance": "", "status": "alive", "evidence": ""}]
+        pp._roster_update(roster, chars, 0)
+        self.assertNotIn("daniel suarez", roster)
+        self.assertIn("peter sebeck", roster)
+
+    # -- _roster_update integration ---------------------------------------
+    def _mk_char(self, name):
+        return {"name": name, "aliases": [], "role": "supporting",
+                "description": "d", "appearance": "", "status": "alive",
+                "evidence": ""}
+
+    def test_roster_update_tier2_merge(self):
+        roster = {}
+        pp._roster_update(roster, [self._mk_char("Neal Decker")], 0)
+        pp._roster_update(roster, [self._mk_char("Special Agent Neal Decker")], 1)
+        self.assertEqual(len(roster), 1)
+        e = roster["neal decker"]
+        self.assertIn("special agent neal decker", e["primary_keys"])
+
+    def test_roster_update_family_trap(self):
+        roster = {}
+        pp._roster_update(roster, [self._mk_char("Peter Sebeck")], 0)
+        # Same chapter lists both -> Tier 1 hard NO (also family trap).
+        pp._roster_update(
+            roster, [self._mk_char("Peter Sebeck"),
+                     self._mk_char("Chris Sebeck")], 1)
+        self.assertEqual(len(roster), 2)
+        self.assertIn("peter sebeck", roster)
+        self.assertIn("chris sebeck", roster)
+
+    def test_roster_update_spelling_merge(self):
+        roster = {}
+        pp._roster_update(roster, [self._mk_char("Joseph Pavlos")], 0)
+        pp._roster_update(roster, [self._mk_char("Josef Pavlos")], 1)
+        self.assertEqual(len(roster), 1)
+
+    # -- _merge_roster_entries ---------------------------------------------
+    def test_merge_roster_entries(self):
+        roster = {
+            "matthew sobol": {
+                "name": "Matthew Sobol", "aliases": set(),
+                "alias_keys": {"matthew sobol"}, "primary_keys": {"matthew sobol"},
+                "appearances": 5, "chapters": {1, 2}, "roles": Counter(),
+                "descriptions": [(1, "game designer", True)], "evidence": "ev1",
+            },
+            "matthew a. sobol": {
+                "name": "Matthew A. Sobol", "aliases": set(),
+                "alias_keys": {"matthew a. sobol"},
+                "primary_keys": {"matthew a. sobol"},
+                "appearances": 2, "chapters": {3}, "roles": Counter(),
+                "descriptions": [(3, "phd", False)], "evidence": "",
+            },
+        }
+        pp._merge_roster_entries(roster, "matthew sobol", "matthew a. sobol")
+        self.assertEqual(len(roster), 1)
+        e = roster["matthew sobol"]
+        self.assertEqual(e["appearances"], 7)
+        self.assertEqual(e["chapters"], {1, 2, 3})
+        self.assertIn("matthew a. sobol", e["alias_keys"])
+        self.assertEqual(len(e["descriptions"]), 2)
+        # Display name prefers the cleaner variant.
+        self.assertEqual(e["name"], "Matthew Sobol")
+
+    # -- post_pass_merge ----------------------------------------------------
+    def _mk_entry(self, name, chapters, desc="d"):
+        nk = pp.norm_name(name)
+        return {nk: {
+            "name": name, "aliases": set(), "alias_keys": {nk},
+            "primary_keys": {nk}, "appearances": 1,
+            "chapters": set(chapters), "roles": Counter(),
+            "descriptions": [(min(chapters), desc, False)], "evidence": "",
+        }}
+
+    def test_postpass_tier2(self):
+        roster = {}
+        roster.update(self._mk_entry("Matthew Sobol", [1, 2]))
+        roster.update(self._mk_entry("Matthew A. Sobol", [5]))
+        n, possible = pp.post_pass_merge(roster, validator=None)
+        self.assertEqual(n, 1)
+        self.assertEqual(len(roster), 1)
+        self.assertIn("matthew sobol", roster)
+
+    def test_postpass_unresolved_without_validator(self):
+        roster = {}
+        roster.update(self._mk_entry("Sebeck", [1], "a detective"))
+        roster.update(self._mk_entry("Peter Sebeck", [2], "a detective"))
+        n, possible = pp.post_pass_merge(roster, validator=None)
+        self.assertEqual(n, 0)
+        self.assertEqual(len(roster), 2)
+        self.assertEqual(len(possible), 1)
+        self.assertEqual(possible[0]["reason"],
+                         "unresolved (decision model disabled)")
+        self.assertIsNone(possible[0]["p_yes"])
+
+    def test_postpass_family_trap_not_candidate(self):
+        roster = {}
+        roster.update(self._mk_entry("Chris Sebeck", [1]))
+        roster.update(self._mk_entry("Peter Sebeck", [2]))
+        n, possible = pp.post_pass_merge(roster, validator=None)
+        self.assertEqual(n, 0)
+        self.assertEqual(possible, [])
+
+    # -- ask_same_person ------------------------------------------------------
+    def _mock_merge_validator(self, p_yes=None, exc=None):
+        import json as _json
+        import urllib.request as _urlreq
+
+        class _FakeResp:
+            def __init__(self, data):
+                self._data = data
+            def read(self):
+                return self._data
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        orig = _urlreq.urlopen
+        def fake(req, timeout=None):
+            if exc:
+                raise exc
+            return _FakeResp(_json.dumps(
+                {"answers": {"same_person": {"type": "noul",
+                                             "noul": p_yes}}}).encode())
+        _urlreq.urlopen = fake
+        self.addCleanup(setattr, _urlreq, "urlopen", orig)
+        return pp.DecisionValidator("http://127.0.0.1:8888/v1")
+
+    def test_ask_same_person_merges(self):
+        dv = self._mock_merge_validator(p_yes=0.92)
+        merged, p = dv.ask_same_person("Pete", "detective", "", "Peter Sebeck",
+                                       "detective", "")
+        self.assertTrue(merged)
+        self.assertAlmostEqual(p, 0.92)
+
+    def test_ask_same_person_below_threshold(self):
+        dv = self._mock_merge_validator(p_yes=0.60)
+        merged, p = dv.ask_same_person("Chris Sebeck", "son", "",
+                                       "Peter Sebeck", "detective", "")
+        self.assertFalse(merged)
+        self.assertAlmostEqual(p, 0.60)
+
+    def test_ask_same_person_error(self):
+        dv = self._mock_merge_validator(exc=ConnectionError("refused"))
+        merged, p = dv.ask_same_person("A", "", "", "B", "", "")
+        self.assertIsNone(merged)
+        self.assertIsNone(p)
+
+    def test_postpass_tier3_merges(self):
+        roster = {}
+        roster.update(self._mk_entry("Sebeck", [1], "detective"))
+        roster.update(self._mk_entry("Peter Sebeck", [2], "detective"))
+        dv = self._mock_merge_validator(p_yes=0.90)
+        n, possible = pp.post_pass_merge(roster, validator=dv)
+        self.assertEqual(n, 1)
+        self.assertEqual(len(roster), 1)
+        self.assertEqual(possible, [])
+
+    def test_postpass_tier3_below_threshold(self):
+        roster = {}
+        roster.update(self._mk_entry("Sebeck", [1], "detective"))
+        roster.update(self._mk_entry("Peter Sebeck", [2], "detective"))
+        dv = self._mock_merge_validator(p_yes=0.60)
+        n, possible = pp.post_pass_merge(roster, validator=dv)
+        self.assertEqual(n, 0)
+        self.assertEqual(len(possible), 1)
+        self.assertAlmostEqual(possible[0]["p_yes"], 0.60)
+        self.assertIn("below threshold", possible[0]["reason"])
