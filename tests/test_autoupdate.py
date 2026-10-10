@@ -134,6 +134,43 @@ class TestDoAutoUpdate(unittest.TestCase):
         self.assertIn("--preview", arg_list)
         self.assertIn("book.epub", arg_list)
 
+    def test_pull_succeeds_preserves_flag_watch_mode(self):
+        # Watch mode: --auto-update must survive the execv so later cycles
+        # keep checking (the 60s sleep prevents tight loops).
+        with mock.patch.object(pp, "_check_for_updates",
+                               return_value=(2, None)):
+            with mock.patch("subprocess.run",
+                            return_value=_mock_run(0, "ok")):
+                with mock.patch("os.execv") as mock_execv:
+                    with mock.patch("builtins.print"):
+                        with mock.patch.object(pp.sys, "argv",
+                                               ["process-portable.py",
+                                                "--auto-update", "--watch"]):
+                            pp._do_auto_update(preserve_flag=True)
+        exec_path, arg_list = mock_execv.call_args[0]
+        self.assertEqual(exec_path, pp.sys.executable)
+        self.assertIn("--auto-update", arg_list)
+        self.assertIn("--watch", arg_list)
+
+    def test_pull_failing_compile_continues(self):
+        # Broken pulled code must NOT be exec'd into: continue on the
+        # currently-loaded (working) version instead.
+        def fake_run(cmd, **kw):
+            if cmd[1:3] == ["-m", "py_compile"]:
+                return _mock_run(1, "", "SyntaxError: bad code")
+            return _mock_run(0, "updating")  # the git pull itself
+        with mock.patch.object(pp, "_check_for_updates",
+                               return_value=(2, None)):
+            with mock.patch("subprocess.run", side_effect=fake_run):
+                with mock.patch("os.execv") as mock_execv:
+                    with mock.patch("builtins.print") as mock_print:
+                        result = pp._do_auto_update()
+        self.assertFalse(result)
+        mock_execv.assert_not_called()
+        printed = " ".join(c.args[0] for c in mock_print.call_args_list)
+        self.assertIn("py_compile", printed.lower())
+        self.assertIn("continuing", printed.lower())
+
 
 class TestCheckpointSha(unittest.TestCase):
     def test_hash_includes_sha(self):

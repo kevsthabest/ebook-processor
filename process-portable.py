@@ -169,6 +169,10 @@ NUM_CTX = 8192            # must comfortably exceed CHUNK_CHARS/3 + prompt + out
 # All use subprocess with timeouts and degrade gracefully when git is missing
 # or the directory is not a git repo. PowerShell-compatible (no ANSI codes).
 
+_GIT_REMOTE = "origin"
+_GIT_BRANCH = "master"
+
+
 def _git_commit_sha():
     """Return the current HEAD commit SHA, or None if unavailable."""
     import subprocess as _sp
@@ -177,7 +181,7 @@ def _git_commit_sha():
                     capture_output=True, text=True, timeout=10,
                     cwd=str(SCRIPT_DIR))
         return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
-    except (FileNotFoundError, _sp.TimeoutExpired, Exception):
+    except Exception:
         return None
 
 
@@ -188,12 +192,13 @@ def _check_for_updates():
     """
     import subprocess as _sp
     try:
-        r = _sp.run(["git", "fetch", "origin"],
+        r = _sp.run(["git", "fetch", _GIT_REMOTE],
                     capture_output=True, text=True, timeout=30,
                     cwd=str(SCRIPT_DIR))
         if r.returncode != 0:
             return 0, "fetch failed: %s" % r.stderr.strip()[:100]
-        r = _sp.run(["git", "rev-list", "--count", "HEAD..origin/master"],
+        r = _sp.run(["git", "rev-list", "--count",
+                     "HEAD..%s/%s" % (_GIT_REMOTE, _GIT_BRANCH)],
                     capture_output=True, text=True, timeout=10,
                     cwd=str(SCRIPT_DIR))
         if r.returncode != 0:
@@ -207,11 +212,14 @@ def _check_for_updates():
         return 0, str(e)[:100]
 
 
-def _do_auto_update():
+def _do_auto_update(preserve_flag=False):
     """Check for updates and pull if behind.
 
-    On successful pull, re-execs the script with the same arguments
-    (minus --auto-update to avoid a loop) and never returns.
+    On successful pull, verify the new code compiles, then re-exec the
+    script and never returns. With preserve_flag=False (one-shot startup)
+    the --auto-update flag is stripped to avoid a loop; with
+    preserve_flag=True (--watch mode) it is kept so later cycles keep
+    checking (the 60s sleep already prevents tight loops).
     Returns False to continue with the current version.
     """
     import subprocess as _sp
@@ -225,7 +233,7 @@ def _do_auto_update():
         return False
     print(f"  {behind} new commit(s) available. Pulling...")
     try:
-        r = _sp.run(["git", "pull", "--ff-only", "origin", "master"],
+        r = _sp.run(["git", "pull", "--ff-only", _GIT_REMOTE, _GIT_BRANCH],
                     capture_output=True, text=True, timeout=60,
                     cwd=str(SCRIPT_DIR))
     except FileNotFoundError:
@@ -243,9 +251,27 @@ def _do_auto_update():
         print(f"  Auto-update failed: {r.stderr.strip()[:200]}. "
               f"Continuing with current version.")
         return False
+    # Never exec into code that does not even compile: stay on the
+    # currently-loaded (working) version instead.
+    try:
+        c = _sp.run([sys.executable, "-m", "py_compile",
+                     str(Path(__file__).resolve())],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=str(SCRIPT_DIR))
+    except Exception as e:
+        print(f"  Auto-update: compile check could not run ({e}). "
+              f"Continuing with current version.")
+        return False
+    if c.returncode != 0:
+        print("  Auto-update: pulled code failed py_compile. "
+              "Continuing with current version; run 'git log' and "
+              "'git reset --hard %s/%s' to recover." %
+              (_GIT_REMOTE, _GIT_BRANCH))
+        return False
     print(f"  Updated to latest ({behind} new commits). Restarting...")
     sys.stdout.flush()
-    new_args = [a for a in sys.argv[1:] if a != "--auto-update"]
+    new_args = [a for a in sys.argv[1:]
+                if preserve_flag or a != "--auto-update"]
     os.execv(sys.executable, [sys.executable, sys.argv[0]] + new_args)
 SAMPLE_RATE = 1           # 1 = every chunk, 2 = every other, 3 = every third, etc.
 SAMPLE_EDGES = 2          # always process this many chunks from start and end
@@ -8953,9 +8979,10 @@ def main():
         try:
             while True:
                 # In watch mode, --auto-update checks at the start of each
-                # cycle. A successful pull re-execs with fresh code.
+                # cycle. A successful pull re-execs with fresh code; the flag
+                # is preserved across the exec so later cycles keep checking.
                 if args.auto_update:
-                    _do_auto_update()
+                    _do_auto_update(preserve_flag=True)
                 run_once(args.dry_run, args.preview, args.max_books, args.file)
                 time.sleep(60)
         except KeyboardInterrupt:
