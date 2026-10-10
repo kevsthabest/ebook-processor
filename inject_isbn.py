@@ -39,17 +39,24 @@ def main():
         sys.exit(1)
 
     # Read the EPUB
-    with zipfile.ZipFile(epub_path, "r") as z:
-        names = z.namelist()
-        # Find the OPF file via container.xml
-        container = z.read("META-INF/container.xml").decode("utf-8")
-        m = re.search(r'full-path="([^"]+\.opf)"', container)
-        if not m:
-            print("Could not find OPF file in container.xml")
-            sys.exit(1)
-        opf_path = m.group(1)
-        opf = z.read(opf_path).decode("utf-8")
-        other_files = {n: z.read(n) for n in names if n != opf_path}
+    try:
+        with zipfile.ZipFile(epub_path, "r") as z:
+            names = z.namelist()
+            # Find the OPF file via container.xml
+            container = z.read("META-INF/container.xml").decode("utf-8")
+            m = re.search(r'full-path="([^"]+\.opf)"', container)
+            if not m:
+                print("Could not find OPF file in container.xml")
+                sys.exit(1)
+            opf_path = m.group(1)
+            opf = z.read(opf_path).decode("utf-8")
+            other_files = {n: z.read(n) for n in names if n != opf_path}
+    except zipfile.BadZipFile:
+        print(f"ERROR: {epub_path} is not a valid EPUB/zip file.")
+        sys.exit(3)
+    except KeyError as e:
+        print(f"ERROR: {epub_path} is missing required file: {e}")
+        sys.exit(3)
 
     # Check if ISBN already present
     if isbn in opf:

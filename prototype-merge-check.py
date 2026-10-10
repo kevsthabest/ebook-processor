@@ -15,8 +15,20 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import urllib.request
+
+
+def resolve_api_key():
+    """API key from environment only (never the command line).
+
+    Checks OPENROUTER_API_KEY, openrouter_api_key, then openrouter_key.
+    Returns "" when none is set (local backends don't need a key).
+    """
+    return (os.environ.get("OPENROUTER_API_KEY", "") or
+            os.environ.get("openrouter_api_key", "") or
+            os.environ.get("openrouter_key", ""))
 
 
 def ask_same_person(base_url, model, api_key, name_a, name_b, desc_a="",
@@ -77,15 +89,15 @@ def main():
     ap.add_argument("--json", help="Preview JSON to test against")
     ap.add_argument("--base-url", default="http://127.0.0.1:8888/v1")
     ap.add_argument("--model", default="")
-    ap.add_argument("--api-key", default="")
     ap.add_argument("--a", help="First name for single-pair test")
     ap.add_argument("--b", help="Second name for single-pair test")
     ap.add_argument("--threshold", type=float, default=0.5)
     args = ap.parse_args()
+    api_key = resolve_api_key()
 
     if args.a and args.b:
         verdict, p_yes, raw = ask_same_person(
-            args.base_url, args.model, args.api_key, args.a, args.b)
+            args.base_url, args.model, api_key, args.a, args.b)
         p_str = f"{p_yes:.2f}" if p_yes is not None else "?"
         print(f"Same person? {verdict} (P(yes)={p_str})")
         return
@@ -111,7 +123,7 @@ def main():
             alias = aliases[0] if isinstance(aliases[0], str) else aliases[0].get('name', '')
             if alias and alias.lower() != name.lower():
                 verdict, p_yes, raw = ask_same_person(
-                    args.base_url, args.model, args.api_key,
+                    args.base_url, args.model, api_key,
                     name, alias,
                     c.get('description', '')[:100])
                 p_str = f"{p_yes:.2f}" if p_yes is not None else "?"
@@ -136,7 +148,7 @@ def main():
             # Only test if they're actually different characters
             # (not already merged)
             verdict, p_yes, raw = ask_same_person(
-                args.base_url, args.model, args.api_key,
+                args.base_url, args.model, api_key,
                 a['name'], b['name'])
             p_str = f"{p_yes:.2f}" if p_yes is not None else "?"
             mark = "✓" if not verdict else "✗"
