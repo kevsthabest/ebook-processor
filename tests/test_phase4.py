@@ -4223,3 +4223,162 @@ class TestPreviewSummaryDiff(unittest.TestCase):
     def test_cmd_preview_diff_bad_path(self):
         out = pp._cmd_preview_diff("/nonexistent/a.json", "/nonexistent/b.json")
         self.assertTrue(out.startswith("ERROR:"))
+
+
+class TestTuiImprovements(unittest.TestCase):
+    """P6/P7/P11: ETA, end-of-run summary, bottleneck detection."""
+
+    # P6: ETA formatting
+    def test_format_eta_seconds(self):
+        self.assertEqual(pp._format_eta(10, 5), "~50 sec remaining")
+
+    def test_format_eta_minutes(self):
+        self.assertEqual(pp._format_eta(60, 25), "~25 min remaining")
+
+    def test_format_eta_hours(self):
+        self.assertEqual(pp._format_eta(120, 60), "~2.0 hr remaining")
+
+    def test_format_eta_no_data(self):
+        self.assertEqual(pp._format_eta(0, 10), "calculating...")
+        self.assertEqual(pp._format_eta(None, 10), "calculating...")
+        self.assertEqual(pp._format_eta(60, 0), "calculating...")
+        self.assertEqual(pp._format_eta(60, -1), "calculating...")
+
+    def test_format_duration(self):
+        self.assertEqual(pp._format_duration(45), "45s")
+        self.assertEqual(pp._format_duration(150), "2m 30s")
+        self.assertEqual(pp._format_duration(3750), "1h 2m")
+        self.assertEqual(pp._format_duration(0), "0s")
+        self.assertEqual(pp._format_duration(None), "0s")
+
+    # P6: ETA in viz stats line
+    def test_viz_stats_line_with_eta(self):
+        st = {"new_count": 7, "chap_idx": 20, "chap_total": 73,
+              "run_t0": 1000.0, "chars_total": 60000,
+              "chap_t0": 1000.0, "chap_chars": 6000,
+              "chapter_times": [30.0] * 10}
+        line = pp._viz_stats_line(st, 1060.0)
+        self.assertIn("Chapter 20/73", line)
+        # 30s avg * 53 remaining = 1590s = ~26 min (rounded)
+        self.assertIn("ETA:", line)
+        self.assertIn("min remaining", line)
+
+    def test_viz_stats_line_no_eta_first_chapter(self):
+        st = {"new_count": 0, "chap_idx": 1, "chap_total": 73,
+              "run_t0": 1000.0, "chars_total": 600,
+              "chap_t0": 1000.0, "chap_chars": 600}
+        line = pp._viz_stats_line(st, 1060.0)
+        self.assertIn("Chapter 1/73", line)
+        self.assertNotIn("ETA:", line)
+
+    # P6/P11: chapter timing tracked in viz_chapter
+    def _ui_rich(self):
+        ui = pp.PipelineUI()
+        ui.rich = True
+        return ui
+
+    def test_viz_chapter_tracks_timing(self):
+        import time
+        ui = self._ui_rich()
+        ui.viz_chapter("b1", "Ch 1", "x" * 1000, chap_idx=1, chap_total=10)
+        t0 = ui._viz["chap_t0"]
+        # Simulate time passing, then start chapter 2
+        ui._viz["chap_t0"] = t0 - 5.0  # pretend ch1 took 5s
+        ui.viz_chapter("b1", "Ch 2", "y" * 2000, chap_idx=2, chap_total=10)
+        times = ui._viz["chapter_times"]
+        self.assertEqual(len(times), 1)
+        self.assertAlmostEqual(times[0], 5.0, places=1)
+        lens = ui._viz["chapter_lens"]
+        self.assertEqual(len(lens), 1)
+        self.assertEqual(lens[0][0], 800)  # text truncated to 800
+
+    def test_viz_chapter_rolling_window(self):
+        ui = self._ui_rich()
+        base = 1000.0
+        for i in range(15):
+            ui.viz_chapter("b1", f"Ch {i+1}", "x" * 100,
+                           chap_idx=i + 1, chap_total=20)
+            # Backdate chap_t0 so each "took" 2s
+            ui._viz["chap_t0"] = base - 2.0
+            base += 0.01
+        # 14 durations recorded (first chapter has no predecessor), capped at 10
+        self.assertEqual(len(ui._viz["chapter_times"]), 10)
+        self.assertEqual(len(ui._viz["chapter_lens"]), 14)
+
+    # P11: bottleneck detection
+    def test_bottleneck_prefill(self):
+        # Long chapters take proportionally longer
+        samples = [(1000, 5), (1200, 6), (1100, 5),
+                   (8000, 40), (9000, 45), (8500, 42)]
+        label, sugg = pp._detect_bottleneck(samples)
+        self.assertIn("Prefill", label)
+        self.assertIn("batch 8", sugg)
+
+    def test_bottleneck_decode(self):
+        # Duration flat regardless of length
+        samples = [(1000, 20), (1200, 21), (8000, 22), (9000, 20)]
+        label, sugg = pp._detect_bottleneck(samples)
+        self.assertIn("Decode", label)
+
+    def test_bottleneck_insufficient_data(self):
+        label, _ = pp._detect_bottleneck([(1000, 5)])
+        self.assertEqual(label, "collecting data...")
+        label, _ = pp._detect_bottleneck([])
+        self.assertEqual(label, "collecting data...")
+
+    # P7: summary stats builder
+    def test_run_summary_stats(self):
+        result = {
+            "characters": [{"name": "A"}, {"name": "B"}],
+            "minor_characters": [{"name": "C"}],
+            "relationships": [
+                {"from": "A", "to": "B", "confidence": "high",
+                 "validation_note": "kept"},
+                {"from": "B", "to": "A", "confidence": "low",
+                 "validation_note": "downgraded"},
+            ],
+            "dropped_relationships": [{"from": "X", "to": "Y"}],
+            "spice_level": 3,
+        }
+        stats = pp._run_summary_stats(result, preview=True, elapsed_sec=150)
+        self.assertEqual(stats["principals"], 2)
+        self.assertEqual(stats["minors"], 1)
+        self.assertEqual(stats["rels_total"], 2)
+        self.assertEqual(stats["rels_high"], 1)
+        self.assertEqual(stats["rels_low"], 1)
+        self.assertEqual(stats["val_kept"], 1)
+        self.assertEqual(stats["val_downgraded"], 1)
+        self.assertEqual(stats["val_dropped"], 1)
+        self.assertEqual(stats["spice"], 3)
+        self.assertTrue(stats["preview"])
+        self.assertEqual(stats["elapsed_sec"], 150)
+
+    def test_run_summary_stats_empty(self):
+        stats = pp._run_summary_stats({}, False, 0)
+        self.assertEqual(stats["principals"], 0)
+        self.assertEqual(stats["rels_total"], 0)
+        self.assertEqual(stats["spice"], 0)
+
+    # P7: run_summary method doesn't crash
+    def test_run_summary_rich(self):
+        ui = self._ui_rich()
+        # Should not raise even without a real console TTY
+        ui.run_summary("Test Book", {
+            "principals": 8, "minors": 62,
+            "rels_total": 16, "rels_high": 10, "rels_medium": 4, "rels_low": 2,
+            "val_kept": 3, "val_downgraded": 5, "val_dropped": 2,
+            "spice": 2, "wrote": None, "elapsed_sec": 2535, "preview": True,
+        })
+
+    def test_run_summary_plain(self):
+        ui = pp.PipelineUI()
+        ui.rich = False
+        ui.run_summary("Test Book", {
+            "principals": 8, "minors": 62,
+            "rels_total": 16, "rels_high": 10, "rels_medium": 4, "rels_low": 2,
+            "val_kept": 3, "val_downgraded": 5, "val_dropped": 2,
+            "spice": 2,
+            "wrote": {"characters": 2, "tropes": 0, "triggers": 0,
+                      "quotes": 4},
+            "elapsed_sec": 61, "preview": False,
+        })

@@ -4402,8 +4402,62 @@ def _viz_stats_line(st, now):
     cur_toks = chap_speed / 60.0 / 4.0
     ci = st.get("chap_idx") or "?"
     ct = st.get("chap_total") or "?"
-    return "Characters: %d | Chapter %s/%s | %.1f tok/s (avg %.1f tok/s)" % (
+    line = "Characters: %d | Chapter %s/%s | %.1f tok/s (avg %.1f tok/s)" % (
         st.get("new_count", 0), ci, ct, cur_toks, avg_toks)
+    # P6: ETA from rolling per-chapter average (last 10 chapters).
+    times = st.get("chapter_times") or []
+    if times and isinstance(ci, int) and isinstance(ct, int) and ct > ci:
+        avg = sum(times) / len(times)
+        line += " | ETA: %s" % _format_eta(avg, ct - ci)
+    return line
+
+
+def _format_eta(avg_sec, remaining):
+    """Pure: format ETA from avg seconds/chapter and chapters remaining."""
+    if not avg_sec or avg_sec <= 0 or remaining <= 0:
+        return "calculating..."
+    total = avg_sec * remaining
+    if total < 60:
+        return "~%d sec remaining" % int(total)
+    mins = total / 60.0
+    if mins < 60:
+        return "~%d min remaining" % int(round(mins))
+    return "~%.1f hr remaining" % (mins / 60.0)
+
+
+def _format_duration(total_sec):
+    """Pure: format seconds as '42m 15s', '3h 5m', or '45s'."""
+    total_sec = max(int(total_sec or 0), 0)
+    if total_sec < 60:
+        return "%ds" % total_sec
+    mins, secs = divmod(total_sec, 60)
+    if mins < 60:
+        return "%dm %ds" % (mins, secs)
+    hrs, mins = divmod(mins, 60)
+    return "%dh %dm" % (hrs, mins)
+
+
+def _detect_bottleneck(samples):
+    """Pure: infer bottleneck from [(input_chars, duration_sec), ...].
+
+    Prefill-bound if long chapters take proportionally longer than short
+    ones; otherwise decode-bound or API-latency-bound. Returns
+    (label, suggestion).
+    """
+    if len(samples) < 3:
+        return ("collecting data...", "")
+    by_len = sorted(samples, key=lambda s: s[0])
+    half = len(by_len) // 2
+    short, long = by_len[:half], by_len[half:]
+    if not short or not long:
+        return ("collecting data...", "")
+    short_avg = sum(s[1] for s in short) / len(short)
+    long_avg = sum(s[1] for s in long) / len(long)
+    if short_avg <= 0:
+        return ("collecting data...", "")
+    if long_avg / short_avg > 1.5:
+        return ("Prefill-bound (long chapters)", "batch 8 helps")
+    return ("Decode-bound or API latency", "try smaller batches")
 
 
 def _viz_new_state(book_key):
@@ -4473,8 +4527,9 @@ class PipelineUI:
             # Live is never started).
             if self._viz_enabled:
                 self._layout = _RichLayout()
-                # +2 rows when matrix viz is on (separator + 3 lines - 1 for border math)
-                viz_size = 26 if getattr(self, '_show_matrices', False) else 24
+                # Panel rows: base 24 + 2 for bottleneck line + 2 more when
+                # matrix viz is on (--show-matrices).
+                viz_size = 28 if getattr(self, '_show_matrices', False) else 26
                 self._layout.split_column(
                     _RichLayout(self.progress, name="bars"),
                     _RichLayout(_VizRenderable(self), name="viz", size=viz_size),
@@ -4557,6 +4612,18 @@ class PipelineUI:
             return
         with self._lock:
             prev = self._viz or {}
+            now = time.time()
+            # P6/P11: rolling per-chapter timing for ETA + bottleneck.
+            # Previous chapter's duration = now - its chap_t0.
+            times = list(prev.get("chapter_times") or [])
+            lens = list(prev.get("chapter_lens") or [])
+            _pt0, _pchars = prev.get("chap_t0"), prev.get("chap_chars")
+            if _pt0 and _pchars:
+                _dur = max(now - _pt0, 0.01)
+                times.append(_dur)
+                times = times[-10:]
+                lens.append((_pchars, _dur))
+                lens = lens[-20:]
             txt = (text or "")[:800]
             self._viz = {
                 "book": book_key,
@@ -4564,18 +4631,20 @@ class PipelineUI:
                 "text": txt,
                 "names": [],
                 "events": prev.get("events", [])[-8:],
-                "t0": time.time(),
+                "t0": now,
                 "spotlight": None,
                 # Run-level state, carried across chapters.
-                "run_t0": prev.get("run_t0") or time.time(),
+                "run_t0": prev.get("run_t0") or now,
                 "chars_total": prev.get("chars_total", 0) + len(txt),
                 "new_count": prev.get("new_count", 0),
                 "milestones": prev.get("milestones") or set(),
                 "ticker": prev.get("ticker") or [],
                 "chap_idx": chap_idx,
                 "chap_total": chap_total,
-                "chap_t0": time.time(),
+                "chap_t0": now,
                 "chap_chars": len(txt),
+                "chapter_times": times,
+                "chapter_lens": lens,
                 # Live matrix snapshot (--show-matrices), carried over so the
                 # panel doesn't flicker to empty between chapters.
                 "matrix": prev.get("matrix"),
@@ -4692,6 +4761,15 @@ class PipelineUI:
         # relationship count. Rendered at the panel's 4fps refresh.
         body += _matrix_panel_block(st.get("matrix"),
                                     CONFIG.get("show_matrices", False))
+        # P11: bottleneck diagnosis from chapter length vs duration.
+        _lens = st.get("chapter_lens") or []
+        if len(_lens) >= 3:
+            _blabel, _bsugg = _detect_bottleneck(_lens)
+            _bline = "[dim]Bottleneck: %s" % _rich_escape(_blabel)
+            if _bsugg:
+                _bline += " — [italic]%s[/]" % _rich_escape(_bsugg)
+            _bline += "[/]"
+            body += "\n[dim]─[/]\n" + _bline
         ci = st.get("chap_idx")
         ct = st.get("chap_total")
         if ci and ct:
@@ -4715,6 +4793,46 @@ class PipelineUI:
             print(f"  {title}")
             for k, v in rows:
                 print(f"    {k}: {v}")
+
+    def run_summary(self, title, stats):
+        """P7: end-of-run summary panel. stats dict keys:
+        principals, minors, rels_total, rels_high, rels_medium, rels_low,
+        val_kept, val_downgraded, val_dropped, spice,
+        wrote (dict or None), elapsed_sec, preview (bool).
+        """
+        s = stats or {}
+        lines = []
+        lines.append("Principals: %d (%d minor)" % (
+            s.get("principals", 0), s.get("minors", 0)))
+        lines.append("Relationships: %d (%d high, %d medium, %d low)" % (
+            s.get("rels_total", 0), s.get("rels_high", 0),
+            s.get("rels_medium", 0), s.get("rels_low", 0)))
+        lines.append("Validation: %d kept, %d downgraded, %d dropped" % (
+            s.get("val_kept", 0), s.get("val_downgraded", 0),
+            s.get("val_dropped", 0)))
+        lines.append("Spice: %d/5" % s.get("spice", 0))
+        wrote = s.get("wrote")
+        if s.get("preview"):
+            lines.append("Preview mode — nothing written to DB")
+        elif wrote:
+            lines.append("Written to DB: %d chars, %d tropes, "
+                         "%d triggers, %d quotes" % (
+                             wrote.get("characters", 0),
+                             wrote.get("tropes", 0),
+                             wrote.get("triggers", 0),
+                             wrote.get("quotes", 0)))
+        else:
+            lines.append("Written to DB: n/a")
+        lines.append("Time: %s" % _format_duration(s.get("elapsed_sec", 0)))
+        body = "\n".join(lines)
+        if self.rich and self.console:
+            self.console.print(_RichPanel(
+                body, title=_rich_escape("Run complete: %s" % title),
+                border_style="green", box=_rich_box.ROUNDED))
+        else:
+            print(f"  Run complete: {title}")
+            for ln in lines:
+                print(f"    {ln}")
 
 
 UI = PipelineUI()
@@ -6467,6 +6585,8 @@ def write_claims(work_id, result, trope_mappings=None):
     UI.status(f"  Wrote {wrote['tropes']} tropes, {wrote['triggers']} triggers, "
                 f"{wrote['characters']} characters, {wrote['proposals']} proposals, "
                 f"{wrote.get('quotes', 0)} quotes (new rows only)")
+    # P7: stash for the end-of-run summary panel.
+    _DIAG.wrote_stats = dict(wrote)
     return errors
 
 
@@ -7154,10 +7274,14 @@ def process_file_v2(fpath, dry_run=False, preview=False):
 
     if dry_run:
         print("  DRY RUN — nothing written")
+        UI.run_summary(title or fpath.stem,
+                       _run_summary_stats(result, True, time.time() - _t0))
         return not aborted
     if preview:
         save_preview(fpath, result)
         print(f"  Preview saved (pipeline=v2)")
+        UI.run_summary(title or fpath.stem,
+                       _run_summary_stats(result, True, time.time() - _t0))
         return not aborted
     # Write mode: still save the preview JSON as an audit trail.
     save_preview(fpath, result)
@@ -7173,7 +7297,43 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if errors:
         print(f"  {errors} database operation(s) failed")
         return False
+    UI.run_summary(title or fpath.stem,
+                   _run_summary_stats(result, False, time.time() - _t0))
     return True
+
+
+def _run_summary_stats(result, preview, elapsed_sec):
+    """P7: build stats dict for UI.run_summary from a v2 result dict."""
+    rels = result.get("relationships", []) or []
+    dropped = result.get("dropped_relationships", []) or []
+    conf = {"high": 0, "medium": 0, "low": 0}
+    val = {"kept": 0, "downgraded": 0, "dropped": 0}
+    for r in rels:
+        c = (r.get("confidence") or "").lower()
+        if c in conf:
+            conf[c] += 1
+        vn = (r.get("validation_note") or "").lower()
+        if vn in ("kept",):
+            val["kept"] += 1
+        elif vn in ("downgraded", "would_downgrade"):
+            val["downgraded"] += 1
+    for r in dropped:
+        val["dropped"] += 1
+    return {
+        "principals": len(result.get("characters", []) or []),
+        "minors": len(result.get("minor_characters", []) or []),
+        "rels_total": len(rels),
+        "rels_high": conf["high"],
+        "rels_medium": conf["medium"],
+        "rels_low": conf["low"],
+        "val_kept": val["kept"],
+        "val_downgraded": val["downgraded"],
+        "val_dropped": val["dropped"],
+        "spice": result.get("spice_level", 0) or 0,
+        "wrote": getattr(_DIAG, "wrote_stats", None),
+        "elapsed_sec": elapsed_sec,
+        "preview": bool(preview),
+    }
 
 
 def process_file(fpath, dry_run=False, preview=False):
@@ -7478,6 +7638,8 @@ def process_file(fpath, dry_run=False, preview=False):
     if errors:
         print(f"  {errors} database operation(s) failed")
         return False
+    UI.run_summary(title or fpath.stem,
+                   _run_summary_stats(result, False, time.time() - _t0))
     return True
 
 
