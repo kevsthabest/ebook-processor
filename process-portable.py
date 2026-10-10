@@ -163,6 +163,90 @@ DONE_DIR = IMPORT_DIR / "done"
 FAILED_DIR = IMPORT_DIR / "failed"
 CHUNK_CHARS = 8000
 NUM_CTX = 8192            # must comfortably exceed CHUNK_CHARS/3 + prompt + output
+
+
+# --- Auto-update helpers (--auto-update) -------------------------------------
+# All use subprocess with timeouts and degrade gracefully when git is missing
+# or the directory is not a git repo. PowerShell-compatible (no ANSI codes).
+
+def _git_commit_sha():
+    """Return the current HEAD commit SHA, or None if unavailable."""
+    import subprocess as _sp
+    try:
+        r = _sp.run(["git", "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=10,
+                    cwd=str(SCRIPT_DIR))
+        return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    except (FileNotFoundError, _sp.TimeoutExpired, Exception):
+        return None
+
+
+def _check_for_updates():
+    """Check origin/master for new commits.
+
+    Returns (behind_count, error_str). error_str is None on success.
+    """
+    import subprocess as _sp
+    try:
+        r = _sp.run(["git", "fetch", "origin"],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=str(SCRIPT_DIR))
+        if r.returncode != 0:
+            return 0, "fetch failed: %s" % r.stderr.strip()[:100]
+        r = _sp.run(["git", "rev-list", "--count", "HEAD..origin/master"],
+                    capture_output=True, text=True, timeout=10,
+                    cwd=str(SCRIPT_DIR))
+        if r.returncode != 0:
+            return 0, "rev-list failed: %s" % r.stderr.strip()[:100]
+        return int(r.stdout.strip()), None
+    except FileNotFoundError:
+        return 0, "git not installed"
+    except _sp.TimeoutExpired:
+        return 0, "git operation timed out"
+    except Exception as e:
+        return 0, str(e)[:100]
+
+
+def _do_auto_update():
+    """Check for updates and pull if behind.
+
+    On successful pull, re-execs the script with the same arguments
+    (minus --auto-update to avoid a loop) and never returns.
+    Returns False to continue with the current version.
+    """
+    import subprocess as _sp
+    behind, err = _check_for_updates()
+    if err:
+        print(f"  Auto-update check failed: {err}. "
+              f"Continuing with current version.")
+        return False
+    if behind <= 0:
+        print("  Already up to date.")
+        return False
+    print(f"  {behind} new commit(s) available. Pulling...")
+    try:
+        r = _sp.run(["git", "pull", "--ff-only", "origin", "master"],
+                    capture_output=True, text=True, timeout=60,
+                    cwd=str(SCRIPT_DIR))
+    except FileNotFoundError:
+        print("  Auto-update failed: git not installed. "
+              "Continuing with current version.")
+        return False
+    except _sp.TimeoutExpired:
+        print("  Auto-update failed: pull timed out. "
+              "Continuing with current version.")
+        return False
+    except Exception as e:
+        print(f"  Auto-update failed: {e}. Continuing with current version.")
+        return False
+    if r.returncode != 0:
+        print(f"  Auto-update failed: {r.stderr.strip()[:200]}. "
+              f"Continuing with current version.")
+        return False
+    print(f"  Updated to latest ({behind} new commits). Restarting...")
+    sys.stdout.flush()
+    new_args = [a for a in sys.argv[1:] if a != "--auto-update"]
+    os.execv(sys.executable, [sys.executable, sys.argv[0]] + new_args)
 SAMPLE_RATE = 1           # 1 = every chunk, 2 = every other, 3 = every third, etc.
 SAMPLE_EDGES = 2          # always process this many chunks from start and end
 BATCH_SIZE = 1            # parallel LLM requests (4 for Unsloth)
@@ -7069,10 +7153,15 @@ def _checkpoint_dir(book_key):
 
 
 def _checkpoint_flags_hash():
-    """Hash of the CONFIG values that affect processing output."""
+    """Hash of the CONFIG values that affect processing output.
+
+    Includes the current git commit SHA so that resuming after a code
+    update (e.g. via --auto-update) invalidates stale checkpoints.
+    """
     import hashlib as _hl
     import json as _js
     vals = {k: CONFIG.get(k) for k in _CHECKPOINT_FLAGS}
+    vals["_code_sha"] = _git_commit_sha() or "unknown"
     return _hl.sha256(_js.dumps(vals, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -8641,6 +8730,9 @@ def _build_parser():
                     help="list available profiles (builtin + saved), then exit")
     g_prof.add_argument("--guided", action="store_true",
                     help="interactive setup: prompts for file, mode, and key options")
+    g_prof.add_argument("--auto-update", action="store_true",
+                    help="check origin/master for updates at startup; pull and "
+                         "restart if behind (also checked each --watch cycle)")
 
     return ap
 
@@ -8708,6 +8800,11 @@ def main():
         load_config()
         cmd_learn_status(args.learn_dir or None)
         return
+
+    # Auto-update: check origin/master before doing any real work. On a
+    # successful pull the process re-execs with fresh code (never returns).
+    if args.auto_update and not args.watch:
+        _do_auto_update()
 
     if args.prompt_cache:
         CONFIG["v2_prompt_cache"] = True
@@ -8855,6 +8952,10 @@ def main():
         print(f"Watching {IMPORT_DIR}... (Ctrl+C to stop)")
         try:
             while True:
+                # In watch mode, --auto-update checks at the start of each
+                # cycle. A successful pull re-execs with fresh code.
+                if args.auto_update:
+                    _do_auto_update()
                 run_once(args.dry_run, args.preview, args.max_books, args.file)
                 time.sleep(60)
         except KeyboardInterrupt:
