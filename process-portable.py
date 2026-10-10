@@ -1164,6 +1164,236 @@ def _push_matrix_viz_ui(chapter_as, chapter_bs):
     UI.update_matrix_data(cf, sp, sc, rc)
 
 
+# ---------------------------------------------------------------------------
+# P4/P5: preview summary + preview diff (pure string builders, no I/O).
+# PowerShell-safe: ASCII arrows, no emoji, no ANSI codes.
+# ---------------------------------------------------------------------------
+
+_SUMMARY_MAX_PRINCIPALS = 12
+_SUMMARY_MAX_RELS = 10
+_SUMMARY_MAX_DROPPED = 6
+_DIFF_MAX_ITEMS = 8
+
+
+def _preview_summary(result):
+    """Pure: result dict -> compact human-readable digest string.
+
+    Same data that goes into the preview JSON, rendered scannable.
+    Never raises on missing/odd keys.
+    """
+    r = result or {}
+    lines = []
+    title = r.get("title") or "?"
+    author = r.get("author") or "Unknown author"
+    lines.append(f"Preview summary: {title} - {author}")
+
+    def _freq(c):
+        try:
+            return float((c or {}).get("frequency") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    chars = r.get("characters") or []
+    minors = r.get("minor_characters") or []
+    ordered = sorted(chars,
+                     key=lambda c: (-_freq(c), str((c or {}).get("name") or "")))
+    lines.append(f"  Principals ({len(chars)}):")
+    for c in ordered[:_SUMMARY_MAX_PRINCIPALS]:
+        c = c or {}
+        name = c.get("name") or "?"
+        pct = int(round(_freq(c) * 100))
+        role = c.get("role") or "unknown"
+        pov = " *" if c.get("is_pov") else ""
+        lines.append(f"    {name} ({pct}%, {role}){pov}")
+    if len(ordered) > _SUMMARY_MAX_PRINCIPALS:
+        lines.append(f"    ... and {len(ordered) - _SUMMARY_MAX_PRINCIPALS} more")
+
+    rels = r.get("relationships") or []
+    lines.append(f"  Relationships ({len(rels)}):")
+    for rel in rels[:_SUMMARY_MAX_RELS]:
+        rel = rel or {}
+        conf = rel.get("confidence")
+        conf_s = f" ({conf})" if conf else ""
+        lines.append(f"    {rel.get('from') or '?'} -> {rel.get('to') or '?'}: "
+                     f"{rel.get('type') or '?'}{conf_s}")
+    if len(rels) > _SUMMARY_MAX_RELS:
+        lines.append(f"    ... and {len(rels) - _SUMMARY_MAX_RELS} more")
+
+    dropped = r.get("dropped_relationships") or []
+    if dropped:
+        lines.append(f"  Dropped relationships ({len(dropped)}):")
+        for rel in dropped[:_SUMMARY_MAX_DROPPED]:
+            rel = rel or {}
+            vp = rel.get("validation_p")
+            note = rel.get("validation_note") or "dropped"
+            p_s = f"P={vp:.2f}, " if isinstance(vp, (int, float)) else ""
+            lines.append(f"    {rel.get('from') or '?'} -> {rel.get('to') or '?'}: "
+                         f"{rel.get('type') or '?'} ({p_s}{note})")
+        if len(dropped) > _SUMMARY_MAX_DROPPED:
+            lines.append(f"    ... and {len(dropped) - _SUMMARY_MAX_DROPPED} more")
+
+    lvl = r.get("spice_level")
+    peak_band = r.get("spice_peak_band") or _spice_band_peak(r.get("spice_peak") or 0)
+    freq_band = r.get("spice_freq_band")
+    spice_s = f"{lvl}/5" if lvl is not None else "?/5"
+    if peak_band and peak_band != "none":
+        detail = f"peak={peak_band}"
+        if freq_band and freq_band != "none":
+            detail += f", freq={freq_band}"
+    else:
+        detail = "no spicy content"
+    lines.append(f"  Spice: {spice_s} ({detail})")
+
+    trigs = r.get("triggers") or []
+    n_high = sum(1 for t in trigs
+                 if isinstance(t, dict) and t.get("prominence") == "high")
+    lines.append(f"  Triggers: {len(trigs)} ({n_high} high prominence)")
+
+    tropes = r.get("tropes") or []
+    lines.append(f"  Tropes: {len(tropes)} confirmed")
+
+    if minors:
+        lines.append(f"  Minor characters: {len(minors)} (see preview JSON)")
+
+    return "\n".join(lines)
+
+
+def _rel_pair_key(rel):
+    """(from, to) identity key, case-insensitive. Pure."""
+    rel = rel or {}
+    return (str(rel.get("from") or "").strip().lower(),
+            str(rel.get("to") or "").strip().lower())
+
+
+def _preview_diff(old, new):
+    """Pure: two preview-JSON dicts -> compact diff string. Never raises."""
+    o, n = old or {}, new or {}
+    lines = []
+    o_title = o.get("title") or "old"
+    n_title = n.get("title") or "new"
+    lines.append(f"Preview diff: {o_title} (old) -> {n_title} (new)")
+
+    # --- Characters ---
+    o_chars = o.get("characters") or []
+    o_minors = o.get("minor_characters") or []
+    n_chars = n.get("characters") or []
+    n_minors = n.get("minor_characters") or []
+    o_total = len(o_chars) + len(o_minors)
+    if n_minors or o_minors:
+        lines.append(f"  Characters: {o_total} -> {len(n_chars)} principals "
+                     f"({len(n_minors)} minor)")
+    else:
+        lines.append(f"  Characters: {o_total} -> {len(n_chars)}")
+
+    # --- Relationships ---
+    o_rels = o.get("relationships") or []
+    n_rels = n.get("relationships") or []
+    n_dropped = n.get("dropped_relationships") or []
+    o_by_pair = {_rel_pair_key(r): r for r in o_rels}
+    n_by_pair = {_rel_pair_key(r): r for r in n_rels}
+    drop_by_pair = {_rel_pair_key(r): r for r in n_dropped}
+
+    added, removed, changed = [], [], []
+    for key, nr in n_by_pair.items():
+        orr = o_by_pair.get(key)
+        if orr is None:
+            added.append(nr)
+        elif (str(orr.get("type") or "").strip().lower()
+              != str(nr.get("type") or "").strip().lower()):
+            changed.append((orr, nr))
+    for key, orr in o_by_pair.items():
+        if key not in n_by_pair:
+            removed.append(orr)
+
+    _chg_s = f", ~{len(changed)} changed" if changed else ""
+    lines.append(f"  Relationships: {len(o_rels)} -> {len(n_rels)} "
+                 f"(+{len(added)} new, -{len(removed)} removed{_chg_s})")
+
+    def _fmt_rel(r):
+        r = r or {}
+        conf = r.get("confidence")
+        return (f"{r.get('from') or '?'} -> {r.get('to') or '?'}: "
+                f"{r.get('type') or '?'}" + (f" ({conf})" if conf else ""))
+
+    for r in added[:_DIFF_MAX_ITEMS]:
+        lines.append(f"    + {_fmt_rel(r)}")
+    for orr, nr in changed[:_DIFF_MAX_ITEMS]:
+        note = (nr or {}).get("validation_note")
+        reason = f" ({note})" if note else ""
+        lines.append(f"    ~ {(orr or {}).get('from')} -> {(orr or {}).get('to')}: "
+                     f"{(orr or {}).get('type')} -> {(nr or {}).get('type')}{reason}")
+    for r in removed[:_DIFF_MAX_ITEMS]:
+        dr = drop_by_pair.get(_rel_pair_key(r))
+        if dr is not None:
+            vp = dr.get("validation_p")
+            note = dr.get("validation_note") or "dropped"
+            p_s = f"P={vp:.2f}, " if isinstance(vp, (int, float)) else ""
+            reason = f" ({p_s}{note})"
+        else:
+            reason = " (not in new run)"
+        lines.append(f"    - {_fmt_rel(r)}{reason}")
+    _shown = (min(len(added), _DIFF_MAX_ITEMS)
+              + min(len(removed), _DIFF_MAX_ITEMS)
+              + min(len(changed), _DIFF_MAX_ITEMS))
+    if len(added) + len(removed) + len(changed) > _shown:
+        lines.append(f"    ... and {len(added) + len(removed) + len(changed) - _shown} more")
+
+    # --- Spice ---
+    o_sp, n_sp = o.get("spice_level"), n.get("spice_level")
+    if o_sp == n_sp:
+        lines.append(f"  Spice: {o_sp} -> {n_sp} (unchanged)")
+    else:
+        lines.append(f"  Spice: {o_sp} -> {n_sp}")
+
+    # --- Triggers (by warning name) ---
+    def _trig_names(d):
+        names = []
+        for t in (d or {}).get("triggers") or []:
+            names.append(str(t.get("warning") or "?") if isinstance(t, dict)
+                         else str(t))
+        return names
+    o_tn, n_tn = _trig_names(o), _trig_names(n)
+    t_added = [w for w in n_tn if w not in o_tn]
+    t_removed = [w for w in o_tn if w not in n_tn]
+    t_line = f"  Triggers: {len(o_tn)} -> {len(n_tn)}"
+    _tbits = [f"+{w}" for w in t_added[:3]] + [f"-{w}" for w in t_removed[:3]]
+    if _tbits:
+        t_line += f" ({', '.join(_tbits)})"
+    elif len(o_tn) != len(n_tn):
+        t_line += f" ({len(n_tn) - len(o_tn):+d})"
+    lines.append(t_line)
+
+    # --- Tropes ---
+    o_tr = [str(t) for t in (o.get("tropes") or [])]
+    n_tr = [str(t) for t in (n.get("tropes") or [])]
+    tr_added = [t for t in n_tr if t not in o_tr]
+    tr_removed = [t for t in o_tr if t not in n_tr]
+    tr_line = f"  Tropes: {len(o_tr)} -> {len(n_tr)}"
+    _rbits = [f"+{t}" for t in tr_added[:3]] + [f"-{t}" for t in tr_removed[:3]]
+    if _rbits:
+        tr_line += f" ({', '.join(_rbits)})"
+    elif len(o_tr) != len(n_tr):
+        tr_line += f" ({len(n_tr) - len(o_tr):+d})"
+    lines.append(tr_line)
+
+    return "\n".join(lines)
+
+
+def _cmd_preview_diff(old_path, new_path):
+    """Load two preview JSONs and return the diff string (or an error)."""
+    try:
+        with open(old_path, encoding="utf-8") as f:
+            old = json.load(f)
+    except (OSError, ValueError) as e:
+        return f"ERROR: cannot read {old_path}: {e}"
+    try:
+        with open(new_path, encoding="utf-8") as f:
+            new = json.load(f)
+    except (OSError, ValueError) as e:
+        return f"ERROR: cannot read {new_path}: {e}"
+    return _preview_diff(old, new)
+
+
 def _filter_principals(characters, relationships, min_frequency=0.20):
     """Filter to principal characters. Returns
     (principals, minors, filtered_relationships).
@@ -3627,8 +3857,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     spices = [b["spice_level"] for b in chapter_bs.values() if b]
     spice_peak = max(spices) if spices else 0
     spice_level = _spice_level_from_chapters(spices, n_successful_b)
+    _sb_peak, _sb_freq, _ = _spice_band_detail(spices, n_successful_b)
     if show_matrices:
-        _sb_peak, _sb_freq, _ = _spice_band_detail(spices, n_successful_b)
         print(_spice_matrix_ascii(_sb_peak, _sb_freq, spice_level))
 
     # --- Trope candidates: union across chapters (gate runs separately) ---
@@ -3780,6 +4010,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         "triggers": triggers,
         "spice_level": spice_level,
         "spice_peak": spice_peak,
+        "spice_peak_band": _sb_peak,
+        "spice_freq_band": _sb_freq,
         "coverage_warning": coverage_warning,
         "chapters_successful": n_successful_b,
         "chapters_total": n,
@@ -7383,6 +7615,12 @@ def save_preview(fpath, result):
     with open(prev_dir / f"{base}.md", "w", encoding="utf-8") as f:
         f.write("\n".join(md))
     print(f"  Preview saved to preview/{base}.md")
+    if CONFIG.get("preview_summary"):
+        _summary = _preview_summary(result)
+        print(_summary)
+        with open(prev_dir / f"{base}_summary.md", "w", encoding="utf-8") as f:
+            f.write(_summary + "\n")
+        print(f"  Preview summary saved to preview/{base}_summary.md")
 
 
 def safe_move(src, dst_dir):
@@ -7722,6 +7960,13 @@ def _build_parser():
     g_out.add_argument("--show-matrices", action="store_true",
                     help="print ASCII matrix visualizations (spice, character "
                          "importance, relationship confidence) during processing")
+    g_out.add_argument("--preview-summary", action="store_true",
+                    help="after a run, print a compact human-readable digest "
+                         "and save it as preview/{book}_summary.md")
+    g_out.add_argument("--preview-diff", nargs=2,
+                    metavar=("OLD_JSON", "NEW_JSON"),
+                    help="compare two preview JSONs and print what changed; "
+                         "exits without processing books")
     g_out.add_argument("--no-viz", action="store_true",
                     help="disable the chapter visualizer panel in the Rich TUI")
     g_out.add_argument("--push-preview", metavar="PREVIEW_JSON",
@@ -7804,6 +8049,10 @@ def main():
     if args.trope_map:
         load_config()
         cmd_trope_map(args.trope_map)
+        return
+
+    if args.preview_diff:
+        print(_cmd_preview_diff(args.preview_diff[0], args.preview_diff[1]))
         return
 
     if args.validate:
@@ -7924,6 +8173,8 @@ def main():
     if args.show_matrices:
         CONFIG["show_matrices"] = True
         UI._show_matrices = True
+    if args.preview_summary:
+        CONFIG["preview_summary"] = True
     # --explain-blocks defaults ON with --debug, OFF otherwise; explicit
     # --explain-blocks/--no-explain-blocks wins.
     if args.explain_blocks is not None:

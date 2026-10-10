@@ -4059,3 +4059,167 @@ class TestDedupeGuard(unittest.TestCase):
         # _merge_tier still returns "no" for the surname trap (logic
         # unchanged; only the reason is now extractable).
         self.assertEqual(pp._merge_tier("chris sebeck", "peter sebeck"), "no")
+
+
+class TestPreviewSummaryDiff(unittest.TestCase):
+    """P4/P5: --preview-summary digest and --preview-diff comparison."""
+
+    def _sample_result(self):
+        return {
+            "title": "Daemon", "author": "Daniel Suarez",
+            "characters": [
+                {"name": "Matthew Sobol", "frequency": 0.67,
+                 "role": "antagonist", "is_pov": False},
+                {"name": "Peter Sebeck", "frequency": 0.32,
+                 "role": "protagonist", "is_pov": True},
+            ],
+            "minor_characters": [{"name": "X%d" % i, "role": "minor"}
+                                 for i in range(3)],
+            "relationships": [
+                {"from": "Peter Sebeck", "to": "Chris Sebeck",
+                 "type": "parent", "confidence": "high"},
+            ],
+            "dropped_relationships": [
+                {"from": "Brian Gragg", "to": "Natalie Philips",
+                 "type": "spouse", "validation_p": 0.03,
+                 "validation_note": "dropped"},
+            ],
+            "spice_level": 2, "spice_peak": 5,
+            "spice_peak_band": "explicit", "spice_freq_band": "rare",
+            "triggers": [
+                {"warning": "graphic_violence", "prominence": "high"},
+                {"warning": "murder", "prominence": "medium"},
+            ],
+            "tropes": ["trope_a", "trope_b", "trope_c"],
+        }
+
+    # -- _preview_summary ------------------------------------------------
+
+    def test_summary_basic(self):
+        out = pp._preview_summary(self._sample_result())
+        self.assertIn("Preview summary: Daemon - Daniel Suarez", out)
+        self.assertIn("Matthew Sobol (67%, antagonist)", out)
+        self.assertIn("Peter Sebeck (32%, protagonist) *", out)
+        self.assertIn("Principals (2):", out)
+        self.assertIn("Peter Sebeck -> Chris Sebeck: parent (high)", out)
+        self.assertIn("Brian Gragg -> Natalie Philips: spouse (P=0.03, dropped)",
+                      out)
+        self.assertIn("Spice: 2/5 (peak=explicit, freq=rare)", out)
+        self.assertIn("Triggers: 2 (1 high prominence)", out)
+        self.assertIn("Tropes: 3 confirmed", out)
+        self.assertIn("Minor characters: 3 (see preview JSON)", out)
+
+    def test_summary_empty_inputs(self):
+        for bad in ({}, None):
+            out = pp._preview_summary(bad)
+            self.assertIn("Preview summary:", out)
+            self.assertIn("Spice:", out)
+
+    def test_summary_line_cap(self):
+        r = self._sample_result()
+        r["characters"] = [{"name": "C%d" % i, "frequency": 0.5,
+                            "role": "supporting"} for i in range(30)]
+        r["relationships"] = [{"from": "A", "to": "B%d" % i, "type": "friend"}
+                              for i in range(40)]
+        r["dropped_relationships"] = [{"from": "A", "to": "D%d" % i,
+                                       "type": "spouse", "validation_p": 0.1,
+                                       "validation_note": "dropped"}
+                                      for i in range(20)]
+        lines = pp._preview_summary(r).split("\n")
+        self.assertLessEqual(len(lines), 40)
+        self.assertTrue(any("... and" in ln for ln in lines))
+
+    def test_summary_no_bands_falls_back(self):
+        r = {"title": "T", "author": "A", "spice_level": 3, "spice_peak": 4,
+             "characters": [], "relationships": [], "triggers": [],
+             "tropes": []}
+        out = pp._preview_summary(r)
+        # peak band derived from spice_peak=4 -> explicit; no freq band shown
+        self.assertIn("Spice: 3/5 (peak=explicit)", out)
+        self.assertNotIn("freq=", out)
+
+    def test_summary_no_spice(self):
+        r = {"title": "T", "author": "A", "spice_level": 0, "spice_peak": 0,
+             "characters": [], "relationships": [], "triggers": [],
+             "tropes": []}
+        self.assertIn("Spice: 0/5 (no spicy content)",
+                      pp._preview_summary(r))
+
+    def test_summary_sorts_by_frequency(self):
+        r = self._sample_result()
+        out = pp._preview_summary(r)
+        self.assertLess(out.index("Matthew Sobol"), out.index("Peter Sebeck"))
+
+    # -- _preview_diff ---------------------------------------------------
+
+    def _old_new(self):
+        new = self._sample_result()
+        old = {
+            "title": "Daemon", "author": "Daniel Suarez",
+            "characters": new["characters"] + [
+                {"name": "Extra Guy", "frequency": 0.5, "role": "supporting"}],
+            "minor_characters": [],
+            "relationships": new["relationships"] + [
+                {"from": "Brian Gragg", "to": "Natalie Philips",
+                 "type": "spouse", "confidence": "low"}],
+            "dropped_relationships": [],
+            "spice_level": 3,
+            "triggers": new["triggers"] + [
+                {"warning": "war", "prominence": "low"}],
+            "tropes": ["trope_a", "trope_b"],
+        }
+        return old, new
+
+    def test_diff_basic(self):
+        old, new = self._old_new()
+        out = pp._preview_diff(old, new)
+        self.assertIn("Preview diff: Daemon (old) -> Daemon (new)", out)
+        self.assertIn("Characters: 3 -> 2 principals (3 minor)", out)
+        self.assertIn("Relationships: 2 -> 1 (+0 new, -1 removed)", out)
+        self.assertIn("- Brian Gragg -> Natalie Philips: spouse (low) "
+                      "(P=0.03, dropped)", out)
+        self.assertIn("Spice: 3 -> 2", out)
+        self.assertIn("Triggers: 3 -> 2 (-war)", out)
+        self.assertIn("Tropes: 2 -> 3 (+trope_c)", out)
+
+    def test_diff_spice_unchanged(self):
+        old, new = self._old_new()
+        old["spice_level"] = 2
+        self.assertIn("Spice: 2 -> 2 (unchanged)",
+                      pp._preview_diff(old, new))
+
+    def test_diff_changed_type(self):
+        old, new = self._old_new()
+        # same pair, different type -> "~" line
+        new["relationships"] = [{"from": "Peter Sebeck", "to": "Chris Sebeck",
+                                 "type": "other",
+                                 "validation_note": "downgraded"}]
+        out = pp._preview_diff(old, new)
+        self.assertIn("~ Peter Sebeck -> Chris Sebeck: parent -> other "
+                      "(downgraded)", out)
+
+    def test_diff_added_relationship(self):
+        old, new = self._old_new()
+        new["relationships"] = new["relationships"] + [
+            {"from": "Jon Ross", "to": "Natalie Philips",
+             "type": "friend", "confidence": "medium"}]
+        out = pp._preview_diff(old, new)
+        self.assertIn("+ Jon Ross -> Natalie Philips: friend (medium)", out)
+
+    def test_diff_empty_inputs(self):
+        for bad in ({}, None):
+            out = pp._preview_diff(bad, bad)
+            self.assertIn("Preview diff:", out)
+
+    def test_diff_no_minors_either_side(self):
+        old = {"title": "A", "characters": [{"name": "X"}],
+               "relationships": [], "triggers": [], "tropes": []}
+        new = {"title": "A", "characters": [{"name": "X"}],
+               "relationships": [], "triggers": [], "tropes": []}
+        out = pp._preview_diff(old, new)
+        self.assertIn("Characters: 1 -> 1", out)
+        self.assertNotIn("principals", out)
+
+    def test_cmd_preview_diff_bad_path(self):
+        out = pp._cmd_preview_diff("/nonexistent/a.json", "/nonexistent/b.json")
+        self.assertTrue(out.startswith("ERROR:"))
