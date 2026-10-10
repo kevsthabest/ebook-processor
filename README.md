@@ -19,7 +19,13 @@ touches the database.
      - *identity task*: characters + relationships, with evidence quotes
    - Aggregates across chunks, optionally dedupes characters via embeddings
    - Resolves the work (ISBN → edition → work, else title/author match)
-   - Writes trope claims as `candidate`, characters/relationships to their tables
+   - Writes to Supabase: `book_trope_claims` (status `candidate`, source
+     `ai`), `trope_proposals` (unmapped names with book provenance),
+     `book_trigger_claims` (source `ai`), `book_characters`,
+     `works.spice_detected`, `book_meta` (POVs, series, up to 20 notable
+     quotes), and `book_quotes` (3–5 memorable quotes per book, source
+     `pipeline`). Relationships are no longer written — the
+     `character_relationships` table was archived (`..._archive_20261009`).
 4. Processed files move to `import/done/`, failures to `import/failed/`
 
 ## Setup
@@ -28,7 +34,7 @@ touches the database.
 2. For MOBI/AZW3: `pip install mobi`
 3. For the rich terminal UI (progress bars, summary tables): `pip install rich`
    (optional — falls back to plain output if not installed)
-3. Copy `config.example.json` → `config.json` and fill in:
+4. Copy `config.example.json` → `config.json` and fill in:
    - `supabase_url` + `supabase_key` (service role)
    - LLM backend (see below)
    - Optional: `embed_url`/`embed_model`/`dedupe_threshold` for `--dedupe`
@@ -41,8 +47,12 @@ touches the database.
 | `--llm openrouter` | OpenRouter | set `openrouter_model` + `openrouter_key` |
 | `--llm openai` | Any OpenAI-compatible endpoint | `openai_base_url` + `openai_model` (+ `openai_key`); used for Unsloth |
 
-Best results so far: **Turbo Brilliance via Unsloth** (`--llm openai`,
-`openai_base_url=http://127.0.0.1:8888/v1`).
+Current stack: local Qwen3.5-4B Q4 via Unsloth (`--llm openai`,
+`openai_base_url=http://127.0.0.1:8888/v1`) for Phase A extraction — it
+beat hosted models on extraction reliability. Decision-model work (merge
+judgments, relationship validation) uses `typesafe/jev-1.13` on OpenRouter
+(`--decision-model-provider openrouter`) or the local Unsloth server
+(default). Turbo Brilliance was evaluated and rejected 2026-10-03.
 
 ## Usage
 
@@ -69,8 +79,13 @@ skip writes, no preview files), `--sample N` (1 of every N chunks),
 `--chunks 2` or `--chunks 2,5,8` (process only those chunk indices —
 numbering matches the sampled list and debug files; handy for re-testing
 one failing chunk), `--debug` (save raw failed-chunk output),
-`--dedupe` (embedding merge), `--max-fail-ratio` (abort threshold,
-default 0.5).
+`--dedupe` (embedding merge), `--trope-map PREVIEW_JSON` (map a preview's
+tropes to the catalog via embeddings; writes a `<preview>-trope-map.json`
+review file, nothing to Supabase).
+
+The abort threshold is the `MAX_FAILED_CHUNK_RATIO = 0.5` constant
+(`:169`), not a flag; aborted runs still save a preview marked
+`"aborted": true`.
 
 ## Two-task extraction (v1.19+)
 
@@ -109,12 +124,26 @@ works at chapter level:
    trigger severities (24-category closed taxonomy, every category explicit),
    spice 0-5, trope candidates, quotes.
 4. **Deterministic reduce** (pure code, no LLM): max trigger severity per
-   category with chapter counts and verified evidence; 75th-percentile spice;
-   POVs named in 2+ chapters; relationship dedup with roster remap;
-   evidence-based confidence (documented formulas in code).
-5. **Trope confirmation gate** — one LLM call judges each per-chapter
-   candidate against the chapter summaries (yes/no/unsure); only "yes"
-   becomes a claim, still subject to the closed-vocabulary DB gate.
+   category with chapter counts and verified evidence; POVs named in 2+
+   chapters; relationship dedup with roster remap; evidence-based confidence
+   (documented formulas in code).
+   - **Spice:** peak-chapter intensity × fraction-at-that-intensity via
+     `_SPICE_MATRIX` (0–5; `_spice_level_from_chapters` at `:821`, matrix at
+     `:783`). Triggers warn that content *exists*; spice measures
+     *pervasiveness*. The legacy pipeline still uses 75th percentile
+     (`:6755`).
+   - **Trigger prominence:** low/medium/high via `_PROMINENCE_MATRIX`
+     (`:855`) for the app UI.
+5. **Trope confirmation gate** — candidates are tiered by chapter count
+   (thresholds scale with book length). `≥ max(3, n // 20)` chapters (5% of
+   chapters) auto-confirms — a recurring pattern is a trope. Borderline
+   candidates (2 to `auto_min - 1` chapters) go to the LLM gate: one call per
+   batch of 30 candidates judges each against the chapter summaries
+   (yes/no/unsure); only "yes" becomes a claim. Single-chapter candidates
+   drop in long books (`≥ 20` chapters). Genre/setting labels are denylisted
+   first (`_is_denylisted_trope`). Before tiering, catalog-ID mapping via
+   embeddings (`trope_map_threshold` 0.78) collapses paraphrases to one
+   display name so chapter counts don't split.
 
 **Context window matters:** v2 chapters default to 16000 chars (~4k tokens)
 via `v2_max_chapter_chars`, sized to leave room in an 8192-token context for
@@ -165,7 +194,8 @@ With `--debug`, the same forensics land in the chunk's debug file.
 change in isolation:
 1. Double `llm_max_tokens` in `config.json` (thinking ate the budget).
 2. Set `llm_response_format` to `"none"` (the JSON constraint is fighting `<think>`).
-3. Set `llm_system_prefix` to `{REASON:ilow}` (Turbo Brilliance verbosity tag).
+3. Set `llm_system_prefix` to a verbosity tag such as `{REASON:ilow}`
+   (supported by some Unsloth-hosted reasoning models).
 
 New config keys: `llm_max_tokens` (default 8000), `llm_system_prefix`
 (default ""), `llm_response_format` (default `"json_object"`, or `"none"`).
@@ -187,6 +217,17 @@ stored digits-only. Resolution order:
 New works store the ISBN in `provider_ids`. Preview/dry-run resolution is
 read-only.
 
+Flags: `--isbn` overrides the ISBN for work resolution (takes priority over
+EPUB metadata and auto-lookup). `--allow-no-isbn` processes books with no
+ISBN instead of skipping them; `--rename-no-isbn` renames skipped no-ISBN
+EPUBs to `NO-ISBN-{original}.epub` for triage. When the ISBN isn't in the
+file, the script tries an Open Library auto-lookup (title + author) before
+giving up. `inject_isbn.py` embeds an ISBN into an EPUB's OPF metadata:
+
+```bash
+py inject_isbn.py "book.epub" 9781615871100
+```
+
 ## Character dedup (--dedupe)
 
 Small models fragment identities ("Narrator" vs "Shirley Jackson" vs "I").
@@ -199,7 +240,80 @@ POVs remap to canonical names; merges are listed in the preview. A failed
 dedup aborts the file rather than writing partial results.
 
 Dedup is janitorial, not a cure — it can't fix model-level coreference
-failures. Review the preview before any real `--dedupe` write.
+failures. Review the preview before any real `--dedupe` write. Embeddings
+run on Kevin's PC only: `embed_url` defaults to `127.0.0.1:8888` in
+`config.example.json`, so dedup and catalog mapping won't work from
+elsewhere.
+
+## Characters
+
+- `--principals-only` (default on) writes only principal characters to
+  Supabase; minors stay in the preview JSON. `--no-principals-only` writes
+  all characters. `--min-frequency 0.20` sets the chapter-frequency floor
+  for principal status.
+- Roles are deterministic (`_char_deterministic_role`): POV = protagonist,
+  ≥30% of chapters = protagonist, 10–30% = supporting, <10% = minor. An
+  LLM "antagonist" label is kept as a subtype on protagonist/supporting.
+- `--alias "Loki=Brian Gragg"` records a manual character alias: repeatable,
+  stored as human-validated, applies cross-book.
+
+## Decision model & character merge
+
+The decision model handles judgment calls that rules can't:
+
+- `--decision-model` — validate family-type relationships with the decision
+  model (uses the same Unsloth server as `openai_base_url`).
+- `--decision-model-provider {local,openrouter}` — `local` (default) uses the
+  local Unsloth `/v1/systemone` server; `openrouter` uses hosted
+  `typesafe/jev-1.13` (needs `openrouter_api_key` in `config.json` — falls
+  back to `openrouter_key` — or the `OPENROUTER_API_KEY` env var).
+- `--decision-model-url URL` — point the local provider at a specific Unsloth
+  server (defaults to the config `openai_base_url`).
+
+Character merging is 3-tiered:
+
+1. **Tier 1 hard-NO** — same-chapter co-occurrence (two names listed in one
+   chapter don't merge; catches the surname-family trap).
+2. **Tier 2 deterministic YES** — title stripping ("Dr. X" → "X"), middle
+   initials, spelling variants, nicknames.
+3. **Tier 3 Qwen** — ambiguous pairs judged by the decision model at a
+   0.85 threshold, capped at 50 calls per book.
+
+Human labels always outrank automatic merges.
+
+### Relationship validation
+
+Family-type relationships (`spouse`, `parent`, `child`, `sibling`) get a
+decision-model score: P ≥ 0.70 keeps the type, 0.30 ≤ P < 0.70 downgrades to
+`"other"`, P < 0.30 drops the relationship (likely hallucinated). No
+evidence = downgrade without spending a decision-model call. In preview mode
+nothing changes; scores and notes land in the preview for audit.
+`--show-matrices` renders the spice/prominence matrices as ASCII during the
+run.
+
+## Cross-run learning
+
+Learning is on by default (`--learn`); `--no-learn` disables it.
+
+- `--learn-dir DIR` — learning state directory (default
+  `~/.ebook-processor/learned/`).
+- `--import-labels PATH` — import hand-labeled merge pairs
+  (`label-merges.py` output) into the nickname dictionary, then continue.
+
+`LearnedState` persists four kinds of knowledge: `nicknames.json` (short
+name → canonical name), `titles.json` (trusted title prefixes),
+`threshold_stats.json` (per-trigger keep/drop stats), and
+`series/<key>.json` (per-author character rosters used as alias hints).
+
+## Helper scripts
+
+`process.py` (413 lines) is the legacy predecessor watching
+`~/workspace/ebook-import/`; `overnight-watch.sh` runs unattended batch
+runs. `label-merges.py` hand-labels merge pairs for `--import-labels`,
+`evaluate-merges.py` scores the tiered merge against those labels,
+`dedupe-prototype.py` prototypes the embedding dedup, and the `prototype-*`
+scripts explore experimental paths before they land in
+`process-portable.py`.
 
 ## Aborted runs still save a preview
 
@@ -212,6 +326,7 @@ results are never written to Supabase.
 - Trope claims are written as `candidate` status for review in Trope Lab.
 - Anthologies are detected per chunk; stories link as separate works via
   the `edition_works` junction table.
-- Each full novel costs roughly 100k tokens through the LLM.
+- Token cost depends on pipeline and book length — re-measure for the v2
+  chapter pipeline before quoting a number.
 - Legacy `--pipeline legacy` and v2 `--pipeline v2` share the same result
   shape, so previews, work resolution, and DB writes work identically.
