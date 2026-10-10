@@ -5546,6 +5546,69 @@ def cmd_push_preview(preview_path):
         print(f"  Push complete, no errors")
 
 
+def cmd_retry_failed(preview_path):
+    """P9: re-run only the failed chapters from a preview JSON.
+
+    Reads chapter_data from the preview, identifies chapters where Call A
+    (identity) or Call B (content) failed, seeds a checkpoint dir with the
+    successful chapters, then runs process_file_v2 in resume mode. The merged
+    result is saved as {book}_retried.json; the original is untouched.
+    Always runs in preview mode (no Supabase writes).
+    """
+    import os
+    if not os.path.isfile(preview_path):
+        print(f"  Not found: {preview_path}")
+        return
+    result = json.load(open(preview_path, encoding="utf-8"))
+    cdata = result.get("chapter_data") or {}
+    chapters = cdata.get("chapters") or {}
+    if not chapters:
+        print(f"  No chapter_data in {preview_path} "
+              f"(needs a preview from the checkpoint-enabled pipeline)")
+        return
+    failed = sorted(int(k) for k, v in chapters.items()
+                    if v.get("a") is None or v.get("b") is None)
+    if not failed:
+        print(f"  No failed chapters to retry in {preview_path}")
+        return
+    print(f"  Retrying {len(failed)} failed chapters: {failed}")
+    # Locate the book file.
+    fname = result.get("file", "")
+    fpath = None
+    for cand in (Path(fname), IMPORT_DIR / fname):
+        if cand.is_file():
+            fpath = cand
+            break
+    if fpath is None:
+        print(f"  Could not find book file '{fname}' "
+              f"(checked cwd and {IMPORT_DIR})")
+        return
+    # Seed checkpoints from the successful chapters so --resume skips them.
+    book_key = _checkpoint_book_key(fpath)
+    _checkpoint_clear(book_key)  # start clean
+    n_total = len(chapters)
+    _checkpoint_save_meta(book_key, n_total)
+    roster = cdata.get("roster") or {}
+    _checkpoint_save_roster(book_key, roster)
+    for k, v in chapters.items():
+        idx = int(k)
+        if idx in failed:
+            continue
+        _checkpoint_save_chapter(book_key, idx, v.get("a"), v.get("b"))
+    # Resume mode + retried output name. Force preview (no DB writes).
+    CONFIG["resume"] = True
+    CONFIG["preview_name_suffix"] = "_retried"
+    # Bypass the interactive flags-hash prompt: the checkpoint was just
+    # seeded from this exact preview, so flags necessarily match.
+    CONFIG["resume_force"] = True
+    try:
+        process_file_v2(fpath, dry_run=False, preview=True)
+    finally:
+        CONFIG.pop("resume_force", None)
+        CONFIG.pop("preview_name_suffix", None)
+    print(f"  Retried preview saved (original untouched)")
+
+
 def cmd_validate(preview_path):
     """Run automated quality checks on a preview JSON or a directory of them.
     Prints a report per file, plus a summary table for directories."""
@@ -6851,6 +6914,173 @@ def _select_chunks(chunks, only):
     return [(i, ch) for i, ch in indexed if i in wanted]
 
 
+# ---------------------------------------------------------------------------
+# P8: Crash resume — per-chapter checkpoints under preview/.checkpoints/
+# ---------------------------------------------------------------------------
+# After each chapter's Call A/B completes, its result is saved to
+# preview/.checkpoints/{book_key}/chapter_{idx}.json. A --resume run loads
+# completed chapters and skips their LLM calls. The roster dict is saved
+# alongside (sets are converted to sorted lists for JSON).
+
+_CHECKPOINT_FLAGS = (
+    # CONFIG keys that affect output; a mismatch on --resume warns.
+    "llm", "batch_size", "pipeline", "principals_only", "min_frequency",
+    "dedupe", "v2_prompt_cache", "v2_shared_system", "v2_task_last",
+    "decision_model", "decision_model_provider", "only_chunks",
+)
+
+
+def _checkpoint_book_key(fpath):
+    """Safe directory name for a book's checkpoints."""
+    import re as _re
+    stem = Path(fpath).stem if not isinstance(fpath, str) else Path(fpath).stem
+    safe = _re.sub(r"[^a-zA-Z0-9_-]+", "_", stem).strip("_")
+    return safe or "book"
+
+
+def _checkpoint_dir(book_key):
+    return SCRIPT_DIR / "preview" / ".checkpoints" / book_key
+
+
+def _checkpoint_flags_hash():
+    """Hash of the CONFIG values that affect processing output."""
+    import hashlib as _hl
+    import json as _js
+    vals = {k: CONFIG.get(k) for k in _CHECKPOINT_FLAGS}
+    return _hl.sha256(_js.dumps(vals, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _ckpt_json_safe(obj):
+    """Convert sets to sorted lists so the object is JSON-serializable."""
+    if isinstance(obj, set):
+        return sorted(obj, key=str)
+    if isinstance(obj, dict):
+        return {k: _ckpt_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_ckpt_json_safe(v) for v in obj]
+    return obj
+
+
+def _ckpt_json_restore(obj):
+    """Best-effort inverse of _ckpt_json_safe for known roster fields.
+
+    Roster entries store several fields as sets (aliases, primary_keys,
+    chapter appearances). On load we restore the known set-valued fields;
+    anything else stays as-is (lists are harmless for the reduce).
+    """
+    _SET_FIELDS = {"aliases", "primary_keys", "chapters", "evidence_chapters"}
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in _SET_FIELDS and isinstance(v, list):
+                out[k] = set(v)
+            else:
+                out[k] = _ckpt_json_restore(v)
+        return out
+    if isinstance(obj, list):
+        return [_ckpt_json_restore(v) for v in obj]
+    return obj
+
+
+def _checkpoint_save_meta(book_key, total_chapters):
+    d = _checkpoint_dir(book_key)
+    d.mkdir(parents=True, exist_ok=True)
+    meta = {"book_key": book_key, "total_chapters": total_chapters,
+            "flags_hash": _checkpoint_flags_hash(),
+            "version": PORTABLE_VERSION}
+    with open(d / "meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
+def _checkpoint_save_chapter(book_key, idx, a, b):
+    d = _checkpoint_dir(book_key)
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / f"chapter_{idx}.json", "w", encoding="utf-8") as f:
+        json.dump({"index": idx, "a": _ckpt_json_safe(a),
+                   "b": _ckpt_json_safe(b)}, f, ensure_ascii=False)
+
+
+def _checkpoint_save_roster(book_key, roster):
+    d = _checkpoint_dir(book_key)
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / "roster.json", "w", encoding="utf-8") as f:
+        json.dump(_ckpt_json_safe(roster), f, ensure_ascii=False)
+
+
+def _checkpoint_load(book_key):
+    """Returns (meta, roster, {idx: (a, b)}) or None if no checkpoints."""
+    d = _checkpoint_dir(book_key)
+    meta_path = d / "meta.json"
+    if not meta_path.is_file():
+        return None
+    meta = json.load(open(meta_path, encoding="utf-8"))
+    roster = {}
+    rp = d / "roster.json"
+    if rp.is_file():
+        roster = _ckpt_json_restore(json.load(open(rp, encoding="utf-8")))
+    chapters = {}
+    for cp in sorted(d.glob("chapter_*.json")):
+        try:
+            idx = int(cp.stem.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        data = json.load(open(cp, encoding="utf-8"))
+        a = _ckpt_json_restore(data.get("a"))
+        b = _ckpt_json_restore(data.get("b"))
+        chapters[idx] = (a, b)
+    return meta, roster, chapters
+
+
+def _checkpoint_clear(book_key):
+    import shutil as _sh
+    d = _checkpoint_dir(book_key)
+    if d.is_dir():
+        _sh.rmtree(d)
+
+
+def _checkpoint_resume_check(book_key, total_chapters):
+    """Validate checkpoints for a --resume run.
+
+    Returns (chapters_dict, roster) or (None, None) if resume is not possible.
+    Warns on flags-hash or chapter-count mismatch; prompts to confirm when
+    interactive, otherwise refuses to resume.
+    """
+    loaded = _checkpoint_load(book_key)
+    if not loaded:
+        print(f"  --resume: no checkpoints found for '{book_key}', starting fresh")
+        return None, None
+    meta, roster, chapters = loaded
+    problems = []
+    if meta.get("flags_hash") != _checkpoint_flags_hash():
+        problems.append("processing flags differ from the checkpointed run")
+    if meta.get("total_chapters") != total_chapters:
+        problems.append(
+            f"chapter count differs (checkpoint: {meta.get('total_chapters')}, "
+            f"now: {total_chapters})")
+    if problems:
+        print(f"  --resume WARNING: {'; '.join(problems)}")
+        if CONFIG.get("resume_force"):
+            print("  Resuming despite mismatch (--retry-failed seeded these)")
+        else:
+            try:
+                import sys as _sys
+                if _sys.stdin.isatty():
+                    ans = input("  Resume anyway? [y/N] ").strip().lower()
+                else:
+                    ans = "n"
+            except (EOFError, KeyboardInterrupt):
+                ans = "n"
+            if ans != "y":
+                print("  Starting fresh (clearing checkpoints)")
+                _checkpoint_clear(book_key)
+                return None, None
+            print("  Resuming despite mismatch")
+    n_done = sum(1 for a, b in chapters.values() if a is not None and b is not None)
+    print(f"  --resume: {n_done}/{total_chapters} chapters already complete, "
+          f"skipping their LLM calls")
+    return chapters, roster
+
+
 def process_file_v2(fpath, dry_run=False, preview=False):
     """v2 pipeline: chapter-level map/reduce. Chapters run Call A (characters,
     sequential for the roster) then Call B (content, parallelizable), followed
@@ -6945,12 +7175,42 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     call = backends.get(CONFIG["llm"], llm_ollama)
     batch_size = effective_batch_size()
 
+    # P8: crash resume. Checkpoint key is stable per book file.
+    _ckpt_key = _checkpoint_book_key(fpath)
+    _resumed_chapters = {}  # idx -> (a, b) loaded from checkpoints
+    _resumed_roster = None
+    if CONFIG.get("resume"):
+        _rc, _rr = _checkpoint_resume_check(_ckpt_key, n)
+        if _rc is not None:
+            _resumed_chapters = _rc
+            _resumed_roster = _rr
+    else:
+        # Fresh run: write meta.json so a later --resume can validate flags.
+        _checkpoint_save_meta(_ckpt_key, n)
+
+    def _ckpt_complete(idx):
+        """True if chapter idx has both Call A and Call B checkpointed."""
+        pair = _resumed_chapters.get(idx)
+        return pair is not None and pair[0] is not None and pair[1] is not None
+
     # Pass 1: Call A sequential (roster must see chapters in order).
     # When v2_prompt_cache is on, submit B(i) right after A(i) so the
     # chapter's KV cache is still hot (interleaved, B on worker threads).
     roster, chapter_as, chapter_bs = {}, {}, {}
     a_ok = a_failed = a_fallback = 0
     b_ok = b_failed = 0
+    # On resume, restore the roster built by the checkpointed chapters and
+    # pre-fill results for fully completed chapters (their LLM calls are skipped).
+    if _resumed_roster:
+        roster.update(_resumed_roster)
+    for _ri, _rpair in sorted(_resumed_chapters.items()):
+        _ra, _rb = _rpair
+        if _ra is not None and _rb is not None:
+            chapter_as[_ri] = _ra
+            chapter_bs[_ri] = _rb
+            a_ok += 1
+            b_ok += 1
+            UI.advance(_book_key, 2)  # both work units already done
     interleave = CONFIG.get("v2_prompt_cache") and batch_size > 1
     # Single-slot prompt-cache: run B inline right after A (cache is hottest).
     inline_b = CONFIG.get("v2_prompt_cache") and batch_size <= 1
@@ -6965,30 +7225,60 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             if interleave:
                 b_pool.shutdown(wait=False, cancel_futures=True)
             UI.book_done(_book_key)
+            print("  Checkpoint saved. Run with --resume to continue.")
             return False
-        UI.viz_chapter(_book_key, ch["label"], ch["text"],
-                       chap_idx=i + 1, chap_total=n)
-        a, fell_back = v2_call_a(call, roster, ch, n)
-        chapter_as[i] = a
-        if a is None:
-            a_failed += 1
-        else:
+        if _ckpt_complete(i):
+            continue  # resumed: A+B already done, roster restored
+        _saved_a, _saved_b = _resumed_chapters.get(i, (None, None))
+        if _saved_a is not None:
+            # A already ran (roster already includes it via the restored
+            # roster) — reuse the saved result, do NOT re-run _roster_update.
+            a, fell_back = _saved_a, False
+            chapter_as[i] = a
             a_ok += 1
-            if fell_back:
-                a_fallback += 1
-        UI.viz_characters(_book_key, a.get("characters", []) if a else [])
-        UI.advance(_book_key)
-        if interleave:
-            b_futs[b_pool.submit(v2_call_b, call, ch, n)] = i
-        elif inline_b:
-            b = v2_call_b(call, ch, n)
-            chapter_bs[i] = b
-            if b is None:
-                b_failed += 1
+            UI.advance(_book_key)  # A unit already done
+        else:
+            UI.viz_chapter(_book_key, ch["label"], ch["text"],
+                           chap_idx=i + 1, chap_total=n)
+            a, fell_back = v2_call_a(call, roster, ch, n)
+            chapter_as[i] = a
+            if a is None:
+                a_failed += 1
             else:
-                b_ok += 1
-            UI.advance(_book_key)  # B unit (A already advanced above)
+                a_ok += 1
+                if fell_back:
+                    a_fallback += 1
+            UI.viz_characters(_book_key, a.get("characters", []) if a else [])
+            UI.advance(_book_key)
+            _checkpoint_save_chapter(_ckpt_key, i, a, _saved_b)
+        _b_already = _saved_b is not None or i in chapter_bs
+        if interleave:
+            if not _b_already:
+                b_futs[b_pool.submit(v2_call_b, call, ch, n)] = i
+            else:
+                if _saved_b is not None and i not in chapter_bs:
+                    chapter_bs[i] = _saved_b
+                    b_ok += 1
+                    UI.advance(_book_key)
+        elif inline_b:
+            if _b_already:
+                if _saved_b is not None and i not in chapter_bs:
+                    chapter_bs[i] = _saved_b
+                    b_ok += 1
+                    UI.advance(_book_key)
+            else:
+                b = v2_call_b(call, ch, n)
+                chapter_bs[i] = b
+                if b is None:
+                    b_failed += 1
+                else:
+                    b_ok += 1
+                UI.advance(_book_key)  # B unit (A already advanced above)
+                _checkpoint_save_chapter(_ckpt_key, i, a, b)
         _push_matrix_viz_ui(chapter_as, chapter_bs)
+    # Roster is complete after Pass 1 (all Call A done) — checkpoint it so a
+    # resume doesn't need to replay _roster_update (which isn't idempotent).
+    _checkpoint_save_roster(_ckpt_key, roster)
     if interleave:
         done_count = 0
         for fut in as_completed(b_futs):
@@ -6997,6 +7287,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                     f.cancel()
                 b_pool.shutdown(wait=False, cancel_futures=True)
                 UI.book_done(_book_key)
+                print("  Checkpoint saved. Run with --resume to continue.")
                 return False
             i = b_futs[fut]
             b = fut.result()
@@ -7007,15 +7298,22 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             else:
                 b_ok += 1
             UI.advance(_book_key)
+            _checkpoint_save_chapter(_ckpt_key, i, chapter_as.get(i), b)
             _push_matrix_viz_ui(chapter_as, chapter_bs)
         b_pool.shutdown()
 
     # Pass 2: Call B parallel (independent per chapter; skipped if interleaved).
+    # Resumed chapters with a saved B result skip their LLM call.
     if not interleave and not inline_b:
         UI.set_phase(_book_key, "content")
+        _pass2_indexed = [(i, ch) for i, ch in indexed if i not in chapter_bs]
+        _skipped_b = len(indexed) - len(_pass2_indexed)
+        if _skipped_b:
+            UI.advance(_book_key, _skipped_b)  # B units already done (resumed)
         if batch_size > 1:
             with ThreadPoolExecutor(max_workers=batch_size) as ex:
-                futs = {ex.submit(v2_call_b, call, ch, n): i for i, ch in indexed}
+                futs = {ex.submit(v2_call_b, call, ch, n): i
+                        for i, ch in _pass2_indexed}
                 done_count = 0
                 for fut in as_completed(futs):
                     if _CANCEL.is_set():
@@ -7023,6 +7321,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                         for f in futs:
                             f.cancel()
                         UI.book_done(_book_key)
+                        print("  Checkpoint saved. Run with --resume to continue.")
                         return False
                     i = futs[fut]
                     b = fut.result()
@@ -7033,10 +7332,15 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                     else:
                         b_ok += 1
                     UI.advance(_book_key)
+                    _checkpoint_save_chapter(_ckpt_key, i, chapter_as.get(i), b)
                     _push_matrix_viz_ui(chapter_as, chapter_bs)
         else:
             UI.set_phase(_book_key, "content")
-            for i, ch in indexed:
+            for i, ch in _pass2_indexed:
+                if _CANCEL.is_set():
+                    UI.book_done(_book_key)
+                    print("  Checkpoint saved. Run with --resume to continue.")
+                    return False
                 b = v2_call_b(call, ch, n)
                 chapter_bs[i] = b
                 if b is None:
@@ -7044,6 +7348,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                 else:
                     b_ok += 1
                 UI.advance(_book_key)
+                _checkpoint_save_chapter(_ckpt_key, i, chapter_as.get(i), b)
                 _push_matrix_viz_ui(chapter_as, chapter_bs)
 
     failed = a_failed + b_failed
@@ -7172,6 +7477,14 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "possible_merges": _pp_possible,
         "post_pass_merged": _pp_merged,
         "chapter_detection": "fallback" if _chap_fallback else "spine",
+        # P8/P9: per-chapter Call A/B results + roster, for --resume and
+        # --retry-failed. Keys are str(idx) for JSON stability.
+        "chapter_data": {
+            "chapters": {str(i): {"a": _ckpt_json_safe(chapter_as.get(i)),
+                                  "b": _ckpt_json_safe(chapter_bs.get(i))}
+                         for i, _ch in indexed},
+            "roster": _ckpt_json_safe(roster),
+        },
     }
     v = red["verification"]
     if v["evidence_checked"]:
@@ -7280,6 +7593,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if preview:
         save_preview(fpath, result)
         print(f"  Preview saved (pipeline=v2)")
+        _checkpoint_clear(_ckpt_key)  # P8: run complete, checkpoints unneeded
         UI.run_summary(title or fpath.stem,
                        _run_summary_stats(result, True, time.time() - _t0))
         return not aborted
@@ -7297,6 +7611,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if errors:
         print(f"  {errors} database operation(s) failed")
         return False
+    _checkpoint_clear(_ckpt_key)  # P8: run complete, checkpoints unneeded
     UI.run_summary(title or fpath.stem,
                    _run_summary_stats(result, False, time.time() - _t0))
     return True
@@ -7647,7 +7962,7 @@ def save_preview(fpath, result):
     """Save human-readable preview to preview/ folder."""
     prev_dir = SCRIPT_DIR / "preview"
     prev_dir.mkdir(exist_ok=True)
-    base = fpath.stem
+    base = fpath.stem + CONFIG.get("preview_name_suffix", "")
 
     with open(prev_dir / f"{base}.json", "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
@@ -7845,6 +8160,7 @@ def run_once(dry_run, preview, max_books=None, file=None):
     except KeyboardInterrupt:
         _CANCEL.set()
         UI.status("\nCancelled — stopping after current chapter...")
+        print("  Checkpoint saved. Run with --resume to continue.")
         raise
     finally:
         UI.stop()
@@ -7867,6 +8183,7 @@ def _run_once_inner(dry_run, preview, files):
         except KeyboardInterrupt:
             _CANCEL.set()
             UI.status("\nInterrupted — stopping current chapters, cancelling pending books...")
+            print("  Checkpoint saved. Run with --resume to continue.")
             ex.shutdown(wait=False, cancel_futures=True)
             raise
         ex.shutdown(wait=True)
@@ -8135,6 +8452,13 @@ def _build_parser():
                     help="push a preview JSON to Supabase without re-running the LLM")
     g_out.add_argument("--verify", metavar="PREVIEW_JSON",
                     help="compare a preview JSON against the DB and flag discrepancies (read-only)")
+    g_out.add_argument("--resume", action="store_true",
+                    help="resume an interrupted v2 run from per-chapter checkpoints "
+                         "(preview/.checkpoints/); skips chapters that already completed")
+    g_out.add_argument("--retry-failed", metavar="PREVIEW_JSON",
+                    help="re-run only the failed chapters from a preview JSON "
+                         "(chapters with content_ok=False or identity_ok=False); "
+                         "saves to {book}_retried.json, original untouched")
     g_out.add_argument("--validate", metavar="PREVIEW_JSON",
                     help="run automated quality checks on a preview file")
     g_out.add_argument("--trope-map", metavar="PREVIEW_JSON",
@@ -8225,6 +8549,11 @@ def main():
     if args.push_preview:
         load_config()
         cmd_push_preview(args.push_preview)
+        return
+
+    if args.retry_failed:
+        load_config()
+        cmd_retry_failed(args.retry_failed)
         return
 
     if args.verify:
@@ -8337,6 +8666,8 @@ def main():
         UI._show_matrices = True
     if args.preview_summary:
         CONFIG["preview_summary"] = True
+    if args.resume:
+        CONFIG["resume"] = True
     # --explain-blocks defaults ON with --debug, OFF otherwise; explicit
     # --explain-blocks/--no-explain-blocks wins.
     if args.explain_blocks is not None:

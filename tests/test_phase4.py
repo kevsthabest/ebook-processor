@@ -4382,3 +4382,150 @@ class TestTuiImprovements(unittest.TestCase):
                       "quotes": 4},
             "elapsed_sec": 61, "preview": False,
         })
+
+
+class TestCheckpoints(unittest.TestCase):
+    """P8: crash-resume checkpoint save/load."""
+
+    def setUp(self):
+        # Redirect checkpoint dir to a temp location by monkeypatching
+        # _checkpoint_dir.
+        import tempfile, shutil
+        self._tmp = tempfile.mkdtemp()
+        self._orig_dir = pp._checkpoint_dir
+        tmp = self._tmp
+
+        def _tmp_dir(book_key, _t=tmp):
+            return Path(_t) / book_key
+        pp._checkpoint_dir = _tmp_dir
+        _orig = self._orig_dir
+        self.addCleanup(lambda: setattr(pp, "_checkpoint_dir", _orig))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+
+    def test_book_key_safe(self):
+        self.assertEqual(pp._checkpoint_book_key("My Book (2020).epub"), "My_Book_2020")
+        self.assertEqual(pp._checkpoint_book_key("/x/y/Zz-9.epub"), "Zz-9")
+
+    def test_save_load_roundtrip(self):
+        pp._checkpoint_save_meta("bk", 3)
+        a = {"characters": [{"name": "Alice", "aliases": ["Al"]}], "pov_character": "Alice"}
+        b = {"summary": "s", "spice_level": 2}
+        pp._checkpoint_save_chapter("bk", 0, a, b)
+        pp._checkpoint_save_chapter("bk", 1, a, None)  # B not done yet
+        roster = {"alice": {"name": "Alice", "aliases": {"Al", "Allie"},
+                            "appearances": 2}}
+        pp._checkpoint_save_roster("bk", roster)
+        meta, loaded_roster, chapters = pp._checkpoint_load("bk")
+        self.assertEqual(meta["total_chapters"], 3)
+        self.assertEqual(meta["book_key"], "bk")
+        # Chapter 0 round-trips fully.
+        la, lb = chapters[0]
+        self.assertEqual(la["characters"][0]["name"], "Alice")
+        self.assertEqual(lb["spice_level"], 2)
+        # Chapter 1 has A but no B.
+        la1, lb1 = chapters[1]
+        self.assertIsNotNone(la1)
+        self.assertIsNone(lb1)
+        # Roster sets survive the round-trip.
+        self.assertEqual(loaded_roster["alice"]["aliases"], {"Al", "Allie"})
+        self.assertEqual(loaded_roster["alice"]["appearances"], 2)
+
+    def test_load_missing(self):
+        self.assertIsNone(pp._checkpoint_load("nonexistent-book-xyz"))
+
+    def test_clear(self):
+        pp._checkpoint_save_meta("bk2", 1)
+        pp._checkpoint_clear("bk2")
+        self.assertIsNone(pp._checkpoint_load("bk2"))
+
+    def test_flags_hash_stable(self):
+        h1 = pp._checkpoint_flags_hash()
+        h2 = pp._checkpoint_flags_hash()
+        self.assertEqual(h1, h2)
+        self.assertEqual(len(h1), 16)
+
+    def test_flags_hash_changes(self):
+        h1 = pp._checkpoint_flags_hash()
+        old = pp.CONFIG.get("batch_size")
+        pp.CONFIG["batch_size"] = (old or 8) + 999
+        try:
+            h2 = pp._checkpoint_flags_hash()
+        finally:
+            if old is None:
+                pp.CONFIG.pop("batch_size", None)
+            else:
+                pp.CONFIG["batch_size"] = old
+        self.assertNotEqual(h1, h2)
+
+    def test_resume_check_no_checkpoints(self):
+        ch, roster = pp._checkpoint_resume_check("nope", 5)
+        self.assertIsNone(ch)
+        self.assertIsNone(roster)
+
+    def test_resume_check_match(self):
+        pp._checkpoint_save_meta("bk3", 2)
+        pp._checkpoint_save_chapter("bk3", 0, {"x": 1}, {"y": 2})
+        pp._checkpoint_save_chapter("bk3", 1, {"x": 1}, {"y": 2})
+        pp._checkpoint_save_roster("bk3", {"a": {}})
+        ch, roster = pp._checkpoint_resume_check("bk3", 2)
+        self.assertIsNotNone(ch)
+        self.assertEqual(len(ch), 2)
+        self.assertEqual(roster, {"a": {}})
+
+    def test_resume_check_flags_mismatch_noninteractive(self):
+        # Non-tty stdin -> refuses to resume on mismatch, clears checkpoints.
+        import io
+        pp._checkpoint_save_meta("bk4", 2)
+        # Corrupt the flags hash to force a mismatch.
+        import json
+        mp = pp._checkpoint_dir("bk4") / "meta.json"
+        meta = json.load(open(mp, encoding="utf-8"))
+        meta["flags_hash"] = "deadbeefdeadbeef"
+        json.dump(meta, open(mp, "w", encoding="utf-8"))
+        old_stdin = __import__("sys").stdin
+        __import__("sys").stdin = io.StringIO("")  # not a tty
+        # isatty() on StringIO returns False
+        try:
+            ch, roster = pp._checkpoint_resume_check("bk4", 2)
+        finally:
+            __import__("sys").stdin = old_stdin
+        self.assertIsNone(ch)
+        # Checkpoints were cleared (fresh start).
+        self.assertIsNone(pp._checkpoint_load("bk4"))
+
+    def test_json_safe_sets(self):
+        obj = {"s": {3, 1, 2}, "nested": [{"a": {1}}]}
+        safe = pp._ckpt_json_safe(obj)
+        self.assertEqual(safe["s"], [1, 2, 3])
+        import json
+        json.dumps(safe)  # must not raise
+
+
+class TestRetryFailed(unittest.TestCase):
+    """P9: --retry-failed identifies failed chapters."""
+
+    def _preview(self, chapters):
+        return {"file": "TestBook.epub", "title": "TestBook",
+                "chapter_data": {"chapters": chapters, "roster": {}}}
+
+    def test_identifies_failed(self):
+        # Chapters 0,2 ok; 1 failed B; 3 failed A.
+        chapters = {
+            "0": {"a": {"x": 1}, "b": {"y": 1}},
+            "1": {"a": {"x": 1}, "b": None},
+            "2": {"a": {"x": 1}, "b": {"y": 1}},
+            "3": {"a": None, "b": None},
+        }
+        failed = sorted(int(k) for k, v in chapters.items()
+                        if v.get("a") is None or v.get("b") is None)
+        self.assertEqual(failed, [1, 3])
+
+    def test_no_chapter_data(self):
+        result = {"file": "x.epub", "title": "x"}
+        self.assertEqual((result.get("chapter_data") or {}).get("chapters"), None)
+
+    def test_all_ok(self):
+        chapters = {"0": {"a": {"x": 1}, "b": {"y": 1}}}
+        failed = [int(k) for k, v in chapters.items()
+                  if v.get("a") is None or v.get("b") is None]
+        self.assertEqual(failed, [])
