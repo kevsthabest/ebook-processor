@@ -1668,6 +1668,20 @@ class DecisionValidator:
 _LEARN_TITLE_TRUST_COUNT = 2  # distinct name-remainders before a title is trusted
 
 
+# Trope rejection learning: human rejections (from Trope Lab / the app) feed
+# back into the pipeline. 3+ global rejections -> never propose again;
+# 1-2 rejections -> raise the acceptance confidence threshold by 0.10 each.
+_REJECT_DENYLIST_COUNT = 3
+_REJECT_CONF_STEP = 0.10
+_TROPE_REJECT_BASE_CONF = 0.50
+
+
+def _trej_key(trope_id):
+    """Rejection lookup key: _tnorm with hyphens -> spaces, so
+    'enemies-to-lovers' matches 'enemies to lovers'."""
+    return _tnorm(trope_id).replace("-", " ")
+
+
 class LearnedState:
     """Persistent cross-run learning state. Thread-safe. Degrades to no-op
     when disabled or when the learn directory isn't writable."""
@@ -1685,6 +1699,7 @@ class LearnedState:
         self.nicknames = {}       # nkey -> {"full": nkey, "count": int, "books": [isbn]}
         self.titles = {}          # title -> {"count": int, "rests": [str]}
         self.threshold_stats = {}  # trigger -> {"kept": [p], "dropped": [p]}
+        self.rejected_tropes = {}  # trej_key -> {"count": int, "books": [book_key], "reasons": [str], "human": True}
         self._titles_cache = None  # cached frozenset of trusted titles
         self._new = Counter()     # fresh learnings this book (for the summary)
         if self.enabled:
@@ -1745,6 +1760,7 @@ class LearnedState:
             self.nicknames = self._load_json("nicknames.json", {})
             self.titles = self._load_json("titles.json", {})
             self.threshold_stats = self._load_json("threshold_stats.json", {})
+            self.rejected_tropes = self._load_json("rejected_tropes.json", {})
             self._titles_cache = None
 
     def save(self):
@@ -1755,6 +1771,7 @@ class LearnedState:
             self._save_json("nicknames.json", self.nicknames)
             self._save_json("titles.json", self.titles)
             self._save_json("threshold_stats.json", self.threshold_stats)
+            self._save_json("rejected_tropes.json", self.rejected_tropes)
 
     # -- nicknames ------------------------------------------------------
     def record_alias(self, alias_name, canonical_name):
@@ -1918,6 +1935,114 @@ class LearnedState:
                 if len(ent[k]) > 500:
                     ent[k] = ent[k][-500:]
             self._new["threshold_samples"] += 1
+
+    # -- trope rejections ------------------------------------------------
+    def record_trope_rejection(self, trope_id, book_key, reason):
+        """Record a human rejection of a trope claim (from Trope Lab or the
+        app). Human rejections outrank everything (same pattern as
+        --import-labels). Idempotent on (trope, book): re-importing the same
+        file does not double-count. Returns True if newly counted."""
+        if not self.enabled or not trope_id:
+            return False
+        key = _trej_key(trope_id)
+        if not key:
+            return False
+        with self._lock:
+            ent = self.rejected_tropes.get(key)
+            if ent is None:
+                ent = {"count": 0, "books": [], "reasons": [],
+                       "human": True}
+                self.rejected_tropes[key] = ent
+                self._new["rejected_tropes"] += 1
+            # Idempotency: the same (trope, book) rejection only counts once.
+            # A new reason for an already-counted book is still kept.
+            dup = bool(book_key) and book_key in ent["books"]
+            if not dup:
+                ent["count"] += 1
+            if book_key and book_key not in ent["books"]:
+                ent["books"].append(book_key)
+            if reason:
+                r = reason[:200]
+                if r not in ent["reasons"]:
+                    ent["reasons"].append(r)
+            return not dup
+
+    def get_trope_rejection_count(self, trope_id):
+        """Global rejection count for a trope (0 when disabled/unknown)."""
+        if not self.enabled or not trope_id:
+            return 0
+        with self._lock:
+            ent = self.rejected_tropes.get(_trej_key(trope_id))
+            return ent["count"] if ent else 0
+
+    def is_trope_denylisted(self, trope_id):
+        """True when a trope has been rejected enough times to never propose."""
+        return self.get_trope_rejection_count(trope_id) >= _REJECT_DENYLIST_COUNT
+
+    def trope_rejection_threshold(self, trope_id, base=_TROPE_REJECT_BASE_CONF):
+        """Acceptance confidence threshold for a trope, raised by
+        _REJECT_CONF_STEP per rejection (capped below the denylist)."""
+        n = min(self.get_trope_rejection_count(trope_id),
+                _REJECT_DENYLIST_COUNT - 1)
+        return round(base + _REJECT_CONF_STEP * n, 2)
+
+    def import_rejections(self, path):
+        """Import trope rejections from a JSON file (see --import-rejections).
+        Accepts a list of {trope_id, book_key, reason} or
+        {"rejections": [...]}. Returns count newly recorded."""
+        if not self.enabled:
+            return 0
+        try:
+            with open(path, encoding="utf-8") as f:
+                items = json.load(f)
+        except Exception as e:
+            print(f"  Could not import rejections from {path}: {e}")
+            return 0
+        if isinstance(items, dict):
+            items = items.get("rejections", [])
+        if not isinstance(items, list):
+            print(f"  Could not import rejections from {path}: "
+                  "expected a list")
+            return 0
+        n = 0
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            if self.record_trope_rejection(it.get("trope_id"),
+                                           it.get("book_key"),
+                                           it.get("reason")):
+                n += 1
+        return n
+
+    def import_rejections_from_supabase(self):
+        """Import rejected trope claims from Supabase (book_trope_claims
+        where status='rejected'). Catalog trope_ids are reverse-mapped to
+        names via the tropes table. Returns count imported, or -1 when
+        Supabase isn't configured/reachable."""
+        if not self.enabled:
+            return 0
+        if not CONFIG.get("supabase_url") or not CONFIG.get("supabase_key"):
+            print("  Supabase not configured; cannot import rejections "
+                  "from Supabase")
+            return -1
+        cat_rows = sb("tropes", params="?select=id,name&limit=500")
+        if cat_rows is None:
+            print("  Could not load trope catalog from Supabase")
+            return -1
+        id_to_name = {str(r.get("id")): r.get("name", "") for r in cat_rows}
+        rows = sb("book_trope_claims",
+                  params="?status=eq.rejected&select=trope_id,work_id&limit=2000")
+        if rows is None:
+            return -1
+        n = 0
+        for r in rows:
+            tid = str(r.get("trope_id") or "")
+            name = id_to_name.get(tid, tid)  # fall back to the raw id
+            if self.record_trope_rejection(
+                    name, r.get("work_id"),
+                    "rejected in Trope Lab/app"):
+                n += 1
+        return n
 
     # -- series rosters -------------------------------------------------
     @staticmethod
@@ -2100,6 +2225,9 @@ class LearnedState:
             sc = self._new.get("series_chars", 0)
             if sc:
                 parts.append(f"{sc} series character{'s' if sc != 1 else ''}")
+            rj = self._new.get("rejected_tropes", 0)
+            if rj:
+                parts.append(f"{rj} trope rejection{'s' if rj != 1 else ''}")
             self._new.clear()
         if not parts:
             return ""
@@ -3612,6 +3740,28 @@ def v2_trope_gate(call, chapter_summaries, candidates, candidate_counts):
                     n_ch = candidate_counts.get(key, 1)
                     conf[_tnorm(name)] = round(min(0.9, 0.55 + 0.1 * n_ch), 2)
     return confirmed, conf
+
+
+def _apply_trope_rejections(tropes, trope_conf, learned):
+    """Pure helper: filter tropes by human rejection learning.
+
+    - 3+ global rejections -> dropped (denylist).
+    - 1-2 rejections -> dropped unless confidence meets the raised
+      threshold (base 0.50 + 0.10 per rejection).
+    Returns (kept_tropes, kept_conf, n_filtered)."""
+    kept, kept_conf, n_filtered = [], {}, 0
+    for t in tropes:
+        n_rej = learned.get_trope_rejection_count(_trej_key(t))
+        if n_rej >= _REJECT_DENYLIST_COUNT:
+            n_filtered += 1
+            continue
+        thresh = _TROPE_REJECT_BASE_CONF + _REJECT_CONF_STEP * n_rej
+        if trope_conf.get(_tnorm(t), 0.0) < thresh:
+            n_filtered += 1
+            continue
+        kept.append(t)
+        kept_conf[_tnorm(t)] = trope_conf.get(_tnorm(t), 0.0)
+    return kept, kept_conf, n_filtered
 
 
 # --- v2 chapter extraction for non-EPUB (single-text) books ---
@@ -5745,6 +5895,8 @@ def write_claims(work_id, result, trope_mappings=None):
             # Skip denylisted and low-confidence
             if _is_denylisted_trope(t):
                 continue
+            if _learn().is_trope_denylisted(_trej_key(t)):
+                continue
             if conf_t.get(key, 0.7) < _PROP_MIN_CONF:
                 continue
             seen_keys.add(key)
@@ -6393,10 +6545,16 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                         trope_chapters.setdefault(key, []).append(idx)
             red["trope_chapters"] = trope_chapters
         _denied = 0
+        _rej_denied = 0
         for c in red["trope_candidates"]:
             # Drop genre/setting labels (not tropes)
             if _is_denylisted_trope(c):
                 _denied += 1
+                continue
+            # Drop tropes humans have rejected 3+ times (rejection denylist)
+            if _learn().is_trope_denylisted(_trej_key(c)):
+                _denied += 1
+                _rej_denied += 1
                 continue
             n_ch = counts.get(_tnorm(c), 1)
             if n_ch >= auto_min:
@@ -6416,7 +6574,15 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                 call, red["chapter_summaries"], gated, counts)
             tropes.extend(g_tropes)
             trope_conf.update(g_conf)
-        print(f"{len(tropes)} confirmed")
+        # Rejection learning: human rejections raise the acceptance bar for
+        # this trope (0.10 per rejection); 3+ rejections already denylisted.
+        _rej_filtered = 0
+        if tropes:
+            tropes, trope_conf, _rej_filtered = _apply_trope_rejections(
+                tropes, trope_conf, _learn())
+        _rej_total = _rej_denied + _rej_filtered
+        rej_note = f", {_rej_total} rejected" if _rej_total else ""
+        print(f"{len(tropes)} confirmed{rej_note}")
     red["tropes"] = tropes
     red["trope_confidence"] = trope_conf
 
@@ -6747,6 +6913,12 @@ def process_file(fpath, dry_run=False, preview=False):
     min_hits = 2 if ok >= 4 else 1
     tropes = sorted(_clean_trope(trope_name[k]) for k, h in trope_hits.items() if h >= min_hits)
     trope_conf = {k: _confidence(h, ok) for k, h in trope_hits.items() if h >= min_hits}
+    # Rejection learning (same as v2): denylist + raised thresholds.
+    if tropes:
+        tropes, trope_conf, _v1_rej = _apply_trope_rejections(
+            tropes, trope_conf, _learn())
+        if _v1_rej:
+            print(f"  Tropes: {_v1_rej} filtered by rejection learning")
     triggers = [dict(trig_data[k], confidence=_confidence(h, ok))
                 for k, h in trig_hits.items() if h >= min_hits]
     characters = [dict(char_data[k], confidence=_confidence(h, ok))
@@ -7212,6 +7384,16 @@ def main():
     ap.add_argument("--import-labels", metavar="PATH", default="",
                     help="import hand-labeled merge pairs (label-merges.py output) "
                          "into the nickname dictionary, then continue")
+    ap.add_argument("--import-rejections", nargs="?", const="", default=None,
+                    metavar="PATH",
+                    help="import trope rejections JSON (from Trope Lab / the app) "
+                         "into the learning system, then continue; "
+                         "combine with --from-supabase to pull from Supabase "
+                         "instead of a file")
+    ap.add_argument("--from-supabase", action="store_true", default=False,
+                    help="with --import-rejections: import rejected trope claims "
+                         "from Supabase book_trope_claims (status='rejected') "
+                         "instead of a JSON file")
     args = ap.parse_args()
 
     if args.trope_map:
@@ -7273,11 +7455,24 @@ def main():
     if args.learn:
         print(f"  Learning state: {_LEARNED.dir} "
               f"({len(_LEARNED.nicknames)} nicknames, "
-              f"{len(_LEARNED.trusted_titles())} trusted titles)")
+              f"{len(_LEARNED.trusted_titles())} trusted titles, "
+              f"{len(_LEARNED.rejected_tropes)} rejected tropes)")
     if args.import_labels:
         n_imp = _LEARNED.import_labels(args.import_labels)
         print(f"  Imported {n_imp} labeled merge pairs from "
               f"{args.import_labels}")
+        _LEARNED.save()
+    if args.import_rejections is not None:
+        if args.from_supabase:
+            n_imp = _LEARNED.import_rejections_from_supabase()
+            if n_imp >= 0:
+                print(f"  Imported {n_imp} trope rejections from Supabase")
+        elif args.import_rejections:
+            n_imp = _LEARNED.import_rejections(args.import_rejections)
+            print(f"  Imported {n_imp} trope rejections from "
+                  f"{args.import_rejections}")
+        else:
+            print("  --import-rejections needs a PATH or --from-supabase")
         _LEARNED.save()
     if args.alias:
         n_alias = 0

@@ -3426,3 +3426,219 @@ class TestMatrixLiveViz(unittest.TestCase):
         self.assertEqual(cf, {"Alice": 1, "Bob": 1})
         self.assertEqual(sp, 3)
         self.assertEqual(rc, 1)
+
+
+class TestTropeRejections(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.ls = pp.LearnedState(learn_dir=self.tmp, enabled=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_trej_key_normalizes_hyphens(self):
+        self.assertEqual(pp._trej_key("enemies-to-lovers"), "enemies to lovers")
+        self.assertEqual(pp._trej_key("Enemies to Lovers"), "enemies to lovers")
+        self.assertEqual(pp._trej_key("enemies_to_lovers"), "enemies to lovers")
+
+    def test_record_increments(self):
+        self.assertTrue(self.ls.record_trope_rejection(
+            "enemies-to-lovers", "daemon-daniel-suarez", "not actually enemies"))
+        self.assertEqual(self.ls.get_trope_rejection_count("enemies to lovers"), 1)
+        ent = self.ls.rejected_tropes["enemies to lovers"]
+        self.assertEqual(ent["books"], ["daemon-daniel-suarez"])
+        self.assertEqual(ent["reasons"], ["not actually enemies"])
+        self.assertTrue(ent["human"])
+
+    def test_three_rejections_denylists(self):
+        for i in range(3):
+            self.ls.record_trope_rejection("love-triangle", f"book-{i}", "r")
+        self.assertTrue(self.ls.is_trope_denylisted("love triangle"))
+        self.assertTrue(self.ls.is_trope_denylisted("love-triangle"))
+        self.assertFalse(self.ls.is_trope_denylisted("enemies to lovers"))
+
+    def test_threshold_raised_per_rejection(self):
+        self.assertEqual(self.ls.trope_rejection_threshold("x"), 0.50)
+        self.ls.record_trope_rejection("x", "b1", "r")
+        self.assertEqual(self.ls.trope_rejection_threshold("x"), 0.60)
+        self.assertEqual(self.ls.get_trope_rejection_count("x"), 1)
+        self.ls.record_trope_rejection("x", "b2", "r")
+        self.assertEqual(self.ls.trope_rejection_threshold("x"), 0.70)
+        self.assertEqual(self.ls.get_trope_rejection_count("x"), 2)
+        # Capped below denylist: 3rd rejection denylists instead of raising.
+        self.ls.record_trope_rejection("x", "b3", "r")
+        self.assertEqual(self.ls.trope_rejection_threshold("x"), 0.70)
+        self.assertTrue(self.ls.is_trope_denylisted("x"))
+
+    def test_per_book_isolation(self):
+        # One book's rejection doesn't denylist for other books; only the
+        # global count matters.
+        self.ls.record_trope_rejection("x", "book-a", "r")
+        self.assertFalse(self.ls.is_trope_denylisted("x"))
+        self.assertEqual(self.ls.get_trope_rejection_count("x"), 1)
+        # A different book sees the same global count (threshold raised),
+        # but is not denylisted.
+        self.assertEqual(self.ls.trope_rejection_threshold("x"), 0.60)
+
+    def test_import_rejections_json(self):
+        import json, tempfile, os
+        items = [
+            {"trope_id": "enemies-to-lovers", "book_key": "daemon-ds",
+             "reason": "not actually enemies"},
+            {"trope_id": "love-triangle", "book_key": "freedom-ds",
+             "reason": "only two people involved"},
+        ]
+        p = os.path.join(self.tmp, "rej.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(items, f)
+        n = self.ls.import_rejections(p)
+        self.assertEqual(n, 2)
+        self.assertEqual(self.ls.get_trope_rejection_count("enemies to lovers"), 1)
+        self.assertEqual(self.ls.get_trope_rejection_count("love triangle"), 1)
+
+    def test_import_rejections_dict_wrapper(self):
+        import json, os
+        p = os.path.join(self.tmp, "rej2.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"rejections": [
+                {"trope_id": "x", "book_key": "b", "reason": "r"}]}, f)
+        self.assertEqual(self.ls.import_rejections(p), 1)
+
+    def test_import_is_idempotent(self):
+        import json, os
+        items = [{"trope_id": "x", "book_key": "b1", "reason": "r1"}]
+        p = os.path.join(self.tmp, "rej3.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(items, f)
+        self.assertEqual(self.ls.import_rejections(p), 1)
+        # Re-importing the same file does not double-count...
+        self.assertEqual(self.ls.import_rejections(p), 0)
+        self.assertEqual(self.ls.get_trope_rejection_count("x"), 1)
+        # ...but a new book does count.
+        items.append({"trope_id": "x", "book_key": "b2", "reason": "r2"})
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(items, f)
+        self.assertEqual(self.ls.import_rejections(p), 1)
+        self.assertEqual(self.ls.get_trope_rejection_count("x"), 2)
+
+    def test_import_bad_file(self):
+        self.assertEqual(self.ls.import_rejections("/nonexistent/rej.json"), 0)
+        import os
+        p = os.path.join(self.tmp, "bad.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("not json{{{")
+        self.assertEqual(self.ls.import_rejections(p), 0)
+
+    def test_disabled_is_noop(self):
+        ls = pp.LearnedState(enabled=False)
+        self.assertFalse(ls.record_trope_rejection("x", "b", "r"))
+        self.assertEqual(ls.get_trope_rejection_count("x"), 0)
+        self.assertFalse(ls.is_trope_denylisted("x"))
+        self.assertEqual(ls.import_rejections("/nonexistent"), 0)
+
+    def test_save_and_reload(self):
+        self.ls.record_trope_rejection("enemies-to-lovers", "b1", "r1")
+        self.ls.record_trope_rejection("enemies-to-lovers", "b2", "r2")
+        self.ls.save()
+        ls2 = pp.LearnedState(learn_dir=self.tmp, enabled=True)
+        self.assertEqual(ls2.get_trope_rejection_count("enemies to lovers"), 2)
+        self.assertEqual(sorted(ls2.rejected_tropes["enemies to lovers"]["books"]),
+                         ["b1", "b2"])
+
+    def test_apply_rejections_denylist(self):
+        for i in range(3):
+            self.ls.record_trope_rejection("love triangle", f"b{i}", "r")
+        tropes = ["love triangle", "enemies to lovers"]
+        conf = {"love triangle": 0.9, "enemies to lovers": 0.6}
+        kept, kept_conf, n = pp._apply_trope_rejections(tropes, conf, self.ls)
+        self.assertEqual(kept, ["enemies to lovers"])
+        self.assertEqual(n, 1)
+        self.assertNotIn("love triangle", kept_conf)
+
+    def test_apply_rejections_threshold(self):
+        self.ls.record_trope_rejection("shaky", "b1", "r")  # threshold 0.60
+        self.ls.record_trope_rejection("shaky2", "b1", "r")
+        self.ls.record_trope_rejection("shaky2", "b2", "r")  # threshold 0.70
+        tropes = ["shaky", "shaky2", "solid"]
+        conf = {"shaky": 0.55, "shaky2": 0.65, "solid": 0.55}
+        kept, kept_conf, n = pp._apply_trope_rejections(tropes, conf, self.ls)
+        # shaky: 0.55 < 0.60 -> dropped; shaky2: 0.65 < 0.70 -> dropped;
+        # solid: 0.55 >= 0.50 -> kept.
+        self.assertEqual(kept, ["solid"])
+        self.assertEqual(n, 2)
+        self.assertEqual(kept_conf, {"solid": 0.55})
+
+    def test_apply_rejections_no_rejections(self):
+        tropes = ["a", "b"]
+        conf = {"a": 0.55, "b": 0.9}
+        kept, kept_conf, n = pp._apply_trope_rejections(tropes, conf, self.ls)
+        self.assertEqual(kept, ["a", "b"])
+        self.assertEqual(n, 0)
+
+    def test_import_from_supabase(self):
+        cat = [{"id": "t1", "name": "Enemies to Lovers"},
+               {"id": "t2", "name": "Love Triangle"}]
+        claims = [{"trope_id": "t1", "work_id": "w1"},
+                  {"trope_id": "t2", "work_id": "w2"},
+                  {"trope_id": "t1", "work_id": "w3"}]
+
+        def fake_sb(table, method="GET", data=None, params="", prefer=None):
+            if table == "tropes":
+                return cat
+            if table == "book_trope_claims":
+                return claims
+            return []
+
+        old_sb, old_url, old_key = pp.sb, pp.CONFIG.get("supabase_url"), pp.CONFIG.get("supabase_key")
+        pp.sb = fake_sb
+        pp.CONFIG["supabase_url"] = "https://example.supabase.co"
+        pp.CONFIG["supabase_key"] = "key"
+        try:
+            n = self.ls.import_rejections_from_supabase()
+        finally:
+            pp.sb = old_sb
+            if old_url is None:
+                pp.CONFIG.pop("supabase_url", None)
+            else:
+                pp.CONFIG["supabase_url"] = old_url
+            if old_key is None:
+                pp.CONFIG.pop("supabase_key", None)
+            else:
+                pp.CONFIG["supabase_key"] = old_key
+        self.assertEqual(n, 3)
+        # Catalog IDs reverse-mapped to names.
+        self.assertEqual(self.ls.get_trope_rejection_count("enemies to lovers"), 2)
+        self.assertEqual(self.ls.get_trope_rejection_count("love triangle"), 1)
+
+    def test_import_from_supabase_unconfigured(self):
+        old_url, old_key = pp.CONFIG.get("supabase_url"), pp.CONFIG.get("supabase_key")
+        pp.CONFIG.pop("supabase_url", None)
+        pp.CONFIG.pop("supabase_key", None)
+        try:
+            self.assertEqual(self.ls.import_rejections_from_supabase(), -1)
+        finally:
+            if old_url is not None:
+                pp.CONFIG["supabase_url"] = old_url
+            if old_key is not None:
+                pp.CONFIG["supabase_key"] = old_key
+
+    def test_import_from_supabase_unknown_id_falls_back(self):
+        def fake_sb(table, method="GET", data=None, params="", prefer=None):
+            if table == "tropes":
+                return []
+            return [{"trope_id": "mystery-id", "work_id": "w1"}]
+
+        old_sb = pp.sb
+        pp.sb = fake_sb
+        pp.CONFIG["supabase_url"] = "https://example.supabase.co"
+        pp.CONFIG["supabase_key"] = "key"
+        try:
+            n = self.ls.import_rejections_from_supabase()
+        finally:
+            pp.sb = old_sb
+            pp.CONFIG.pop("supabase_url", None)
+            pp.CONFIG.pop("supabase_key", None)
+        self.assertEqual(n, 1)
+        self.assertEqual(self.ls.get_trope_rejection_count("mystery id"), 1)
