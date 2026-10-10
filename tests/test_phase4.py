@@ -3874,3 +3874,188 @@ class TestInjectIsbnValidation(unittest.TestCase):
 
     def test_invalid_length(self):
         self.assertIsNone(self.ii.validate_isbn("123"))
+
+
+class TestLearnStatus(unittest.TestCase):
+    """P10: --learn-status prints correct counts from LearnedState."""
+
+    def _mock_state(self, tmpdir):
+        """Build a mock state with known data."""
+        import json
+
+        class MockState:
+            dir = tmpdir
+            nicknames = {
+                "loki": {"full": "brian gragg", "count": 3, "books": [],
+                         "human": True, "manual": True},
+                "pete": {"full": "peter sebeck", "count": 5, "books": [],
+                         "human": True},
+                "tripwire": {"full": "roy merritt", "count": 1, "books": []},
+            }
+            threshold_stats = {
+                "spouse": {"kept": [0.9, 0.8], "dropped": [0.2]},
+                "parent": {"kept": [0.7], "dropped": []},
+            }
+            rejected_tropes = {
+                "love_triangle": {"count": 3, "books": ["b1"],
+                                  "reasons": [], "human": True},
+                "chosen_one": {"count": 1, "books": ["b1"],
+                               "reasons": [], "human": True},
+            }
+
+            def trusted_titles(self):
+                return frozenset({"special agent", "dr"})
+
+        # Series rosters: one author-based flat file, one named series.
+        (tmpdir / "series").mkdir(exist_ok=True)
+        (tmpdir / "series" / "author_x.json").write_text(json.dumps(
+            {"characters": [{"name": "A", "aliases": []},
+                            {"name": "B", "aliases": []}]}))
+        d = tmpdir / "series" / "daemon"
+        d.mkdir(exist_ok=True)
+        (d / "roster.json").write_text(json.dumps(
+            {"characters": [{"name": "C", "aliases": []}]}))
+        return MockState()
+
+    def test_counts(self):
+        import tempfile
+        tmpdir = Path(tempfile.mkdtemp())
+        st = self._mock_state(tmpdir)
+        text = pp._learn_status_text(st)
+        self.assertIn("Nicknames: 3 (2 human-validated)", text)
+        self.assertIn("Manual aliases: 1", text)
+        self.assertIn("Trusted titles: 2", text)
+        self.assertIn("Rejected tropes: 2 (1 denylisted)", text)
+        self.assertIn("Denylisted: love_triangle", text)
+        self.assertIn("Threshold samples: 4", text)
+        self.assertIn("Series rosters: 2 series, 3 characters", text)
+
+    def test_empty(self):
+        import tempfile
+        tmpdir = Path(tempfile.mkdtemp())
+
+        class EmptyState:
+            dir = tmpdir
+            nicknames = {}
+            threshold_stats = {}
+            rejected_tropes = {}
+
+            def trusted_titles(self):
+                return frozenset()
+
+        text = pp._learn_status_text(EmptyState())
+        self.assertIn("Nicknames: 0 (0 human-validated)", text)
+        self.assertIn("Manual aliases: 0", text)
+        self.assertIn("Trusted titles: 0", text)
+        self.assertIn("Rejected tropes: 0 (0 denylisted)", text)
+        self.assertIn("Threshold samples: 0", text)
+        self.assertIn("Series rosters: 0 series, 0 characters", text)
+        # No denylisted section when none exist.
+        self.assertNotIn("Denylisted:", text)
+
+    def test_series_count_skips_tmp(self):
+        import tempfile
+        import json
+        tmpdir = Path(tempfile.mkdtemp())
+        (tmpdir / "series").mkdir(exist_ok=True)
+        # .tmp files are ignored.
+        (tmpdir / "series" / "author_x.json.tmp").write_text("{}")
+        (tmpdir / "series" / "author_y.json").write_text(json.dumps(
+            {"characters": [{"name": "A", "aliases": []}]}))
+
+        class S:
+            dir = tmpdir
+
+        n_series, n_chars = pp._count_series_rosters(S())
+        self.assertEqual(n_series, 1)
+        self.assertEqual(n_chars, 1)
+
+
+class TestDedupeGuard(unittest.TestCase):
+    """P12: guard explainer returns (allowed, reason) for each block type."""
+
+    def test_gender_mismatch(self):
+        allowed, reason = pp._dedupe_guard(
+            "Mr. Smith", "Mrs. Smith", "a man", "a woman")
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "gender mismatch")
+
+    def test_nonperson_noun(self):
+        allowed, reason = pp._dedupe_guard(
+            "John Smith", "the old house", "a man", "a building")
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "non-person noun")
+
+    def test_group_vs_individual(self):
+        allowed, reason = pp._dedupe_guard(
+            "the host and hostess", "the husband", "two people", "a man")
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "group vs individual")
+
+    def test_generic_label(self):
+        allowed, reason = pp._dedupe_guard(
+            "The Voice", "Unknown Voice", "a voice", "a voice")
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "generic label, insufficient evidence")
+
+    def test_generic_label_lowercase(self):
+        allowed, reason = pp._dedupe_guard(
+            "the voice", "Mary Smith", "a voice", "a woman")
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "generic label, insufficient evidence")
+
+    def test_nonperson_takes_priority_over_generic(self):
+        # "mother" is both generic and a non-person noun; the non-person
+        # guard fires first (guard order is significant).
+        allowed, reason = pp._dedupe_guard(
+            "the mother", "Mary Smith", "a woman", "a woman")
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "non-person noun")
+
+    def test_distinct_proper_names(self):
+        allowed, reason = pp._dedupe_guard(
+            "John Smith", "Jane Doe", "a man", "a woman")
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "distinct proper names")
+
+    def test_allowed_same_name(self):
+        allowed, reason = pp._dedupe_guard(
+            "John Smith", "john smith", "a man", "a man")
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "")
+
+    def test_allowed_matching_descriptions(self):
+        # Distinct proper names with identical descriptions are allowed
+        # through to the embedding check.
+        allowed, reason = pp._dedupe_guard(
+            "John Smith", "Jon Smith", "a tall man", "a tall man")
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "")
+
+    def test_surname_trap(self):
+        blocked, reason = pp._surname_trap_blocked(
+            "chris sebeck", "peter sebeck")
+        self.assertTrue(blocked)
+        self.assertIn("surname trap", reason)
+        self.assertIn("sebeck", reason)
+
+    def test_surname_trap_nickname_ok(self):
+        # Nickname pairs are not a trap.
+        blocked, _ = pp._surname_trap_blocked("pete sebeck", "peter sebeck")
+        self.assertFalse(blocked)
+
+    def test_surname_trap_different_surname(self):
+        blocked, _ = pp._surname_trap_blocked("chris sebeck", "peter ross")
+        self.assertFalse(blocked)
+
+    def test_is_generic_label(self):
+        self.assertTrue(pp._is_generic_label("the voice"))
+        self.assertTrue(pp._is_generic_label("Unknown Voice"))
+        self.assertTrue(pp._is_generic_label("the mother"))
+        self.assertFalse(pp._is_generic_label("John Smith"))
+        self.assertFalse(pp._is_generic_label("John Voice"))
+
+    def test_merge_tier_surname_trap_unchanged(self):
+        # _merge_tier still returns "no" for the surname trap (logic
+        # unchanged; only the reason is now extractable).
+        self.assertEqual(pp._merge_tier("chris sebeck", "peter sebeck"), "no")

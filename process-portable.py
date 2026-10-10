@@ -3084,6 +3084,12 @@ def post_pass_merge(roster, validator=None):
                     n_merged += 1
                     _changed = True
                     break
+                elif _tier == "no" and CONFIG.get("explain_blocks"):
+                    # Explain Tier 1 hard-NO blocks (surname trap).
+                    _st_blocked, _st_reason = _surname_trap_blocked(ka, kb)
+                    if _st_blocked:
+                        print(f"  Merge blocked: '{ka}' vs '{kb}' \u2014 "
+                              f"{_st_reason}")
             if _changed:
                 break
 
@@ -7739,6 +7745,13 @@ def _build_parser():
     g_dbg = ap.add_argument_group("Debug")
     g_dbg.add_argument("--debug", action="store_true",
                     help="save raw LLM output of failed chunks to preview/debug/")
+    g_dbg.add_argument("--explain-blocks", dest="explain_blocks",
+                    action="store_true", default=None,
+                    help="explain why dedupe/merge guards block merges "
+                         "(default: on with --debug, off otherwise)")
+    g_dbg.add_argument("--no-explain-blocks", dest="explain_blocks",
+                    action="store_false",
+                    help="disable merge-block explanations")
     g_dbg.add_argument("--prompt-cache", action="store_true",
                     help="v2: task-last prompt layout for llama.cpp KV cache "
                          "reuse + interleaved A/B calls (experimental)")
@@ -7911,6 +7924,12 @@ def main():
     if args.show_matrices:
         CONFIG["show_matrices"] = True
         UI._show_matrices = True
+    # --explain-blocks defaults ON with --debug, OFF otherwise; explicit
+    # --explain-blocks/--no-explain-blocks wins.
+    if args.explain_blocks is not None:
+        CONFIG["explain_blocks"] = bool(args.explain_blocks)
+    elif args.debug:
+        CONFIG["explain_blocks"] = True
     if args.llm:
         CONFIG["llm"] = args.llm
     if args.full:
