@@ -2299,6 +2299,92 @@ def _learn():
     return _LEARNED
 
 
+def _count_series_rosters(state):
+    """(n_series, n_characters) from the <learn_dir>/series/ tree.
+
+    Counts each series bucket once: author-based flat files
+    (series/*.json) and named-series rosters (series/*/roster.json).
+    Pure (no I/O beyond reading); returns (0, 0) when the dir is absent.
+    """
+    series_dir = state.dir / "series"
+    if not series_dir.is_dir():
+        return 0, 0
+    n_series = 0
+    n_chars = 0
+    seen = set()
+    for p in sorted(series_dir.rglob("*.json")):
+        if p.name.endswith(".tmp"):
+            continue
+        # Bucket key: flat file -> stem; roster.json -> parent dir name.
+        # Prevents double-counting if both layouts ever overlap.
+        if p.name == "roster.json":
+            key = p.parent.name
+        else:
+            key = p.stem
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        n_series += 1
+        chars = data.get("characters", [])
+        if isinstance(chars, list):
+            n_chars += len(chars)
+    return n_series, n_chars
+
+
+def _learn_status_text(state):
+    """Human-readable summary of a LearnedState. Pure (no I/O)."""
+    lines = [f"Learning system status ({state.dir}/):"]
+    # Nicknames (human-validated subset) and manual aliases.
+    nicks = state.nicknames or {}
+    n_total = len(nicks)
+    n_human = sum(1 for e in nicks.values()
+                  if isinstance(e, dict) and e.get("human"))
+    lines.append(f"  Nicknames: {n_total} ({n_human} human-validated)")
+    n_manual = sum(1 for e in nicks.values()
+                   if isinstance(e, dict) and e.get("manual"))
+    lines.append(f"  Manual aliases: {n_manual}")
+    # Trusted titles.
+    try:
+        n_titles = len(state.trusted_titles())
+    except Exception:
+        n_titles = 0
+    lines.append(f"  Trusted titles: {n_titles}")
+    # Rejected tropes (denylisted subset, with names).
+    rej = state.rejected_tropes or {}
+    n_rej = len(rej)
+    deny_names = sorted(
+        k for k, e in rej.items()
+        if isinstance(e, dict)
+        and e.get("count", 0) >= _REJECT_DENYLIST_COUNT)
+    lines.append(f"  Rejected tropes: {n_rej} ({len(deny_names)} denylisted)")
+    if deny_names:
+        lines.append(f"    Denylisted: {', '.join(deny_names)}")
+    # Threshold samples.
+    n_samples = 0
+    for e in (state.threshold_stats or {}).values():
+        if isinstance(e, dict):
+            n_samples += len(e.get("kept", []) or [])
+            n_samples += len(e.get("dropped", []) or [])
+    lines.append(f"  Threshold samples: {n_samples}")
+    # Series rosters.
+    n_series, n_chars = _count_series_rosters(state)
+    lines.append(f"  Series rosters: {n_series} series, {n_chars} characters")
+    return "\n".join(lines)
+
+
+def cmd_learn_status(learn_dir=None):
+    """Print learning system status and exit (for --learn-status)."""
+    state = LearnedState(learn_dir=learn_dir, enabled=True)
+    print(_learn_status_text(state))
+
+
 def _effective_titles():
     """Hardcoded titles plus learned trusted titles."""
     return _TITLES | _learn().trusted_titles()
@@ -5590,13 +5676,9 @@ def _merge_tier(a_key, b_key, chapter_keys=None, a_chapters=None,
     # Surname-family trap: same surname, incompatible first names -> hard NO.
     # (The prototype's #1 false-merge source; the decision model still gets
     # these wrong sometimes, so they never reach Tier 3.)
-    if len(sa) >= 2 and len(sb) >= 2 and sa[-1] == sb[-1]:
-        fa, fb = sa[0], sb[0]
-        if (fa != fb and len(fa) >= 3 and len(fb) >= 3
-                and not _nick_pair(fa, fb)
-                and not _is_spelling_variant(fa, fb)
-                and len(fa) > 1 and len(fb) > 1):
-            return "no"
+    _blocked, _ = _surname_trap_blocked(a_key, b_key)
+    if _blocked:
+        return "no"
     return "ambiguous"
 
 
@@ -6181,6 +6263,73 @@ def embed_vectors(base_url, model, texts):
     return vecs
 
 
+# Words that mark a name as a descriptive label rather than a real name
+# ("the voice", "unknown voice", "the stranger").
+_GENERIC_LABEL_WORDS = {
+    "voice", "unknown", "unidentified", "stranger", "figure", "individual",
+    "intruder", "caller", "speaker", "visitor", "newcomer", "bystander",
+    "witness", "suspect", "victim", "officer", "guard", "clerk", "driver",
+}
+
+
+def _is_generic_label(name):
+    """True for descriptive labels like 'the voice' or 'unknown voice'.
+
+    These are not real names; merging them needs strong evidence.
+    A name is generic if it is not a proper name, or if every content
+    word is a generic descriptor (articles excluded).
+    """
+    if not name:
+        return True
+    if not _is_proper(name):
+        return True
+    toks = set(norm_name(name).split()) - {"the", "a", "an"}
+    return bool(toks) and toks <= _GENERIC_LABEL_WORDS
+
+
+def _dedupe_guard(name_a, name_b, desc_a="", desc_b=""):
+    """Check dedupe Signal-2 guards for a candidate pair.
+
+    Returns (allowed: bool, reason: str). Guards are evaluated in order;
+    the first block wins. An empty reason means allowed. The guard
+    conditions are identical to the inline checks they replace in
+    dedupe_characters(); only the reason strings are new.
+    """
+    ga, gb = _guess_gender(name_a), _guess_gender(name_b)
+    if ga and gb and ga != gb:
+        return False, "gender mismatch"
+    if _has_nonperson_noun(name_a) or _has_nonperson_noun(name_b):
+        return False, "non-person noun"
+    if _is_multi(name_a) != _is_multi(name_b):
+        return False, "group vs individual"
+    if norm_name(name_a) != norm_name(name_b):
+        if _is_generic_label(name_a) or _is_generic_label(name_b):
+            return False, "generic label, insufficient evidence"
+        if _is_proper(name_a) and _is_proper(name_b):
+            if _norm_desc(desc_a) != _norm_desc(desc_b):
+                return False, "distinct proper names"
+    return True, ""
+
+
+def _surname_trap_blocked(a_key, b_key):
+    """(blocked: bool, reason: str) for the surname-family trap.
+
+    Same surname with incompatible first names (e.g. 'chris sebeck' vs
+    'peter sebeck') are family members, not the same person. Extracted
+    from _merge_tier(); the condition is unchanged.
+    """
+    sa = _strip_merge_noise(a_key)
+    sb = _strip_merge_noise(b_key)
+    if len(sa) >= 2 and len(sb) >= 2 and sa[-1] == sb[-1]:
+        fa, fb = sa[0], sb[0]
+        if (fa != fb and len(fa) >= 3 and len(fb) >= 3
+                and not _nick_pair(fa, fb)
+                and not _is_spelling_variant(fa, fb)
+                and len(fa) > 1 and len(fb) > 1):
+            return True, f"surname trap (family members sharing '{sa[-1]}')"
+    return False, ""
+
+
 def dedupe_characters(characters, relationships, povs):
     """Merge duplicate characters.
 
@@ -6224,20 +6373,15 @@ def dedupe_characters(characters, relationships, povs):
         for j in range(i + 1, len(characters)):
             if s1_root[i] == s1_root[j]:
                 continue  # already merged by signal 1
-            ga, gb = _guess_gender(names[i]), _guess_gender(names[j])
-            if ga and gb and ga != gb:
-                continue  # never merge across genders
-            if _has_nonperson_noun(names[i]) or _has_nonperson_noun(names[j]):
-                continue  # places/things never merge into people
-            if _is_multi(names[i]) != _is_multi(names[j]):
-                continue  # "the host and hostess" != "the husband"
-            if (_is_proper(names[i]) and _is_proper(names[j])
-                    and norm_name(names[i]) != norm_name(names[j])):
-                # Distinct proper names: only merge on (near-)identical
-                # descriptions, e.g. the same mentioned-only plumber.
-                if (_norm_desc(characters[i].get("description")) !=
-                        _norm_desc(characters[j].get("description"))):
-                    continue
+            _allowed, _reason = _dedupe_guard(
+                names[i], names[j],
+                characters[i].get("description"),
+                characters[j].get("description"))
+            if not _allowed:
+                if CONFIG.get("explain_blocks"):
+                    print(f"  Merge blocked: '{names[i]}' vs "
+                          f"'{names[j]}' \u2014 {_reason}")
+                continue
             if _cos(vecs[i], vecs[j]) >= thr:
                 union(i, j)
 
@@ -7340,114 +7484,309 @@ def _run_once_inner(dry_run, preview, files):
     return failures
 
 
-def main():
+# ---------------------------------------------------------------------------
+# CLI profiles (P1) and guided mode (P3)
+# ---------------------------------------------------------------------------
+
+PROFILES_DIR = Path(os.path.expanduser("~")) / ".ebook-processor" / "profiles"
+
+# Built-in profiles ship in code so they work on any machine with no setup.
+BUILTIN_PROFILES = {
+    "mass": {
+        "decision_model": True,
+        "decision_model_provider": "openrouter",
+        "llm": "openai",
+        "pipeline": "v2",
+        "batch": 8,
+        "rename_no_isbn": True,
+        "show_matrices": True,
+    },
+    "quick": {
+        "preview": True,
+        "pipeline": "v2",
+        "llm": "openai",
+    },
+}
+
+# Dests that --save-profile never persists (per-run values or meta commands).
+_PROFILE_EXCLUDE = frozenset({
+    "file", "isbn", "series", "series_position",
+    "import_labels", "import_rejections", "from_supabase",
+    "trope_map", "validate", "push_preview", "verify",
+    "profile", "save_profile", "list_profiles", "guided",
+})
+
+
+def _profile_path(name):
+    return PROFILES_DIR / f"{name}.json"
+
+
+def _available_profiles():
+    """name -> 'builtin' | 'user'."""
+    names = {n: "builtin" for n in BUILTIN_PROFILES}
+    try:
+        if PROFILES_DIR.is_dir():
+            for p in sorted(PROFILES_DIR.glob("*.json")):
+                names[p.stem] = "user"
+    except OSError:
+        pass
+    return names
+
+
+def _load_profile(name):
+    """Return the profile dict, or None if not found / unreadable."""
+    if name in BUILTIN_PROFILES:
+        return dict(BUILTIN_PROFILES[name])
+    p = _profile_path(name)
+    try:
+        if p.is_file():
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _save_profile(name, args, defaults):
+    """Persist non-default, non-excluded flag values as JSON. Returns path."""
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    data = {}
+    for dest, val in vars(args).items():
+        if dest in _PROFILE_EXCLUDE:
+            continue
+        if val != getattr(defaults, dest, None):
+            data[dest] = val
+    path = _profile_path(name)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    return path
+
+
+def _apply_profile(args, defaults, profile):
+    """Apply profile values for flags the user did not explicitly set.
+
+    Explicit CLI flags win: a flag counts as explicit when its parsed value
+    differs from the argparse default.
+    """
+    applied = []
+    for dest, val in profile.items():
+        if not hasattr(args, dest):
+            print(f"  WARNING: profile key '{dest}' is not a known flag, ignored")
+            continue
+        if getattr(args, dest) != getattr(defaults, dest, None):
+            continue  # explicit CLI flag overrides the profile
+        setattr(args, dest, val)
+        applied.append(dest)
+    if applied:
+        print(f"  Profile: {', '.join(sorted(applied))}")
+
+
+def _guided_setup(args):
+    """Interactive prompts for the key options. Mutates args.
+
+    Returns True to continue, False when cancelled / no file given.
+    """
+    def ask(prompt, default=""):
+        suffix = f" [{default}]" if default else ""
+        val = input(f"{prompt}{suffix}: ").strip() or default
+        # Strip surrounding quotes (common when pasting Windows paths).
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        return val
+
+    try:
+        fpath = ask("EPUB file path")
+        if not fpath:
+            print("No file given, aborting.")
+            return False
+        args.file = fpath
+
+        mode = ask("Preview or write?", "preview").lower()
+        args.preview = mode != "write"
+
+        dm = ask("Use decision model?", "y").lower()
+        args.decision_model = dm in ("y", "yes")
+
+        princ = ask("Principals-only?", "y").lower()
+        args.principals_only = princ in ("y", "yes")
+
+        mat = ask("Show matrices?", "n").lower()
+        args.show_matrices = mat in ("y", "yes")
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.")
+        return False
+    return True
+
+
+def _build_parser():
     ap = argparse.ArgumentParser(description="Extract tropes/triggers/characters from ebooks.")
-    ap.add_argument("--dry-run", action="store_true", help="extract only; write and move nothing")
-    ap.add_argument("--preview", action="store_true", help="save preview files; write and move nothing")
-    ap.add_argument("--show-matrices", action="store_true",
-                    help="print ASCII matrix visualizations (spice, character "
-                         "importance, relationship confidence) during processing")
-    ap.add_argument("--watch", action="store_true", help="rescan the import folder every 60s")
-    ap.add_argument("--llm", choices=["ollama", "openrouter", "openai"], help="override config llm")
-    ap.add_argument("--sample", type=int, default=None, help="process every Nth chunk (e.g. --sample 3)")
-    ap.add_argument("--full", action="store_true", help="disable sampling, process every chunk")
-    ap.add_argument("--batch", type=int, default=None, help="parallel LLM requests (e.g. --batch 4)")
-    ap.add_argument("--max-books", type=int, default=None,
-                        help="process at most N books from the import folder (e.g. --max-books 3)")
-    ap.add_argument("--file", metavar="EBOOK", default=None,
+
+    g_in = ap.add_argument_group("Input")
+    g_in.add_argument("--file", metavar="EBOOK", default=None,
                     help="process a single ebook file instead of the import folder")
-    ap.add_argument("--isbn", metavar="ISBN", default="",
+    g_in.add_argument("--watch", action="store_true", help="rescan the import folder every 60s")
+    g_in.add_argument("--max-books", type=int, default=None,
+                        help="process at most N books from the import folder (e.g. --max-books 3)")
+    g_in.add_argument("--isbn", metavar="ISBN", default="",
                     help="override ISBN for work resolution (e.g. when the EPUB "
                          "has no ISBN in its metadata); takes priority over EPUB "
                          "metadata and auto-lookup")
-    ap.add_argument("--alias", metavar="A=B", action="append", default=[],
-                    help="manual character alias: 'Loki=Brian Gragg' merges them. "
-                         "Repeatable. Stored as human-validated, applies cross-book.")
-    ap.add_argument("--series", metavar="NAME", default="",
+    g_in.add_argument("--series", metavar="NAME", default="",
                     help="override series name for this book (e.g. 'Daemon'); "
                          "takes priority over EPUB metadata, filename, and lookup")
-    ap.add_argument("--series-position", metavar="N", type=float, default=None,
+    g_in.add_argument("--series-position", metavar="N", type=float, default=None,
                     help="override series position (e.g. 2 or 2.5)")
-    ap.add_argument("--principals-only", dest="principals_only",
-                    action="store_true", default=True,
-                    help="write only principal characters to Supabase "
-                         "(default on; minors kept in preview JSON)")
-    ap.add_argument("--no-principals-only", dest="principals_only",
-                    action="store_false",
-                    help="disable the principal filter; write all characters")
-    ap.add_argument("--min-frequency", metavar="F", type=float, default=0.20,
-                    help="minimum chapter frequency for principal status "
-                         "(default 0.20)")
-    ap.add_argument("--allow-no-isbn", action="store_true",
-                    help="process books without ISBN instead of skipping them "
-                         "(default is to skip with a message)")
-    ap.add_argument("--rename-no-isbn", action="store_true",
-                    help="rename skipped no-ISBN EPUBs to NO-ISBN-{original}.epub "
-                         "so they are visible in the folder (never deletes)")
-    ap.add_argument("--jobs", type=int, default=None,
-                    help="process N books in parallel, splitting --batch slots across them (e.g. --jobs 2)")
-    ap.add_argument("--chunks", default=None,
-                    help="process only these chunk indices (e.g. --chunks 2 or --chunks 2,5,8); "
-                         "numbering matches the sampled chunk list and debug files")
-    ap.add_argument("--pipeline", default=None, choices=["legacy", "v2"],
-                    help="extraction pipeline: legacy (fixed chunks) or v2 "
-                         "(chapter-level map/reduce with character roster)")
-    ap.add_argument("--debug", action="store_true",
-                    help="save raw LLM output of failed chunks to preview/debug/")
-    ap.add_argument("--no-viz", action="store_true",
-                    help="disable the chapter visualizer panel in the Rich TUI")
-    ap.add_argument("--decision-model-url", metavar="URL", default="",
-                    help="Unsloth /v1/systemone base URL for trigger validation "
-                         "(e.g. http://127.0.0.1:8888/v1); omit for regex gates")
-    ap.add_argument("--decision-model", action="store_true",
+
+    g_models = ap.add_argument_group("Models")
+    g_models.add_argument("--llm", choices=["ollama", "openrouter", "openai"], help="override config llm")
+    g_models.add_argument("--decision-model", action="store_true",
                     help="enable decision-model trigger validation using the "
                          "configured openai_base_url (same Unsloth server)")
-    ap.add_argument("--decision-model-provider",
+    g_models.add_argument("--decision-model-provider",
                     choices=["local", "openrouter"], default="local",
                     help="decision-model backend: 'local' Unsloth server "
                          "(default) or 'openrouter' hosted Jev (needs "
                          "openrouter_api_key in config.json or "
                          "OPENROUTER_API_KEY env)")
-    ap.add_argument("--dedupe", action="store_true",
+    g_models.add_argument("--decision-model-url", metavar="URL", default="",
+                    help="Unsloth /v1/systemone base URL for trigger validation "
+                         "(e.g. http://127.0.0.1:8888/v1); omit for regex gates")
+    g_models.add_argument("--batch", type=int, default=None, help="parallel LLM requests (e.g. --batch 4)")
+
+    g_pipe = ap.add_argument_group("Pipeline")
+    g_pipe.add_argument("--pipeline", default=None, choices=["legacy", "v2"],
+                    help="extraction pipeline: legacy (fixed chunks) or v2 "
+                         "(chapter-level map/reduce with character roster)")
+    g_pipe.add_argument("--chunks", default=None,
+                    help="process only these chunk indices (e.g. --chunks 2 or --chunks 2,5,8); "
+                         "numbering matches the sampled chunk list and debug files")
+    g_pipe.add_argument("--jobs", type=int, default=None,
+                    help="process N books in parallel, splitting --batch slots across them (e.g. --jobs 2)")
+    g_pipe.add_argument("--sample", type=int, default=None, help="process every Nth chunk (e.g. --sample 3)")
+    g_pipe.add_argument("--full", action="store_true", help="disable sampling, process every chunk")
+    g_pipe.add_argument("--dedupe", action="store_true",
                     help="merge duplicate characters (name normalization + "
                          "embeddings) before writing; needs embed_url/embed_model")
-    ap.add_argument("--trope-map", metavar="PREVIEW_JSON",
-                    help="map a preview file's tropes to the Cozy Libram catalog "
-                         "via embeddings; writes a review JSON, nothing to Supabase")
-    ap.add_argument("--validate", metavar="PREVIEW_JSON",
-                    help="run automated quality checks on a preview file")
-    ap.add_argument("--push-preview", metavar="PREVIEW_JSON",
-                    help="push a preview JSON to Supabase without re-running the LLM")
-    ap.add_argument("--verify", metavar="PREVIEW_JSON",
-                    help="compare a preview JSON against the DB and flag discrepancies (read-only)")
-    ap.add_argument("--prompt-cache", action="store_true",
-                    help="v2: task-last prompt layout for llama.cpp KV cache "
-                         "reuse + interleaved A/B calls (experimental)")
-    ap.add_argument("--shared-system", action="store_true",
-                    help="v2: use shared system prompt for A/B calls (isolation test)")
-    ap.add_argument("--task-last", action="store_true",
-                    help="v2: put chapter text before task instructions (isolation test)")
-    ap.add_argument("--learn", dest="learn", action="store_true", default=True,
+
+    g_merge = ap.add_argument_group("Merging")
+    g_merge.add_argument("--alias", metavar="A=B", action="append", default=[],
+                    help="manual character alias: 'Loki=Brian Gragg' merges them. "
+                         "Repeatable. Stored as human-validated, applies cross-book.")
+    g_merge.add_argument("--principals-only", dest="principals_only",
+                    action="store_true", default=True,
+                    help="write only principal characters to Supabase "
+                         "(default on; minors kept in preview JSON)")
+    g_merge.add_argument("--no-principals-only", dest="principals_only",
+                    action="store_false",
+                    help="disable the principal filter; write all characters")
+    g_merge.add_argument("--min-frequency", metavar="F", type=float, default=0.20,
+                    help="minimum chapter frequency for principal status "
+                         "(default 0.20)")
+
+    g_learn = ap.add_argument_group("Learning")
+    g_learn.add_argument("--learn", dest="learn", action="store_true", default=True,
                     help="learn nicknames/titles/thresholds across runs (default on)")
-    ap.add_argument("--no-learn", dest="learn", action="store_false",
+    g_learn.add_argument("--no-learn", dest="learn", action="store_false",
                     help="disable cross-run learning")
-    ap.add_argument("--learn-dir", metavar="DIR", default="",
+    g_learn.add_argument("--learn-dir", metavar="DIR", default="",
                     help="learning state directory "
                          "(default ~/.ebook-processor/learned/)")
-    ap.add_argument("--import-labels", metavar="PATH", default="",
+    g_learn.add_argument("--learn-status", action="store_true",
+                    help="print a summary of the learning system state "
+                         "and exit (no books processed)")
+    g_learn.add_argument("--import-labels", metavar="PATH", default="",
                     help="import hand-labeled merge pairs (label-merges.py output) "
                          "into the nickname dictionary, then continue")
-    ap.add_argument("--import-rejections", nargs="?", const="", default=None,
+    g_learn.add_argument("--import-rejections", nargs="?", const="", default=None,
                     metavar="PATH",
                     help="import trope rejections JSON (from Trope Lab / the app) "
                          "into the learning system, then continue; "
                          "combine with --from-supabase to pull from Supabase "
                          "instead of a file")
-    ap.add_argument("--from-supabase", action="store_true", default=False,
+    g_learn.add_argument("--from-supabase", action="store_true", default=False,
                     help="with --import-rejections: import rejected trope claims "
                          "from Supabase book_trope_claims (status='rejected') "
                          "instead of a JSON file")
+
+    g_out = ap.add_argument_group("Output")
+    g_out.add_argument("--preview", action="store_true", help="save preview files; write and move nothing")
+    g_out.add_argument("--dry-run", action="store_true", help="extract only; write and move nothing")
+    g_out.add_argument("--show-matrices", action="store_true",
+                    help="print ASCII matrix visualizations (spice, character "
+                         "importance, relationship confidence) during processing")
+    g_out.add_argument("--no-viz", action="store_true",
+                    help="disable the chapter visualizer panel in the Rich TUI")
+    g_out.add_argument("--push-preview", metavar="PREVIEW_JSON",
+                    help="push a preview JSON to Supabase without re-running the LLM")
+    g_out.add_argument("--verify", metavar="PREVIEW_JSON",
+                    help="compare a preview JSON against the DB and flag discrepancies (read-only)")
+    g_out.add_argument("--validate", metavar="PREVIEW_JSON",
+                    help="run automated quality checks on a preview file")
+    g_out.add_argument("--trope-map", metavar="PREVIEW_JSON",
+                    help="map a preview file's tropes to the Cozy Libram catalog "
+                         "via embeddings; writes a review JSON, nothing to Supabase")
+
+    g_isbn = ap.add_argument_group("ISBN")
+    g_isbn.add_argument("--allow-no-isbn", action="store_true",
+                    help="process books without ISBN instead of skipping them "
+                         "(default is to skip with a message)")
+    g_isbn.add_argument("--rename-no-isbn", action="store_true",
+                    help="rename skipped no-ISBN EPUBs to NO-ISBN-{original}.epub "
+                         "so they are visible in the folder (never deletes)")
+
+    g_dbg = ap.add_argument_group("Debug")
+    g_dbg.add_argument("--debug", action="store_true",
+                    help="save raw LLM output of failed chunks to preview/debug/")
+    g_dbg.add_argument("--prompt-cache", action="store_true",
+                    help="v2: task-last prompt layout for llama.cpp KV cache "
+                         "reuse + interleaved A/B calls (experimental)")
+    g_dbg.add_argument("--shared-system", action="store_true",
+                    help="v2: use shared system prompt for A/B calls (isolation test)")
+    g_dbg.add_argument("--task-last", action="store_true",
+                    help="v2: put chapter text before task instructions (isolation test)")
+
+    g_prof = ap.add_argument_group("Profiles & modes")
+    g_prof.add_argument("--profile", metavar="NAME", default=None,
+                    help="load flag values from a saved profile "
+                         "(~/.ebook-processor/profiles/NAME.json); "
+                         "explicit CLI flags override the profile")
+    g_prof.add_argument("--save-profile", metavar="NAME", default=None,
+                    help="save the current non-default flags as a profile, then exit")
+    g_prof.add_argument("--list-profiles", action="store_true",
+                    help="list available profiles (builtin + saved), then exit")
+    g_prof.add_argument("--guided", action="store_true",
+                    help="interactive setup: prompts for file, mode, and key options")
+
+    return ap
+
+
+def main():
+    ap = _build_parser()
     args = ap.parse_args()
+    defaults = ap.parse_args([])
+
+    if args.list_profiles:
+        for name, src in sorted(_available_profiles().items()):
+            print(f"  {name} ({src})")
+        return
+
+    if args.save_profile:
+        path = _save_profile(args.save_profile, args, defaults)
+        print(f"  Profile saved to {path}")
+        return
+
+    if args.guided:
+        if not _guided_setup(args):
+            return
+
+    if args.profile:
+        profile = _load_profile(args.profile)
+        if profile is None:
+            sys.exit(f"ERROR: profile '{args.profile}' not found "
+                     "(--list-profiles to see available)")
+        _apply_profile(args, defaults, profile)
 
     if args.trope_map:
         load_config()
@@ -7467,6 +7806,11 @@ def main():
     if args.verify:
         load_config()
         cmd_verify(args.verify)
+        return
+
+    if args.learn_status:
+        load_config()
+        cmd_learn_status(args.learn_dir or None)
         return
 
     if args.prompt_cache:
