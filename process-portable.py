@@ -275,18 +275,40 @@ def read_opf(z):
                                            "series_index": series_index}
 
 
+def _validate_isbn(isbn):
+    """Validate an ISBN string. Returns normalized digits-only ISBN or None.
+
+    Strips hyphens, spaces, and urn:isbn: prefixes. Requires 10 or 13
+    digits and a valid check digit (mod-11 for ISBN-10, mod-10 for
+    ISBN-13). ISBN-10 may end in 'X' (check digit 10). The returned value
+    keeps its original length (10 stays 10, 13 stays 13); callers that
+    need ISBN-13 should convert via _clean_isbn.
+    """
+    s = re.sub(r"(?i)^urn:isbn:", "", (isbn or "").strip())
+    s = re.sub(r"[\s\-]", "", s).upper()
+    if len(s) == 13 and s.isdigit():
+        total = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(s))
+        return s if total % 10 == 0 else None
+    if len(s) == 10 and s[:9].isdigit() and s[9] in "0123456789X":
+        total = sum(int(s[i]) * (10 - i) for i in range(9))
+        check_val = 10 if s[9] == "X" else int(s[9])
+        return s if (total + check_val) % 11 == 0 else None
+    return None
+
+
 def _clean_isbn(s):
     """Normalize an identifier string to digits-only ISBN-13, or None.
-    Handles urn:isbn: prefixes, hyphens/spaces, and ISBN-10 -> ISBN-13."""
-    s = re.sub(r"(?i)^urn:isbn:", "", (s or "").strip())
-    s = re.sub(r"[^0-9Xx]", "", s).upper()
-    if len(s) == 13 and s.isdigit():
-        return s
-    if len(s) == 10 and s[:9].isdigit() and s[9] in "0123456789X":
-        core = "978" + s[:9]
-        total = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(core))
-        return core + str((10 - total % 10) % 10)
-    return None
+    Handles urn:isbn: prefixes, hyphens/spaces, and ISBN-10 -> ISBN-13.
+    Check digits are validated; invalid ISBNs return None."""
+    valid = _validate_isbn(s)
+    if not valid:
+        return None
+    if len(valid) == 13:
+        return valid
+    # ISBN-10 -> ISBN-13 (check digit already validated above).
+    core = "978" + valid[:9]
+    total = sum(int(c) * (1 if i % 2 == 0 else 3) for i, c in enumerate(core))
+    return core + str((10 - total % 10) % 10)
 
 
 def _pick_identifiers(raw_list, series=None, series_index=None):
@@ -305,6 +327,22 @@ def _pick_identifiers(raw_list, series=None, series_index=None):
     return out
 
 
+def _ol_request(url, timeout=10):
+    """GET a URL from Open Library and parse the JSON response.
+
+    Sets the ebook-processor User-Agent header and applies the timeout.
+    Returns the parsed dict, or None on any failure (network error,
+    HTTP error, invalid JSON). Callers must URL-quote query parameters
+    with urllib.parse.quote before building the URL.
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "ebook-processor/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "ignore"))
+    except Exception:
+        return None
+
+
 def _lookup_isbn_openlibrary(title, author):
     """Look up an ISBN via Open Library search API. Returns cleaned ISBN-13 or None.
 
@@ -315,13 +353,13 @@ def _lookup_isbn_openlibrary(title, author):
     """
     if not title:
         return None
+    q = (f"https://openlibrary.org/search.json?title={quote(title or '', safe='')}"
+         f"&author={quote(author or '', safe='')}"
+         f"&fields=title,isbn&limit=1")
+    data = _ol_request(q)
+    if not data:
+        return None
     try:
-        q = (f"https://openlibrary.org/search.json?title={quote(title or '', safe='')}"
-             f"&author={quote(author or '', safe='')}"
-             f"&fields=title,isbn&limit=1")
-        req = urllib.request.Request(q, headers={"User-Agent": "ebook-processor/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8", "ignore"))
         docs = data.get("docs") or []
         if not docs:
             return None
@@ -359,10 +397,24 @@ def _resolve_book_isbn(identifiers, title, author):
     """
     override = CONFIG.get("isbn_override", "")
     if override:
-        identifiers["isbn"] = override
-        return override, "flag"
+        valid = _validate_isbn(override)
+        if not valid:
+            print(f"  ERROR: --isbn value {override!r} is not a valid ISBN "
+                  f"(bad length or check digit); ignoring override.")
+        else:
+            # Normalize through _clean_isbn so the work key is always ISBN-13.
+            normalized = _clean_isbn(override)
+            identifiers["isbn"] = normalized
+            return normalized, "flag"
     if identifiers.get("isbn"):
-        return identifiers["isbn"], "epub"
+        # EPUB-sourced; _clean_isbn already validated the check digit, but
+        # re-validate defensively since identifiers may be populated directly.
+        valid = _validate_isbn(identifiers["isbn"])
+        if valid:
+            return _clean_isbn(identifiers["isbn"]), "epub"
+        print(f"  WARNING: EPUB ISBN {identifiers['isbn']!r} failed check-digit "
+              f"validation; ignoring.")
+        identifiers["isbn"] = None
     # Auto-lookup before giving up.
     auto = _lookup_isbn_openlibrary(title, author)
     if auto:
@@ -433,13 +485,13 @@ def _lookup_series_openlibrary(title, author):
     series data in Open Library is sparse, so this is a last resort."""
     if not title:
         return None, None
+    q = (f"https://openlibrary.org/search.json?title={quote(title or '', safe='')}"
+         f"&author={quote(author or '', safe='')}"
+         f"&fields=title,series&limit=1")
+    data = _ol_request(q)
+    if not data:
+        return None, None
     try:
-        q = (f"https://openlibrary.org/search.json?title={quote(title or '', safe='')}"
-             f"&author={quote(author or '', safe='')}"
-             f"&fields=title,series&limit=1")
-        req = urllib.request.Request(q, headers={"User-Agent": "ebook-processor/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8", "ignore"))
         docs = data.get("docs") or []
         if not docs:
             return None, None
@@ -5691,11 +5743,12 @@ def correct_metadata(title, author, identifiers):
     isbn = (identifiers or {}).get("isbn")
     if not isbn:
         return title, author, False
+    url = (f"https://openlibrary.org/search.json?q={quote(isbn, safe='')}"
+           f"&fields=title,author_name&limit=1")
+    data = _ol_request(url)
+    if not data:
+        return title, author, False
     try:
-        url = f"https://openlibrary.org/search.json?q={isbn}&fields=title,author_name&limit=1"
-        req = urllib.request.Request(url, headers={"User-Agent": "ebook-processor/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read().decode("utf-8") or "{}")
         docs = data.get("docs") or []
         if not docs:
             return title, author, False

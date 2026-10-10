@@ -21,23 +21,27 @@ OPENROUTER_DECISION_MODEL = "typesafe/jev-1.13"
 OPENROUTER_ATTRIBUTION_TITLE = "ebook-processor"
 
 
-def resolve_provider(provider, base_url, model, api_key):
+def resolve_provider(provider, base_url, model):
     """Resolve decision-model connection details.
 
     Returns (base_url, model, api_key, extra_headers). Raises ValueError
     when the openrouter provider lacks an API key; the key is never logged.
+    The key comes from environment variables only (never the command line):
+    OPENROUTER_API_KEY, openrouter_api_key, or openrouter_key.
     """
     if provider == "openrouter":
-        key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
+        key = (os.environ.get("OPENROUTER_API_KEY", "") or
+               os.environ.get("openrouter_api_key", "") or
+               os.environ.get("openrouter_key", ""))
         if not key:
             raise ValueError(
-                "provider 'openrouter' needs an API key: pass --api-key "
-                "or set OPENROUTER_API_KEY")
+                "provider 'openrouter' needs an API key: set OPENROUTER_API_KEY "
+                "(or openrouter_api_key / openrouter_key) in the environment")
         return (OPENROUTER_SYSTEMONE_BASE,
                 model or OPENROUTER_DECISION_MODEL,
                 key,
                 {"X-Title": OPENROUTER_ATTRIBUTION_TITLE})
-    return (base_url, model, api_key, {})
+    return (base_url, model, "", {})
 
 
 def ask_same_person(base_url, model, api_key, name_a, name_b, timeout=30,
@@ -93,14 +97,12 @@ def main():
                     help="decision-model backend: 'local' Unsloth server "
                          "(default) or 'openrouter' hosted Jev")
     ap.add_argument('--model', default='')
-    ap.add_argument('--api-key', default='',
-                    help='API key override (or OPENROUTER_API_KEY env)')
     ap.add_argument('--threshold', type=float, default=0.5)
     args = ap.parse_args()
 
     try:
         base_url, model, api_key, extra_headers = resolve_provider(
-            args.provider, args.base_url, args.model, args.api_key)
+            args.provider, args.base_url, args.model)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(2)

@@ -3642,3 +3642,235 @@ class TestTropeRejections(unittest.TestCase):
             pp.CONFIG.pop("supabase_key", None)
         self.assertEqual(n, 1)
         self.assertEqual(self.ls.get_trope_rejection_count("mystery id"), 1)
+
+
+class TestIsbnValidation(unittest.TestCase):
+    """_validate_isbn: length, digits, and check-digit validation."""
+
+    def test_valid_isbn13(self):
+        self.assertEqual(pp._validate_isbn("9781615871100"), "9781615871100")
+        self.assertEqual(pp._validate_isbn("9781101007518"), "9781101007518")
+
+    def test_valid_isbn13_hyphens_spaces(self):
+        self.assertEqual(pp._validate_isbn("978-1-61587-110-0"), "9781615871100")
+        self.assertEqual(pp._validate_isbn("978 1 61587 110 0"), "9781615871100")
+        self.assertEqual(pp._validate_isbn("urn:isbn:9781615871100"), "9781615871100")
+
+    def test_valid_isbn10(self):
+        # 1615871101: weighted sum 198, 198 % 11 == 0.
+        self.assertEqual(pp._validate_isbn("1615871101"), "1615871101")
+        self.assertEqual(pp._validate_isbn("1-61587-110-1"), "1615871101")
+
+    def test_valid_isbn10_x_check(self):
+        # 080442957X is a known-valid ISBN-10 ending in X.
+        self.assertEqual(pp._validate_isbn("080442957X"), "080442957X")
+        self.assertEqual(pp._validate_isbn("080442957x"), "080442957X")
+        self.assertEqual(pp._validate_isbn("0-8044-2957-X"), "080442957X")
+
+    def test_invalid_check_digit_13(self):
+        self.assertIsNone(pp._validate_isbn("9781615871101"))  # last digit wrong
+        self.assertIsNone(pp._validate_isbn("9781615871109"))
+
+    def test_invalid_check_digit_10(self):
+        self.assertIsNone(pp._validate_isbn("1615871102"))  # last digit wrong
+        self.assertIsNone(pp._validate_isbn("161587110X"))  # X not valid here
+
+    def test_wrong_length(self):
+        self.assertIsNone(pp._validate_isbn("978161587110"))
+        self.assertIsNone(pp._validate_isbn("97816158711000"))
+        self.assertIsNone(pp._validate_isbn("123"))
+        self.assertIsNone(pp._validate_isbn(""))
+
+    def test_non_digits(self):
+        self.assertIsNone(pp._validate_isbn("garbage"))
+        self.assertIsNone(pp._validate_isbn(None))
+        self.assertIsNone(pp._validate_isbn("978161587110A"))
+
+    def test_clean_isbn_rejects_bad_check_digit(self):
+        # _clean_isbn now validates check digits too.
+        self.assertIsNone(pp._clean_isbn("9781615871101"))
+        self.assertIsNone(pp._clean_isbn("1615871102"))
+        # Valid ones still convert.
+        self.assertEqual(pp._clean_isbn("1615871101"), "9781615871100")
+
+    def test_resolve_book_isbn_rejects_invalid_override(self):
+        # An invalid --isbn override must not become the work key.
+        from unittest import mock
+        old = pp.CONFIG.get("isbn_override")
+        pp.CONFIG["isbn_override"] = "9781615871101"  # bad check digit
+        try:
+            identifiers = {"isbn": None}
+            with mock.patch.object(pp, "_ol_request", return_value=None):
+                isbn, source = pp._resolve_book_isbn(identifiers, "Title", "Author")
+            # Falls through: no valid override, no EPUB isbn, no OL hit.
+            self.assertIsNone(isbn)
+            self.assertEqual(source, "none")
+            self.assertIsNone(identifiers["isbn"])
+        finally:
+            if old is None:
+                pp.CONFIG.pop("isbn_override", None)
+            else:
+                pp.CONFIG["isbn_override"] = old
+
+    def test_resolve_book_isbn_accepts_valid_override(self):
+        old = pp.CONFIG.get("isbn_override")
+        pp.CONFIG["isbn_override"] = "978-1-61587-110-0"
+        try:
+            identifiers = {"isbn": None}
+            isbn, source = pp._resolve_book_isbn(identifiers, "Title", "Author")
+            self.assertEqual(isbn, "9781615871100")
+            self.assertEqual(source, "flag")
+            self.assertEqual(identifiers["isbn"], "9781615871100")
+        finally:
+            if old is None:
+                pp.CONFIG.pop("isbn_override", None)
+            else:
+                pp.CONFIG["isbn_override"] = old
+
+
+class TestOlRequest(unittest.TestCase):
+    """_ol_request: consolidated Open Library HTTP helper."""
+
+    def _fake_urlopen(self, payload_bytes=None, exc=None):
+        from unittest import mock
+
+        def fake(req, timeout=None):
+            fake.last_timeout = timeout
+            fake.last_headers = dict(req.headers)
+            if exc:
+                raise exc
+            m = mock.MagicMock()
+            m.read.return_value = payload_bytes
+            m.__enter__ = mock.MagicMock(return_value=m)
+            m.__exit__ = mock.MagicMock(return_value=False)
+            return m
+
+        fake.last_timeout = None
+        fake.last_headers = {}
+        return mock.patch.object(pp.urllib.request, "urlopen", fake), fake
+
+    def test_success(self):
+        import json as _json
+        patcher, fake = self._fake_urlopen(
+            _json.dumps({"docs": [{"title": "Daemon"}]}).encode("utf-8"))
+        with patcher:
+            data = pp._ol_request("https://openlibrary.org/search.json?q=x")
+        self.assertEqual(data, {"docs": [{"title": "Daemon"}]})
+
+    def test_invalid_json_returns_none(self):
+        patcher, fake = self._fake_urlopen(b"not json{{")
+        with patcher:
+            self.assertIsNone(pp._ol_request("https://example.com/x"))
+
+    def test_http_error_returns_none(self):
+        import urllib.error
+        patcher, fake = self._fake_urlopen(exc=urllib.error.HTTPError(
+            "https://example.com", 500, "boom", {}, None))
+        with patcher:
+            self.assertIsNone(pp._ol_request("https://example.com/x"))
+
+    def test_timeout_returns_none(self):
+        import socket
+        patcher, fake = self._fake_urlopen(exc=socket.timeout("timed out"))
+        with patcher:
+            self.assertIsNone(pp._ol_request("https://example.com/x"))
+
+    def test_timeout_forwarded(self):
+        patcher, fake = self._fake_urlopen(exc=IOError("nope"))
+        with patcher:
+            pp._ol_request("https://example.com/x", timeout=42)
+        self.assertEqual(fake.last_timeout, 42)
+
+    def test_user_agent_header(self):
+        patcher, fake = self._fake_urlopen(exc=IOError("nope"))
+        with patcher:
+            pp._ol_request("https://example.com/x")
+        # Header keys are capitalized by urllib ("User-agent").
+        ua = (fake.last_headers.get("User-agent")
+              or fake.last_headers.get("User-Agent"))
+        self.assertEqual(ua, "ebook-processor/1.0")
+
+
+class TestEvaluateMergesNoCliKey(unittest.TestCase):
+    """evaluate-merges.py: no --api-key flag; env-only key resolution."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        mod_path = str(Path(__file__).resolve().parent.parent / "evaluate-merges.py")
+        spec = importlib.util.spec_from_file_location("evaluate_merges", mod_path)
+        cls.em = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.em)
+
+    def test_no_api_key_flag(self):
+        import argparse
+        # Parse known args the way main() does; --api-key must not exist.
+        ap = argparse.ArgumentParser()
+        ap.add_argument('--labels', required=True)
+        ap.add_argument('--base-url', default='http://127.0.0.1:8888/v1')
+        ap.add_argument('--provider', choices=['local', 'openrouter'], default='local')
+        ap.add_argument('--model', default='')
+        ap.add_argument('--threshold', type=float, default=0.5)
+        # Mirror of evaluate-merges main(): must not accept --api-key.
+        with self.assertRaises(SystemExit):
+            ap.parse_args(['--labels', 'x.json', '--api-key', 'sk-secret'])
+
+    def test_resolve_provider_no_key_raises_clear_error(self):
+        import os
+        old = {k: os.environ.get(k) for k in
+               ("OPENROUTER_API_KEY", "openrouter_api_key", "openrouter_key")}
+        for k in old:
+            os.environ.pop(k, None)
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                self.em.resolve_provider("openrouter", "http://x", "")
+            msg = str(ctx.exception)
+            self.assertIn("OPENROUTER_API_KEY", msg)
+            self.assertNotIn("--api-key", msg)
+        finally:
+            for k, v in old.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_resolve_provider_env_key(self):
+        import os
+        old = os.environ.get("OPENROUTER_API_KEY")
+        os.environ["OPENROUTER_API_KEY"] = "sk-test-key"
+        try:
+            base, model, key, headers = self.em.resolve_provider(
+                "openrouter", "http://x", "")
+            self.assertEqual(key, "sk-test-key")
+            self.assertEqual(model, self.em.OPENROUTER_DECISION_MODEL)
+        finally:
+            if old is None:
+                os.environ.pop("OPENROUTER_API_KEY", None)
+            else:
+                os.environ["OPENROUTER_API_KEY"] = old
+
+    def test_resolve_provider_local_needs_no_key(self):
+        base, model, key, headers = self.em.resolve_provider(
+            "local", "http://127.0.0.1:8888/v1", "")
+        self.assertEqual(key, "")
+        self.assertEqual(base, "http://127.0.0.1:8888/v1")
+
+
+class TestInjectIsbnValidation(unittest.TestCase):
+    """inject_isbn.py refuses invalid ISBNs."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        mod_path = str(Path(__file__).resolve().parent.parent / "inject_isbn.py")
+        spec = importlib.util.spec_from_file_location("inject_isbn", mod_path)
+        cls.ii = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.ii)
+
+    def test_valid(self):
+        self.assertEqual(self.ii.validate_isbn("9781615871100"), "9781615871100")
+        self.assertEqual(self.ii.validate_isbn("978-1-61587-110-0"), "9781615871100")
+
+    def test_invalid_check_digit(self):
+        self.assertIsNone(self.ii.validate_isbn("9781615871101"))
+
+    def test_invalid_length(self):
+        self.assertIsNone(self.ii.validate_isbn("123"))
