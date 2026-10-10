@@ -1639,12 +1639,15 @@ class DecisionValidator:
                                label=f"rel_{rel_type}")
         if p_yes is None:
             return None, None
-        verdict = p_yes >= _REL_VALIDATION_THRESHOLD
+        if p_yes >= _REL_VALIDATION_THRESHOLD:
+            _action = "keep"
+        elif p_yes >= _REL_DROP_THRESHOLD:
+            _action = "downgrade to other"
+        else:
+            _action = "drop"
         print(f"  Relationship validation: {from_name[:30]} -> "
-              f"{to_name[:30]} ({rel_type}): P(yes)={p_yes:.2f} "
-              f"{'≥' if verdict else '<'} {_REL_VALIDATION_THRESHOLD:.2f} → "
-              f"{'keep' if verdict else 'downgrade to other'}")
-        return verdict, p_yes
+              f"{to_name[:30]} ({rel_type}): P(yes)={p_yes:.2f} → {_action}")
+        return p_yes >= _REL_VALIDATION_THRESHOLD, p_yes
 
 
 # ---------------------------------------------------------------------------
@@ -2993,7 +2996,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     shaped for write_claims()/save_preview()/resolve_work()/dedupe_characters().
 
     preview: when True, decision-model validation scores are recorded but
-    low-confidence family relationships are NOT downgraded (audit only).
+    low-confidence family relationships are NOT downgraded and
+    very-low-confidence ones are NOT dropped (audit only).
 
     show_matrices: when True, print ASCII matrix visualizations (spice,
     relationship confidence) to the terminal during processing.
@@ -3099,6 +3103,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     # Exclusive types resolve by precedence; non-exclusive kept as extras w/ evidence.
     _pair_cands = {}    # unordered (a, b) -> list of candidate dicts
     _pair_chapters = {}  # unordered (a, b) -> set of chapter indices
+    # Author filter: the book's author is never a character, so relationships
+    # naming the author are dropped here (the roster filter only covers the
+    # character list; relationship endpoints bypass it via _roster_canonical).
+    _book_author = getattr(_DIAG, "book_author", None)
     for idx in sorted(chapter_as):
         a = chapter_as[idx]
         if not a:
@@ -3106,6 +3114,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         for r in a["relationships"]:
             frm = _roster_canonical(roster, r["from"])
             to = _roster_canonical(roster, r["to"])
+            if _rel_involves_author({"from": frm, "to": to}, _book_author):
+                continue
             # Self-relationship guard (after canonicalisation)
             if norm_name(frm) == norm_name(to):
                 continue
@@ -3163,10 +3173,15 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
 
     # --- Family relationship validation (decision model) ---
     # High-stakes types (spouse/parent/child/sibling): the claim is judged
-    # against its evidence quote. Low P or no evidence -> downgrade to
-    # "other" (the relationship exists; we're just unsure of the type).
-    # In preview mode the score is recorded but the type is NOT changed.
+    # against its evidence quote. Three tiers:
+    #   P >= 0.70: keep the type.
+    #   0.30 <= P < 0.70: downgrade to "other" (relationship exists;
+    #     we're just unsure of the type).
+    #   P < 0.30: drop entirely (likely hallucinated, not just mistyped).
+    # No evidence -> downgrade without spending a decision-model call.
+    # In preview mode scores/notes are recorded but nothing is changed.
     # Draws from the shared per-book decision-model budget (merges first).
+    _dropped_relationships = []
     for rel in relationships:
         _rt = rel.get("type", "")
         if _rt not in _REL_FAMILY_TYPES:
@@ -3192,10 +3207,22 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             continue
         rel["validation_p"] = round(_p, 4)
         rel["validation_model"] = _DECISION_VALIDATOR.model
-        if not _v:
+        if _p >= _REL_VALIDATION_THRESHOLD:
+            rel["validation_note"] = "kept"
+        elif _p >= _REL_DROP_THRESHOLD:
             rel["validation_note"] = "downgraded"
             if not preview:
                 rel["type"] = "other"
+        else:
+            # Very low P: likely hallucinated. Drop (audit in preview).
+            rel["validation_note"] = "dropped" if not preview else "would_drop"
+            if not preview:
+                _dropped_relationships.append(rel)
+    if _dropped_relationships:
+        _drop_ids = {id(r) for r in _dropped_relationships}
+        relationships = [r for r in relationships if id(r) not in _drop_ids]
+        print(f"  Relationship validation: dropped "
+              f"{len(_dropped_relationships)} hallucinated relationship(s)")
 
     if show_matrices:
         print(_rel_confidence_ascii(relationships))
@@ -3477,6 +3504,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     return {
         "characters": characters,
         "relationships": relationships,
+        "dropped_relationships": _dropped_relationships,
         "triggers": triggers,
         "spice_level": spice_level,
         "spice_peak": spice_peak,
@@ -5181,6 +5209,11 @@ _MERGE_TIER3_CAP = 50
 # Lower than the merge threshold: a wrong relationship type is embarrassing
 # but doesn't corrupt the roster permanently.
 _REL_VALIDATION_THRESHOLD = 0.70
+# Decision-model relationship DROP threshold (family types only).
+# Three-tier logic: P >= 0.70 keeps the type; 0.30 <= P < 0.70 downgrades
+# to "other" (relationship exists, type uncertain); P < 0.30 drops the
+# relationship entirely (likely hallucinated, not just mistyped).
+_REL_DROP_THRESHOLD = 0.30
 # Family relationship types validated by the decision model. High-stakes:
 # being wrong about spouse/parent/child/sibling is worse than being wrong
 # about friend/enemy/colleague.
@@ -5365,6 +5398,14 @@ def _merge_tier(a_key, b_key, chapter_keys=None, a_chapters=None,
     return "ambiguous"
 
 
+def _rel_involves_author(rel, author):
+    """True if either relationship endpoint matches the book's author."""
+    if not author:
+        return False
+    return (_is_author_name(rel.get("from", ""), author) or
+            _is_author_name(rel.get("to", ""), author))
+
+
 def _is_author_name(name, author):
     """True if a character name matches the book's author (any common form).
     Prevents 'Daniel Suarez' the author from becoming a character."""
@@ -5383,10 +5424,28 @@ def _is_author_name(name, author):
             _rev = norm_name(f"{_parts[1]} {_parts[0]}")
             if _rev == ak:
                 return True
-    # Author surname alone as a character name ("suarez" for Daniel Suarez).
+    _ntok = nk.split()
     _atok = ak.split()
+    # Author surname alone as a character name ("suarez" for Daniel Suarez).
     if len(_atok) >= 2 and nk == _atok[-1] and len(nk) > 3:
         return True
+    # Middle-name variants: "Daniel James Suarez" vs "Daniel Suarez".
+    # The shorter token list must be a subsequence of the longer, sharing
+    # first and last tokens. ("Daniel Smith" vs "Daniel Suarez" fails on
+    # the last token, so similar-but-different names are safe.)
+    if len(_ntok) >= 2 and len(_atok) >= 2:
+        _short, _long = (_ntok, _atok) if len(_ntok) <= len(_atok) \
+            else (_atok, _ntok)
+        if _short[0] == _long[0] and _short[-1] == _long[-1]:
+            _li, _matched = 0, 0
+            for _st in _short:
+                while _li < len(_long) and _long[_li] != _st:
+                    _li += 1
+                if _li < len(_long):
+                    _matched += 1
+                    _li += 1
+            if _matched == len(_short):
+                return True
     return False
 
 
@@ -6374,6 +6433,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "tropes": tropes, "trope_confidence": trope_conf,
         "triggers": red["triggers"], "characters": red["characters"],
         "relationships": red["relationships"],
+        "dropped_relationships": red.get("dropped_relationships", []),
         "spice_level": red["spice_level"],
         "povs": red["povs"], "quotes": red["quotes"],
         "chapter_summaries": red["chapter_summaries"],
@@ -6529,6 +6589,9 @@ def process_file(fpath, dry_run=False, preview=False):
     text, title, author, identifiers = extracted
 
     UI.status(f"  Title: {title or fpath.stem}, Chars: {len(text):,}")
+    # Author filter: the book's author is never a character. Stashed on
+    # _DIAG for the v1 chunk loop below (same pattern as process_file_v2).
+    _DIAG.book_author = author
     # ISBN resolution: --isbn flag > EPUB metadata > Open Library lookup.
     # Default is to skip books with no ISBN (see --allow-no-isbn).
     _isbn, _isbn_source = _resolve_book_isbn(identifiers, title, author)
@@ -6650,6 +6713,10 @@ def process_file(fpath, dry_run=False, preview=False):
                     ex["evidence"] = c["evidence"]
                     ex["evidence_verified"] = True
         for rel in r["relationships"]:
+            # Author filter: the book's author is never a character, so
+            # relationships naming the author are dropped.
+            if _rel_involves_author(rel, author):
+                continue
             k = (rel["from"].lower(), rel["to"].lower(), rel["type"].lower())
             if k not in rel_seen:
                 rel_seen.add(k)
@@ -6698,7 +6765,8 @@ def process_file(fpath, dry_run=False, preview=False):
         "chunks": n, "chunks_failed": failed,
         "tropes": tropes, "trope_confidence": trope_conf,
         "triggers": triggers, "characters": characters,
-        "relationships": relationships, "spice_level": spice_level,
+        "relationships": relationships, "dropped_relationships": [],
+        "spice_level": spice_level,
         "povs": sorted(povs), "quotes": _spread_quotes(quotes, 10),
         "is_anthology": is_anth, "stories": stories,
         "aborted": aborted, "chunks_ok": ok,
@@ -6912,13 +6980,24 @@ def save_preview(fpath, result):
             _conf = r.get("confidence", "")
             _conf_str = f" ({_conf} confidence)" if _conf else ""
             _vp = r.get("validation_p")
+            _vn = r.get("validation_note", "")
             if _vp is not None:
                 _conf_str += f" [validated P={_vp:.2f}]"
-            elif r.get("validation_note") == "downgraded":
+            if _vn == "downgraded":
                 _conf_str += " [downgraded: low validation]"
-            elif r.get("validation_note") == "no_evidence":
+            elif _vn == "would_drop":
+                _conf_str += " [would drop: very low validation]"
+            elif _vn == "no_evidence":
                 _conf_str += " [downgraded: no evidence]"
             md.append(f"- {r['from']} → {r['to']}: {r['type']}{_conf_str}")
+        md.append("")
+    _dropped = result.get("dropped_relationships") or []
+    if _dropped:
+        md.append(f"## Dropped relationships ({len(_dropped)}) — likely hallucinated")
+        for r in _dropped:
+            _vp = r.get("validation_p")
+            _vp_str = f" [P={_vp:.2f}]" if _vp is not None else ""
+            md.append(f"- {r['from']} → {r['to']}: {r['type']}{_vp_str}")
         md.append("")
     if result["quotes"]:
         md.append(f"## Quotes ({len(result['quotes'])})")

@@ -2131,6 +2131,21 @@ class TestHybridMerge(unittest.TestCase):
         self.assertFalse(pp._is_author_name("Peter Sebeck", "Daniel Suarez"))
         self.assertFalse(pp._is_author_name("", "Daniel Suarez"))
 
+    def test_is_author_name_variants(self):
+        # Double space, mixed case.
+        self.assertTrue(pp._is_author_name("Daniel  Suarez", "Daniel Suarez"))
+        self.assertTrue(pp._is_author_name("DANIEL SUAREZ", "Daniel Suarez"))
+        # Middle name variants both directions.
+        self.assertTrue(pp._is_author_name("Daniel James Suarez",
+                                          "Daniel Suarez"))
+        self.assertTrue(pp._is_author_name("Daniel Suarez",
+                                          "Daniel James Suarez"))
+        # Similar-but-different names are NOT the author.
+        self.assertFalse(pp._is_author_name("Daniel Smith", "Daniel Suarez"))
+        self.assertFalse(pp._is_author_name("James Suarez", "Daniel Suarez"))
+        # Surname alone still matches.
+        self.assertTrue(pp._is_author_name("Suarez", "Daniel Suarez"))
+
     def test_roster_update_skips_author(self):
         roster = {}
         pp._DIAG.book_author = "Daniel Suarez"
@@ -2787,6 +2802,121 @@ class TestRelationshipValidation(unittest.TestCase):
         red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
         self.assertEqual(red["relationships"][0]["type"], "spouse")
         self.assertNotIn("validation_p", red["relationships"][0])
+
+
+class TestRelationshipDropThreshold(unittest.TestCase):
+    """Three-tier validation: keep >= 0.70, downgrade 0.30-0.70, drop < 0.30."""
+
+    def _make_chapter_a(self, relationships):
+        return {"characters": [], "relationships": relationships,
+                "task_status": {"identity": "ok"}}
+
+    def _rel(self, frm, to, rtype, evidence=""):
+        return {"from": frm, "to": to, "type": rtype, "evidence": evidence}
+
+    def setUp(self):
+        self._old_validator = pp._DECISION_VALIDATOR
+        pp._dm_budget_reset()
+
+    def tearDown(self):
+        pp._DECISION_VALIDATOR = self._old_validator
+        pp._dm_budget_reset()
+
+    def _run(self, p, preview=False):
+        class FakeValidator:
+            model = "fake"
+            def validate_relationship(self, frm, to, rtype, quote, context=""):
+                return p >= 0.70, p
+        pp._DECISION_VALIDATOR = FakeValidator()
+        chs = [_ch(1, "A"), _ch(2, "B")]
+        chapter_as = {1: self._make_chapter_a(
+            [self._rel("Alice", "Bob", "spouse", "some quote")])}
+        return pp.v2_reduce(chapter_as, {}, {}, chs, preview=preview)
+
+    def test_p_080_keeps_type(self):
+        red = self._run(0.80)
+        self.assertEqual(len(red["relationships"]), 1)
+        self.assertEqual(red["relationships"][0]["type"], "spouse")
+        self.assertEqual(red["relationships"][0]["validation_note"], "kept")
+        self.assertEqual(red["dropped_relationships"], [])
+
+    def test_p_050_downgrades_to_other(self):
+        red = self._run(0.50)
+        self.assertEqual(len(red["relationships"]), 1)
+        self.assertEqual(red["relationships"][0]["type"], "other")
+        self.assertEqual(red["relationships"][0]["validation_note"],
+                         "downgraded")
+        self.assertEqual(red["dropped_relationships"], [])
+
+    def test_p_015_drops_entirely(self):
+        red = self._run(0.15)
+        self.assertEqual(len(red["relationships"]), 0)
+        self.assertEqual(len(red["dropped_relationships"]), 1)
+        _d = red["dropped_relationships"][0]
+        self.assertEqual(_d["from"], "Alice")
+        self.assertEqual(_d["to"], "Bob")
+        self.assertEqual(_d["type"], "spouse")  # original type preserved
+        self.assertEqual(_d["validation_p"], 0.15)
+        self.assertEqual(_d["validation_note"], "dropped")
+
+    def test_boundary_029_drops_030_downgrades(self):
+        red = self._run(0.29)
+        self.assertEqual(len(red["relationships"]), 0)
+        self.assertEqual(len(red["dropped_relationships"]), 1)
+        red = self._run(0.30)
+        self.assertEqual(len(red["relationships"]), 1)
+        self.assertEqual(red["relationships"][0]["type"], "other")
+        self.assertEqual(red["dropped_relationships"], [])
+
+    def test_preview_does_not_drop(self):
+        red = self._run(0.15, preview=True)
+        # Audit only: relationship kept, marked would_drop.
+        self.assertEqual(len(red["relationships"]), 1)
+        self.assertEqual(red["relationships"][0]["type"], "spouse")
+        self.assertEqual(red["relationships"][0]["validation_note"],
+                         "would_drop")
+        self.assertEqual(red["dropped_relationships"], [])
+
+    def test_dropped_in_result_dict(self):
+        red = self._run(0.10)
+        self.assertIn("dropped_relationships", red)
+        self.assertIsInstance(red["dropped_relationships"], list)
+
+
+class TestAuthorRelationshipFilter(unittest.TestCase):
+    """Relationships naming the book's author are dropped (v1 and v2)."""
+
+    def _make_chapter_a(self, relationships):
+        return {"characters": [], "relationships": relationships,
+                "task_status": {"identity": "ok"}}
+
+    def _rel(self, frm, to, rtype, evidence=""):
+        return {"from": frm, "to": to, "type": rtype, "evidence": evidence}
+
+    def test_rel_involves_author(self):
+        _r = {"from": "Daniel Suarez", "to": "Michelle", "type": "spouse"}
+        self.assertTrue(pp._rel_involves_author(_r, "Daniel Suarez"))
+        _r2 = {"from": "Peter Sebeck", "to": "Daniel Suarez", "type": "friend"}
+        self.assertTrue(pp._rel_involves_author(_r2, "Daniel Suarez"))
+        _r3 = {"from": "Peter Sebeck", "to": "Michelle", "type": "friend"}
+        self.assertFalse(pp._rel_involves_author(_r3, "Daniel Suarez"))
+        self.assertFalse(pp._rel_involves_author(_r3, ""))
+        self.assertFalse(pp._rel_involves_author(_r3, None))
+
+    def test_v2_drops_author_relationships(self):
+        pp._DIAG.book_author = "Daniel Suarez"
+        self.addCleanup(setattr, pp._DIAG, "book_author", None)
+        chs = [_ch(1, "A"), _ch(2, "B")]
+        chapter_as = {1: self._make_chapter_a([
+            self._rel("Daniel Suarez", "Michelle", "spouse", "his wife"),
+            self._rel("Peter Sebeck", "Chris Sebeck", "parent", "his son"),
+        ])}
+        red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
+        _froms = {r["from"] for r in red["relationships"]}
+        self.assertNotIn("Daniel Suarez", _froms)
+        # Non-author relationship survives.
+        self.assertTrue(any(r["from"] == "Peter Sebeck"
+                            for r in red["relationships"]))
 
 
 class TestSeriesDetection(unittest.TestCase):
