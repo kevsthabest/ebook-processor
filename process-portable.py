@@ -1265,6 +1265,58 @@ def _rel_pair_key(rel):
             str(rel.get("to") or "").strip().lower())
 
 
+def _dialogue_ratio(text):
+    """Pure: fraction of characters inside quotes (dialogue) vs total.
+
+    Handles straight quotes (") and curly quotes (\u201c \u201d).
+    Returns 0.0 for empty text, 1.0 for all-dialogue.
+    """
+    if not text:
+        return 0.0
+    # Match quoted spans: "..." or "..." (non-greedy, no nesting)
+    # Straight quotes: "..."  Curly: "\u201c...\u201d"
+    import re as _re
+    _QUOTE_RE = _re.compile(r'"[^"]*"|\u201c[^\u201d]*\u201d')
+    dialogue_chars = sum(len(m.group(0)) for m in _QUOTE_RE.finditer(text))
+    total = len(text)
+    if total == 0:
+        return 0.0
+    return round(min(1.0, dialogue_chars / total), 4)
+
+
+def _chapter_spice_array(chapter_bs, n_chapters):
+    """Pure: build per-chapter spice array indexed by chapter number.
+
+    chapter_bs: {chapter_index: result or None}. Returns list where
+    index i holds the spice level for chapter i (0 if missing/failed).
+    """
+    arr = [0] * (n_chapters + 1)  # 1-based indexing; [0] unused
+    for idx, b in (chapter_bs or {}).items():
+        if b and 1 <= idx <= n_chapters:
+            try:
+                arr[idx] = max(0, min(5, int(b.get("spice_level", 0))))
+            except (TypeError, ValueError):
+                arr[idx] = 0
+    return arr
+
+
+def _trigger_chapters_map(triggers):
+    """Pure: build {trigger_name: [chapter_indices]} from trigger list.
+
+    Each trigger dict may have 'chapter_indices' (preferred) or 'chapters'
+    (label strings, skipped). Returns sorted index lists.
+    """
+    result = {}
+    for t in triggers or []:
+        name = t.get("warning") or t.get("name")
+        if not name:
+            continue
+        indices = t.get("chapter_indices")
+        if indices:
+            result[name] = sorted(indices)
+    return result
+
+
 def _preview_diff(old, new):
     """Pure: two preview-JSON dicts -> compact diff string. Never raises."""
     o, n = old or {}, new or {}
@@ -1392,6 +1444,58 @@ def _cmd_preview_diff(old_path, new_path):
     except (OSError, ValueError) as e:
         return f"ERROR: cannot read {new_path}: {e}"
     return _preview_diff(old, new)
+
+
+def _recalibrate_spice(preview_data):
+    """Pure: check if a preview JSON has per-chapter spice data and recompute.
+
+    Returns (status, old_level, new_level, detail) where status is one of:
+    - "ok": recomputed successfully
+    - "no_data": no per-chapter spice data, needs reprocessing
+    - "no_change": recomputed level matches the stored level
+    """
+    d = preview_data or {}
+    old_level = d.get("spice_level")
+    chapter_spice = d.get("chapter_spice")
+    if not chapter_spice:
+        return ("no_data", old_level, None,
+                "no per-chapter spice data — needs reprocessing")
+    # chapter_spice is 1-based (index 0 unused); filter to successful chapters
+    n_successful = d.get("chapters_successful") or d.get("chapters_total") or 0
+    # Use non-zero entries as the spice levels (0 = no spice or failed chapter)
+    spices = [s for s in chapter_spice[1:] if s]
+    if not spices and not n_successful:
+        return ("no_data", old_level, None,
+                "chapter_spice present but empty — needs reprocessing")
+    new_level = _spice_level_from_chapters(spices, n_successful or len(spices))
+    if new_level == old_level:
+        return ("no_change", old_level, new_level,
+                f"spice {old_level} confirmed by current matrix")
+    return ("ok", old_level, new_level,
+            f"spice {old_level} -> {new_level} under current matrix")
+
+
+def _cmd_recalibrate_spice(path):
+    """Load a preview JSON and report spice recalibration status."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return f"ERROR: cannot read {path}: {e}"
+    title = data.get("title", path)
+    status, old, new, detail = _recalibrate_spice(data)
+    lines = [f"Recalibrate spice: {title}"]
+    if status == "no_data":
+        lines.append(f"  Old spice: {old}")
+        lines.append(f"  Status: NEEDS REPROCESSING — {detail}")
+    elif status == "no_change":
+        lines.append(f"  Spice: {old} (unchanged)")
+        lines.append(f"  Status: {detail}")
+    else:
+        lines.append(f"  Old spice: {old}")
+        lines.append(f"  New spice: {new}")
+        lines.append(f"  Status: {detail}")
+    return "\n".join(lines)
 
 
 def _filter_principals(characters, relationships, min_frequency=0.20):
@@ -3589,6 +3693,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             "appearance": _appearance,
             "status": _status,
             "first_appearance_chapter": _chapters_sorted[0] if _chapters_sorted else None,
+            "first_appearance": _chapters_sorted[0] if _chapters_sorted else None,
             "evidence": ev,
             "evidence_verified": bool(ev),
             "evidence_offered": bool(ev),
@@ -3730,7 +3835,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         print(_rel_confidence_ascii(relationships))
 
     # --- Triggers: max severity per category, chapter counts, top evidence ---
-    trig_acc = {c: {"sev": 0, "chapters": [], "evidence": []}
+    trig_acc = {c: {"sev": 0, "chapters": [], "chapter_indices": [], "evidence": []}
                 for c in TRIGGER_CATEGORIES}
     for idx in sorted(chapter_bs):
         b = chapter_bs[idx]
@@ -3742,6 +3847,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 acc = trig_acc[cat]
                 acc["sev"] = max(acc["sev"], sev)
                 acc["chapters"].append(idx_to_label.get(idx, ""))
+                acc["chapter_indices"].append(idx)
                 q = b["trigger_evidence"].get(cat)
                 if q and len(acc["evidence"]) < 3:
                     acc["evidence"].append({"quote": q,
@@ -3837,6 +3943,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             "severity": sev_names[sev],
             "severity_claimed": sev_names[acc["sev"]],
             "chapters": acc["chapters"],
+            "chapter_indices": sorted(acc["chapter_indices"]),
             "chapter_count": len(acc["chapters"]),
             "frequency": round(len(acc["chapters"]) / n_successful_b, 4) if n_successful_b else 0,
             "prominence": _trigger_prominence(
@@ -3860,6 +3967,21 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     _sb_peak, _sb_freq, _ = _spice_band_detail(spices, n_successful_b)
     if show_matrices:
         print(_spice_matrix_ascii(_sb_peak, _sb_freq, spice_level))
+    # Per-chapter spice array (1-based; index 0 unused) for the Spice Forecast
+    # app feature and --recalibrate-spice.
+    chapter_spice = _chapter_spice_array(chapter_bs, n)
+
+    # --- Dialogue/narration ratio: regex-based, no LLM calls ---
+    # Per-chapter fraction of characters inside quotes. Book-level average
+    # for the app's "dialogue-heavy" badge.
+    _chapter_dialogue = {}
+    for c in chapters:
+        _ci = c.get("index")
+        _ct = c.get("text", "")
+        if _ci is not None and _ct:
+            _chapter_dialogue[_ci] = _dialogue_ratio(_ct)
+    avg_dialogue_ratio = (round(sum(_chapter_dialogue.values()) / len(_chapter_dialogue), 4)
+                          if _chapter_dialogue else 0.0)
 
     # --- Trope candidates: union across chapters (gate runs separately) ---
     # (POVs computed earlier, before the characters section.)
@@ -4008,10 +4130,14 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         "relationships": relationships,
         "dropped_relationships": _dropped_relationships,
         "triggers": triggers,
+        "trigger_chapters": _trigger_chapters_map(triggers),
         "spice_level": spice_level,
         "spice_peak": spice_peak,
         "spice_peak_band": _sb_peak,
         "spice_freq_band": _sb_freq,
+        "chapter_spice": chapter_spice,
+        "avg_dialogue_ratio": avg_dialogue_ratio,
+        "chapter_dialogue": _chapter_dialogue,
         "coverage_warning": coverage_warning,
         "chapters_successful": n_successful_b,
         "chapters_total": n,
@@ -7978,6 +8104,9 @@ def save_preview(fpath, result):
         md.append(f"**Tasks:** discipline {t.get('discipline', '?')}/{result.get('chunks', '?')} ok, "
                   f"identity {t.get('identity', '?')}/{result.get('chunks', '?')} ok")
     md.append(f"**Spice:** {'🌶️' * result['spice_level'] or 'None'} ({result['spice_level']}/5)")
+    _adr = result.get("avg_dialogue_ratio")
+    if _adr is not None:
+        md.append(f"**Dialogue:** {int(_adr * 100)}% of text is dialogue")
     md.append(f"**POVs:** {', '.join(result['povs']) or 'Unknown'}")
     if result.get("isbn"):
         _src = result.get("isbn_source", "")
@@ -8025,6 +8154,9 @@ def save_preview(fpath, result):
             if t.get("prominence"):
                 line += f", {t['prominence']} prominence"
             line += ")"
+        _tci = t.get("chapter_indices")
+        if _tci:
+            line += f" [chapters: {', '.join(str(i) for i in _tci)}]"
         if t.get("detail"):
             line += f": {t['detail']}"
         if t.get("spoiler"):
@@ -8045,6 +8177,9 @@ def save_preview(fpath, result):
     md.append(f"## Characters ({len(result['characters'])})")
     for c in result["characters"]:
         md.append(f"### {c['name']} ({c.get('role') or 'unknown'})")
+        _fa = c.get("first_appearance")
+        if _fa is not None:
+            md.append(f"*First appears: chapter {_fa}*")
         if c.get("description"):
             md.append(c["description"])
         if c.get("evidence"):
@@ -8446,6 +8581,10 @@ def _build_parser():
                     metavar=("OLD_JSON", "NEW_JSON"),
                     help="compare two preview JSONs and print what changed; "
                          "exits without processing books")
+    g_out.add_argument("--recalibrate-spice", metavar="PREVIEW_JSON",
+                    help="recompute book spice from per-chapter data using the "
+                         "current matrix; reports old vs new or flags for "
+                         "reprocessing; exits without processing books")
     g_out.add_argument("--no-viz", action="store_true",
                     help="disable the chapter visualizer panel in the Rich TUI")
     g_out.add_argument("--push-preview", metavar="PREVIEW_JSON",
@@ -8539,6 +8678,10 @@ def main():
 
     if args.preview_diff:
         print(_cmd_preview_diff(args.preview_diff[0], args.preview_diff[1]))
+        return
+
+    if args.recalibrate_spice:
+        print(_cmd_recalibrate_spice(args.recalibrate_spice))
         return
 
     if args.validate:

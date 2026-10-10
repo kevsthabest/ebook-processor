@@ -4529,3 +4529,176 @@ class TestRetryFailed(unittest.TestCase):
         failed = [int(k) for k, v in chapters.items()
                   if v.get("a") is None or v.get("b") is None]
         self.assertEqual(failed, [])
+
+
+class TestMetadataImprovements(unittest.TestCase):
+    """Tests for the 5 metadata improvements: trigger chapters, first
+    appearance, chapter spice array, dialogue ratio, spice recalibration."""
+
+    # --- 1. _dialogue_ratio ---
+
+    def test_dialogue_ratio_straight_quotes(self):
+        text = 'He said "hello there" and walked away.'
+        r = pp._dialogue_ratio(text)
+        # '"hello there"' = 13 chars, total = 38
+        self.assertAlmostEqual(r, 13 / 38, places=3)
+
+    def test_dialogue_ratio_curly_quotes(self):
+        text = 'She whispered \u201cgoodnight\u201d softly.'
+        r = pp._dialogue_ratio(text)
+        self.assertGreater(r, 0)
+        self.assertLessEqual(r, 1.0)
+
+    def test_dialogue_ratio_no_dialogue(self):
+        self.assertEqual(pp._dialogue_ratio("No quotes here at all."), 0.0)
+
+    def test_dialogue_ratio_all_dialogue(self):
+        self.assertEqual(pp._dialogue_ratio('"Everything is quoted."'), 1.0)
+
+    def test_dialogue_ratio_empty(self):
+        self.assertEqual(pp._dialogue_ratio(""), 0.0)
+        self.assertEqual(pp._dialogue_ratio(None), 0.0)
+
+    def test_dialogue_ratio_mixed_quotes(self):
+        text = '"Straight" and \u201ccurly\u201d together.'
+        r = pp._dialogue_ratio(text)
+        self.assertGreater(r, 0.3)
+
+    # --- 2. _chapter_spice_array ---
+
+    def test_chapter_spice_array_basic(self):
+        chapter_bs = {
+            1: {"spice_level": 2},
+            2: {"spice_level": 0},
+            3: None,  # failed chapter
+            4: {"spice_level": 5},
+        }
+        arr = pp._chapter_spice_array(chapter_bs, 4)
+        self.assertEqual(arr, [0, 2, 0, 0, 5])
+
+    def test_chapter_spice_array_clamps(self):
+        chapter_bs = {1: {"spice_level": 99}, 2: {"spice_level": -3}}
+        arr = pp._chapter_spice_array(chapter_bs, 2)
+        self.assertEqual(arr[1], 5)
+        self.assertEqual(arr[2], 0)
+
+    def test_chapter_spice_array_empty(self):
+        self.assertEqual(pp._chapter_spice_array({}, 5), [0] * 6)
+        self.assertEqual(pp._chapter_spice_array(None, 3), [0] * 4)
+
+    # --- 3. _trigger_chapters_map ---
+
+    def test_trigger_chapters_map(self):
+        triggers = [
+            {"warning": "murder", "chapter_indices": [3, 1, 7]},
+            {"warning": "torture", "chapter_indices": [2]},
+            {"warning": "stalking"},  # no indices
+        ]
+        result = pp._trigger_chapters_map(triggers)
+        self.assertEqual(result, {"murder": [1, 3, 7], "torture": [2]})
+
+    def test_trigger_chapters_map_empty(self):
+        self.assertEqual(pp._trigger_chapters_map([]), {})
+        self.assertEqual(pp._trigger_chapters_map(None), {})
+
+    # --- 4. _recalibrate_spice ---
+
+    def test_recalibrate_with_data_no_change(self):
+        # One explicit chapter in 100 chapters -> spice 2 (explicit, rare)
+        preview = {
+            "spice_level": 2,
+            "chapters_successful": 100,
+            "chapter_spice": [0] + [0] * 99 + [4],  # ch 100 has spice 4
+        }
+        # Actually: 1 chapter at >=4 out of 100 = rare -> explicit/rare = 2
+        preview["chapter_spice"] = [0] + [4] + [0] * 99
+        status, old, new, detail = pp._recalibrate_spice(preview)
+        self.assertEqual(status, "no_change")
+        self.assertEqual(old, 2)
+        self.assertEqual(new, 2)
+
+    def test_recalibrate_with_data_changed(self):
+        # Old book computed with pre-matrix logic; matrix gives different result
+        preview = {
+            "spice_level": 5,  # old (wrong) value
+            "chapters_successful": 100,
+            "chapter_spice": [0] + [4] + [0] * 99,
+        }
+        status, old, new, detail = pp._recalibrate_spice(preview)
+        self.assertEqual(status, "ok")
+        self.assertEqual(old, 5)
+        self.assertEqual(new, 2)
+
+    def test_recalibrate_no_data(self):
+        preview = {"spice_level": 3, "title": "Old Book"}
+        status, old, new, detail = pp._recalibrate_spice(preview)
+        self.assertEqual(status, "no_data")
+        self.assertEqual(old, 3)
+        self.assertIsNone(new)
+        self.assertIn("reprocessing", detail)
+
+    def test_recalibrate_empty(self):
+        status, old, new, detail = pp._recalibrate_spice({})
+        self.assertEqual(status, "no_data")
+        status, old, new, detail = pp._recalibrate_spice(None)
+        self.assertEqual(status, "no_data")
+
+    def test_cmd_recalibrate_spice_bad_path(self):
+        result = pp._cmd_recalibrate_spice("/nonexistent/path.json")
+        self.assertTrue(result.startswith("ERROR:"))
+
+    # --- 5. v2_reduce integration ---
+
+    def test_v2_reduce_has_new_fields(self):
+        """v2_reduce output includes trigger_chapters, chapter_spice,
+        first_appearance, avg_dialogue_ratio."""
+        chapters = [_ch(1, "Chapter 1", text='He said "hi" loudly. ' * 50),
+                    _ch(2, "Chapter 2", text="No dialogue here. " * 50)]
+        chapter_as = {
+            1: {"characters": [{"name": "Alice", "description": "d",
+                               "role": "protagonist"}],
+                "relationships": [], "povs": []},
+            2: {"characters": [{"name": "Alice", "description": "d",
+                               "role": "protagonist"}],
+                "relationships": [], "povs": []},
+        }
+        chapter_bs = {
+            1: _b(triggers={"murder": "on_page"}, spice=3),
+            2: _b(triggers={"murder": "mentioned"}, spice=1),
+        }
+        roster = {}
+        # Build minimal roster entries (merge chapters across iterations)
+        for idx, a in chapter_as.items():
+            for c in a["characters"]:
+                if c["name"] not in roster:
+                    roster[c["name"]] = {
+                        "name": c["name"], "aliases": set(),
+                        "chapters": set(), "appearances": 5,
+                        "appearances_desc": ["d"],
+                        "unresolved_mentions": set(),
+                        "death_reports": [], "alive_reports": [],
+                        "roles": Counter(["protagonist"]),
+                    }
+                roster[c["name"]]["chapters"].add(idx)
+        result = pp.v2_reduce(chapter_as, chapter_bs, roster, chapters,
+                              preview=True)
+        # trigger_chapters
+        self.assertIn("trigger_chapters", result)
+        self.assertIn("murder", result["trigger_chapters"])
+        self.assertEqual(sorted(result["trigger_chapters"]["murder"]), [1, 2])
+        # chapter_spice
+        self.assertIn("chapter_spice", result)
+        self.assertEqual(result["chapter_spice"][1], 3)
+        self.assertEqual(result["chapter_spice"][2], 1)
+        # first_appearance on characters
+        for c in result["characters"]:
+            self.assertIn("first_appearance", c)
+            if c["name"] == "Alice":
+                self.assertEqual(c["first_appearance"], 1)
+        # dialogue ratio
+        self.assertIn("avg_dialogue_ratio", result)
+        self.assertGreater(result["avg_dialogue_ratio"], 0)
+        self.assertIn("chapter_dialogue", result)
+        # trigger dicts have chapter_indices
+        for t in result["triggers"]:
+            self.assertIn("chapter_indices", t)
