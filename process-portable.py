@@ -765,6 +765,27 @@ def _is_frontmatter_content(text):
             signals += 1
     return signals >= 2
 
+
+def _is_toc_chapter(text):
+    """True if a chapter-sized text block is a table of contents, not prose.
+
+    A ToC is a title list: many short lines, almost no sentence
+    punctuation. Its "content" is other chapters' titles, so feeding it to
+    trope/trigger extraction invents claims from titles (e.g. a chapter
+    titled "Mind Mapping" becoming the Mind Game trope).
+    Conservative: dialogue-heavy prose has short lines but ends them in
+    punctuation/quotes, so it is not flagged.
+    """
+    lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
+    if len(lines) < 12:
+        return False
+    short = sum(1 for l in lines if len(l) < 60)
+    if short / len(lines) < 0.7:
+        return False
+    punct = sum(1 for l in lines
+                if l[-1] in ".!?\"'" "\u201d\u2019" or "," in l or ";" in l)
+    return punct / len(lines) < 0.3
+
 # Chapter-detection fallback flag lives on _DIAG (threading.local) because
 # --jobs runs books in a ThreadPoolExecutor. See _DIAG definition above.
 
@@ -886,7 +907,8 @@ def split_chapters(units):
             clen += len(p)
         if cur:
             out.append(_chapter_part(u, "\n\n".join(cur), part))
-    return [{"index": i, "label": u["label"], "text": u["text"]}
+    return [{"index": i, "label": u["label"], "text": u["text"],
+             "is_toc": _is_toc_chapter(u["text"])}
             for i, u in enumerate(out, 1)]
 
 
@@ -3720,6 +3742,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     """
     n = len(chapters)
     idx_to_label = {c["index"]: c["label"] for c in chapters}
+    # Table-of-contents chapters are title lists, not story content. Their
+    # candidates would be inferred from other chapters' titles, so they are
+    # excluded from trope/trigger evidence collection below.
+    _toc_idx = {c["index"] for c in chapters if c.get("is_toc")}
     _label_to_text = {c["label"]: c.get("text", "") for c in chapters}
     # Extraction coverage: chapters with successful Call B results. Failed
     # chapters are NOT treated as "no content" — frequency denominators use
@@ -3951,6 +3977,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         b = chapter_bs[idx]
         if not b:
             continue
+        if idx in _toc_idx:
+            continue  # ToC chapter: titles, not trigger evidence
         for cat in TRIGGER_CATEGORIES:
             sev = _SEVERITY_ORDER[b["triggers"][cat]]
             if sev > 0:
@@ -4061,8 +4089,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             "evidence": acc["evidence"],
             "evidence_verified": bool(acc["evidence"]),
             "evidence_offered": bool(acc["evidence"]),
-            "confidence": _v2_trigger_confidence(sev, len(acc["chapters"]),
-                                                 len(acc["evidence"])),
+            # No textual evidence -> no real confidence. A "mentioned"
+            # claim with zero quotes must not carry a 0.65-style score.
+            "confidence": (0.0 if not acc["evidence"]
+                           else _v2_trigger_confidence(sev, len(acc["chapters"]),
+                                                      len(acc["evidence"]))),
         })
     if _gated_dropped:
         print(f"  Trigger gate: dropped {_gated_dropped} unsupported claim(s)")
@@ -4101,21 +4132,34 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     trope_candidates = []
     trope_counts = Counter()
     seen_t = set()
+    red_trope_chapters = {}  # display-key -> [chapter labels]; seeded here,
+    # rebuilt with catalog-collapsed keys by the embedding branch below.
     for idx in sorted(chapter_bs):
         b = chapter_bs[idx]
         if not b:
             continue
+        if idx in _toc_idx:
+            continue  # ToC chapter: titles, not trope evidence
+        seen_this_chapter = set()
         for t in b["trope_candidates"]:
             k = _tnorm(t)
-            if not k:
+            if not k or k in seen_this_chapter:
                 continue
+            seen_this_chapter.add(k)
             trope_counts[k] += 1
+            # Chapter-level evidence fallback: the embedding branch below
+            # rebuilds this with catalog-collapsed keys, but without
+            # embeddings this mapping is the only chapter evidence tropes
+            # get. One chapter lists each trope at most once.
+            red_trope_chapters.setdefault(k, []).append(
+                idx_to_label.get(idx, ""))
             if k not in seen_t:
                 seen_t.add(k)
                 trope_candidates.append(_clean_trope(t))
     # Catalog mapping: collapse paraphrases to catalog IDs before tiering.
+    # (red_trope_chapters was seeded by the union loop above; the embedding
+    # branch below rebuilds it with catalog-collapsed keys.)
     catalog_map = {}  # _tnorm(candidate) -> catalog_id (or None if unmapped)
-    red_trope_chapters = {}  # display-key -> [chapter labels], built below
     if trope_candidates and CONFIG.get("embed_url"):
         try:
             catalog = trope_catalog_vectors()
@@ -4138,10 +4182,15 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 names = {ci: cn for ci, cn, _ in catalog}  # catalog_id -> name
                 new_counts, new_candidates, new_seen = Counter(), [], set()
                 new_catalog_map = {}
+                # Rebuild chapter evidence with catalog-collapsed keys,
+                # replacing the candidate-keyed fallback seeded above.
+                red_trope_chapters = {}
                 for idx in sorted(chapter_bs):
                     b = chapter_bs[idx]
                     if not b:
                         continue
+                    if idx in _toc_idx:
+                        continue  # ToC chapter: titles, not trope evidence
                     seen_this_chapter = set()
                     for t in b["trope_candidates"]:
                         k = _tnorm(t)
@@ -4173,7 +4222,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             print(f"  (catalog mapping skipped: {e})")
     # Stash the mapping for write_claims.
     red_catalog_map = {k: v for k, v in catalog_map.items() if v}
-    # red_trope_chapters was built in the recount loop above (empty if skipped).
+    # red_trope_chapters: catalog-collapsed keys when embeddings ran, else
+    # the candidate-keyed fallback seeded by the union loop (never empty
+    # when candidates exist, so trope claims always carry chapter evidence).
 
     # --- Quotes: filtered, ranked by length * distinctiveness, top 5-8 ---
     def _qtokens(s):
@@ -4281,7 +4332,8 @@ Candidate tropes:
 RULES:
 1. "yes" only if a summary clearly supports the trope. "unsure" if plausible but not clearly supported. "no" otherwise.
 2. Every verdict needs a justification citing the chapter number (e.g. "Ch 3").
-3. Do not add tropes that are not in the candidate list."""
+3. Do not add tropes that are not in the candidate list.
+4. Judge ONLY from the summary content, never from a chapter title or heading alone. A trope requires the story to actually contain it — a suggestive title (e.g. "Mind Mapping") is not evidence of the trope."""
 
 
 def _sanitize_v2_gate(r):
@@ -6764,8 +6816,13 @@ def write_claims(work_id, result, trope_mappings=None):
                 continue
             used.add(str(tid).lower())
             _chaps = (result.get("trope_chapters") or {}).get(_tnorm(t), [])
+            _tconf = conf_t.get(_tnorm(t), 0.7)
+            if not _chaps:
+                # No supporting chapters recorded: the claim has no
+                # evidence, so it must not carry real confidence.
+                _tconf = 0.0
             rows.append({"work_id": work_id, "trope_id": tid, "status": "candidate",
-                         "confidence": conf_t.get(_tnorm(t), 0.7),
+                         "confidence": _tconf,
                          "source_type": "ai",
                          "model": model,
                          "evidence": {"source": "ebook-extraction",
@@ -6823,8 +6880,13 @@ def write_claims(work_id, result, trope_mappings=None):
                 continue
             seen.add(str(warn).lower())
             td = t if isinstance(t, dict) else {}
+            _tev = td.get("evidence") or []
+            _tconf = td.get("confidence", 0.7)
+            if not _tev:
+                # No textual evidence -> no real confidence.
+                _tconf = 0.0
             rows.append({"work_id": work_id, "warning": warn, "status": "candidate",
-                         "confidence": td.get("confidence", 0.7),
+                         "confidence": _tconf,
                          "source_type": "ai",
                          "model": model,
                          "evidence": {"source": "ebook-extraction",
