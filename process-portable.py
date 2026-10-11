@@ -6469,7 +6469,87 @@ def _is_multi(name):
     return " and " in f" {norm_name(name)} "
 
 
-def correct_metadata(title, author, identifiers):
+_EDITION_MARKER_RE = re.compile(
+    r"\s*[\(\[][^()\[\]]*(?:unabridged|abridged|dramatized|adaptation|"
+    r"audiobook|audio\s+edition|special\s+edition|deluxe\s+edition|"
+    r"illustrated\s+edition|collector'?s\s+edition|movie\s+tie-?in|"
+    r"film\s+tie-?in|tv\s+tie-?in|large\s+print|\ba\s+novel\b|"
+    r"part\s+\d+(?:\s+of\s+\d+)?|\bbook\s+\d+\b|\bvol(?:ume)?\.?\s*\d+|#\s*\d+)"
+    r"[^()\[\]]*[\)\]]\s*$",
+    re.IGNORECASE)
+
+_GENERIC_SUBTITLE_RE = re.compile(
+    r"\s*:\s*(?:a novel|a thriller|a mystery|a memoir|an autobiography|"
+    r"a biography|a romance|a novella)\.?\s*$",
+    re.IGNORECASE)
+
+
+def _invisible_to_space(s):
+    """Map invisible format chars (zero-width spaces, BOM, word joiners, soft
+    hyphens) to plain spaces and collapse whitespace. Word boundaries stay
+    intact so 'Silver\\u200bFlames' becomes 'Silver Flames', not 'SilverFlames'."""
+    return re.sub(r"\s+", " ", "".join(
+        " " if unicodedata.category(ch) == "Cf" else ch
+        for ch in (s or ""))).strip()
+
+
+def _strip_edition_suffix(title):
+    """Reduce an edition/variant title to its canonical work title.
+
+    Strips trailing bracketed/paren edition markers ("(Part 1 of 2)",
+    "[Dramatized Adaptation]", "(Unabridged)", "(Women of the Otherworld, #1)")
+    and generic ": A Novel"-style subtitles. Real subtitles ("Dune: House
+    Atreides") are untouched. Applied iteratively so stacked suffixes collapse
+    fully.
+    """
+    t = _invisible_to_space(title)
+    while True:
+        stepped = _EDITION_MARKER_RE.sub("", t)
+        stepped = _GENERIC_SUBTITLE_RE.sub("", stepped).strip()
+        if stepped == t:
+            return t
+        t = stepped
+
+
+def _canonical_author(author):
+    """'Last, First' (Calibre-style) -> 'First Last'; otherwise tidy whitespace."""
+    a = _invisible_to_space(author)
+    parts = [p.strip() for p in a.split(",")]
+    if len(parts) == 2 and parts[0] and parts[1]:
+        a = f"{parts[1]} {parts[0]}"
+    return re.sub(r"\s+", " ", a).strip()
+
+
+def _display_title(title):
+    """Consistent stored-title casing. A title with no uppercase letters at all
+    (e.g. 'radicalized') gets word-initial caps, apostrophe-aware ("o'brien"
+    -> "O'Brien"); anything already cased is left untouched so acronyms like
+    'IT' survive."""
+    t = _invisible_to_space(title)
+    if not t or any(ch.isupper() for ch in t):
+        return t
+
+    def _cap_word(w):
+        # "o'brien's" -> "O'Brien's", "don't" -> "Don't", "d'artagnan" -> "D'Artagnan":
+        # capitalize the first segment and any post-apostrophe segment longer
+        # than one char (possessives like 's stay lowercase).
+        segs = w.split("'")
+        out = [segs[0][:1].upper() + segs[0][1:]]
+        out += ["'" + (s[:1].upper() + s[1:] if len(s) > 1 else s)
+                for s in segs[1:]]
+        return "".join(out)
+
+    return " ".join(_cap_word(w) for w in t.split())
+
+
+def _work_key(title, author):
+    """Match key for work resolution: edition suffixes stripped, invisible
+    chars neutralized, author order canonicalized, then norm(). The same book
+    resolves to the same key regardless of which edition was processed."""
+    return norm(_strip_edition_suffix(title)), norm(_canonical_author(author))
+
+
+def _correct_metadata_raw(title, author, identifiers):
     """Cross-check parsed title/author against OpenLibrary via ISBN.
 
     Returns (title, author, corrected: bool). Only overrides when the API
@@ -6519,21 +6599,46 @@ def correct_metadata(title, author, identifiers):
         return title, author, False
 
 
+def correct_metadata(title, author, identifiers):
+    """Cross-check parsed title/author against OpenLibrary via ISBN, then
+    canonicalize the display forms (consistent title casing, 'Last, First' ->
+    'First Last'). Wrapper around _correct_metadata_raw so every return path
+    yields canonical display metadata."""
+    t, a, fixed = _correct_metadata_raw(title, author, identifiers)
+    return _display_title(t), _canonical_author(a), fixed
+
+
 def resolve_work(title, author, identifiers, is_anthology=False, create=True):
     """Return (work_id, how). Resolution order: ISBN -> edition -> work,
-    then exact title/author match. With create=False (preview) never POSTs:
-    how is 'new' when nothing matched."""
+    then provider_ids ISBN -> work (catches re-runs whose title form changed),
+    then exact canonical title/author match. With create=False (preview) never
+    POSTs: how is 'new' when nothing matched.
+
+    Author-name-only titles are refused outright ('author_title'): never
+    matched, never created. Edition suffixes and invisible characters are
+    stripped for both matching and the stored title, so one book maps to one
+    work row.
+    """
     isbn = (identifiers or {}).get("isbn")
     if isbn:
-        rows = sb("editions", params=f"?isbn=eq.{isbn}&select=work_id&limit=1")
+        rows = sb("editions", params=f"?isbn=eq.{quote(isbn, safe='')}&select=work_id&limit=1")
         if rows is None:
             return None, "db_error"
         if rows and rows[0].get("work_id"):
             return rows[0]["work_id"], f"isbn:{isbn}"
-    tn, an = norm(title), norm(author)
+        rows = sb("works",
+                  params=f"?provider_ids->>isbn=eq.{quote(isbn, safe='')}&select=id&limit=1")
+        if rows is None:
+            return None, "db_error"
+        if rows:
+            return rows[0]["id"], f"work_isbn:{isbn}"
+    tn, an = _work_key(title, author)
     if not tn:
         print("  Cannot build a match key from the title; refusing to create a work")
         return None, "no_title"
+    if an and tn == an:
+        print(f"  Refusing work resolution: title is the author name ('{title}')")
+        return None, "author_title"
     rows = sb("works", params=f"?title_norm=eq.{quote(tn, safe='')}"
                               f"&author_norm=eq.{quote(an, safe='')}&select=id&limit=1")
     if rows is None:
@@ -6542,9 +6647,10 @@ def resolve_work(title, author, identifiers, is_anthology=False, create=True):
         return rows[0]["id"], "title_author"
     if not create:
         return None, "new"
+    disp_title, disp_author = _display_title(_strip_edition_suffix(title)), _canonical_author(author)
     rows = sb("works", method="POST", data={
-        "title": title, "title_norm": tn,
-        "authors": [author] if author else [], "author_norm": an,
+        "title": disp_title, "title_norm": tn,
+        "authors": [disp_author] if disp_author else [], "author_norm": an,
         "provider_ids": {"isbn": isbn} if isbn else {},
         "is_anthology": is_anthology,
     })
