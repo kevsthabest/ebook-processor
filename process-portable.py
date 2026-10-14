@@ -8417,6 +8417,50 @@ def _ckpt_json_restore(obj):
     return obj
 
 
+# Roster-entry fields _roster_update produces with non-JSON-native types
+# beyond the four _ckpt_json_restore restores generically. The generic
+# restore cannot cover these: it also walks chapter a/b payloads, which
+# may legitimately carry same-named keys (roles, statuses, alias_keys,
+# descriptions) that must stay plain JSON values.
+_ROSTER_SET_FIELDS = {"alias_keys", "alive_reports", "unresolved_mentions",
+                      "_generic_keys"}
+_ROSTER_COUNTER_FIELDS = {"roles", "statuses"}
+
+
+def _ckpt_restore_roster_entry(entry):
+    """Coerce one checkpoint-rehydrated roster entry back to the
+    producer's canonical field types. Mutates and returns the entry.
+
+    _ckpt_json_safe turns sets into sorted lists, Counters into dicts,
+    and description tuples into lists; _ckpt_json_restore only undoes
+    the four generic set fields. Left as JSON values, a resumed roster
+    crashed _merge_roster_entries (roles: dict += Counter -> TypeError)
+    and would crash v2_reduce instead on statuses.most_common(1) in a
+    merge-free resumed run; statuses merged via Counter.update(dict)
+    also silently replaced counts instead of summing. Only fields that
+    are present AND still of the JSON type are coerced — nothing is
+    invented. death_reports / appearances_desc are lists by design and
+    stay lists; descriptions stays a list, its 3-element entries
+    (chapter, text, has_evidence) become tuples again so the
+    description selectors see the shape _roster_update appended.
+    """
+    if not isinstance(entry, dict):
+        return entry
+    for k in _ROSTER_SET_FIELDS:
+        if isinstance(entry.get(k), list):
+            entry[k] = set(entry[k])
+    for k in _ROSTER_COUNTER_FIELDS:
+        if isinstance(entry.get(k), dict) \
+                and not isinstance(entry[k], Counter):
+            entry[k] = Counter(entry[k])
+    descs = entry.get("descriptions")
+    if isinstance(descs, list):
+        entry["descriptions"] = [
+            tuple(d) if isinstance(d, list) and len(d) == 3 else d
+            for d in descs]
+    return entry
+
+
 def _checkpoint_save_meta(book_key, total_chapters):
     d = _checkpoint_dir(book_key)
     d.mkdir(parents=True, exist_ok=True)
@@ -8453,6 +8497,11 @@ def _checkpoint_load(book_key):
     rp = d / "roster.json"
     if rp.is_file():
         roster = _ckpt_json_restore(json.load(open(rp, encoding="utf-8")))
+        if isinstance(roster, dict):
+            # Roster-scoped: chapter a/b payloads below share
+            # _ckpt_json_restore but must NOT get Counter/tuple coercion.
+            for _entry in roster.values():
+                _ckpt_restore_roster_entry(_entry)
     chapters = {}
     for cp in sorted(d.glob("chapter_*.json")):
         try:
