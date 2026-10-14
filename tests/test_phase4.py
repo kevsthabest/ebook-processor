@@ -4511,34 +4511,11 @@ class TestCheckpoints(unittest.TestCase):
         json.dumps(safe)  # must not raise
 
 
-class TestRetryFailed(unittest.TestCase):
-    """P9: --retry-failed identifies failed chapters."""
-
-    def _preview(self, chapters):
-        return {"file": "TestBook.epub", "title": "TestBook",
-                "chapter_data": {"chapters": chapters, "roster": {}}}
-
-    def test_identifies_failed(self):
-        # Chapters 0,2 ok; 1 failed B; 3 failed A.
-        chapters = {
-            "0": {"a": {"x": 1}, "b": {"y": 1}},
-            "1": {"a": {"x": 1}, "b": None},
-            "2": {"a": {"x": 1}, "b": {"y": 1}},
-            "3": {"a": None, "b": None},
-        }
-        failed = sorted(int(k) for k, v in chapters.items()
-                        if v.get("a") is None or v.get("b") is None)
-        self.assertEqual(failed, [1, 3])
-
-    def test_no_chapter_data(self):
-        result = {"file": "x.epub", "title": "x"}
-        self.assertEqual((result.get("chapter_data") or {}).get("chapters"), None)
-
-    def test_all_ok(self):
-        chapters = {"0": {"a": {"x": 1}, "b": {"y": 1}}}
-        failed = [int(k) for k, v in chapters.items()
-                  if v.get("a") is None or v.get("b") is None]
-        self.assertEqual(failed, [])
+# NOTE: the old TestRetryFailed class was removed (QA-scout remediation,
+# 2026-10-14). Its three tests never called production code — they
+# re-implemented the failed-chapter detection inline and asserted the
+# fixture's own values. Coverage of the real cmd_retry_failed now lives
+# in tests/test_dispatch.py (TestCmdRetryFailed).
 
 
 class TestMetadataImprovements(unittest.TestCase):

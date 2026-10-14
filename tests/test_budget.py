@@ -89,16 +89,75 @@ class TestBudgetPriority(unittest.TestCase):
 
 
 class TestBudgetExhaustionNote(unittest.TestCase):
-    """The 'budget_exhausted' validation note is set when starved."""
+    """The 'budget_exhausted' validation note is set when starved.
 
-    def test_note_value(self):
-        # The sentinel string used when validation can't claim budget
-        # (set in v2_reduce relationship validation loop)
-        self.assertEqual("budget_exhausted", "budget_exhausted")
-        # Verify the code path exists: search for the literal in source
-        import inspect
-        src = inspect.getsource(pp)
-        self.assertIn('"budget_exhausted"', src)
+    Behavioural (QA-scout remediation, 2026-10-14): drives the real
+    v2_reduce family-validation loop with a stub validator. Replaces the
+    old tautological test, which asserted
+    "budget_exhausted" == "budget_exhausted" plus a source-string
+    search; the source-presence check was dropped — once the behaviour
+    is pinned end-to-end it adds nothing.
+    """
+
+    def setUp(self):
+        self._old_validator = pp._DECISION_VALIDATOR
+        pp._dm_budget_reset()
+        self.calls = []
+
+        outer = self
+
+        class StubValidator:
+            model = "stub"
+
+            def validate_relationship(self, frm, to, rtype, quote,
+                                      context=""):
+                outer.calls.append((frm, to, rtype))
+                return True, 0.95
+
+        pp._DECISION_VALIDATOR = StubValidator()
+
+    def tearDown(self):
+        pp._DECISION_VALIDATOR = self._old_validator
+        pp._dm_budget_reset()
+
+    @staticmethod
+    def _reduce_spouse():
+        chs = [{"index": 1, "label": "A", "text": "x " * 200},
+               {"index": 2, "label": "B", "text": "x " * 200}]
+        chapter_as = {1: {"characters": [],
+                          "task_status": {"identity": "ok"},
+                          "relationships": [{
+                              "from": "Alice", "to": "Bob",
+                              "type": "spouse",
+                              "evidence": "my wife Alice"}]}}
+        return pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
+
+    def test_starved_validation_notes_budget_exhausted(self):
+        # Exhaust the shared per-book budget (merges claim first in a
+        # real run; here the pool is simply drained before reduce).
+        for _ in range(pp._MERGE_TIER3_CAP):
+            self.assertTrue(pp._dm_budget_claim(1))
+        self.assertFalse(pp._dm_budget_claim(1))
+        red = self._reduce_spouse()
+        self.assertEqual(len(red["relationships"]), 1)
+        rel = red["relationships"][0]
+        # The note lands, the ORIGINAL type survives unvalidated, and
+        # the validator was never consulted.
+        self.assertEqual(rel["validation_note"], "budget_exhausted")
+        self.assertEqual(rel["type"], "spouse")
+        self.assertNotIn("validation_p", rel)
+        self.assertEqual(self.calls, [])
+
+    def test_available_budget_validates_normally(self):
+        # Contrast: with budget available the same input validates —
+        # the note above is specifically about starvation.
+        red = self._reduce_spouse()
+        self.assertEqual(len(red["relationships"]), 1)
+        rel = red["relationships"][0]
+        self.assertEqual(self.calls, [("Alice", "Bob", "spouse")])
+        self.assertEqual(rel["validation_p"], 0.95)
+        self.assertEqual(rel["validation_note"], "kept")
+        self.assertEqual(rel["type"], "spouse")
 
 
 if __name__ == "__main__":

@@ -335,9 +335,7 @@ name → canonical name), `titles.json` (trusted title prefixes),
 `~/workspace/ebook-import/`; `overnight-watch.sh` runs unattended batch
 runs. `label-merges.py` hand-labels merge pairs for `--import-labels`,
 `evaluate-merges.py` scores the tiered merge against those labels,
-`dedupe-prototype.py` prototypes the embedding dedup, and the `prototype-*`
-scripts explore experimental paths before they land in
-`process-portable.py`.
+`dedupe-prototype.py` prototypes the embedding dedup.
 
 ## Aborted runs still save a preview
 

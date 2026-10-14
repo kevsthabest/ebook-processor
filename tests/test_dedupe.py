@@ -271,9 +271,35 @@ class TestDedupeThresholdConfig(unittest.TestCase):
         self.assertEqual(thr, 0.85)
 
     def test_threshold_boundary(self):
-        # At exactly 0.85, a 0.85 cosine merges (>= semantics)
-        self.assertTrue(0.85 >= 0.85)
-        self.assertFalse(0.849 >= 0.85)
+        # Behavioural (QA-scout remediation, 2026-10-14): drive the REAL
+        # comparison in dedupe_characters (_cos(vec_i, vec_j) >= thr)
+        # with embeddings stubbed at the embed_vectors boundary.
+        # Replaces the old literal asserts (0.85 >= 0.85), which tested
+        # Python's operator, not the code.
+        def run(cosine):
+            chars = [
+                {"name": "Jonathan Pryce", "description": "a knight",
+                 "confidence": 0.9},
+                {"name": "Jon Pryce", "description": "a knight",
+                 "confidence": 0.8},
+            ]
+            # Unit vectors with the requested cosine against [1, 0].
+            vecs = [[1.0, 0.0],
+                    [cosine, math.sqrt(1 - cosine * cosine)]]
+            with patch.dict(pp.CONFIG, {"dedupe_threshold": 0.85}), \
+                    patch.object(pp, "embed_vectors", return_value=vecs):
+                out, _rels, _povs, report = pp.dedupe_characters(
+                    chars, [], [])
+            return out, report
+
+        # At exactly the 0.85 threshold, the pair merges (>= semantics).
+        out, report = run(0.85)
+        self.assertEqual([c["name"] for c in out], ["Jonathan Pryce"])
+        self.assertEqual(report[0]["merged"], ["Jon Pryce"])
+        # Just below it (0.849), the pair stays separate.
+        out, report = run(0.849)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(report, [])
 
 
 if __name__ == "__main__":
