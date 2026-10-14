@@ -6528,9 +6528,17 @@ def cmd_retry_failed(preview_path):
     _checkpoint_save_roster(book_key, roster)
     for k, v in chapters.items():
         idx = int(k)
-        if idx in failed:
-            continue
-        _checkpoint_save_chapter(book_key, idx, v.get("a"), v.get("b"))
+        if idx not in failed:
+            _checkpoint_save_chapter(book_key, idx, v.get("a"), v.get("b"))
+        elif v.get("a") is not None:
+            # Call A succeeded but Call B failed. The roster seeded
+            # above is the FINAL roster — it already contains this
+            # chapter's Call A fold, and _roster_update is explicitly
+            # non-idempotent. Seed the saved A (with b=None) so the
+            # resume guard in process_file_v2 reuses it instead of
+            # re-running Call A and double-counting the chapter's
+            # appearances in the retried preview.
+            _checkpoint_save_chapter(book_key, idx, v.get("a"), None)
     # Resume mode + retried output name. Force preview (no DB writes).
     CONFIG["resume"] = True
     CONFIG["preview_name_suffix"] = "_retried"
@@ -7519,13 +7527,20 @@ def _delete_processor_claims(table, work_id):
     The source_type condition is on every DELETE; claims tables also
     carry status=neq.rejected AND status=neq.confirmed (PostgREST ANDs
     repeated column filters) so human curation state — rejections and
-    confirmations alike — is never removed.
+    confirmations alike — is never removed. A third exclusion,
+    status=neq. (empty value), keeps the DELETE consistent with
+    _partition_claims: the partition preserves ''-status processor rows,
+    but a plain neq.rejected/neq.confirmed pair MATCHES '' in PostgREST
+    (only NULL is unmatched by neq), so without it a preserved ''-status
+    row was deleted while its key stayed in the skip set — deleted and
+    never re-inserted. NULL-status rows are unaffected either way (no
+    neq filter matches NULL).
     Returns the number of rows deleted, or None on error."""
     src = _CLAIM_TABLES[table]["source"]
     params = (f"?work_id=eq.{quote(str(work_id), safe='')}"
               f"&source_type=eq.{src}")
     if table != "book_quotes":
-        params += "&status=neq.rejected&status=neq.confirmed"
+        params += "&status=neq.rejected&status=neq.confirmed&status=neq."
     gone = sb(table, method="DELETE", params=params)
     return None if gone is None else len(gone)
 
@@ -7777,34 +7792,38 @@ def write_claims(work_id, result, trope_mappings=None):
             else:
                 wrote["tropes"] = len(rows)
 
-    # Unmapped tropes -> trope_proposals (with book provenance).
-    if unmatched:
-        _all_keys, _own = _proposal_state(result)
-        if _all_keys is None:
-            errors += 1
-        else:
-            _own_pending = {r["name_key"] for r in _own
-                            if (r.get("status") or "pending") == "pending"}
-            preserved_rej += sum(1 for r in _own
-                                 if (r.get("status") or "") == "rejected")
-            prop_rows = _build_proposal_rows(
-                result, unmatched, _all_keys - _own_pending)
-            _ok = True
-            if _own_pending:
-                _gone_rows = sb(
-                    "trope_proposals", method="DELETE",
-                    params=f"?book_key=eq.{quote(str(result.get('isbn') or result.get('title', '')), safe='')}"
-                           f"&status=eq.pending&{_proposal_scope()}")
-                if _gone_rows is None:
-                    errors += 1
-                    _ok = False
-                else:
-                    deleted["proposals"] = len(_gone_rows)
-            if _ok and prop_rows:
-                if sb("trope_proposals", method="POST", data=prop_rows) is None:
-                    errors += 1
-                else:
-                    wrote["proposals"] = len(prop_rows)
+    # Unmapped tropes -> trope_proposals (with book provenance). Runs
+    # unconditionally, like the other sections: a reprocess where every
+    # trope now maps (unmatched empty) must still replace away this
+    # work's own pending proposals from earlier runs — zero new rows is
+    # a valid insert set. Human-reviewed and foreign-proposer rows are
+    # outside the delete scope and survive exactly.
+    _all_keys, _own = _proposal_state(result)
+    if _all_keys is None:
+        errors += 1
+    else:
+        _own_pending = {r["name_key"] for r in _own
+                        if (r.get("status") or "pending") == "pending"}
+        preserved_rej += sum(1 for r in _own
+                             if (r.get("status") or "") == "rejected")
+        prop_rows = _build_proposal_rows(
+            result, unmatched, _all_keys - _own_pending)
+        _ok = True
+        if _own_pending:
+            _gone_rows = sb(
+                "trope_proposals", method="DELETE",
+                params=f"?book_key=eq.{quote(str(result.get('isbn') or result.get('title', '')), safe='')}"
+                       f"&status=eq.pending&{_proposal_scope()}")
+            if _gone_rows is None:
+                errors += 1
+                _ok = False
+            else:
+                deleted["proposals"] = len(_gone_rows)
+        if _ok and prop_rows:
+            if sb("trope_proposals", method="POST", data=prop_rows) is None:
+                errors += 1
+            else:
+                wrote["proposals"] = len(prop_rows)
 
     # Triggers
     _gstate = _claim_rows("book_trigger_claims", work_id)
@@ -7929,37 +7948,49 @@ def write_claims(work_id, result, trope_mappings=None):
         isbn = result.get("isbn")
         if isbn:
             existing = sb("book_meta", params=f"?isbn=eq.{isbn}&select=data")
-            merged = dict(existing[0]["data"]) if existing and existing[0].get("data") else {}
-            merged.update(meta_updates)
-            # POST with upsert (merge-duplicates required for on_conflict)
-            r = sb("book_meta", method="POST",
-                   params="?on_conflict=isbn",
-                   data={"isbn": isbn, "data": merged},
-                   prefer="resolution=merge-duplicates")
-            if r is None:
+            if existing is None:
+                # sb() returns None on ANY error — falsy exactly like an
+                # empty result ([]), but the two are not interchangeable
+                # here: book_meta.data is a shared per-ISBN merge store,
+                # and merging this run's updates into an empty dict and
+                # upserting would REPLACE the stored blob, discarding
+                # every other contributor's keys. Abort this book's
+                # book_meta update instead and count the failure.
                 errors += 1
+            else:
+                merged = dict(existing[0]["data"]) if existing and existing[0].get("data") else {}
+                merged.update(meta_updates)
+                # POST with upsert (merge-duplicates required for on_conflict)
+                r = sb("book_meta", method="POST",
+                       params="?on_conflict=isbn",
+                       data={"isbn": isbn, "data": merged},
+                       prefer="resolution=merge-duplicates")
+                if r is None:
+                    errors += 1
 
-    # Quotes -> book_quotes (3-5 memorable per book, no speaker attribution yet)
-    if result.get("quotes"):
-        _qstate = _claim_rows("book_quotes", work_id)
-        if _qstate is None:
-            errors += 1
-        else:
-            _preserved, _rejected, _ndel = _partition_claims("book_quotes", _qstate)
-            qrows = _build_quote_rows(work_id, result, _preserved)
-            _ok = True
-            if _ndel:
-                _gone = _delete_processor_claims("book_quotes", work_id)
-                if _gone is None:
-                    errors += 1
-                    _ok = False
-                else:
-                    deleted["quotes"] = _gone
-            if _ok and qrows:
-                if sb("book_quotes", method="POST", data=qrows) is None:
-                    errors += 1
-                else:
-                    wrote["quotes"] = len(qrows)
+    # Quotes -> book_quotes (3-5 memorable per book, no speaker
+    # attribution yet). Runs unconditionally, like the other sections:
+    # a reprocess that now yields zero quotes must still delete this
+    # work's stale pipeline quotes — zero rows is a valid insert set.
+    _qstate = _claim_rows("book_quotes", work_id)
+    if _qstate is None:
+        errors += 1
+    else:
+        _preserved, _rejected, _ndel = _partition_claims("book_quotes", _qstate)
+        qrows = _build_quote_rows(work_id, result, _preserved)
+        _ok = True
+        if _ndel:
+            _gone = _delete_processor_claims("book_quotes", work_id)
+            if _gone is None:
+                errors += 1
+                _ok = False
+            else:
+                deleted["quotes"] = _gone
+        if _ok and qrows:
+            if sb("book_quotes", method="POST", data=qrows) is None:
+                errors += 1
+            else:
+                wrote["quotes"] = len(qrows)
 
     _tot_del = sum(deleted.values())
     _tot_new = sum(wrote.values())
@@ -8002,18 +8033,20 @@ def plan_replace(work_id, result, trope_mappings=None):
         work_id, result, _cat, trope_mappings, model, _preserved)
     plan["would_insert"]["tropes"] = len(_rows)
 
-    if unmatched:
-        _all_keys, _own = _proposal_state(result)
-        if _all_keys is None:
-            return {}
-        _own_pending = {r["name_key"] for r in _own
-                        if (r.get("status") or "pending") == "pending"}
-        plan["would_delete"]["trope_proposals"] = len(_own_pending)
-        plan["existing"] += len(_own)
-        plan["rejections_preserved"] += sum(
-            1 for r in _own if (r.get("status") or "") == "rejected")
-        plan["would_insert"]["proposals"] = len(_build_proposal_rows(
-            result, unmatched, _all_keys - _own_pending))
+    # Mirrors write_claims: the proposals replace is unconditional,
+    # so the plan counts own pending proposals even when this run's
+    # unmatched list is empty.
+    _all_keys, _own = _proposal_state(result)
+    if _all_keys is None:
+        return {}
+    _own_pending = {r["name_key"] for r in _own
+                    if (r.get("status") or "pending") == "pending"}
+    plan["would_delete"]["trope_proposals"] = len(_own_pending)
+    plan["existing"] += len(_own)
+    plan["rejections_preserved"] += sum(
+        1 for r in _own if (r.get("status") or "") == "rejected")
+    plan["would_insert"]["proposals"] = len(_build_proposal_rows(
+        result, unmatched, _all_keys - _own_pending))
 
     _gstate = _claim_rows("book_trigger_claims", work_id)
     if _gstate is None:
@@ -8036,15 +8069,16 @@ def plan_replace(work_id, result, trope_mappings=None):
     plan["would_insert"]["characters"] = len(
         _build_character_rows(work_id, result, _rel_map, _preserved))
 
-    if result.get("quotes"):
-        _qstate = _claim_rows("book_quotes", work_id)
-        if _qstate is None:
-            return {}
-        _preserved, _rejected, _ndel = _partition_claims("book_quotes", _qstate)
-        plan["would_delete"]["book_quotes"] = _ndel
-        plan["existing"] += len(_qstate)
-        plan["would_insert"]["quotes"] = len(
-            _build_quote_rows(work_id, result, _preserved))
+    # Mirrors write_claims: the quotes replace is unconditional, so
+    # the plan counts stale pipeline quotes even for a zero-quote run.
+    _qstate = _claim_rows("book_quotes", work_id)
+    if _qstate is None:
+        return {}
+    _preserved, _rejected, _ndel = _partition_claims("book_quotes", _qstate)
+    plan["would_delete"]["book_quotes"] = _ndel
+    plan["existing"] += len(_qstate)
+    plan["would_insert"]["quotes"] = len(
+        _build_quote_rows(work_id, result, _preserved))
     return plan
 
 
@@ -8242,6 +8276,68 @@ def dedupe_characters(characters, relationships, povs):
             (characters[i].get("description") or "" for i in members), key=len)
         merged["confidence"] = max(characters[i].get("confidence") or 0
                                    for i in members)
+        # Union the dropped members' fields into the canonical character
+        # instead of silently discarding them (previously the merged
+        # character kept only the canonical member's aliases, appearance
+        # counts, first appearance, status and POV flag, so the write
+        # path and the principals filter saw a partial character).
+        # Mirrors _merge_roster_entries where the shapes allow; each
+        # field is only written when at least one member carries it, so
+        # leaner character shapes (e.g. legacy sanitize output) gain no
+        # invented keys.
+        def _union_list(field):
+            out = []
+            for i in members:
+                for v in characters[i].get(field) or []:
+                    if v not in out:
+                        out.append(v)
+            return out
+
+        if any("aliases" in characters[i] for i in members):
+            _aliases = _union_list("aliases")
+            # A merged member's name is another name for the canonical
+            # character (the roster merge preserves dropped primaries
+            # the same way, in primary_keys/alias_keys).
+            for i in members:
+                if i != canon_idx and names[i] and names[i] not in _aliases:
+                    _aliases.append(names[i])
+            merged["aliases"] = _aliases
+        if any("unresolved_mentions" in characters[i] for i in members):
+            merged["unresolved_mentions"] = _union_list("unresolved_mentions")
+        # Appearances are mention counts — additive, summed like the
+        # roster merge sums them.
+        for field in ("appearances", "mention_count"):
+            if any(field in characters[i] for i in members):
+                merged[field] = sum(characters[i].get(field) or 0
+                                    for i in members)
+        # Chapter counts cannot be summed (members may share chapters
+        # and the dicts carry no chapter set to union — the shape
+        # differs from roster entries): take the max, the union's
+        # lower bound, rather than overstating presence.
+        for field in ("chapters_present", "chapter_count"):
+            if any(field in characters[i] for i in members):
+                merged[field] = max(characters[i].get(field) or 0
+                                    for i in members)
+        for field in ("first_appearance_chapter", "first_appearance"):
+            _vals = [characters[i].get(field) for i in members
+                     if characters[i].get(field) is not None]
+            if _vals:
+                merged[field] = min(_vals)
+        if any("is_pov" in characters[i] for i in members):
+            merged["is_pov"] = any(characters[i].get("is_pov")
+                                    for i in members)
+        # Sticky death (the reduce's rule): a member reported dead
+        # keeps the merged character dead.
+        if any(characters[i].get("status") == "dead" for i in members):
+            merged["status"] = "dead"
+        if any("appearance" in characters[i] for i in members):
+            merged["appearance"] = max(
+                (characters[i].get("appearance") or "" for i in members),
+                key=len)
+        if any("evidence" in characters[i] for i in members):
+            merged["evidence"] = max(
+                (characters[i].get("evidence") or "" for i in members),
+                key=len)
         for i in members:
             canon_of[i] = canon_name
         new_chars.append(merged)
@@ -8277,7 +8373,16 @@ def dedupe_characters(characters, relationships, povs):
         key = (a.lower(), b.lower(), t.lower())
         if key not in seen:
             seen.add(key)
-            new_rels.append({"from": a, "to": b, "type": t})
+            # Remap the endpoints on the FULL relationship dict: every
+            # other key (evidence, evidence_source, confidence, ...)
+            # is preserved verbatim. Reducing the dict to just
+            # {from, to, type} here made every relationship look
+            # evidence-less to the write path, which then wrote none
+            # of them — a dedupe run silently shipped zero embedded
+            # relationships even when zero clusters merged.
+            _nr = dict(r)
+            _nr["from"], _nr["to"], _nr["type"] = a, b, t
+            new_rels.append(_nr)
     if _n_self_dropped:
         print(f"  Dedup: dropped {_n_self_dropped} self-relationship(s) "
               f"created by remapping")

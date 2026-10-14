@@ -219,13 +219,18 @@ class TestCmdRetryFailed(_ConfigGuard):
         self.assertNotIn("preview_name_suffix", pp.CONFIG)
         self.assertNotIn("resume_force", pp.CONFIG)
         self.assertTrue(pp.CONFIG.get("resume"))
-        # Checkpoints were seeded with the SUCCESSFUL chapters only.
+        # Checkpoints were seeded with the successful chapters, plus
+        # the saved Call A of chapter 1 (A ok / B failed): the seeded
+        # roster is the final roster and already contains chapter 1's
+        # A fold, so the resume guard must reuse the saved A instead of
+        # re-folding it (sweep F5). Chapter 3 (A failed) stays unseeded.
         loaded = pp._checkpoint_load(self.book_key)
         self.assertIsNotNone(loaded)
         meta, saved_roster, saved = loaded
         self.assertEqual(meta["total_chapters"], 4)
-        self.assertEqual(sorted(saved), [0, 2])
+        self.assertEqual(sorted(saved), [0, 1, 2])
         self.assertEqual(saved[0], ({"x": 1}, {"y": 1}))
+        self.assertEqual(saved[1], ({"x": 1}, None))
         self.assertEqual(saved[2], ({"x": 2}, {"y": 2}))
         self.assertEqual(saved_roster, roster)
 
