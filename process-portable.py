@@ -3846,6 +3846,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     # Exclusive types resolve by precedence; non-exclusive kept as extras w/ evidence.
     _pair_cands = {}    # unordered (a, b) -> list of candidate dicts
     _pair_chapters = {}  # unordered (a, b) -> set of chapter indices
+    _self_pairs_extracted = 0  # LLM emitted from == to verbatim
+    _self_pairs_remapped = 0   # canonical remap collapsed a real pair
     # Author filter: the book's author is never a character, so relationships
     # naming the author are dropped here (the roster filter only covers the
     # character list; relationship endpoints bypass it via _roster_canonical).
@@ -3859,8 +3861,17 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             to = _roster_canonical(roster, r["to"])
             if _rel_involves_author({"from": frm, "to": to}, _book_author):
                 continue
-            # Self-relationship guard (after canonicalisation)
+            # Self-relationship guard (after canonicalisation). The origin
+            # is counted: "extracted" pairs were emitted from == to by the
+            # LLM, but "remapped" pairs named a real second person whose
+            # name/alias canonicalised onto the first character — a real
+            # relationship is being eaten, which is a roster-alias problem,
+            # not an extraction one (see the field-leakage audit).
             if norm_name(frm) == norm_name(to):
+                if norm_name(r["from"]) == norm_name(r["to"]):
+                    _self_pairs_extracted += 1
+                else:
+                    _self_pairs_remapped += 1
                 continue
             rtype = r["type"]
             _pair_key = tuple(sorted([frm.lower(), to.lower()]))
@@ -3873,6 +3884,12 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 "chapter": idx_to_label.get(idx, ""),
                 "_idx": idx,
             })
+
+    if _self_pairs_extracted or _self_pairs_remapped:
+        print(f"  Self-relationship guard: dropped "
+              f"{_self_pairs_extracted + _self_pairs_remapped} self-pair(s) "
+              f"({_self_pairs_extracted} extracted, "
+              f"{_self_pairs_remapped} created by canonical remap)")
 
     relationships = []
     _CONF_RANK = {"high": 0, "medium": 1, "low": 2}
@@ -4132,6 +4149,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     trope_candidates = []
     trope_counts = Counter()
     seen_t = set()
+    _pov_tropes_dropped = set()  # _tnorm keys of POV labels filtered out
     red_trope_chapters = {}  # display-key -> [chapter labels]; seeded here,
     # rebuilt with catalog-collapsed keys by the embedding branch below.
     for idx in sorted(chapter_bs):
@@ -4144,6 +4162,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         for t in b["trope_candidates"]:
             k = _tnorm(t)
             if not k or k in seen_this_chapter:
+                continue
+            if _is_pov_trope_label(t):
+                # POV metadata, not a trope: never counted, never a
+                # candidate, so it cannot reach the gate or proposals.
+                _pov_tropes_dropped.add(k)
                 continue
             seen_this_chapter.add(k)
             trope_counts[k] += 1
@@ -4196,6 +4219,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                         k = _tnorm(t)
                         if not k:
                             continue
+                        if _is_pov_trope_label(t):
+                            continue  # filtered in the union loop above
                         cid = catalog_map.get(k)
                         shown = names.get(cid) if cid else None
                         shown = shown or _clean_trope(t)
@@ -4220,6 +4245,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 print(f"  Trope catalog mapping: {n_mapped} mapped, {n_unmapped} unmapped")
         except Exception as e:
             print(f"  (catalog mapping skipped: {e})")
+    if _pov_tropes_dropped:
+        print(f"  Trope filter: dropped {len(_pov_tropes_dropped)} "
+              f"POV label(s) from trope candidates")
     # Stash the mapping for write_claims.
     red_catalog_map = {k: v for k, v in catalog_map.items() if v}
     # red_trope_chapters: catalog-collapsed keys when embeddings ran, else
@@ -4290,6 +4318,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         "characters": characters,
         "relationships": relationships,
         "dropped_relationships": _dropped_relationships,
+        "self_pairs_dropped": {"extracted": _self_pairs_extracted,
+                               "remapped": _self_pairs_remapped},
         "triggers": triggers,
         "trigger_chapters": _trigger_chapters_map(triggers),
         "spice_level": spice_level,
@@ -6450,6 +6480,21 @@ def _clean_trope(t):
     return re.sub(r"\s+", " ", (t or "").replace("_", " ")).strip()
 
 
+def _is_pov_trope_label(label):
+    """True when a trope label is really POV metadata ("Xaden's POV",
+    "POV: Xaden", "Villain POV", "Dual POV"). POV belongs in the povs
+    list, never in tropes — these labels leak out of chapter extraction
+    and must not survive into final tropes or trope proposals.
+
+    Token check on the punctuation-stripped form (norm): only a
+    standalone "pov"/"povs" token counts. Deliberate: a catalogued
+    "Point of View" label has no such token and survives — it names
+    a narrative technique, not a per-character POV tag. Substrings
+    do not count either ("Poverty" is not a POV label).
+    """
+    return any(tok in ("pov", "povs") for tok in norm(label).split())
+
+
 _MALE_TOKENS = {"mr", "master", "sir", "lord", "king", "father", "dad",
                 "daddy", "papa", "husband", "son", "boy", "brother",
                 "uncle", "nephew", "grandfather", "grandpa", "groom",
@@ -7251,6 +7296,10 @@ def dedupe_characters(characters, relationships, povs):
     new_rels, seen = [], set()
     for r in relationships:
         a, b, t = remap(r["from"]), remap(r["to"]), r["type"]
+        # Remap guard: merging two characters who had a relationship
+        # between them must not create a self-pair in the output.
+        if norm_name(a) == norm_name(b):
+            continue
         key = (a.lower(), b.lower(), t.lower())
         if key not in seen:
             seen.add(key)
@@ -7869,6 +7918,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "triggers": red["triggers"], "characters": red["characters"],
         "relationships": red["relationships"],
         "dropped_relationships": red.get("dropped_relationships", []),
+        "self_pairs_dropped": red.get("self_pairs_dropped",
+                                      {"extracted": 0, "remapped": 0}),
         "spice_level": red["spice_level"],
         "povs": red["povs"], "quotes": red["quotes"],
         "chapter_summaries": red["chapter_summaries"],
@@ -8202,6 +8253,11 @@ def process_file(fpath, dry_run=False, preview=False):
             # relationships naming the author are dropped.
             if _rel_involves_author(rel, author):
                 continue
+            # Self-relationship guard: a character cannot have a
+            # relationship with themselves (same backstop as v2_reduce
+            # and the dedupe remap).
+            if norm_name(rel["from"]) == norm_name(rel["to"]):
+                continue
             k = (rel["from"].lower(), rel["to"].lower(), rel["type"].lower())
             if k not in rel_seen:
                 rel_seen.add(k)
@@ -8232,6 +8288,13 @@ def process_file(fpath, dry_run=False, preview=False):
     min_hits = 2 if ok >= 4 else 1
     tropes = sorted(_clean_trope(trope_name[k]) for k, h in trope_hits.items() if h >= min_hits)
     trope_conf = {k: _confidence(h, ok) for k, h in trope_hits.items() if h >= min_hits}
+    # POV labels are not tropes (same filter as the v2 candidate path).
+    _pov_dropped = [t for t in tropes if _is_pov_trope_label(t)]
+    if _pov_dropped:
+        tropes = [t for t in tropes if not _is_pov_trope_label(t)]
+        trope_conf = {k: v for k, v in trope_conf.items()
+                      if not _is_pov_trope_label(k)}
+        print(f"  Trope filter: dropped {len(_pov_dropped)} POV label(s)")
     # Rejection learning (same as v2): denylist + raised thresholds.
     if tropes:
         tropes, trope_conf, _v1_rej = _apply_trope_rejections(
