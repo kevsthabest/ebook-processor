@@ -621,5 +621,102 @@ class TestNullStatusPreserved(_ReplaceBase):
         self.assertEqual(fake.mutating_calls(), [])
 
 
+class TestConfirmedPreservation(_ReplaceBase):
+    """Decision (A), approved 2026-10-14: a claim a human reviewed and
+    confirmed is curation state exactly like a rejection, with the
+    opposite sign. On reprocess a status='confirmed' processor row must
+    survive untouched — never deleted, and the new run must not insert
+    a fresh 'candidate' copy of the same claim over it."""
+
+    def test_confirmed_claims_not_deleted_not_reinserted(self):
+        fake = self.install(_StatefulSB({
+            "book_trope_claims": [
+                {"id": 1, "work_id": 1, "trope_id": "cat-c",
+                 "status": "confirmed", "source_type": "ai"},
+                {"id": 2, "work_id": 1, "trope_id": "cat-old",
+                 "status": "candidate", "source_type": "ai"}],
+            "book_trigger_claims": [
+                {"id": 3, "work_id": 1, "warning": "murder",
+                 "status": "confirmed", "source_type": "ai"}],
+            "book_characters": [
+                {"id": 4, "work_id": 1, "name": "Confirmed Char",
+                 "status": "confirmed", "source_type": "ai",
+                 "appearance": "x", "vitality": "alive", "aliases": ["CC"],
+                 "first_appearance_chapter": 1}],
+        }))
+        res = _result(
+            tropes=["Mind Game"],
+            trope_chapters={pp._tnorm("Mind Game"): ["Ch 1"]},
+            triggers=[_trig("murder")],
+            characters=[{"name": "Confirmed Char", "role": "minor"}],
+        )
+        errors = pp.write_claims(1, res, trope_mappings={"Mind Game": "cat-c"})
+        self.assertEqual(errors, 0)
+
+        # The confirmed trope row is the ONLY cat-c row, still confirmed —
+        # not deleted, not duplicated by a fresh candidate.
+        rows = [r for r in fake.tables["book_trope_claims"]
+                if r["trope_id"] == "cat-c"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], 1)
+        self.assertEqual(rows[0]["status"], "confirmed")
+        # An un-curated stale processor row WAS replaced as before.
+        self.assertNotIn("cat-old",
+                         [r["trope_id"] for r in fake.tables["book_trope_claims"]])
+        # Confirmed trigger and character likewise survive alone.
+        trigs = fake.tables["book_trigger_claims"]
+        self.assertEqual(len(trigs), 1)
+        self.assertEqual(trigs[0]["id"], 3)
+        self.assertEqual(trigs[0]["status"], "confirmed")
+        chars = fake.tables["book_characters"]
+        self.assertEqual(len(chars), 1)
+        self.assertEqual(chars[0]["id"], 4)
+        self.assertEqual(chars[0]["status"], "confirmed")
+        # Every claims-table DELETE excludes confirmed alongside rejected.
+        for tbl in ("book_trope_claims", "book_trigger_claims",
+                    "book_characters"):
+            for _t, _m, params, _d in fake.deletes_for(tbl):
+                self.assertIn("status=neq.rejected", params)
+                self.assertIn("status=neq.confirmed", params)
+
+    def test_plan_counts_treat_confirmed_as_preserved(self):
+        fake = self.install(_StatefulSB({
+            "book_trope_claims": [
+                {"id": 1, "work_id": 1, "trope_id": "cat-c",
+                 "status": "confirmed", "source_type": "ai"},
+                {"id": 2, "work_id": 1, "trope_id": "cat-old",
+                 "status": "candidate", "source_type": "ai"}],
+            "book_trigger_claims": [
+                {"id": 3, "work_id": 1, "warning": "murder",
+                 "status": "confirmed", "source_type": "ai"}],
+            "book_characters": [
+                {"id": 4, "work_id": 1, "name": "Confirmed Char",
+                 "status": "confirmed", "source_type": "ai"}],
+        }))
+        pp.CONFIG["supabase_url"] = "http://example.invalid"
+        pp.CONFIG["supabase_key"] = "test-key"
+        res = _result(
+            tropes=["Mind Game"],
+            trope_chapters={pp._tnorm("Mind Game"): ["Ch 1"]},
+            triggers=[_trig("murder")],
+            characters=[{"name": "Confirmed Char", "role": "minor"}],
+        )
+        plan = pp.plan_replace(1, res, trope_mappings={"Mind Game": "cat-c"})
+        self.assertTrue(plan)
+        # Only the un-curated candidate row would be deleted; confirmed
+        # rows are preserved on every claims table.
+        self.assertEqual(plan["would_delete"]["book_trope_claims"], 1)
+        self.assertEqual(plan["would_delete"]["book_trigger_claims"], 0)
+        self.assertEqual(plan["would_delete"]["book_characters"], 0)
+        # Re-detected confirmed claims are NOT planned for re-insert.
+        self.assertEqual(plan["would_insert"]["tropes"], 0)
+        self.assertEqual(plan["would_insert"]["triggers"], 0)
+        self.assertEqual(plan["would_insert"]["characters"], 0)
+        # Confirmed rows are preserved, but they are not rejections and
+        # must not inflate the rejections-preserved count.
+        self.assertEqual(plan["rejections_preserved"], 0)
+        self.assertEqual(fake.mutating_calls(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

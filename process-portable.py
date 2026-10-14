@@ -7061,10 +7061,14 @@ def _partition_claims(table, rows):
     """Split existing rows into (preserved_keys, rejected_keys, deletable_n).
 
     Preserved = contributor rows (source_type != processor marker) plus
-    rejected rows; new-run claims are deduped against preserved keys.
-    Deletable = processor rows with a non-empty, non-rejected status.
+    human-curated rows: rejected rows and confirmed rows (decision A,
+    2026-10-14 — confirmation is curation state like rejection, with the
+    opposite sign). New-run claims are deduped against preserved keys, so
+    a curated claim is never re-inserted as a fresh candidate.
+    Deletable = processor rows with a non-empty status that is neither
+    rejected nor confirmed.
     A NULL/empty-status processor row is NOT deletable: the DELETE's
-    status=neq.rejected filter never matches NULL in PostgREST, so the
+    status=neq.* filters never match NULL in PostgREST, so the
     row would survive the delete while its key left the preserved set
     and a re-proposed claim would insert a duplicate beside it.
     (book_quotes has no status column; partition == delete there.)
@@ -7077,6 +7081,8 @@ def _partition_claims(table, rows):
         if status == "rejected":
             rejected.add(k)
             preserved.add(k)
+        elif status == "confirmed":
+            preserved.add(k)
         elif (r.get("source_type") or "") == src:
             if table != "book_quotes" and not status:
                 preserved.add(k)
@@ -7088,15 +7094,17 @@ def _partition_claims(table, rows):
 
 
 def _delete_processor_claims(table, work_id):
-    """Delete ONLY this work's processor-sourced, non-rejected rows.
-    The source_type condition is on every DELETE; claims tables also carry
-    status=neq.rejected so human rejection state is never removed.
+    """Delete ONLY this work's processor-sourced, non-curated rows.
+    The source_type condition is on every DELETE; claims tables also
+    carry status=neq.rejected AND status=neq.confirmed (PostgREST ANDs
+    repeated column filters) so human curation state — rejections and
+    confirmations alike — is never removed.
     Returns the number of rows deleted, or None on error."""
     src = _CLAIM_TABLES[table]["source"]
     params = (f"?work_id=eq.{quote(str(work_id), safe='')}"
               f"&source_type=eq.{src}")
     if table != "book_quotes":
-        params += "&status=neq.rejected"
+        params += "&status=neq.rejected&status=neq.confirmed"
     gone = sb(table, method="DELETE", params=params)
     return None if gone is None else len(gone)
 
@@ -7298,9 +7306,11 @@ def write_claims(work_id, result, trope_mappings=None):
       * Only processor rows are deleted — the per-table source_type marker
         in _CLAIM_TABLES is a condition on every DELETE. Contributor/human
         rows are untouched, and new claims dedupe against them.
-      * Human rejections survive: status='rejected' rows are excluded from
-        every DELETE (the rejection record itself is kept) and the new run
-        dedupes against them, so a rejected claim is never resurrected.
+      * Human curation survives: status='rejected' and status='confirmed'
+        rows are excluded from every DELETE (the curation record itself
+        is kept) and the new run dedupes against them, so a rejected claim
+        is never resurrected and a confirmed claim never silently
+        reverts to a fresh candidate.
     trope_proposals is scoped by book_key + status='pending' +
     _proposal_scope() (it has no source_type, so proposed_by is the
     structural own-rows boundary). works.spice_detected is already an overwrite; book_meta
