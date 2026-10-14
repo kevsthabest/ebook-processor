@@ -15,11 +15,20 @@
     "false_pairs survival ~ UNCHANGED vs baseline: baseline 0/13 survive (all dropped); mining must not resurrect them (target <= 1/13, and any survivor must be a downgrade to 'other', never the claimed family type).",
     "evidence-less write skips DOWN: baseline 18 evidence-less relationships in preview; target <= 8 after mined write evidence (count via the run's 'Skipped N evidence-less relationships' line / _build_rel_map on the new artefact)."
   ],
+  "error_taxonomy": {
+    "source": "Error classes from the character-extraction literature, in this pipeline's terms. Used to label fixture failures so live-run results stay comparable across runs and against published work.",
+    "missing": "A true pair or character the pipeline failed to produce in correct form: never extracted, dropped before write, or stripped of its true type in validation (e.g. a true sibling claim downgraded to 'other').",
+    "hallucinated": "A claim the pipeline produced with no basis in the text: an invented relationship, type, or character that validation exists to kill before it is written.",
+    "false_merge": "Two distinct characters collapsed into one roster entry (usually via a shared or mis-assigned alias), so both characters' claims and relationships land on a single identity.",
+    "false_split": "One character split across two roster entries (e.g. a title-name entry and a given-name entry), fragmenting their claims, relationships, and chapter counts.",
+    "fixture_annotation": "true_pairs carry taxonomy 'missing' (the class their failure takes if it recurs); false_pairs carry 'hallucinated' (the class of the claim itself). false_merge / false_split have no pair entries in this fixture; they are scored at roster level (see eval/README.md)."
+  },
   "true_pairs": [
     {
       "from": "General Sorrengail",
       "to": "Violet Sorrengail",
       "type": "parent",
+      "taxonomy": "missing",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.16
@@ -29,6 +38,7 @@
       "from": "Dad Sorrengail",
       "to": "Violet Sorrengail",
       "type": "parent",
+      "taxonomy": "missing",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.14
@@ -38,6 +48,7 @@
       "from": "Fen Riorson",
       "to": "Xaden Riorson",
       "type": "parent",
+      "taxonomy": "missing",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.04
@@ -47,6 +58,7 @@
       "from": "Brennan Sorrengail",
       "to": "Violet Sorrengail",
       "type": "sibling",
+      "taxonomy": "missing",
       "baseline": {
         "outcome": "downgraded",
         "validation_p": 0.32,
@@ -57,6 +69,7 @@
       "from": "Mira Sorrengail",
       "to": "Violet Sorrengail",
       "type": "sibling",
+      "taxonomy": "missing",
       "baseline": {
         "outcome": "kept",
         "validation_p": 0.96,
@@ -69,6 +82,7 @@
       "from": "Rhiannon Matthias",
       "to": "Violet Sorrengail",
       "type": "parent",
+      "taxonomy": "hallucinated",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.03
@@ -78,6 +92,7 @@
       "from": "General Melgren",
       "to": "Violet Sorrengail",
       "type": "parent",
+      "taxonomy": "hallucinated",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.02
@@ -87,6 +102,7 @@
       "from": "King Tauri",
       "to": "Violet Sorrengail",
       "type": "parent",
+      "taxonomy": "hallucinated",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.06
@@ -96,6 +112,7 @@
       "from": "Tairneanach",
       "to": "Violet Sorrengail",
       "type": "sibling",
+      "taxonomy": "hallucinated",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.05
@@ -105,6 +122,7 @@
       "from": "Andarna",
       "to": "Violet Sorrengail",
       "type": "spouse",
+      "taxonomy": "hallucinated",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.05
@@ -114,6 +132,7 @@
       "from": "Sgaeyl",
       "to": "Violet Sorrengail",
       "type": "spouse",
+      "taxonomy": "hallucinated",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.03
@@ -123,6 +142,7 @@
       "from": "Brown Clubtail",
       "to": "Imogen",
       "type": "sibling",
+      "taxonomy": "hallucinated",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.02
@@ -132,6 +152,7 @@
       "from": "Brown Clubtail",
       "to": "Heaton",
       "type": "sibling",
+      "taxonomy": "hallucinated",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.03
@@ -141,6 +162,7 @@
       "from": "Brown Clubtail",
       "to": "Emery",
       "type": "sibling",
+      "taxonomy": "hallucinated",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.03
@@ -150,6 +172,7 @@
       "from": "Jack Barlowe",
       "to": "Orange Scorpiontail",
       "type": "sibling",
+      "taxonomy": "hallucinated",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.03
@@ -159,6 +182,7 @@
       "from": "Liam Mairi",
       "to": "Mira Sorrengail",
       "type": "child",
+      "taxonomy": "hallucinated",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.05
@@ -168,6 +192,7 @@
       "from": "Liam Mairi",
       "to": "Tairneanach",
       "type": "sibling",
+      "taxonomy": "hallucinated",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.03
@@ -177,6 +202,7 @@
       "from": "Andarna",
       "to": "Rhiannon Matthias",
       "type": "sibling",
+      "taxonomy": "hallucinated",
       "baseline": {
         "outcome": "dropped",
         "validation_p": 0.03
