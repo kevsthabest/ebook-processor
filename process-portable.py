@@ -3805,6 +3805,156 @@ def _merge_roster_entries(roster, keep_key, drop_key):
                         if not _alias_shadowed(roster, keep_key, ak)}
 
 
+def _roster_claim_keys(entry):
+    """Name keys an entry CLAIMS denote itself: adopted alias keys plus
+    the preserved unresolved mentions. Mentions were rejected at fold
+    time because their target was already an entry (the GPT-audit
+    "useful clues" set) — with whole-roster hindsight they carry the
+    other half of the mutual-claim signal."""
+    keys = set(entry.get("alias_keys", set()))
+    for m in entry.get("unresolved_mentions", set()):
+        mk = norm_name(m)
+        if mk:
+            keys.add(mk)
+    return keys
+
+
+def _roster_reconcile(roster):
+    """Deterministic whole-roster reconciliation (Experiment 1,
+    --roster-reconcile). Runs ONCE after Call A completes, before
+    post_pass_merge / v2_reduce consume the roster. Mutates roster.
+
+    Call A builds the roster chapter by chapter, so alias claims are
+    judged against a partial roster: a claim adopted in ch. 2 may be
+    pollution by ch. 40 (its target became a real entry), and a full
+    name revealed in ch. 40 never reunites with its early short form
+    (the surname trap hard-NOs that pair in every later pass). With
+    the whole book sighted, three deterministic repairs apply — all
+    from existing machinery, no LLM/Jev calls:
+
+    1. Mutual-claim merge: two entries that each claim the other's
+       primary (via alias_keys or unresolved_mentions), never
+       co-listed in a chapter (Tier 1 cannot-link: their chapter
+       sets are disjoint), and claimed by no third entry, are one
+       person sighted under two name forms. A LONE proper-name
+       claim never merges (the _roster_update doctrine: aliases
+       are recorded, not trusted) — one-directional claims fall
+       through to pruning instead.
+    2. Learned/manual link merge: nick_lookup maps one entry's
+       primary to another entry's primary. Update-time lookups
+       miss when both entries already exist; the same vetoes apply.
+    3. Stale-shadow pruning: alias keys / display aliases that are
+       another entry's primary in the FINAL roster are pollution
+       (_alias_shadowed with hindsight) and are pruned, so a stale
+       claim can never become the unique claimant that resolves a
+       name to the wrong entry.
+
+    Membership invariant: merges only fold sighted entries into each
+    other (_merge_roster_entries unions existing forms and keeps a
+    sighted display name). Nothing is created.
+
+    Returns {"entries_before", "entries_after", "variants_merged",
+    "aliases_pruned"}; aliases_pruned counts alias keys + display
+    aliases removed by pass 3 (merges prune their own keepers).
+    """
+    stats = {"entries_before": len(roster),
+             "entries_after": len(roster),
+             "variants_merged": 0, "aliases_pruned": 0}
+    _ln = _learn()
+    _isbn = getattr(_DIAG, "learn_isbn", None)
+
+    def _record(keep_key, drop_key):
+        if _ln.enabled:
+            _ln.record_merge(drop_key, keep_key, _isbn)
+            _dw = drop_key.split()
+            _cw = keep_key.split()
+            if len(_dw) == 1 and _cw and _dw[0] != _cw[0]:
+                _ln.record_token_merge(_dw[0], _cw[0], _isbn)
+
+    # Passes 1+2, converging: a merge can complete a mutual claim
+    # for a third entry, so loop until stable. Pair enumeration is
+    # sorted for determinism; each merge shrinks the roster.
+    _changed = True
+    while _changed:
+        _changed = False
+        prim = {}
+        for k, e in roster.items():
+            for pk in e.get("primary_keys", {k}):
+                prim[pk] = k
+        claims = {k: _roster_claim_keys(e) for k, e in roster.items()}
+        # target primary key -> claimant entry keys (an entry's
+        # claims on its OWN forms are not claims on another entry).
+        claimants = {}
+        for k, cks in claims.items():
+            own = roster[k].get("primary_keys", {k})
+            for c in cks:
+                if c in own:
+                    continue
+                tgt = prim.get(c)
+                if tgt is not None and tgt != k:
+                    claimants.setdefault(c, set()).add(k)
+
+        def _unique(pks, ka, kb):
+            # Canonical pass 2 lifted to entries: a primary claimed
+            # by a third entry is ambiguous and links nothing.
+            return all(claimants.get(pk, set()) <= {ka, kb}
+                       for pk in pks)
+
+        for ka in sorted(roster):
+            if ka not in roster:
+                continue
+            for kb in sorted(roster):
+                if kb <= ka or kb not in roster:
+                    continue
+                ea, eb = roster[ka], roster[kb]
+                # Tier 1 cannot-link (the signal post_pass_merge
+                # uses): co-listed in a chapter -> two people.
+                if ea.get("chapters", set()) & eb.get("chapters", set()):
+                    continue
+                pa = ea.get("primary_keys", {ka})
+                pb = eb.get("primary_keys", {kb})
+                mutual = (any(c in pb for c in claims[ka])
+                          and any(c in pa for c in claims[kb]))
+                learned = False
+                if _ln.enabled:
+                    for pk in pa:
+                        if prim.get(_ln.nick_lookup(pk) or "") == kb:
+                            learned = True
+                    for pk in pb:
+                        if prim.get(_ln.nick_lookup(pk) or "") == ka:
+                            learned = True
+                if not (learned or (mutual and _unique(pa, ka, kb)
+                                    and _unique(pb, ka, kb))):
+                    continue
+                keep, drop = (ka, kb) if ea.get("appearances", 0) >= \
+                    eb.get("appearances", 0) else (kb, ka)
+                _merge_roster_entries(roster, keep, drop)
+                _record(keep, drop)
+                stats["variants_merged"] += 1
+                _changed = True
+                break
+            if _changed:
+                break
+
+    # Pass 3: prune stale shadowed aliases with final-roster
+    # hindsight (the keeper pruning _merge_roster_entries does,
+    # applied to every entry).
+    for k, e in roster.items():
+        kept_keys = {ak for ak in e.get("alias_keys", set())
+                     if not _alias_shadowed(roster, k, ak)}
+        stats["aliases_pruned"] += \
+            len(e.get("alias_keys", set())) - len(kept_keys)
+        e["alias_keys"] = kept_keys
+        kept_aliases = {a for a in e.get("aliases", set())
+                        if not _alias_shadowed(roster, k, norm_name(a))}
+        stats["aliases_pruned"] += \
+            len(e.get("aliases", set())) - len(kept_aliases)
+        e["aliases"] = kept_aliases
+
+    stats["entries_after"] = len(roster)
+    return stats
+
+
 def _roster_best_desc(entry):
     """Best description text for a roster entry (same policy as v2_reduce:
     earliest evidence-backed, then longest)."""
@@ -8651,6 +8801,18 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if aborted:
         print(f"  {failed}/{2 * n} calls failed; not writing partial results")
 
+    # Roster reconciliation (Experiment 1, --roster-reconcile): Call A
+    # built the roster chapter by chapter against partial information;
+    # canonicalize it once with the whole book sighted, before the
+    # post-pass merge and the reduce consume it. Deterministic.
+    _recon_stats = None
+    if CONFIG.get("roster_reconcile"):
+        _recon_stats = _roster_reconcile(roster)
+        print(f"  Roster reconcile: {_recon_stats['entries_before']} -> "
+              f"{_recon_stats['entries_after']} entries "
+              f"({_recon_stats['variants_merged']} variants merged, "
+              f"{_recon_stats['aliases_pruned']} polluted aliases pruned)")
+
     # Post-pass character merge (Tier 1/2 deterministic + Tier 3 decision
     # model). Runs after all chapters, before the reduce, so v2_reduce sees
     # the final merged roster and relationships canonical-remap correctly.
@@ -8783,6 +8945,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             "roster": _ckpt_json_safe(roster),
         },
     }
+    if _recon_stats is not None:
+        result["roster_reconcile"] = _recon_stats
     v = red["verification"]
     if v["evidence_checked"]:
         print(f"  Evidence: {v['evidence_verified']}/{v['evidence_checked']} verified")
@@ -9737,6 +9901,11 @@ def _build_parser():
     g_merge.add_argument("--min-frequency", metavar="F", type=float, default=0.20,
                     help="minimum chapter frequency for principal status "
                          "(default 0.20)")
+    g_merge.add_argument("--roster-reconcile", action="store_true",
+                    help="experiment (v2): deterministic whole-roster "
+                         "reconciliation after Call A — mutual alias "
+                         "claims and learned links merge, stale alias "
+                         "pollution is pruned (default off)")
 
     g_learn = ap.add_argument_group("Learning")
     g_learn.add_argument("--learn", dest="learn", action="store_true", default=True,
@@ -10010,6 +10179,8 @@ def main():
     if args.show_matrices:
         CONFIG["show_matrices"] = True
         UI._show_matrices = True
+    if args.roster_reconcile:
+        CONFIG["roster_reconcile"] = True
     if args.preview_summary:
         CONFIG["preview_summary"] = True
     if args.resume:
