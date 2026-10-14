@@ -4919,6 +4919,288 @@ def adopt_roster_store(learn_dir, work_id, title="", author="",
     return adopted
 
 
+def _matcher_no_veto(no_pairs, entry_forms, view_forms):
+    """The recorded NO a link between these form sets would
+    contradict, or None (same cross-check as RosterStore.union_veto,
+    over plain sets so the matcher stays a pure function)."""
+    for a, b in no_pairs:
+        if (a in entry_forms and b in view_forms) \
+                or (a in view_forms and b in entry_forms):
+            return (a, b)
+    return None
+
+
+def _view_form_keys(view):
+    """Every form key an entity view claims: observed primaries, all
+    observed alias keys, its canonical key, and its anchor's closed
+    key set."""
+    forms = set(view.get("primary_forms") or ())
+    forms |= set(view.get("alias_keys_all") or ())
+    if view.get("canonical_key"):
+        forms.add(view["canonical_key"])
+    anchor = view.get("anchor")
+    if anchor:
+        forms.add(norm_name(anchor.get("name") or ""))
+        forms |= {norm_name(a) for a in anchor.get("aliases") or []}
+    return forms
+
+
+def roster_match_entries(entries, views, no_pairs=()):
+    """Cross-run identity matcher (design section 4): a pure
+    function over (run entries, store entity views, human NOs).
+
+    entries: [{key, name, form_key, alias_keys, chapters,
+               appearances, desc_hash}]
+    views:   RosterStore.entity_views() dicts.
+    no_pairs: iterable of (form_key, form_key) human NOs.
+
+    Tiers are tried in order; the first tier producing a UNIQUE,
+    unvetoed match wins. Every tier is deterministic in v1 (OC-1) —
+    JEV/embeddings never link here. Returns {links, folds,
+    suspensions, collisions, suspects, vetoed}: links maps entry
+    key -> {entity, tier}; pairs no tier links but which carry a
+    similarity signal are split SUSPECTS (proposed, never applied).
+    """
+    no_pairs = [(norm_name(a), norm_name(b)) for a, b in no_pairs
+                if a and b]
+    views = sorted(views, key=lambda v: v["id"])
+    entries = sorted(entries,
+                     key=lambda e: (-(e.get("appearances") or 0),
+                                    e["key"]))
+    by_id = {v["id"]: v for v in views}
+    view_forms = {v["id"]: _view_form_keys(v) for v in views}
+    links = {}          # entry key -> {"entity", "tier"}
+    collisions, vetoed, suspects = [], [], []
+    cannot_link = set()  # (entry key, entity id) — surname trap
+    entry_forms = {e["key"]: {e["form_key"]} | set(e["alias_keys"])
+                   for e in entries}
+
+    def _veto(e, view):
+        return _matcher_no_veto(no_pairs, entry_forms[e["key"]],
+                                view_forms[view["id"]])
+
+    def _link(e, view, tier):
+        links[e["key"]] = {"entity": view["id"], "tier": tier}
+
+    # -- Tier 0: curation anchors -------------------------------------
+    # The anchor's key set is closed and exact (A3): its own form
+    # key plus the aliases recorded for it. No token decomposition —
+    # a bare surname never claims an anchor.
+    anchor_claims = {}   # entity id -> [entry keys]
+    for v in views:
+        anchor = v.get("anchor")
+        if not anchor:
+            continue
+        keyset = {norm_name(anchor.get("name") or "")} | {
+            norm_name(a) for a in anchor.get("aliases") or []}
+        keyset.discard("")
+        claimed = [e["key"] for e in entries
+                   if e["form_key"] in keyset
+                   or (set(e["alias_keys"]) & keyset)]
+        if claimed:
+            anchor_claims[v["id"]] = claimed
+    contested_entries = set()
+    for eid, keys in anchor_claims.items():
+        if len(keys) > 1:
+            collisions.append({
+                "kind": "anchor", "entity": eid, "entries": keys,
+                "why": "two entries claim one anchor; the anchor "
+                       "claims neither (both fall through)"})
+            contested_entries.update(keys)
+    tentative = {}
+    for eid, keys in anchor_claims.items():
+        if len(keys) == 1 and keys[0] not in contested_entries:
+            tentative.setdefault(keys[0], []).append(eid)
+    for e in entries:
+        cands = tentative.get(e["key"]) or []
+        if len(cands) == 1:
+            v = by_id[cands[0]]
+            if _veto(e, v):
+                vetoed.append({"entry": e["key"], "entity": v["id"],
+                               "tier": "anchor",
+                               "why": "human NO veto"})
+            else:
+                _link(e, v, "anchor")
+        elif len(cands) > 1:
+            collisions.append({
+                "kind": "anchor", "entity": None,
+                "entries": [e["key"]],
+                "why": "one entry claims two anchors; neither claims "
+                       "it at tier 0"})
+
+    # -- Tiers 1-3 ------------------------------------------------------
+    all_forms = set()
+    for v in views:
+        all_forms |= view_forms[v["id"]]
+    for e in entries:
+        all_forms |= entry_forms[e["key"]]
+
+    def _third_party_claims(e, candidate):
+        """Entities other than the candidate claiming the entry's
+        form (primary or alias): the form is contested ground."""
+        out = []
+        for v in views:
+            if v["id"] == candidate["id"]:
+                continue
+            if e["form_key"] in (set(v.get("primary_forms") or ())
+                                 | set(v.get("alias_keys_all") or ())):
+                out.append(v)
+        return out
+
+    for e in entries:
+        if e["key"] in links:
+            continue
+        # Tier 1 — exact form match (unique candidate required; a
+        # same-form collision abstains rather than picking the
+        # bigger entity).
+        cands = [v for v in views
+                 if e["form_key"] in (v.get("primary_forms") or ())]
+        live = []
+        for v in cands:
+            if _veto(e, v):
+                vetoed.append({"entry": e["key"], "entity": v["id"],
+                               "tier": "exact-form",
+                               "why": "human NO veto"})
+            else:
+                live.append(v)
+        if len(live) == 1:
+            _link(e, live[0], "exact-form")
+            continue
+        if len(cands) > 1:
+            collisions.append({
+                "kind": "exact-form",
+                "entities": [v["id"] for v in cands],
+                "entries": [e["key"]],
+                "why": "two entities observed under the same form; "
+                       "tier 1 abstains rather than guessing"})
+        # Tier 2 — alias cross-match (mutual claim + uniqueness).
+        cands = [v for v in views
+                 if e["form_key"] in (v.get("alias_keys") or ())
+                 and v.get("canonical_key")
+                 and v["canonical_key"] in e["alias_keys"]]
+        live = []
+        for v in cands:
+            if _veto(e, v):
+                vetoed.append({"entry": e["key"], "entity": v["id"],
+                               "tier": "alias-cross",
+                               "why": "human NO veto"})
+            else:
+                live.append(v)
+        if len(live) == 1 \
+                and not _third_party_claims(e, live[0]):
+            _link(e, live[0], "alias-cross")
+            continue
+        # Tier 3 — subsequence / title signals, cross-run: the
+        # _merge_tier Tier-2 signals (titles, spelling, nicknames,
+        # unambiguous subsequence) plus unambiguous word-prefix
+        # growth, against the entity's OWN observed forms in this
+        # work's store (closed comparison set, design A7). A
+        # surname-trap 'no' is a cannot-link, recorded as such.
+        cands = []
+        for v in views:
+            signal = False
+            for f in (set(v.get("primary_forms") or ())
+                      | set(v.get("alias_keys") or ())):
+                if f == e["form_key"]:
+                    continue
+                t = _merge_tier(e["form_key"], f,
+                                roster_keys=all_forms)
+                if t == "no":
+                    cannot_link.add((e["key"], v["id"]))
+                    signal = False
+                    break
+                if t == "yes" or _names_overlap(e["form_key"], f):
+                    signal = True
+            if signal:
+                cands.append(v)
+        live = []
+        for v in cands:
+            if (e["key"], v["id"]) in cannot_link:
+                continue
+            if _veto(e, v):
+                vetoed.append({"entry": e["key"], "entity": v["id"],
+                               "tier": "subsequence",
+                               "why": "human NO veto"})
+            else:
+                live.append(v)
+        if len(live) == 1 \
+                and not _third_party_claims(e, live[0]):
+            _link(e, live[0], "subsequence")
+            continue
+
+    # -- Folds / suspensions ---------------------------------------------
+    # Two entries of the SAME run linked to one entity fold into it
+    # ONLY when their chapter sets are disjoint (the Tier 1
+    # cannot-link, enforced cross-run). Co-occurring dual links are
+    # refused: the weaker entry's link suspends and is reported —
+    # B never lets last run's identity overrule this run's own
+    # co-occurrence evidence.
+    folds, suspensions = [], []
+    by_entity = {}
+    for e in entries:
+        link = links.get(e["key"])
+        if link:
+            by_entity.setdefault(link["entity"], []).append(e)
+    entry_by_key = {e["key"]: e for e in entries}
+    for eid, es in by_entity.items():
+        if len(es) < 2:
+            continue
+        ordered = sorted(es, key=lambda x: (-(x.get("appearances")
+                                              or 0), x["key"]))
+        keep = ordered[0]
+        refused = []
+        for other in ordered[1:]:
+            shared = set(keep.get("chapters") or ()) \
+                & set(other.get("chapters") or ())
+            if shared:
+                refused.append((other, shared))
+        if not refused:
+            folds.append({"entity": eid,
+                          "entries": [x["key"] for x in ordered]})
+            continue
+        for other, shared in refused:
+            del links[other["key"]]
+            suspensions.append({
+                "entity": eid, "entry": other["key"],
+                "form_key": other["form_key"],
+                "evidence": f"fold refused: co-occurs with "
+                            f"{keep['name']!r} in chapter(s) "
+                            f"{sorted(shared)} (the Tier 1 "
+                            f"cannot-link, enforced cross-run)"})
+
+    # -- Split suspects ----------------------------------------------------
+    # Pairs no tier linked but which carry a similarity signal:
+    # proposed for a human, never applied.
+    for e in entries:
+        if e["key"] in links:
+            continue
+        first = e["form_key"].split()[0] if e["form_key"] else ""
+        for v in views:
+            if (e["key"], v["id"]) in cannot_link:
+                continue
+            if any(s["entry"] == e["key"] and s["entity"] == v["id"]
+                   for s in suspensions):
+                continue
+            if _veto(e, v):
+                continue
+            why = None
+            if first and any(f.split()[0] == first
+                             for f in (v.get("primary_forms") or ())):
+                if set(e.get("chapters") or ()) \
+                        & set(v.get("chapters") or ()):
+                    why = ("shared first token + overlapping "
+                           "chapters; no deterministic bridge")
+            if why is None and e.get("desc_hash") \
+                    and e["desc_hash"] == v.get("desc_hash"):
+                why = "description-hash proximity; no name bridge"
+            if why:
+                suspects.append({"a": e["key"], "b": v["id"],
+                                 "why": why})
+    return {"links": links, "folds": folds,
+            "suspensions": suspensions, "collisions": collisions,
+            "suspects": suspects, "vetoed": vetoed}
+
+
 # Module-level staging state, mirroring _learn(): _staging() always
 # returns a usable object (disabled stub when --staging-gate is off),
 # rooted at the learned-state directory so staging.json sits beside
