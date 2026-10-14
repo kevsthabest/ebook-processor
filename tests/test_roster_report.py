@@ -161,6 +161,28 @@ class TestCorrectionCommands(_ReportCase):
                if o["form_key"] == "violet"]
         self.assertTrue(obs and not obs[0]["detached"])
 
+    def test_link_back_after_unlinking_the_only_form(self):
+        # Regression: an entity whose single observed form attested
+        # an alias — unlinking the form records a NO against the
+        # alias form, which lives only on the detached observation.
+        # Link-back must still retire that NO.
+        st = self._store()
+        r1 = {"violet sorrengail": _entry(
+            "Violet Sorrengail", alias_keys=["Violet"])}
+        pp.roster_assign_entities(r1, st, anchors=[])
+        eid = r1["violet sorrengail"]["entity_id"]
+        _capture(pp.cmd_roster_unlink, "wk-x", eid,
+                 "Violet Sorrengail", learn_dir=self.dir)
+        st = self._store()
+        self.assertTrue(
+            st.has_no("violet sorrengail", "violet"))
+        _out, text = _capture(pp.cmd_roster_link, "wk-x", eid,
+                              "Violet Sorrengail",
+                              learn_dir=self.dir)
+        self.assertIn("Retired 1 recorded NO", text)
+        self.assertFalse(self._store().has_no(
+            "violet sorrengail", "violet"))
+
     def test_split_moves_form_and_original_accounts_as_split(self):
         eid = self._two_form_entity()
         _out, text = _capture(pp.cmd_roster_split, "wk-x", eid,

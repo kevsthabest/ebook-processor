@@ -5210,7 +5210,11 @@ def cmd_roster_link(work, entity_id, form, learn_dir=None):
               f"--roster-link asserts identity between recorded "
               f"observations; it does not invent forms.")
         return
-    others = store._entity_form_keys(eid) - {form_key}
+    # include_detached: the NO being superseded may pair the form
+    # with a form claimed only through the very observations the
+    # unlink detached — they still count for pair retirement.
+    others = store._entity_form_keys(eid, include_detached=True) \
+        - {form_key}
     retired = store.retire_no_pairs(form_key, others)
     evidence = "human assertion (--roster-link)"
     if retired:
