@@ -9,6 +9,13 @@ field stability: set overlap, Jaccard similarity, added/removed items, and
 a one-line score per field. Run-to-run variance becomes a number instead
 of an impression, so two pipeline experiments can be compared at a glance.
 
+Below the legacy report, a quality-dashboard block adds labelled
+precision/recall (when an eval/ labels fixture matches the book, or one
+is passed with --labels), roster-identity indicators, form-flip
+explanations for Jaccard churn, unresolved-endpoint and empty-evidence
+rates, spice threshold crossings, and queue churn. The legacy sections
+are a frozen historical record; the dashboard only ever appends.
+
 Stdlib only. Keys are compared through the pipeline's own normalization
 (norm / norm_name from process-portable.py, copy-pasted so this stays a
 standalone helper like inject_isbn.py).
@@ -232,7 +239,488 @@ def compare_spice(old_d, new_d):
     return lines, 1.0 if o == n else 0.0
 
 
-def compare_previews(old_d, new_d):
+# --- quality dashboard ------------------------------------------------------
+# Added measurement sections, appended after the legacy report. The legacy
+# sections above are a frozen historical record: their lines and scores
+# must stay byte-identical for the same inputs, so everything below only
+# ever appends. The dashboard separates WHAT changed from HOW BAD it is:
+# labelled precision/recall, roster-identity indicators, evidence quality,
+# and the churn the raw Jaccards cannot explain.
+
+# Mirrors _REL_FAMILY_TYPES in process-portable.py (same copy-paste
+# convention as norm/norm_name above).
+FAMILY_TYPES = frozenset({"spouse", "parent", "child", "sibling"})
+_INVERSE_TYPE = {"parent": "child", "child": "parent"}
+
+
+def _token_prefix(a, b):
+    """Length of the shared leading-token prefix of two normalized names."""
+    k = 0
+    for x, y in zip(a.split(), b.split()):
+        if x != y:
+            break
+        k += 1
+    return k
+
+
+def _prefix_related(a, b):
+    """True when one normalized name is a leading-token prefix of the
+    other ('violet' vs 'violet sorrengail'). Trailing tokens never match:
+    a bare surname is shared by the whole family and identifies nobody."""
+    if not a or not b or a == b:
+        return False
+    return _token_prefix(a, b) == min(len(a.split()), len(b.split()))
+
+
+def _roster_entries(d):
+    """Identity-bearing entries of a preview: chapter_data.roster when
+    present (richest alias data), else characters + minor_characters.
+    Returns [(entry_id, display_name, {normalized name forms})]."""
+    cd = d.get("chapter_data")
+    roster = cd.get("roster") if isinstance(cd, dict) else None
+    entries = []
+    if isinstance(roster, dict) and roster:
+        for key, e in roster.items():
+            if not isinstance(e, dict):
+                continue
+            forms = set()
+            raw = [e.get("name")] + list(e.get("aliases") or []) \
+                + list(e.get("alias_keys") or []) \
+                + list(e.get("primary_keys") or [])
+            for f in raw:
+                k = norm_name(str(f or ""))
+                if k:
+                    forms.add(k)
+            entries.append((str(key), (e.get("name") or str(key)).strip(),
+                            forms))
+        return entries
+    for field in ("characters", "minor_characters"):
+        for c in d.get(field) or []:
+            name = c.get("name") if isinstance(c, dict) else str(c)
+            aliases = c.get("aliases") if isinstance(c, dict) else None
+            forms = set()
+            for f in [name] + list(aliases or []):
+                k = norm_name(str(f or ""))
+                if k:
+                    forms.add(k)
+            entries.append((norm_name(name or ""), (name or "").strip(),
+                            forms))
+    return entries
+
+
+class _Resolver:
+    """Resolves a raw endpoint/name string to a roster entry id within
+    one preview, mirroring the pipeline's own identity mechanism: exact
+    alias/name forms first, then a unique leading-token match. Ambiguous
+    or unknown strings resolve to their own normalized form, so they can
+    still match an identical string on the other side."""
+
+    def __init__(self, d):
+        self.entries = _roster_entries(d)
+        self._exact = {}
+        for eid, _disp, forms in self.entries:
+            for f in forms:
+                self._exact.setdefault(f, set()).add(eid)
+
+    def resolve(self, raw):
+        n = norm_name(raw or "")
+        if not n:
+            return n
+        hits = self._exact.get(n)
+        if hits:
+            return next(iter(hits)) if len(hits) == 1 else n
+        best, best_len = set(), 0
+        for eid, _disp, forms in self.entries:
+            for f in forms:
+                if _prefix_related(n, f):
+                    k = _token_prefix(n, f)
+                    if k > best_len:
+                        best, best_len = {eid}, k
+                    elif k == best_len:
+                        best.add(eid)
+        if len(best) == 1 and best_len:
+            return next(iter(best))
+        return n
+
+
+def _pair_key(resolver, a, b):
+    """Unordered resolved endpoint pair for a claim or labelled pair."""
+    return tuple(sorted((resolver.resolve(a), resolver.resolve(b))))
+
+
+def _endpoints_match(a, b):
+    return a == b or _prefix_related(a, b)
+
+
+def _type_verdict(label_pair, rel, resolver):
+    """Classify a kept claim against a labelled pair whose endpoints it
+    shares: 'kept' (claimed type, either orientation), 'downgraded'
+    (survived as 'other'), 'wrong_type' (survived at another family
+    type), or None (a different, non-family claim — not this pair).
+    Orientation is determined by resolved entry ids first, then by the
+    raw endpoint strings, so a claim stays attributable even when the
+    run's roster conflated the labelled identities (see the roster-
+    identity indicators for the conflation itself)."""
+    ltype = norm(label_pair.get("type") or "")
+    rtype = norm(rel.get("type") or "")
+    la, lb = resolver.resolve(label_pair.get("from")), \
+        resolver.resolve(label_pair.get("to"))
+    ra, rb = resolver.resolve(rel.get("from")), resolver.resolve(rel.get("to"))
+    if (ra, rb) == (la, lb):
+        strict = rtype == ltype
+    elif (ra, rb) == (lb, la):
+        strict = rtype == _INVERSE_TYPE.get(ltype, ltype)
+    else:
+        lf, lto = norm_name(label_pair.get("from") or ""), \
+            norm_name(label_pair.get("to") or "")
+        rf, rto = norm_name(rel.get("from") or ""), \
+            norm_name(rel.get("to") or "")
+        if _endpoints_match(lf, rf) and _endpoints_match(lto, rto):
+            strict = rtype == ltype
+        elif _endpoints_match(lf, rto) and _endpoints_match(lto, rf):
+            strict = rtype == _INVERSE_TYPE.get(ltype, ltype)
+        else:
+            return None
+    if strict:
+        return "kept"
+    if rtype == "other":
+        return "downgraded"
+    if rtype in FAMILY_TYPES:
+        return "wrong_type"
+    return None
+
+
+def _raw_form_match(label_pair, rel):
+    """Tier signal: the claim's raw endpoint strings directly resemble
+    the label's (normalized-equal or leading-token related) in the
+    orientation that resolves. Preferred over resolver-only matches,
+    which can arise when a run merged two labelled identities into one
+    entry and one claim then serves two pairs."""
+    lf, lt = norm_name(label_pair.get("from") or ""), \
+        norm_name(label_pair.get("to") or "")
+    rf, rt = norm_name(rel.get("from") or ""), norm_name(rel.get("to") or "")
+    same = all(x == y or _prefix_related(x, y)
+               for x, y in ((lf, rf), (lt, rt)))
+    swap = all(x == y or _prefix_related(x, y)
+               for x, y in ((lf, rt), (lt, rf)))
+    return same or swap
+
+
+def score_labelled_pairs(d, labels):
+    """Per-pair outcomes for one preview against a labels fixture.
+    Returns {'true': {...}, 'false': {...}} mapping outcome ->
+    [display strings]. Outcomes: kept (at the claimed type),
+    downgraded (survived as 'other'), wrong_type (survived at another
+    family type), dropped (killed; a validation_note of 'no_evidence'
+    counts, per eval/README.md), absent (never extracted as a family
+    claim). A budget-exhaustion survival is a kept claim in the preview
+    and is classified by its surviving type like any other."""
+    resolver = _Resolver(d)
+    kept = [r for r in d.get("relationships") or [] if isinstance(r, dict)]
+    dropped = [r for r in d.get("dropped_relationships") or []
+               if isinstance(r, dict)]
+    kept_by_pair = {}
+    for r in kept:
+        kept_by_pair.setdefault(
+            _pair_key(resolver, r.get("from"), r.get("to")), []).append(r)
+    dropped_family = [r for r in dropped
+                      if norm(r.get("type") or "") in FAMILY_TYPES
+                      or norm(r.get("type") or "") == "other"]
+    dropped_pairs = {
+        _pair_key(resolver, r.get("from"), r.get("to"))
+        for r in dropped_family}
+    out = {}
+    for kind, key in (("true", "true_pairs"), ("false", "false_pairs")):
+        res = {"kept": [], "downgraded": [], "wrong_type": [],
+               "dropped": [], "absent": []}
+        for pair in labels.get(key) or []:
+            disp = f"{pair.get('from')} -> {pair.get('to')} " \
+                   f"[{pair.get('type')}]"
+            pk = _pair_key(resolver, pair.get("from"), pair.get("to"))
+            best = None  # (tier, rank, verdict)
+            rank = {"kept": 3, "downgraded": 2, "wrong_type": 1}
+            candidates = list(kept_by_pair.get(pk, []))
+            for r in kept:
+                if r not in candidates and _raw_form_match(pair, r):
+                    candidates.append(r)
+            for r in candidates:
+                verdict = _type_verdict(pair, r, resolver)
+                if verdict is None:
+                    continue
+                cand = (1 if _raw_form_match(pair, r) else 0,
+                        rank[verdict], verdict)
+                if best is None or cand[:2] > best[:2]:
+                    best = cand
+            if best is not None:
+                res[best[2]].append(disp)
+            elif pk in dropped_pairs or any(
+                    _raw_form_match(pair, r) for r in dropped_family):
+                res["dropped"].append(disp)
+            else:
+                res["absent"].append(disp)
+        out[kind] = res
+    return out
+
+
+def _labelled_entities(labels):
+    """Distinct endpoint display names across both pair lists."""
+    seen, out = set(), []
+    for key in ("true_pairs", "false_pairs"):
+        for pair in labels.get(key) or []:
+            for end in (pair.get("from"), pair.get("to")):
+                k = norm_name(end or "")
+                if k and k not in seen:
+                    seen.add(k)
+                    out.append((k, (end or "").strip()))
+    return out
+
+
+def identity_indicators(d, labels):
+    """Roster-level false_merge / false_split indicators (heuristic).
+    A roster entry CLAIMS a labelled entity when one of its name forms
+    matches the entity's name exactly or by unique leading-token match
+    (a form matching two entities claims neither — ambiguity is not
+    evidence). A merge = one entry claiming >= 2 labelled entities; a
+    split = one entity claimed by >= 2 entries. Returns
+    ([merge lines], [split lines])."""
+    entities = _labelled_entities(labels)
+    entries = _roster_entries(d)
+    claims = {}  # entry index -> {entity keys}
+    for idx, (_eid, _disp, forms) in enumerate(entries):
+        claimed = set()
+        for f in forms:
+            cands = [ek for ek, _ed in entities
+                     if f == ek or _prefix_related(f, ek)]
+            if len(cands) == 1:
+                claimed.add(cands[0])
+        if claimed:
+            claims[idx] = claimed
+    disp_of = dict(entities)
+    merges = []
+    for idx in sorted(claims):
+        if len(claims[idx]) >= 2:
+            names = ", ".join(disp_of[k] for k in sorted(claims[idx]))
+            merges.append(
+                f"entry '{entries[idx][1]}' carries forms of: {names}")
+    by_entity = {}
+    for idx, claimed in claims.items():
+        for ek in claimed:
+            by_entity.setdefault(ek, []).append(idx)
+    splits = []
+    for ek in sorted(by_entity):
+        idxs = by_entity[ek]
+        if len(idxs) >= 2:
+            names = ", ".join(f"'{entries[i][1]}'" for i in sorted(idxs))
+            splits.append(f"'{disp_of[ek]}' claimed by entries: {names}")
+    return merges, splits
+
+
+def form_flips(old_d, new_d):
+    """Names that left one run and plausibly re-entered the other under
+    a different form: (old display, new display, reason) triples where
+    reason is 'token-subset' or 'alias-linked'. Heuristic — it explains
+    raw-Jaccard churn and changes no score."""
+    def universe(d):
+        keys, labels = extract_full_roster(d)
+        pk, plabels = extract_povs(d)
+        merged = dict(labels)
+        merged.update(plabels)
+        return keys | pk, merged
+    old_keys, old_labels = universe(old_d)
+    new_keys, new_labels = universe(new_d)
+    labels = {**old_labels, **new_labels}
+
+    def alias_owner(d):
+        owner = {}
+        for _eid, disp, forms in _roster_entries(d):
+            for f in forms:
+                owner.setdefault(f, norm_name(disp))
+        return owner
+    old_owner, new_owner = alias_owner(old_d), alias_owner(new_d)
+    flips = []
+    for o in sorted(old_keys - new_keys):
+        for n in sorted(new_keys - old_keys):
+            ot, nt = set(o.split()), set(n.split())
+            if ot < nt or nt < ot:
+                flips.append((labels[o], labels[n], "token-subset"))
+            elif new_owner.get(o) == n or old_owner.get(n) == o:
+                flips.append((labels[o], labels[n], "alias-linked"))
+    return flips
+
+
+def unresolved_endpoints(d):
+    """Kept relationships pointing at names with no character row:
+    (bad count, total kept, [unresolved endpoint displays]). Resolution
+    is against the character list (characters + minor_characters) by
+    name or alias — the set the app can actually join on."""
+    forms = set()
+    for field in ("characters", "minor_characters"):
+        for c in d.get(field) or []:
+            name = c.get("name") if isinstance(c, dict) else str(c)
+            aliases = c.get("aliases") if isinstance(c, dict) else None
+            for f in [name] + list(aliases or []):
+                k = norm_name(str(f or ""))
+                if k:
+                    forms.add(k)
+    bad, names = 0, []
+    rels = [r for r in d.get("relationships") or [] if isinstance(r, dict)]
+    for r in rels:
+        missing = [r.get(e) for e in ("from", "to")
+                   if norm_name(r.get(e) or "") not in forms]
+        if missing:
+            bad += 1
+            for m in missing:
+                if (m or "").strip() not in names:
+                    names.append((m or "").strip())
+    return bad, len(rels), names
+
+
+def empty_evidence_rates(d):
+    """Kept claims with no evidence quote, split family / non-family:
+    ((empty, total) family, (empty, total) non-family). This is the
+    review-queue cost driver: evidence-less claims are the ones a human
+    (or a later gate) has to re-derive from the text."""
+    fam = [0, 0]
+    nonfam = [0, 0]
+    for r in d.get("relationships") or []:
+        if not isinstance(r, dict):
+            continue
+        bucket = fam if norm(r.get("type") or "") in FAMILY_TYPES else nonfam
+        bucket[1] += 1
+        ev = r.get("evidence")
+        if ev is None or not str(ev).strip():
+            bucket[0] += 1
+    return tuple(fam), tuple(nonfam)
+
+
+def _rate(num, den):
+    return f"{num / den:.3f}" if den else "n/a"
+
+
+def _dashboard_run_lines(tag, d, labels):
+    """Per-run dashboard lines for one preview."""
+    lines = []
+    if labels is not None:
+        out = score_labelled_pairs(d, labels)
+        t, f = out["true"], out["false"]
+        nt = sum(len(v) for v in t.values())
+        nf = sum(len(v) for v in f.values())
+        lines.append(
+            f"  {tag} true pairs: kept {len(t['kept'])}/{nt} "
+            f"(recall {_rate(len(t['kept']), nt)}), "
+            f"downgraded {len(t['downgraded'])}, "
+            f"wrong family type {len(t['wrong_type'])}, "
+            f"dropped {len(t['dropped'])}, "
+            f"never extracted {len(t['absent'])}")
+        fkept = len(f["kept"]) + len(f["downgraded"]) + len(f["wrong_type"])
+        lines.append(
+            f"  {tag} false pairs: kept {fkept}/{nf} (precision failures: "
+            f"at claimed type {len(f['kept'])}, "
+            f"downgraded {len(f['downgraded'])}, "
+            f"wrong family type {len(f['wrong_type'])}), "
+            f"dropped {len(f['dropped'])}, "
+            f"never extracted {len(f['absent'])}")
+        for disp in f["kept"] + f["downgraded"] + f["wrong_type"]:
+            lines.append(f"    false pair survived: {disp}")
+        merges, splits = identity_indicators(d, labels)
+        src = "chapter_data.roster" if isinstance(
+            d.get("chapter_data"), dict) and d["chapter_data"].get("roster") \
+            else "characters"
+        lines.append(
+            f"  {tag} roster identity (heuristic, from {src}): "
+            f"false merges {len(merges)}, false splits {len(splits)}")
+        for m in merges[:MAX_LIST]:
+            lines.append(f"    merge: {m}")
+        for s in splits[:MAX_LIST]:
+            lines.append(f"    split: {s}")
+    bad, total, names = unresolved_endpoints(d)
+    lines.append(
+        f"  {tag} unresolved endpoints: {bad}/{total} kept relationships "
+        f"({_rate(bad, total)})")
+    if names:
+        lines.append("    unresolved: " + ", ".join(
+            f"'{n}'" for n in names[:MAX_LIST]))
+    (fe, ft), (ne, nt2) = empty_evidence_rates(d)
+    lines.append(
+        f"  {tag} empty-evidence kept claims: family {fe}/{ft} "
+        f"({_rate(fe, ft)}), non-family {ne}/{nt2} ({_rate(ne, nt2)})")
+    return lines
+
+
+def compare_dashboard(old_d, new_d, labels_data=None, labels_source=None):
+    """The quality-dashboard block (lines after the legacy Summary)."""
+    lines = ["Quality dashboard:"]
+    if labels_data is not None:
+        lines.append(
+            f"  Labelled family pairs (source: {labels_source}):")
+    else:
+        lines.append("  Labelled family pairs: n/a (no labels file "
+                     "matched this book)")
+        lines.append("  Roster identity: n/a (not determinable from "
+                     "preview without labels)")
+    lines += _dashboard_run_lines("old run:", old_d, labels_data)
+    lines += _dashboard_run_lines("new run:", new_d, labels_data)
+    flips = form_flips(old_d, new_d)
+    lines.append(f"  Form flips (heuristic; scores unchanged): "
+                 f"{len(flips)}")
+    for o, n, why in flips[:MAX_LIST]:
+        lines.append(f"    '{o}' (old) ~ '{n}' (new) [{why}]")
+    if len(flips) > MAX_LIST:
+        lines.append(f"    ... and {len(flips) - MAX_LIST} more")
+    o_sp, n_sp = old_d.get("spice_level"), new_d.get("spice_level")
+    if o_sp is None or n_sp is None:
+        lines.append("  Spice threshold crossings: n/a (spice absent)")
+    elif o_sp == n_sp:
+        lines.append(f"  Spice threshold crossings: {o_sp} -> {n_sp}, "
+                     f"no boundary crossed")
+    else:
+        crossed = list(range(min(o_sp, n_sp) + 1, max(o_sp, n_sp) + 1))
+        lines.append(
+            f"  Spice threshold crossings: {o_sp} -> {n_sp}, crossed: "
+            + ", ".join(str(c) for c in crossed))
+    ot, _ol = extract_tropes(old_d)
+    nt_, _nl = extract_tropes(new_d)
+    og, _ogl, _ogp = extract_triggers(old_d)
+    ng, _ngl, _ngp = extract_triggers(new_d)
+    lines.append(
+        f"  Queue churn: tropes +{len(nt_ - ot)}/-{len(ot - nt_)}, "
+        f"triggers +{len(ng - og)}/-{len(og - ng)} "
+        f"(lists in the Tropes/Triggers sections above)")
+    return lines
+
+
+def find_labels(old_d, new_d):
+    """Locate a labels fixture for this book in the eval/ directory
+    next to this script. Matches on work_id first, then on the fixture's
+    book string containing both the previews' title and author.
+    Returns (labels dict, source name) or None."""
+    eval_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "eval")
+    if not os.path.isdir(eval_dir):
+        return None
+    work_ids = {d.get("work_id") for d in (old_d, new_d)} - {None}
+    title = norm((old_d.get("title") or new_d.get("title") or ""))
+    author = norm((old_d.get("author") or new_d.get("author") or ""))
+    for fname in sorted(os.listdir(eval_dir)):
+        if not fname.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(eval_dir, fname),
+                      encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict) or "true_pairs" not in data:
+            continue
+        if data.get("work_id") and data.get("work_id") in work_ids:
+            return data, f"eval/{fname}"
+        book = norm(data.get("book") or "")
+        if title and author and title in book and author in book:
+            return data, f"eval/{fname}"
+    return None
+
+
+def compare_previews(old_d, new_d, labels_data=None, labels_source=None):
     """Full report as a list of lines; last block is the summary scores."""
     lines = []
     ot, nt = old_d.get("title") or "?", new_d.get("title") or "?"
@@ -285,6 +773,8 @@ def compare_previews(old_d, new_d):
     if present:
         lines.append(f"  {'overall (mean)':<26} "
                      f"{sum(present) / len(present):.3f}")
+    lines.append("")
+    lines += compare_dashboard(old_d, new_d, labels_data, labels_source)
     return lines
 
 
@@ -294,23 +784,47 @@ def load_preview(path):
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: py preview_variance.py OLD_JSON NEW_JSON")
+    args = sys.argv[1:]
+    labels_path = None
+    if "--labels" in args:
+        i = args.index("--labels")
+        if i + 1 >= len(args):
+            print("Usage: py preview_variance.py OLD_JSON NEW_JSON "
+                  "[--labels LABELS_JSON]")
+            sys.exit(1)
+        labels_path = args[i + 1]
+        del args[i:i + 2]
+    if len(args) != 2:
+        print("Usage: py preview_variance.py OLD_JSON NEW_JSON "
+              "[--labels LABELS_JSON]")
         sys.exit(1)
-    for p in sys.argv[1:]:
+    for p in args:
         if not os.path.isfile(p):
             print(f"Not found: {p}")
             sys.exit(1)
     try:
-        old_d = load_preview(sys.argv[1])
-        new_d = load_preview(sys.argv[2])
+        old_d = load_preview(args[0])
+        new_d = load_preview(args[1])
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         print(f"ERROR: could not parse preview JSON: {e}")
         sys.exit(2)
-    print(f"Old: {sys.argv[1]}")
-    print(f"New: {sys.argv[2]}")
+    labels_data = labels_source = None
+    if labels_path is not None:
+        try:
+            labels_data = load_preview(labels_path)
+            labels_source = labels_path
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            print(f"ERROR: could not parse labels JSON: {e}")
+            sys.exit(2)
+    else:
+        found = find_labels(old_d, new_d)
+        if found is not None:
+            labels_data, labels_source = found
+    print(f"Old: {args[0]}")
+    print(f"New: {args[1]}")
     print()
-    print("\n".join(compare_previews(old_d, new_d)))
+    print("\n".join(compare_previews(old_d, new_d,
+                                     labels_data, labels_source)))
 
 
 if __name__ == "__main__":
