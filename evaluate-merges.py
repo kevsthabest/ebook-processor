@@ -1,11 +1,44 @@
 #!/usr/bin/env python3
-"""Evaluate decision model merge predictions against hand-labeled pairs.
+"""Evaluate decision model merge predictions against labeled pairs.
+
+Production-faithful: each pair is judged with the SAME payload shape
+DecisionValidator.ask_same_person builds in process-portable.py —
+names + best descriptions + evidence snippets, assembled by
+build_same_person_state() below with the same part order and the same
+truncation (descriptions 600 chars, evidence 300). Pairs without any
+description/evidence run in name-only mode and are reported as such —
+name-only scores measure a judge production never runs.
+
+Two instruction variants, selectable with --prompt:
+  legacy    the production instruction text, verbatim (the default);
+  identity  a candidate rewrite implementing the identity-evidence
+            rule (positive identity evidence required; similar
+            descriptions alone never establish identity; insufficient
+            evidence scores mid-scale instead of forcing a side).
+The payload surrounding the instructions is identical for both, so a
+run pair isolates the instruction text as the only variable. Per the
+quality-loop discipline, the identity variant ships nowhere until a
+live run on labeled pairs beats legacy on held-out books.
 
 Usage:
+    python3 evaluate-merges.py --labels eval/merge_pairs.json \
+        --provider openrouter --prompt identity
     python3 evaluate-merges.py --labels merge-labels.json \
         --base-url http://127.0.0.1:8888/v1
 
-Reports accuracy, precision, recall, and per-threshold analysis.
+Labels: either the pair-list format (eval/merge_pairs.json: a JSON
+list of {name_a, name_b, label: "same"|"different", book, desc_a,
+desc_b, evidence_a, evidence_b, source}) or the legacy label-merges.py
+dict format ({key: {a, b, same_person, uncertain}}).
+
+--dry-run exercises the plumbing against a stubbed endpoint (no
+network): a pair's "stub_score" field wins when present (null forces
+unanswered), else a deterministic token-overlap heuristic scores it.
+
+Reports accuracy, precision, recall at thresholds 0.5 and 0.85, with
+false merges and false splits listed separately by name — they are
+not equally costly. Unanswered pairs (missing/invalid score) are
+counted and excluded from every denominator.
 """
 
 import argparse
@@ -20,6 +53,79 @@ OPENROUTER_SYSTEMONE_BASE = "https://openrouter.ai/api/v1"
 # Pinned Jev release; never the "latest" alias.
 OPENROUTER_DECISION_MODEL = "typesafe/jev-1.13"
 OPENROUTER_ATTRIBUTION_TITLE = "ebook-processor"
+
+
+# --- Prompt variants ---------------------------------------------------
+# DRIFT RISK: the legacy text below duplicates the instruction literal
+# in DecisionValidator.ask_same_person (process-portable.py) verbatim.
+# This script is a standalone artefact (hyphenated module name, run
+# directly against any checkout), so it cannot import the portable
+# script; instead tests/test_jev_eval_harness.py captures the REAL
+# production instructions + state via a stubbed _ask_noul and pins them
+# against these constants. If production text changes, that test fails
+# and this copy must be updated in the same commit.
+LEGACY_INSTRUCTIONS = (
+    "Are these two character entries referring to the same person? "
+    "Answer YES when: the names are variants of each other (nickname, "
+    "shortened form, title + name matching a fuller name, minor "
+    "spelling differences) AND the descriptions are compatible. "
+    "Answer NO when: different first names, different people sharing "
+    "a surname (siblings, parent/child), incompatible descriptions "
+    "or roles, or insufficient evidence they are the same individual."
+)
+
+# Candidate rewrite: identity evidence, not first-name equality. YES
+# needs positive evidence of one identity; NO needs positive evidence
+# of two identities (or a contradiction / deterministic exclusion);
+# anything else is explicitly an intermediate score, not a forced
+# side. Deliberately contains no nickname-vs-first-names contradiction.
+IDENTITY_INSTRUCTIONS = (
+    "Are these two character entries referring to the same person? "
+    "Answer YES only when there is positive evidence of one identity: "
+    "a supported alias or nickname linking the two names, a reliable "
+    "name variant (shortened form, title change, minor spelling "
+    "difference) with compatible attributes, or contextual evidence "
+    "that both entries describe the same individual. "
+    "Answer NO when the book supports two distinct identities, when "
+    "the descriptions meaningfully contradict each other (roles, "
+    "relationships, or histories one person could not hold), or when "
+    "a deterministic constraint rules the pair out. "
+    "Similar descriptions alone never establish identity: different "
+    "people can share a surname, a role, and a description. "
+    "If the evidence is insufficient either way, score near the "
+    "middle of the scale rather than guessing — an unresolved pair "
+    "stays separate and is reviewed; it is not merged on a guess."
+)
+
+PROMPT_VARIANTS = {
+    "legacy": LEGACY_INSTRUCTIONS,
+    "identity": IDENTITY_INSTRUCTIONS,
+}
+
+# Thresholds every run reports in full (the production merge bar and
+# the historical experiment bar).
+REPORT_THRESHOLDS = (0.5, 0.85)
+
+
+def build_same_person_state(name_a, desc_a, ev_a, name_b, desc_b, ev_b):
+    """Assemble the judge state exactly as production does.
+
+    Mirrors DecisionValidator.ask_same_person in process-portable.py:
+    same parts, same order, same truncation (desc 600, evidence 300),
+    empty fields omitted. Pinned against the real validator by
+    tests/test_jev_eval_harness.py — change both or neither.
+    """
+    parts = [f"Character A: {name_a}"]
+    if desc_a:
+        parts.append(f"Description A: {desc_a[:600]}")
+    if ev_a:
+        parts.append(f"Evidence A: {ev_a[:300]}")
+    parts.append(f"Character B: {name_b}")
+    if desc_b:
+        parts.append(f"Description B: {desc_b[:600]}")
+    if ev_b:
+        parts.append(f"Evidence B: {ev_b[:300]}")
+    return "\n".join(parts)
 
 
 def resolve_provider(provider, base_url, model):
@@ -46,22 +152,24 @@ def resolve_provider(provider, base_url, model):
 
 
 def ask_same_person(base_url, model, api_key, name_a, name_b, timeout=30,
-                    extra_headers=None):
+                    extra_headers=None, desc_a="", ev_a="", desc_b="",
+                    ev_b="", instructions=None):
+    """Ask the decision model about one pair. Returns p_yes or None.
+
+    The payload state is the production shape (build_same_person_state)
+    and the default instructions are the production text verbatim; pass
+    instructions=PROMPT_VARIANTS["identity"] for the candidate rewrite.
+    """
+    if instructions is None:
+        instructions = LEGACY_INSTRUCTIONS
     payload = json.dumps({
         "model": model or "default",
-        "state": f"Character A: {name_a}\nCharacter B: {name_b}",
+        "state": build_same_person_state(name_a, desc_a, ev_a,
+                                         name_b, desc_b, ev_b),
         "questions": {
             "same_person": {
                 "type": "noul",
-                "instructions": (
-                    "Are these two names referring to the same person? "
-                    "Answer YES when: the names are variants of each other "
-                    "(nickname, shortened form, title + surname matching full name, "
-                    "same first name with compatible details). "
-                    "Answer NO when: different first names, different people with "
-                    "similar surnames (siblings, parent/child), or insufficient "
-                    "evidence they are the same individual."
-                ),
+                "instructions": instructions,
             }
         },
     }).encode()
@@ -101,7 +209,136 @@ def ask_same_person(base_url, model, api_key, name_a, name_b, timeout=30,
         return None
 
 
-def main():
+# --- Labeled pairs -----------------------------------------------------
+
+def _normalize_pair(entry, where):
+    """Validate one pair-list entry; return the internal pair dict."""
+    if not isinstance(entry, dict):
+        raise ValueError(f"{where}: pair entry is not an object")
+    name_a = entry.get("name_a") or ""
+    name_b = entry.get("name_b") or ""
+    if not name_a or not name_b:
+        raise ValueError(f"{where}: pair needs non-empty name_a/name_b")
+    label = entry.get("label")
+    if label not in ("same", "different"):
+        raise ValueError(
+            f"{where}: label must be 'same' or 'different', got {label!r}")
+    pair = {
+        "name_a": name_a,
+        "name_b": name_b,
+        "expected": label == "same",
+        "book": entry.get("book") or "unknown",
+        "desc_a": entry.get("desc_a") or "",
+        "desc_b": entry.get("desc_b") or "",
+        "evidence_a": entry.get("evidence_a") or "",
+        "evidence_b": entry.get("evidence_b") or "",
+        "source": entry.get("source") or "",
+    }
+    if "stub_score" in entry:
+        pair["stub_score"] = entry["stub_score"]
+    return pair
+
+
+def load_pairs_file(path):
+    """Load labeled pairs from a labels file.
+
+    Accepts the pair-list format (list of entries with name_a/name_b/
+    label/book + optional desc/evidence) and the legacy label-merges.py
+    dict format ({key: {a, b, same_person, uncertain}} — uncertain
+    entries are skipped, as the old main() did). Returns a list of
+    normalized pair dicts. Raises ValueError on malformed input: an
+    eval tool fails loud on a bad pair file rather than silently
+    dropping pairs from the denominator.
+    """
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return [_normalize_pair(e, f"entry {i}")
+                for i, e in enumerate(data)]
+    if isinstance(data, dict):
+        pairs = []
+        for key, lbl in data.items():
+            if not isinstance(lbl, dict) or lbl.get("uncertain"):
+                continue
+            if "a" not in lbl or "b" not in lbl \
+                    or "same_person" not in lbl:
+                raise ValueError(f"legacy entry {key!r}: needs a/b/"
+                                 f"same_person")
+            pairs.append({
+                "name_a": lbl["a"],
+                "name_b": lbl["b"],
+                "expected": bool(lbl["same_person"]),
+                "book": lbl.get("book") or "unknown",
+                "desc_a": "", "desc_b": "",
+                "evidence_a": "", "evidence_b": "",
+                "source": lbl.get("source") or "",
+            })
+        return pairs
+    raise ValueError("labels file must be a pair list or a legacy "
+                     "label dict")
+
+
+def pair_mode(pair):
+    """'full' when the judge receives any description/evidence for the
+    pair (the production shape), else 'name-only'."""
+    if pair.get("desc_a") or pair.get("desc_b") \
+            or pair.get("evidence_a") or pair.get("evidence_b"):
+        return "full"
+    return "name-only"
+
+
+# --- Scoring -----------------------------------------------------------
+
+def score_summary(scored, threshold):
+    """Confusion counts + rates for scored pairs at one threshold.
+
+    scored: pair dicts carrying "p_yes" (float) or None (unanswered).
+    Unanswered pairs are counted and excluded from every denominator.
+    False merges (different people predicted same) and false splits
+    (same person predicted different) are returned as separate named
+    lists — they are not equally costly.
+    """
+    answered = [p for p in scored if p.get("p_yes") is not None]
+    tp = sum(1 for p in answered if p["expected"] and p["p_yes"] >= threshold)
+    tn = sum(1 for p in answered
+             if not p["expected"] and p["p_yes"] < threshold)
+    false_merges = [p for p in answered
+                    if not p["expected"] and p["p_yes"] >= threshold]
+    false_splits = [p for p in answered
+                    if p["expected"] and p["p_yes"] < threshold]
+    fp, fn = len(false_merges), len(false_splits)
+    total = len(answered)
+    return {
+        "threshold": threshold,
+        "tp": tp, "tn": tn, "fp": fp, "fn": fn,
+        "answered": total,
+        "unanswered": len(scored) - total,
+        "accuracy": (tp + tn) / total if total else 0,
+        "precision": tp / (tp + fp) if (tp + fp) else 0,
+        "recall": tp / (tp + fn) if (tp + fn) else 0,
+        "false_merges": false_merges,
+        "false_splits": false_splits,
+    }
+
+
+def stub_score(pair):
+    """Deterministic dry-run score: the pair's explicit "stub_score"
+    when present (null/invalid -> unanswered), else token overlap."""
+    if "stub_score" in pair:
+        v = pair["stub_score"]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        if math.isnan(v) or math.isinf(v) or not 0 <= v <= 1:
+            return None
+        return float(v)
+    a = set(pair["name_a"].lower().split())
+    b = set(pair["name_b"].lower().split())
+    return 0.9 if a & b else 0.1
+
+
+# --- Main --------------------------------------------------------------
+
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--labels', required=True)
     ap.add_argument('--base-url', default='http://127.0.0.1:8888/v1')
@@ -111,74 +348,122 @@ def main():
                          "(default) or 'openrouter' hosted Jev")
     ap.add_argument('--model', default='')
     ap.add_argument('--threshold', type=float, default=0.5)
-    args = ap.parse_args()
+    ap.add_argument('--prompt', choices=sorted(PROMPT_VARIANTS),
+                    default='legacy',
+                    help="instruction variant: 'legacy' (production "
+                         "text, verbatim) or 'identity' (candidate "
+                         "identity-evidence rewrite)")
+    ap.add_argument('--dry-run', action='store_true',
+                    help="stubbed endpoint, no network: prove the "
+                         "plumbing with deterministic synthetic scores")
+    args = ap.parse_args(argv)
 
-    try:
-        base_url, model, api_key, extra_headers = resolve_provider(
-            args.provider, args.base_url, args.model)
-    except ValueError as e:
-        print(f"Error: {e}")
-        sys.exit(2)
+    instructions = PROMPT_VARIANTS[args.prompt]
+    if args.dry_run:
+        base_url, model, api_key, extra_headers = "", "stub", "", {}
+    else:
+        try:
+            base_url, model, api_key, extra_headers = resolve_provider(
+                args.provider, args.base_url, args.model)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return 2
 
-    labels = json.load(open(args.labels, encoding='utf-8'))
-    # Skip uncertain labels for evaluation
-    pairs = [(k, v) for k, v in labels.items() if not v.get('uncertain')]
-    print(f"Evaluating {len(pairs)} labeled pairs (threshold={args.threshold}) "
-          f"provider={args.provider} model={model or 'default'}\n")
+    pairs = load_pairs_file(args.labels)
+    n_full = sum(1 for p in pairs if pair_mode(p) == "full")
+    n_name_only = len(pairs) - n_full
+    print(f"Evaluating {len(pairs)} labeled pairs "
+          f"(threshold={args.threshold}) prompt={args.prompt} "
+          f"provider={'dry-run' if args.dry_run else args.provider} "
+          f"model={model or 'default'}")
+    print(f"Pair modes: {n_full} with descriptions/evidence (production "
+          f"shape), {n_name_only} name-only")
+    if n_full == 0:
+        print("WARNING: every pair is name-only — these scores measure "
+              "a name-only judge, NOT production, which receives "
+              "descriptions + evidence.")
+    if args.dry_run:
+        print("DRY RUN: stubbed endpoint — scores are synthetic and "
+              "say nothing about the model.")
+    print()
 
-    results = []
-    n_unanswered = 0
-    for i, (key, lbl) in enumerate(pairs):
-        expected = lbl['same_person']
-        p_yes = ask_same_person(
-            base_url, model, api_key,
-            lbl['a'], lbl['b'], extra_headers=extra_headers)
+    scored = []
+    for i, pair in enumerate(pairs):
+        if args.dry_run:
+            p_yes = stub_score(pair)
+        else:
+            p_yes = ask_same_person(
+                base_url, model, api_key,
+                pair["name_a"], pair["name_b"],
+                extra_headers=extra_headers,
+                desc_a=pair["desc_a"], ev_a=pair["evidence_a"],
+                desc_b=pair["desc_b"], ev_b=pair["evidence_b"],
+                instructions=instructions)
+        entry = dict(pair)
+        entry["p_yes"] = p_yes
+        scored.append(entry)
         if p_yes is None:
-            n_unanswered += 1
             continue
         predicted = p_yes >= args.threshold
-        correct = predicted == expected
-        results.append((expected, predicted, p_yes, lbl))
+        correct = predicted == pair["expected"]
         mark = "✓" if correct else "✗"
-        print(f"{mark} [{i+1}/{len(pairs)}] {lbl['a']} vs {lbl['b']}: "
-              f"exp={expected} pred={predicted} P={p_yes:.2f}")
+        print(f"{mark} [{i+1}/{len(pairs)}] {pair['name_a']} vs "
+              f"{pair['name_b']}: exp={pair['expected']} "
+              f"pred={predicted} P={p_yes:.2f}")
 
-    # Metrics
-    tp = sum(1 for e, p, _, _ in results if e and p)
-    tn = sum(1 for e, p, _, _ in results if not e and not p)
-    fp = sum(1 for e, p, _, _ in results if not e and p)
-    fn = sum(1 for e, p, _, _ in results if e and not p)
-    total = len(results)
-    acc = (tp + tn) / total if total else 0
-    prec = tp / (tp + fp) if (tp + fp) else 0
-    rec = tp / (tp + fn) if (tp + fn) else 0
-
-    print(f"\n=== RESULTS (threshold={args.threshold}) ===")
-    print(f"Accuracy:  {acc:.2%} ({tp+tn}/{total})")
-    print(f"Precision: {prec:.2%} (of predicted merges, how many correct)")
-    print(f"Recall:    {rec:.2%} (of true merges, how many caught)")
-    print(f"TP={tp} TN={tn} FP={fp} FN={fn}")
-    print(f"Unanswered: {n_unanswered} of {len(pairs)} pairs "
+    # Primary-threshold results (the historical report shape).
+    s = score_summary(scored, args.threshold)
+    print(f"\n=== RESULTS (threshold={args.threshold}) "
+          f"prompt={args.prompt} ===")
+    print(f"Accuracy:  {s['accuracy']:.2%} ({s['tp'] + s['tn']}/"
+          f"{s['answered']})")
+    print(f"Precision: {s['precision']:.2%} (of predicted merges, "
+          f"how many correct)")
+    print(f"Recall:    {s['recall']:.2%} (of true merges, "
+          f"how many caught)")
+    print(f"TP={s['tp']} TN={s['tn']} FP={s['fp']} FN={s['fn']}")
+    print(f"Unanswered: {s['unanswered']} of {len(pairs)} pairs "
           f"(excluded from the metrics above)")
 
-    # Show errors
-    errors = [(e, p, s, l) for e, p, s, l in results if e != p]
+    # Errors at the primary threshold.
+    errors = [p for p in scored if p["p_yes"] is not None
+              and (p["p_yes"] >= args.threshold) != p["expected"]]
     if errors:
         print(f"\n=== ERRORS ({len(errors)}) ===")
-        for expected, predicted, p_yes, lbl in errors:
-            print(f"  {lbl['a']} vs {lbl['b']}: "
-                  f"expected={expected} got={predicted} P={p_yes:.2f}")
+        for p in errors:
+            print(f"  {p['name_a']} vs {p['name_b']}: "
+                  f"expected={p['expected']} "
+                  f"got={p['p_yes'] >= args.threshold} "
+                  f"P={p['p_yes']:.2f}")
+
+    # Full report at both standing thresholds, false merges and false
+    # splits named separately — they are not equally costly.
+    print("\n=== FALSE MERGES / FALSE SPLITS BY THRESHOLD ===")
+    for thresh in REPORT_THRESHOLDS:
+        st = score_summary(scored, thresh)
+        print(f"--- threshold {thresh:.2f} ---")
+        print(f"Accuracy:  {st['accuracy']:.2%}  "
+              f"Precision: {st['precision']:.2%}  "
+              f"Recall: {st['recall']:.2%}")
+        print(f"False merges ({st['fp']}) — different people the "
+              f"judge would merge:")
+        for p in st["false_merges"]:
+            print(f"  {p['name_a']} vs {p['name_b']} ({p['book']}): "
+                  f"P={p['p_yes']:.2f}")
+        print(f"False splits ({st['fn']}) — same person the judge "
+              f"would keep apart:")
+        for p in st["false_splits"]:
+            print(f"  {p['name_a']} vs {p['name_b']} ({p['book']}): "
+                  f"P={p['p_yes']:.2f}")
 
     # Threshold sweep
     print("\n=== THRESHOLD SWEEP ===")
     for thresh in [0.3, 0.5, 0.7, 0.8, 0.9]:
-        tp_ = sum(1 for e, _, s, _ in results if e and s >= thresh)
-        fp_ = sum(1 for e, _, s, _ in results if not e and s >= thresh)
-        fn_ = sum(1 for e, _, s, _ in results if e and s < thresh)
-        prec_ = tp_ / (tp_ + fp_) if (tp_ + fp_) else 0
-        rec_ = tp_ / (tp_ + fn_) if (tp_ + fn_) else 0
-        print(f"  thresh={thresh:.1f}: prec={prec_:.2%} rec={rec_:.2%}")
+        st = score_summary(scored, thresh)
+        print(f"  thresh={thresh:.1f}: prec={st['precision']:.2%} "
+              f"rec={st['recall']:.2%}")
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
