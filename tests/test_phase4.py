@@ -2753,7 +2753,15 @@ class TestRelationshipValidation(unittest.TestCase):
         self.assertEqual(red["relationships"][0]["type"], "spouse")
         self.assertEqual(red["relationships"][0]["validation_p"], 0.3)
 
-    def test_no_evidence_downgrades_without_call(self):
+    def test_no_evidence_drops_without_call(self):
+        # BAR-MOVE (family fail-closed, 2026-10-14): this test used to
+        # pin the auto-downgrade — an evidence-less family claim
+        # survived as type "other" with validation_note "no_evidence".
+        # The FW -14 labelled control set showed that let false family
+        # claims survive unjudged (in -13 the same claims carried junk
+        # quotes, were validated, and dropped). Approved behaviour is
+        # fail-closed: no quote + no binding-grade mine -> the claim
+        # DROPS, original type visible in dropped_relationships.
         calls = []
         class FakeValidator:
             model = "fake"
@@ -2766,8 +2774,11 @@ class TestRelationshipValidation(unittest.TestCase):
             [self._rel("Alice", "Bob", "spouse", "")])}  # no evidence
         red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
         self.assertEqual(len(calls), 0)  # no API call made
-        self.assertEqual(red["relationships"][0]["type"], "other")
-        self.assertEqual(red["relationships"][0]["validation_note"], "no_evidence")
+        self.assertEqual(red["relationships"], [])
+        dropped = red["dropped_relationships"]
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(dropped[0]["type"], "spouse")
+        self.assertEqual(dropped[0]["validation_note"], "no_evidence")
 
     def test_non_family_not_validated(self):
         calls = []

@@ -150,17 +150,24 @@ class TestFamilyGuard(unittest.TestCase):
         self.assertEqual(dropped[0]["family_guard"], "suppressed_by_family")
         self.assertEqual(dropped[0]["suppressed_by_type"], "sibling")
 
-    def test_family_winner_still_validated_in_write_mode(self):
-        # The guard picks the family claim; the existing no-evidence rule
-        # then downgrades it to "other" in write mode. The enemy claim
-        # stays suppressed either way.
+    def test_family_winner_no_evidence_drops_in_write_mode(self):
+        # BAR-MOVE (family fail-closed, 2026-10-14): this test used to
+        # pin the guard winner surviving write mode as "other" with
+        # note "no_evidence" (the auto-downgrade). Fail-closed: the
+        # evidence-less family winner DROPS, so the pair ends with no
+        # surviving relationship, and dropped_relationships carries
+        # BOTH audit entries — the suppressed enemy (family_guard at
+        # selection) and the dropped sibling (no_evidence at
+        # validation).
         red = _reduce(self._FW, preview=False)
-        self.assertEqual(len(red["relationships"]), 1)
-        self.assertEqual(red["relationships"][0]["type"], "other")
-        self.assertEqual(red["relationships"][0]["validation_note"],
-                         "no_evidence")
+        self.assertEqual(red["relationships"], [])
+        dropped = red["dropped_relationships"]
         self.assertTrue(any(d.get("family_guard") == "suppressed_by_family"
-                            for d in red["dropped_relationships"]))
+                            for d in dropped))
+        sibling_drops = [d for d in dropped
+                         if d.get("validation_note") == "no_evidence"]
+        self.assertEqual(len(sibling_drops), 1)
+        self.assertEqual(sibling_drops[0]["type"], "sibling")
 
     def test_no_family_claim_no_guard(self):
         red = _reduce({

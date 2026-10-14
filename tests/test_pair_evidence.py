@@ -349,9 +349,14 @@ class TestWriteEvidenceIntegration(unittest.TestCase):
             "evidence": "Alice met Bob at the market square.",
             "evidence_source": "mined"}])
 
-    def test_evidenceless_family_cooccurrence_still_skipped(self):
-        # Mandatory case: evidence-less FAMILY pair with only a
-        # co-occurrence sentence -> still skipped at write.
+    def test_evidenceless_family_cooccurrence_drops(self):
+        # BAR-MOVE (family fail-closed, 2026-10-14): this test used to
+        # pin the claim surviving reduce (auto-downgraded) and being
+        # skipped at WRITE. Fail-closed moves the exclusion to family
+        # validation: an evidence-less family pair with only a
+        # co-occurrence sentence DROPS in reduce, so nothing reaches
+        # the write pass at all. The write outcome is unchanged in
+        # effect — the pair is not written.
         text = ("General Sorrengail reviewed the cadets while Violet "
                 "Sorrengail thought of her mother.")
         chs = _chs(text)
@@ -360,12 +365,13 @@ class TestWriteEvidenceIntegration(unittest.TestCase):
             "type": "parent", "evidence": ""}], "pov_character": None}}
         red = pp.v2_reduce(chapter_as, {}, _FW_ROSTER, chs,
                            preview=False)
-        self.assertEqual(len(red["relationships"]), 1)
-        rel = red["relationships"][0]
-        self.assertFalse((rel.get("evidence") or "").strip())
-        self.assertNotIn("evidence_source", rel)
+        self.assertEqual(red["relationships"], [])
+        dropped = red["dropped_relationships"]
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(dropped[0]["type"], "parent")
+        self.assertEqual(dropped[0]["validation_note"], "no_evidence")
         rel_map, evidenceless = pp._build_rel_map(red)
-        self.assertEqual(evidenceless, 1)
+        self.assertEqual(evidenceless, 0)
         self.assertEqual(rel_map, {})
 
     def test_evidenceless_family_binding_written(self):

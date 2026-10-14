@@ -4313,7 +4313,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     #   0.30 <= P < 0.70: downgrade to "other" (relationship exists;
     #     we're just unsure of the type).
     #   P < 0.30: drop entirely (likely hallucinated, not just mistyped).
-    # No evidence -> downgrade without spending a decision-model call.
+    # No evidence (no quote, no binding-grade mined sentence) -> drop,
+    # fail closed, without spending a decision-model call.
     # In preview mode scores/notes are recorded but nothing is changed.
     # Draws from the shared per-book decision-model budget (merges first).
     _dropped_relationships = []
@@ -4353,11 +4354,27 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 rel["evidence_mined"] = _mined["sentence"]
                 _ev = _mined["sentence"]
         if not _ev:
-            # No evidence: downgrade without spending a decision-model call.
+            # No evidence at all — no extracted quote and no
+            # binding-grade mined sentence: fail closed. The claim
+            # DROPS rather than surviving as an unjudged downgrade
+            # (FW -14 control set: false family claims that carried
+            # junk quotes in -13 were validated and dropped; the same
+            # claims survived in -14 purely because no quote was
+            # attached — survival must not depend on that accident).
+            # No decision-model call is spent. In write mode the
+            # claim moves to dropped_relationships with its ORIGINAL
+            # family type; the note records the reason (location +
+            # note carry the meaning). In preview mode the claim
+            # stays in relationships with the note, as with every
+            # other validation outcome — preview changes nothing.
+            # The budget boundary is separate: a claim WITH a quote
+            # whose validation is skipped on budget keeps its type
+            # with note "budget_exhausted" below; "the validator
+            # wasn't consulted" is never conflated with "no evidence".
             rel["validation_p"] = None
             rel["validation_note"] = "no_evidence"
             if not preview:
-                rel["type"] = "other"
+                _dropped_relationships.append(rel)
             continue
         if _DECISION_VALIDATOR is None:
             continue  # no validator configured; leave as-is
@@ -9385,7 +9402,7 @@ def save_preview(fpath, result):
             elif _vn == "would_drop":
                 _conf_str += " [would drop: very low validation]"
             elif _vn == "no_evidence":
-                _conf_str += " [downgraded: no evidence]"
+                _conf_str += " [would drop: no evidence]"
             md.append(f"- {r['from']} → {r['to']}: {r['type']}{_conf_str}")
         md.append("")
     _dropped = result.get("dropped_relationships") or []
