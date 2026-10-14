@@ -652,7 +652,8 @@ def compare_dashboard(old_d, new_d, labels_data=None, labels_source=None):
     lines = ["Quality dashboard:"]
     if labels_data is not None:
         lines.append(
-            f"  Labelled family pairs (source: {labels_source}):")
+            f"  Labelled family pairs (shipped set — post-principals; "
+            f"source: {labels_source}):")
     else:
         lines.append("  Labelled family pairs: n/a (no labels file "
                      "matched this book)")
