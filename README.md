@@ -256,6 +256,11 @@ elsewhere.
   LLM "antagonist" label is kept as a subtype on protagonist/supporting.
 - `--alias "Loki=Brian Gragg"` records a manual character alias: repeatable,
   stored as human-validated, applies cross-book.
+- `--roster-reconcile` (experiment, default off) canonicalizes the roster
+  once after Call A with the whole book sighted: mutual alias claims and
+  learned/manual links merge split sightings of one character, and alias
+  claims that turned out to name a real character are pruned. The preview
+  JSON records the outcome under `roster_reconcile`.
 
 ## Relationship direction
 
