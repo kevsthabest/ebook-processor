@@ -1486,6 +1486,11 @@ def _preview_summary(result):
     tropes = r.get("tropes") or []
     lines.append(f"  Tropes: {len(tropes)} confirmed")
 
+    _stg = r.get("staging")
+    if _stg:
+        lines.append(f"  Staging: {len(_stg.get('staged') or [])} "
+                     f"held back (staging gate)")
+
     if minors:
         lines.append(f"  Minor characters: {len(minors)} (see preview JSON)")
 
@@ -3249,6 +3254,19 @@ def staging_claim_key(cls, name=None, catalog_id=None, warning=None):
         "never staged or promoted (fail-closed has no bypass)")
 
 
+def staging_work_key(work_id=None, isbn=None, title="", author=""):
+    """Store key for a work (design section 3): the catalog work_id
+    when resolved, else the ISBN, else normalized title|author. The
+    weaker keys are a fallback for previewing un-ingested books, not
+    a second identity system: entries under them are adopted into
+    the work_id entry when a run resolves the id (OC-8)."""
+    if work_id:
+        return str(work_id)
+    if isbn:
+        return f"isbn:{isbn}"
+    return f"title:{_tnorm(title)}|{_tnorm(author)}"
+
+
 def _staging_day(s):
     """ISO date string -> ordinal day number (None when unparsable)."""
     if not s:
@@ -3469,19 +3487,29 @@ class StagingState:
                     {"from_key": cand, "claims_moved": moved})
 
     def _merge_work_into(self, dst, src):
-        """Fold src's claims into dst (adoption). Sightings union by
-        ordinal — never summed. staged_ever stays exact: a claim key
-        live in BOTH entries was one claim staged once (counted on
-        both sides), so each such overlap subtracts one duplicate;
-        a key expired on one side and live on the other is two
-        staging episodes (expired, then re-staged) and counts twice,
-        exactly as observe counts a re-stage. Promotion is sticky:
-        a claim promoted on either side stays promoted. Returns the
-        number of claim keys moved or merged."""
+        """Fold src's claims into dst (adoption). The two entries
+        partition the work's runs (each run observes under exactly
+        one key), so src's sighting ordinals SHIFT by dst's completed
+        run count before unioning — a fallback entry recreated fresh
+        each run numbers its run 1 every time, and a plain union
+        would silently eat every later sighting (delay-only, but it
+        would break promotion for exactly the books adoption serves).
+        staged_ever stays exact: a claim key live in BOTH entries was
+        one claim counted on both sides, so each such overlap
+        subtracts one duplicate; a key expired on one side and live
+        on the other is two staging episodes (expired, then
+        re-staged) and counts twice, exactly as observe counts a
+        re-stage. Promotion is sticky. Returns claims moved/merged."""
         moved = 0
         dup = 0
+        shift = dst["runs_completed"]
         for key, entry in list(src["claims"].items()):
             moved += 1
+            if shift:
+                entry["sightings"] = [s + shift
+                                      for s in entry["sightings"]]
+                if entry.get("promoted_run"):
+                    entry["promoted_run"] += shift
             cur = dst["claims"].get(key)
             if cur is None:
                 dst["claims"][key] = entry
@@ -3489,6 +3517,8 @@ class StagingState:
                 self._fold_entry_into(cur, entry)
                 dup += 1
         for rec in src["expired_recent"]:
+            if shift and rec.get("expired_run"):
+                rec["expired_run"] += shift
             if all(r["key"] != rec["key"]
                    for r in dst["expired_recent"]):
                 dst["expired_recent"].append(rec)
@@ -3500,9 +3530,34 @@ class StagingState:
         while len(dst["expired_recent"]) > _STAGING_EXPIRED_CAP:
             dst["expired_recent"].pop(0)
             dst["expired_dropped"] += 1
-        dst["runs_completed"] = max(dst["runs_completed"],
-                                    src["runs_completed"])
+        dst["runs_completed"] = shift + src["runs_completed"]
         return moved
+
+    def adopt_for(self, work_id, title="", author="", isbn=None):
+        """Post-resolution adoption (OC-8) for callers that learn the
+        work_id only AFTER observing under a fallback key — the
+        pipeline resolves works after extraction, so the observe seam
+        never has the id. Creates no entry when nothing waits to be
+        adopted. Returns True when an adoption happened."""
+        if not work_id or not self.enabled:
+            return False
+        with self._lock:
+            dst_key = str(work_id)
+            candidates = []
+            if isbn:
+                candidates.append(f"isbn:{isbn}")
+            candidates.append(
+                f"title:{_tnorm(title)}|{_tnorm(author)}")
+            if not any(c in self.data["works"] for c in candidates
+                       if c != dst_key):
+                return False
+            dst = self.work_entry(dst_key, work_id, title, author)
+            before = len(dst["adoptions"])
+            self._adopt_fallbacks(dst, work_id, title, author, isbn)
+            if len(dst["adoptions"]) == before:
+                return False
+            self.save()
+            return True
 
     @staticmethod
     def _fold_entry_into(dst, src):
@@ -3893,6 +3948,101 @@ def staging_report_data(state, today=None):
             "corrupt_at_load": state.corrupt_at_load}
 
 
+def staging_observe_result(parts, state, *, independent):
+    """Option F seam helper (design section 5): observe one completed
+    run's stageable claims and compute the ship set. Called ONCE per
+    run from process_file_v2; result["tropes"]/["triggers"] become
+    the returned ship set and every downstream consumer inherits the
+    split.
+
+    The pre-staging hard filters run here for the gated candidates,
+    exactly as they do for any claim: rejection learning is applied
+    with the pipeline's own formula confidence (the gate block applied
+    it to the ship candidates), so a claim the filter drops is never
+    observed and never staged. Denylisted candidates never reach this
+    helper at all (the gate block's split already excluded them).
+
+    parts keys: work_key, work_id, title, author, isbn, auto_min,
+    trope_auto, trope_gated, trope_counts, trope_ship, trope_conf,
+    catalog_map, triggers.
+    Returns {ship_tropes, trope_conf, ship_triggers, marker,
+    trope_persistence, trigger_persistence}."""
+    counts = parts.get("trope_counts") or {}
+    cat_map = parts.get("catalog_map") or {}
+    gated = list(parts.get("trope_gated") or [])
+    if gated:
+        _gconf = {_tnorm(c): round(
+            min(0.9, 0.55 + 0.1 * counts.get(_tnorm(c), 1)), 2)
+            for c in gated}
+        gated, _gconf, _nf = _apply_trope_rejections(
+            gated, _gconf, _learn())
+    obs_tropes = [{"name": c,
+                   "n_ch": counts.get(_tnorm(c), 1),
+                   "catalog_id": cat_map.get(_tnorm(c))}
+                  for c in list(parts.get("trope_auto") or []) + gated]
+    triggers_in = list(parts.get("triggers") or [])
+    obs_triggers = []
+    for t in triggers_in:
+        if isinstance(t, dict):
+            obs_triggers.append({
+                "warning": t.get("warning") or "",
+                "has_evidence": bool(t.get("evidence"))})
+        else:
+            obs_triggers.append({"warning": str(t),
+                                 "has_evidence": False})
+    out = state.observe_work(
+        work_key=parts["work_key"], work_id=parts.get("work_id"),
+        title=parts.get("title", ""), author=parts.get("author", ""),
+        isbn=parts.get("isbn"), tropes=obs_tropes,
+        triggers=obs_triggers, auto_min=parts.get("auto_min", 3),
+        independent=independent)
+    acts = {}
+    for obs, act in zip(obs_tropes, out["trope_actions"]):
+        acts[_tnorm(obs["name"])] = act
+    ship_src = list(parts.get("trope_ship") or [])
+    ship_tropes = [t for t in ship_src
+                   if (acts.get(_tnorm(t)) or {}).get("action")
+                   == "ship"]
+    in_ship = {_tnorm(t) for t in ship_tropes}
+    for c in list(parts.get("trope_auto") or []) + gated:
+        if _tnorm(c) not in in_ship \
+                and (acts.get(_tnorm(c)) or {}).get("action") == "ship":
+            ship_tropes.append(c)
+            in_ship.add(_tnorm(c))
+    conf = {k: v for k, v in (parts.get("trope_conf") or {}).items()
+            if k in in_ship}
+    for t in ship_tropes:
+        k = _tnorm(t)
+        if k not in conf:
+            # A claim shipping via promotion carries the pipeline's
+            # own formula confidence for its support — never boosted,
+            # and identical to what a gate "yes" would have given it.
+            conf[k] = round(min(0.9, 0.55 + 0.1
+                                * counts.get(k, 1)), 2)
+    trope_persistence = {}
+    for obs, act in zip(obs_tropes, out["trope_actions"]):
+        if act.get("stamp"):
+            trope_persistence[_tnorm(obs["name"])] = act["stamp"]
+    ship_triggers = []
+    trigger_persistence = {}
+    for t, act in zip(triggers_in, out["trigger_actions"]):
+        if act.get("action") == "ship":
+            ship_triggers.append(t)
+            if act.get("stamp"):
+                w = t.get("warning") if isinstance(t, dict) else str(t)
+                trigger_persistence[str(w).lower()] = act["stamp"]
+    marker = {"staged": out["staged"], "promoted": out["promoted"],
+              "trapped_total": out["trapped_total"],
+              "expired_this_run": out["expired_this_run"],
+              "sightings_recorded": out["sightings_recorded"],
+              "trapped_store_total":
+                  staging_report_data(state)["totals"]["staged"]}
+    return {"ship_tropes": ship_tropes, "trope_conf": conf,
+            "ship_triggers": ship_triggers, "marker": marker,
+            "trope_persistence": trope_persistence,
+            "trigger_persistence": trigger_persistence}
+
+
 # Module-level staging state, mirroring _learn(): _staging() always
 # returns a usable object (disabled stub when --staging-gate is off),
 # rooted at the learned-state directory so staging.json sits beside
@@ -3903,7 +4053,7 @@ _STAGING_STATE = None
 def _staging():
     global _STAGING_STATE
     if _STAGING_STATE is None:
-        if getattr(CONFIG, "staging_gate", False):
+        if CONFIG.get("staging_gate", False):
             _STAGING_STATE = StagingState(_learn().dir)
         else:
             _STAGING_STATE = StagingState(enabled=False)
@@ -10065,6 +10215,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     # - 2 to auto_min-1 chapters: LLM gate judges against summaries.
     # - 1 chapter: drop in long books (not a book-level trope).
     tropes, trope_conf = [], {}
+    _sb_auto, _sb_gated = [], []  # staging observe inputs (Option F)
     if not dry_run and red["trope_candidates"]:
         counts = red["trope_candidate_counts"]
         # Scale thresholds with book length: 5% of chapters, min 3.
@@ -10112,6 +10263,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                 dropped += 1
         print(f"  Tropes: {len(auto)} auto ({auto_min}+ ch), {len(gated)} to gate, "
               f"{dropped} single-ch dropped, {_denied} denylisted...", end=" ", flush=True)
+        _sb_auto, _sb_gated = list(auto), list(gated)
         for c in auto:
             tropes.append(c)
             trope_conf[_tnorm(c)] = round(
@@ -10132,6 +10284,47 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         print(f"{len(tropes)} confirmed{rej_note}")
     red["tropes"] = tropes
     red["trope_confidence"] = trope_conf
+
+    # Option F staging seam (design section 5): ONE split point,
+    # after the trope gate + rejection learning and the trigger
+    # finalization in v2_reduce, before result assembly. Flag off
+    # (or dry-run, or an aborted run): skipped entirely — no store
+    # access, no marker, byte-identical behaviour. Flag on: observe
+    # the run's stageable claims and rewrite tropes/triggers to the
+    # ship set here; write_claims, plan_replace, save_preview and
+    # push-preview all inherit the split from the result.
+    _staging_marker = None
+    _trope_persistence = {}
+    _trigger_persistence = {}
+    if CONFIG.get("staging_gate") and not dry_run and not aborted:
+        _st = _staging()
+        if _st.enabled and _st.writable:
+            _sg = staging_observe_result({
+                "work_key": staging_work_key(
+                    None, identifiers.get("isbn"),
+                    title or fpath.stem, author),
+                "work_id": None, "title": title or fpath.stem,
+                "author": author, "isbn": identifiers.get("isbn"),
+                "auto_min": max(3, n // 20),
+                "trope_auto": _sb_auto, "trope_gated": _sb_gated,
+                "trope_counts": red.get("trope_candidate_counts")
+                                or {},
+                "trope_ship": tropes, "trope_conf": trope_conf,
+                "catalog_map": red.get("trope_catalog_map") or {},
+                "triggers": red["triggers"],
+            }, _st, independent=not _resumed_chapters)
+            tropes = _sg["ship_tropes"]
+            trope_conf = _sg["trope_conf"]
+            red["tropes"] = tropes
+            red["trope_confidence"] = trope_conf
+            red["triggers"] = _sg["ship_triggers"]
+            _staging_marker = _sg["marker"]
+            _trope_persistence = _sg["trope_persistence"]
+            _trigger_persistence = _sg["trigger_persistence"]
+            print(f"  Staging: {len(_staging_marker['staged'])} held "
+                  f"back, {len(_staging_marker['promoted'])} promoted, "
+                  f"{_staging_marker['trapped_total']} trapped for "
+                  f"this work")
 
     reading_mins = word_count // 250
     result = {
@@ -10193,6 +10386,12 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     }
     if _recon_stats is not None:
         result["roster_reconcile"] = _recon_stats
+    if _staging_marker is not None:
+        result["staging"] = _staging_marker
+    if _trope_persistence:
+        result["trope_persistence"] = _trope_persistence
+    if _trigger_persistence:
+        result["trigger_persistence"] = _trigger_persistence
     v = red["verification"]
     if v["evidence_checked"]:
         print(f"  Evidence: {v['evidence_verified']}/{v['evidence_checked']} verified")
@@ -10207,6 +10406,13 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                             create=not (preview or dry_run))
     result["work_id"] = wid
     result["work_resolution"] = how
+    if _staging_marker is not None and wid:
+        # OC-8: the observe seam ran before the work_id existed, so
+        # this run's entries sit under a fallback key; adopt them
+        # into the resolved work's entry now that the id is known.
+        _staging().adopt_for(wid, result.get("title") or "",
+                             result.get("author") or "",
+                             identifiers.get("isbn"))
     if how == "new":
         result["work_candidates"] = _title_candidates(title or fpath.stem)
         print("  Work: no match — NEW WORK would be created")
@@ -10762,6 +10968,32 @@ def save_preview(fpath, result):
         md.append(f"**Evidence:** {v['evidence_verified']}/{v['evidence_checked']} quotes verified"
                   + (f", {v['quotes_dropped']} fabricated quotes dropped"
                      if v.get("quotes_dropped") else ""))
+    _stg = result.get("staging")
+    if _stg:
+        # Option F: the staging outcome is declared on the preview's
+        # face — held-back claims, promotions WITH their mechanism,
+        # and the sightings this preview recorded (OC-4). "Promoted"
+        # always pairs with its via; a sighting is an observation,
+        # never a verification.
+        _prom = _stg.get("promoted") or []
+        _vias = {}
+        for _p in _prom:
+            _v = _p.get("via") or "?"
+            _vias[_v] = _vias.get(_v, 0) + 1
+        if _prom:
+            _prom_s = (f"{len(_prom)} promoted (" + ", ".join(
+                f"via {v}" + (f" ×{c}" if c > 1 else "")
+                for v, c in sorted(_vias.items())) + ")")
+        else:
+            _prom_s = "0 promoted"
+        md.append(f"**Staging:** {len(_stg.get('staged') or [])} held "
+                  f"back, {_prom_s}, "
+                  f"{_stg.get('trapped_store_total', 0)} trapped across "
+                  f"all works")
+        _ns = _stg.get("sightings_recorded", 0)
+        md.append(f"**Staging:** this preview recorded {_ns} "
+                  f"sighting{'s' if _ns != 1 else ''} in the local "
+                  f"staging store")
     md.append("")
     md.append(f"## Tropes ({len(result['tropes'])})")
     for t in result["tropes"]:
@@ -11168,6 +11400,13 @@ def _build_parser():
                          "reconciliation after Call A — mutual alias "
                          "claims and learned links merge, stale alias "
                          "pollution is pruned (default off)")
+    g_merge.add_argument("--staging-gate", action="store_true",
+                    help="option F (v2): gate-band trope claims and "
+                         "evidence-less trigger claims stage locally "
+                         "instead of shipping; a claim ships when it "
+                         "recurs across independent runs, grows into "
+                         "the auto band, or gains evidence (default "
+                         "off; see eval/f-staging-design.md)")
 
     g_learn = ap.add_argument_group("Learning")
     g_learn.add_argument("--learn", dest="learn", action="store_true", default=True,
@@ -11443,6 +11682,8 @@ def main():
         UI._show_matrices = True
     if args.roster_reconcile:
         CONFIG["roster_reconcile"] = True
+    if args.staging_gate:
+        CONFIG["staging_gate"] = True
     if args.preview_summary:
         CONFIG["preview_summary"] = True
     if args.resume:
