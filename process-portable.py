@@ -3200,6 +3200,716 @@ class LearnedState:
         return summary
 
 
+# ---------------------------------------------------------------------------
+# Option F: staging store (empty-evidence staging gate + persistence gate).
+#
+# Design: eval/f-staging-design.md. Doctrine, binding on everything
+# below: persistence is a stability filter, not truth. A promoted claim
+# is a claim that stopped flickering, not a claim that was verified.
+# Promotion never raises a claim's confidence, never applies to family
+# relationships (the helper REFUSES those classes — there is no code
+# path from staging to a relationship row), and never overrides a
+# denylist, a rejection, or a human curation state.
+#
+# StagingState is per-work RUN BOOKKEEPING, not learning: entries
+# expire, learning accumulates. It shares LearnedState's directory and
+# its F8 persistence discipline (atomic save, loud corruption notice,
+# .corrupt preservation) but is a separate class and file
+# (staging.json), deliberately unentangled from the learning
+# governance questions. Every failure direction is delay-only:
+# corruption, splits and lost state can postpone a claim, never ship
+# one early — promotion requires state the failure destroyed.
+# ---------------------------------------------------------------------------
+
+_STAGEABLE_CLASSES = ("trope", "trigger")
+_STAGING_EXPIRE_ABSENCES = 3    # completed runs unsighted -> expired
+_STAGING_STALE_DAYS = 180       # report flag; no wall-clock expiry
+_STAGING_EXPIRED_CAP = 200      # retained expired records per work
+_STAGING_SIZE_WARN = 5 * 1024 * 1024
+
+
+def staging_claim_key(cls, name=None, catalog_id=None, warning=None):
+    """Identity key for a stageable claim (design section 3).
+
+    Tropes anchor on the catalog id when the claim resolves to one
+    (paraphrases collapse to one id, surviving display-form flips);
+    otherwise the normalized name. Triggers key on the normalized
+    warning name. Any other claim class — relationships above all —
+    is refused: staging has no identity for them and must never grow
+    one in v1 (endpoint identity is the unsolved roster problem)."""
+    if cls == "trope":
+        if catalog_id:
+            return f"trope:id:{catalog_id}"
+        return f"trope:name:{_tnorm(name)}"
+    if cls == "trigger":
+        return f"trigger:{(warning or '').lower().strip()}"
+    raise ValueError(
+        f"claim class {cls!r} is not stageable: only trope and "
+        "trigger claims stage in v1; relationships/family claims are "
+        "never staged or promoted (fail-closed has no bypass)")
+
+
+def _staging_day(s):
+    """ISO date string -> ordinal day number (None when unparsable)."""
+    if not s:
+        return None
+    try:
+        from datetime import date
+        y, m, d = (int(p) for p in str(s).split("-"))
+        return date(y, m, d).toordinal()
+    except (ValueError, TypeError):
+        return None
+
+
+def _staging_today():
+    from datetime import date
+    return date.today().isoformat()
+
+
+class StagingState:
+    """Per-work staging bookkeeping. Thread-safe: observe+save are
+    serialized under an RLock (books run concurrently under --jobs;
+    an unsynchronized load-modify-save would lose sightings — delay
+    only, but promotion timing would go nondeterministic). Degrades
+    to no-claims-ship-differently when the directory isn't writable:
+    the seam checks .enabled/.writable and skips staging entirely."""
+
+    FILE_NAME = "staging.json"
+
+    def __init__(self, learn_dir=None, enabled=True):
+        # RLock: observe holds the lock while its helpers record
+        # state under it (same lesson as LearnedState, sweep F8).
+        self._lock = threading.RLock()
+        self.enabled = enabled
+        if learn_dir:
+            self.dir = Path(learn_dir)
+        else:
+            self.dir = Path(os.path.expanduser("~")) / ".ebook-processor" / "learned"
+        self._writable = True
+        self._warned = False
+        self._corrupt_paths = set()
+        self._corrupt_seen = set()
+        self.data = {"version": 1, "works": {}}
+        if self.enabled:
+            self._ensure_dir()
+            self._load()
+
+    # -- setup / persistence (LearnedState's F8 pattern) --------------
+    def _ensure_dir(self):
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            self._writable = False
+            self._warn_once(
+                f"  Staging dir not writable ({self.dir}); staging "
+                "disabled for this run")
+
+    def _warn_once(self, msg):
+        with self._lock:
+            if self._warned:
+                return
+            self._warned = True
+        print(msg)
+
+    @property
+    def writable(self):
+        return self._writable
+
+    @property
+    def corrupt_at_load(self):
+        return bool(self._corrupt_seen)
+
+    def _path(self):
+        return self.dir / self.FILE_NAME
+
+    def _note_corrupt(self, path, err):
+        """Record a staging file that failed to load and say so
+        LOUDLY. The store starts empty — the failure direction is
+        safe by construction: lost state means sightings reset and
+        promotions are DELAYED, because promotion requires state the
+        corruption destroyed. The original bytes are preserved as a
+        .corrupt backup before any overwrite."""
+        path = Path(path)
+        with self._lock:
+            self._corrupt_paths.add(path)
+            first = path.name not in self._corrupt_seen
+            self._corrupt_seen.add(path.name)
+        if first:
+            print(f"  !! WARNING: staging file {path} could not be "
+                  f"loaded ({err}); starting the staging store EMPTY "
+                  f"(claims will re-stage; nothing can promote "
+                  f"early). The original file will be preserved as a "
+                  f".corrupt backup before it is overwritten.")
+
+    def _preserve_corrupt(self, path):
+        """Back up a corrupt staging file's original bytes before it
+        is overwritten. Never clobbers an existing backup."""
+        path = Path(path)
+        with self._lock:
+            if path not in self._corrupt_paths:
+                return
+        try:
+            if path.exists():
+                dest = path.with_name(path.name + ".corrupt")
+                n = 1
+                while dest.exists():
+                    dest = path.with_name(f"{path.name}.corrupt-{n}")
+                    n += 1
+                shutil.copyfile(path, dest)
+                print(f"  !! Preserved corrupt staging file as {dest}")
+            with self._lock:
+                self._corrupt_paths.discard(path)
+        except Exception as e:
+            print(f"  !! WARNING: could not preserve corrupt file "
+                  f"{path} ({e}); it will still be overwritten")
+
+    def _load(self):
+        p = self._path()
+        if not p.exists():
+            return
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) \
+                    or not isinstance(data.get("works"), dict):
+                raise ValueError("staging store has no 'works' map")
+            self.data = {"version": 1, "works": data["works"]}
+        except Exception as e:
+            self._note_corrupt(p, e)
+            self.data = {"version": 1, "works": {}}
+
+    def save(self):
+        """Atomic write: temp file + os.replace. No-op when not
+        writable. A size guard warns past 5 MB (the realistic growth
+        driver is works never reprocessed; the report shows them)."""
+        if not self._writable or not self.enabled:
+            return False
+        with self._lock:
+            try:
+                p = self._path()
+                self._preserve_corrupt(p)
+                tmp = p.with_suffix(p.suffix + ".tmp")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=1)
+                os.replace(tmp, p)
+                try:
+                    if p.stat().st_size > _STAGING_SIZE_WARN:
+                        self._warn_once(
+                            f"  Staging store is large "
+                            f"({p.stat().st_size} bytes); run "
+                            "--staging-report to see what is trapped")
+                except OSError:
+                    pass
+                return True
+            except Exception as e:
+                self._writable = False
+                self._warn_once(
+                    f"  Staging dir write failed ({e}); staging "
+                    "disabled for this run")
+                return False
+
+    # -- work entries ---------------------------------------------------
+    @staticmethod
+    def _new_work(work_id, title, author):
+        return {"work_id": work_id, "title": title or "",
+                "author": author or "", "runs_completed": 0,
+                "staged_ever": 0, "claims": {}, "expired_recent": [],
+                "expired_dropped": 0, "adoptions": []}
+
+    @staticmethod
+    def _new_claim(cls, display, today):
+        return {"class": cls, "display": display or "",
+                "name_forms": [display] if display else [],
+                "sightings": [], "first_seen": today,
+                "last_seen": today, "best_chapters": 0,
+                "evidence_ever": False, "state": "staged",
+                "promoted_run": None, "promoted_via": None,
+                "promoted_form_changed": False}
+
+    def work_entry(self, work_key, work_id=None, title="", author=""):
+        """Fetch-or-create a work entry (call under the lock)."""
+        w = self.data["works"].get(work_key)
+        if w is None:
+            w = self._new_work(work_id, title, author)
+            self.data["works"][work_key] = w
+        else:
+            if work_id and not w.get("work_id"):
+                w["work_id"] = work_id
+            if title and not w.get("title"):
+                w["title"] = title
+            if author and not w.get("author"):
+                w["author"] = author
+        return w
+
+    # -- adoption (OC-8) --------------------------------------------------
+    def _adopt_fallbacks(self, work, work_id, title, author, isbn):
+        """Adopt fallback-key entries into the work_id entry when a
+        work first resolves its id. Exact title+author match only
+        (normalized); adoptions are recorded on the surviving entry
+        so the next trapped report lists them — a wrong adoption
+        must be visible to be correctable."""
+        if not work_id:
+            return
+        candidates = []
+        if isbn:
+            candidates.append(f"isbn:{isbn}")
+        candidates.append(
+            f"title:{_tnorm(title)}|{_tnorm(author)}")
+        for cand in candidates:
+            src = self.data["works"].get(cand)
+            if src is None or src is work:
+                continue
+            if _tnorm(src.get("title")) != _tnorm(title) \
+                    or _tnorm(src.get("author")) != _tnorm(author):
+                continue
+            moved = self._merge_work_into(work, src)
+            del self.data["works"][cand]
+            if moved:
+                work["adoptions"].append(
+                    {"from_key": cand, "claims_moved": moved})
+
+    def _merge_work_into(self, dst, src):
+        """Fold src's claims into dst (adoption). Sightings union by
+        ordinal — never summed. staged_ever stays exact: a claim key
+        live in BOTH entries was one claim staged once (counted on
+        both sides), so each such overlap subtracts one duplicate;
+        a key expired on one side and live on the other is two
+        staging episodes (expired, then re-staged) and counts twice,
+        exactly as observe counts a re-stage. Promotion is sticky:
+        a claim promoted on either side stays promoted. Returns the
+        number of claim keys moved or merged."""
+        moved = 0
+        dup = 0
+        for key, entry in list(src["claims"].items()):
+            moved += 1
+            cur = dst["claims"].get(key)
+            if cur is None:
+                dst["claims"][key] = entry
+            else:
+                self._fold_entry_into(cur, entry)
+                dup += 1
+        for rec in src["expired_recent"]:
+            if all(r["key"] != rec["key"]
+                   for r in dst["expired_recent"]):
+                dst["expired_recent"].append(rec)
+            else:
+                dup += 1
+        dst["expired_dropped"] = dst.get("expired_dropped", 0) \
+            + src.get("expired_dropped", 0)
+        dst["staged_ever"] += src["staged_ever"] - dup
+        while len(dst["expired_recent"]) > _STAGING_EXPIRED_CAP:
+            dst["expired_recent"].pop(0)
+            dst["expired_dropped"] += 1
+        dst["runs_completed"] = max(dst["runs_completed"],
+                                    src["runs_completed"])
+        return moved
+
+    @staticmethod
+    def _fold_entry_into(dst, src):
+        """Merge src claim entry into dst (same claim, two keyings).
+        Sightings union (ordinals are per-work; a run contributes at
+        most one ordinal per claim, so union is exact)."""
+        dst["sightings"] = sorted(set(dst["sightings"])
+                                   | set(src["sightings"]))
+        for form in src["name_forms"]:
+            if _tnorm(form) not in {_tnorm(f)
+                                    for f in dst["name_forms"]}:
+                dst["name_forms"].append(form)
+        dst["best_chapters"] = max(dst["best_chapters"],
+                                   src["best_chapters"])
+        dst["evidence_ever"] = dst["evidence_ever"] \
+            or src["evidence_ever"]
+        for f in ("first_seen",):
+            a, b = _staging_day(dst.get(f)), _staging_day(src.get(f))
+            if b is not None and (a is None or b < a):
+                dst[f] = src[f]
+        a, b = _staging_day(dst.get("last_seen")), \
+            _staging_day(src.get("last_seen"))
+        if b is not None and (a is None or b > a):
+            dst["last_seen"] = src["last_seen"]
+        if src["state"] == "promoted" and dst["state"] != "promoted":
+            dst["state"] = "promoted"
+            dst["promoted_run"] = src["promoted_run"]
+            dst["promoted_via"] = src["promoted_via"]
+            dst["promoted_form_changed"] = \
+                src["promoted_form_changed"]
+
+    # -- observe ----------------------------------------------------------
+    def observe_work(self, *, work_key, work_id=None, title="",
+                     author="", isbn=None, tropes=(), triggers=(),
+                     auto_min=3, independent=True, today=None):
+        """Record one completed run's stageable claims for a work and
+        decide this run's ship/hold split.
+
+        tropes:   [{"name", "n_ch", "catalog_id"}]
+        triggers: [{"warning", "has_evidence"}]
+
+        A sighting counts only on an INDEPENDENT run (fresh
+        extraction — no checkpoint payloads reused). A resumed or
+        retried run re-derives the same extraction; counting it would
+        manufacture persistence out of one observation. Non-independent
+        runs still get the split from current store state (the run is
+        a continuation of its original) and may move last_seen, but
+        they create no entries, record no sightings, promote nothing
+        and expire nothing.
+
+        Returns {"trope_actions", "trigger_actions", "staged",
+        "promoted", "expired_this_run", "sightings_recorded",
+        "trapped_total"}. Actions align with the input lists:
+        {"action": "ship"|"hold", "key", "stamp", "form_changed"}.
+        Serialized under the lock, save included."""
+        today = today or _staging_today()
+        with self._lock:
+            if not independent \
+                    and work_key not in self.data["works"]:
+                # A continuation of a run this store never saw: no
+                # entries to continue, nothing may be created.
+                ship = {"action": "ship", "key": None, "stamp": None,
+                        "form_changed": False}
+                return {"trope_actions": [dict(ship) for _ in tropes],
+                        "trigger_actions": [dict(ship)
+                                            for _ in triggers],
+                        "staged": [], "promoted": [],
+                        "expired_this_run": 0, "sightings_recorded": 0,
+                        "trapped_total": 0}
+            work = self.work_entry(work_key, work_id, title, author)
+            self._adopt_fallbacks(work, work_id, title, author, isbn)
+            out = {"trope_actions": [], "trigger_actions": [],
+                   "staged": [], "promoted": [], "expired_this_run": 0,
+                   "sightings_recorded": 0, "trapped_total": 0}
+            ordinal = None
+            if independent:
+                work["runs_completed"] += 1
+                ordinal = work["runs_completed"]
+            for obs in tropes:
+                act = self._observe_trope(work, obs, auto_min,
+                                          independent, ordinal, today,
+                                          out)
+                out["trope_actions"].append(act)
+            for obs in triggers:
+                act = self._observe_trigger(work, obs, independent,
+                                            ordinal, today, out)
+                out["trigger_actions"].append(act)
+            if independent:
+                out["expired_this_run"] = self._expire_absent(
+                    work, ordinal)
+            out["trapped_total"] = sum(
+                1 for e in work["claims"].values()
+                if e["state"] == "staged")
+            self.save()
+            return out
+
+    def _resolve_trope_entry(self, work, obs):
+        """Find (entry, key, form_changed) for a trope observation,
+        folding a name-keyed entry into its catalog-id entry when the
+        claim now resolves (union of ordinals — exact, never summed).
+        Creates nothing; returns (None, key, False) when unsighted."""
+        name = obs.get("name") or ""
+        cat = obs.get("catalog_id")
+        key_name = staging_claim_key("trope", name=name)
+        if not cat:
+            return work["claims"].get(key_name), key_name, False
+        key_id = staging_claim_key("trope", name=name, catalog_id=cat)
+        claims = work["claims"]
+        entry = claims.get(key_id)
+        name_entry = claims.get(key_name)
+        if name_entry is not None:
+            if entry is None:
+                # The entry MOVES to the id key; it was always one
+                # claim, so staged_ever does not change.
+                entry = name_entry
+                claims[key_id] = entry
+                del claims[key_name]
+            else:
+                # Two entries were one claim sighted under two keys.
+                self._fold_entry_into(entry, name_entry)
+                del claims[key_name]
+                work["staged_ever"] -= 1
+        key = key_id or key_name
+        entry = claims.get(key)
+        form_changed = False
+        if entry is not None and key_id:
+            forms = {_tnorm(f) for f in entry["name_forms"]}
+            form_changed = _tnorm(name) not in forms
+        return entry, key, form_changed
+
+    def _record_sighting(self, work, entry, ordinal, today, obs,
+                         name):
+        if ordinal not in entry["sightings"]:
+            entry["sightings"].append(ordinal)
+            entry["sightings"].sort()
+            recorded = True
+        else:
+            recorded = False
+        entry["last_seen"] = today
+        if name and _tnorm(name) not in {
+                _tnorm(f) for f in entry["name_forms"]}:
+            entry["name_forms"].append(name)
+        return recorded
+
+    def _promote(self, work, entry, ordinal, via, form_changed, out,
+                 display):
+        entry["state"] = "promoted"
+        entry["promoted_run"] = ordinal
+        entry["promoted_via"] = via
+        entry["promoted_form_changed"] = bool(form_changed)
+        item = {"key": None, "display": display or entry["display"],
+                "via": via, "sightings": len(entry["sightings"])}
+        if form_changed:
+            item["form_changed"] = True
+        out["promoted"].append(item)
+        return item
+
+    def _observe_trope(self, work, obs, auto_min, independent, ordinal,
+                       today, out):
+        name = obs.get("name") or ""
+        n_ch = obs.get("n_ch") or 0
+        entry, key, form_changed = self._resolve_trope_entry(work, obs)
+        if entry is None:
+            if not independent or n_ch >= auto_min:
+                # Non-independent runs create no entries (the run is
+                # a continuation); auto-band claims never stage.
+                return {"action": "ship", "key": None, "stamp": None,
+                        "form_changed": False}
+            entry = self._new_claim("trope", name, today)
+            entry["best_chapters"] = n_ch
+            work["claims"][key] = entry
+            work["staged_ever"] += 1
+            if self._record_sighting(work, entry, ordinal, today,
+                                     obs, name):
+                out["sightings_recorded"] += 1
+            out["staged"].append(
+                {"key": key, "display": name, "class": "trope",
+                 "sightings": len(entry["sightings"])})
+            return {"action": "hold", "key": key, "stamp": None,
+                    "form_changed": False}
+        # Existing entry.
+        if independent:
+            if self._record_sighting(work, entry, ordinal, today,
+                                     obs, name):
+                out["sightings_recorded"] += 1
+            entry["best_chapters"] = max(entry["best_chapters"], n_ch)
+        else:
+            entry["last_seen"] = today
+        if entry["state"] == "promoted":
+            stamp = None
+            if n_ch < auto_min:
+                # Gate-band ship explained by earned standing alone:
+                # the stamp is how a reviewer sees that (OC-7).
+                stamp = {"sightings": len(entry["sightings"]),
+                         "via": entry["promoted_via"]}
+            return {"action": "ship", "key": key, "stamp": stamp,
+                    "form_changed": False}
+        # Staged entry: promotion rules (independent sightings only;
+        # a non-independent run adds no sighting, so nothing new can
+        # promote — the checks below simply don't fire for it because
+        # len(sightings) did not change... except support: a resumed
+        # run re-derives the same n_ch its original run saw, which
+        # already had its chance; gate on independent explicitly).
+        if independent and n_ch >= auto_min:
+            item = self._promote(work, entry, ordinal, "support",
+                                 form_changed, out, name)
+            item["key"] = key
+            return {"action": "ship", "key": key, "stamp": None,
+                    "form_changed": form_changed}
+        if independent and len(entry["sightings"]) >= 2:
+            item = self._promote(work, entry, ordinal, "persistence",
+                                 form_changed, out, name)
+            item["key"] = key
+            stamp = {"sightings": len(entry["sightings"]),
+                     "via": "persistence"}
+            return {"action": "ship", "key": key, "stamp": stamp,
+                    "form_changed": form_changed}
+        out["staged"].append(
+            {"key": key, "display": name, "class": "trope",
+             "sightings": len(entry["sightings"])})
+        return {"action": "hold", "key": key, "stamp": None,
+                "form_changed": False}
+
+    def _observe_trigger(self, work, obs, independent, ordinal, today,
+                         out):
+        warning = obs.get("warning") or ""
+        has_ev = bool(obs.get("has_evidence"))
+        key = staging_claim_key("trigger", warning=warning)
+        entry = work["claims"].get(key)
+        if entry is None:
+            if not independent or has_ev:
+                # Evidenced triggers never stage; non-independent
+                # runs create no entries.
+                return {"action": "ship", "key": None, "stamp": None,
+                        "form_changed": False}
+            entry = self._new_claim("trigger", warning, today)
+            entry["evidence_ever"] = False
+            work["claims"][key] = entry
+            work["staged_ever"] += 1
+            if self._record_sighting(work, entry, ordinal, today,
+                                     obs, warning):
+                out["sightings_recorded"] += 1
+            out["staged"].append(
+                {"key": key, "display": warning, "class": "trigger",
+                 "sightings": len(entry["sightings"])})
+            return {"action": "hold", "key": key, "stamp": None,
+                    "form_changed": False}
+        if independent:
+            if self._record_sighting(work, entry, ordinal, today,
+                                     obs, warning):
+                out["sightings_recorded"] += 1
+        else:
+            entry["last_seen"] = today
+        entry["evidence_ever"] = entry["evidence_ever"] or has_ev
+        if entry["state"] == "promoted":
+            stamp = None
+            if not has_ev:
+                stamp = {"sightings": len(entry["sightings"]),
+                         "via": entry["promoted_via"]}
+            return {"action": "ship", "key": key, "stamp": stamp,
+                    "form_changed": False}
+        if independent and has_ev:
+            item = self._promote(work, entry, ordinal, "evidence",
+                                 False, out, warning)
+            item["key"] = key
+            return {"action": "ship", "key": key, "stamp": None,
+                    "form_changed": False}
+        if independent and len(entry["sightings"]) >= 2:
+            item = self._promote(work, entry, ordinal, "persistence",
+                                 False, out, warning)
+            item["key"] = key
+            stamp = {"sightings": len(entry["sightings"]),
+                     "via": "persistence"}
+            return {"action": "ship", "key": key, "stamp": stamp,
+                    "form_changed": False}
+        out["staged"].append(
+            {"key": key, "display": warning, "class": "trigger",
+             "sightings": len(entry["sightings"])})
+        return {"action": "hold", "key": key, "stamp": None,
+                "form_changed": False}
+
+    def _expire_absent(self, work, ordinal):
+        """Expire staged entries unseen for 3 completed runs of this
+        work. Absence evidence, not the clock: a never-reprocessed
+        book accrues no absences and its claims wait, visibly."""
+        n_expired = 0
+        for key, entry in list(work["claims"].items()):
+            if entry["state"] != "staged":
+                continue
+            last = max(entry["sightings"]) if entry["sightings"] else 0
+            if ordinal - last >= _STAGING_EXPIRE_ABSENCES:
+                work["expired_recent"].append(
+                    {"key": key, "display": entry["display"],
+                     "class": entry["class"], "expired_run": ordinal,
+                     "sightings": len(entry["sightings"])})
+                del work["claims"][key]
+                n_expired += 1
+        while len(work["expired_recent"]) > _STAGING_EXPIRED_CAP:
+            work["expired_recent"].pop(0)
+            work["expired_dropped"] = work.get("expired_dropped", 0) + 1
+        return n_expired
+
+    def consume_adoptions(self):
+        """Return all pending adoption records and clear them (the
+        trapped report lists each adoption once)."""
+        with self._lock:
+            out = []
+            for key, w in self.data["works"].items():
+                for rec in w.get("adoptions", []):
+                    out.append({"work_key": key, **rec})
+                w["adoptions"] = []
+            if out:
+                self.save()
+            return out
+
+
+def staging_report_data(state, today=None):
+    """Pure read model over a StagingState for --staging-report and
+    the dashboard: per-work buckets that must satisfy
+    staged_ever = promoted + still_staged + expired, with the
+    difference surfaced as `unaccounted` (printed; must be 0)."""
+    today = today or _staging_today()
+    today_ord = _staging_day(today)
+    works_out = []
+    totals = {"works": 0, "staged_ever": 0, "promoted": 0, "staged": 0,
+              "expired": 0, "form_changed_promotions": 0}
+    unaccounted = 0
+    for key in sorted(state.data.get("works", {})):
+        w = state.data["works"][key]
+        claims_out = []
+        n_promoted = n_staged = 0
+        fc_promotions = 0
+        for ckey in sorted(w["claims"]):
+            e = w["claims"][ckey]
+            if e["state"] == "promoted":
+                n_promoted += 1
+                if e.get("promoted_form_changed"):
+                    fc_promotions += 1
+            else:
+                n_staged += 1
+            first = _staging_day(e.get("first_seen"))
+            last = _staging_day(e.get("last_seen"))
+            forms = {_tnorm(f) for f in e.get("name_forms", [])}
+            claims_out.append({
+                "key": ckey, "display": e["display"],
+                "class": e["class"], "state": e["state"],
+                "sightings": list(e["sightings"]),
+                "sightings_count": len(e["sightings"]),
+                "best_chapters": e["best_chapters"],
+                "first_seen": e.get("first_seen"),
+                "last_seen": e.get("last_seen"),
+                "age_days": (today_ord - first)
+                            if (today_ord and first) else 0,
+                "stale": bool(
+                    e["state"] == "staged" and today_ord and last
+                    and today_ord - last >= _STAGING_STALE_DAYS),
+                "forms_differ": len(forms) > 1,
+                "promoted_via": e.get("promoted_via"),
+                "promoted_form_changed": bool(
+                    e.get("promoted_form_changed")),
+            })
+        n_expired = len(w["expired_recent"]) \
+            + w.get("expired_dropped", 0)
+        w_unacc = w["staged_ever"] - (n_promoted + n_staged
+                                      + n_expired)
+        unaccounted += w_unacc
+        works_out.append({
+            "key": key, "work_id": w.get("work_id"),
+            "title": w.get("title", ""), "author": w.get("author", ""),
+            "runs_completed": w["runs_completed"],
+            "staged_ever": w["staged_ever"], "promoted": n_promoted,
+            "staged": n_staged, "expired": n_expired,
+            "expired_retained": len(w["expired_recent"]),
+            "unaccounted": w_unacc,
+            "form_changed_promotions": fc_promotions,
+            "claims": claims_out,
+            "expired_recent": list(w["expired_recent"]),
+            "adoptions": list(w.get("adoptions", [])),
+        })
+        totals["works"] += 1
+        totals["staged_ever"] += w["staged_ever"]
+        totals["promoted"] += n_promoted
+        totals["staged"] += n_staged
+        totals["expired"] += n_expired
+        totals["form_changed_promotions"] += fc_promotions
+    return {"works": works_out, "totals": totals,
+            "unaccounted": unaccounted,
+            "corrupt_at_load": state.corrupt_at_load}
+
+
+# Module-level staging state, mirroring _learn(): _staging() always
+# returns a usable object (disabled stub when --staging-gate is off),
+# rooted at the learned-state directory so staging.json sits beside
+# the learning files. Tests may assign _STAGING_STATE directly.
+_STAGING_STATE = None
+
+
+def _staging():
+    global _STAGING_STATE
+    if _STAGING_STATE is None:
+        if getattr(CONFIG, "staging_gate", False):
+            _STAGING_STATE = StagingState(_learn().dir)
+        else:
+            _STAGING_STATE = StagingState(enabled=False)
+    return _STAGING_STATE
+
+
 # Module-level learning state, created in main() when --learn is on.
 # _learn() always returns a usable object (disabled stub when off), so
 # call sites never need None checks.
