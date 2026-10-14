@@ -2506,12 +2506,20 @@ class DecisionValidator:
             _parts.append(f"Evidence B: {ev_b[:300]}")
         _instructions = (
             "Are these two character entries referring to the same person? "
-            "Answer YES when: the names are variants of each other (nickname, "
-            "shortened form, title + name matching a fuller name, minor "
-            "spelling differences) AND the descriptions are compatible. "
-            "Answer NO when: different first names, different people sharing "
-            "a surname (siblings, parent/child), incompatible descriptions "
-            "or roles, or insufficient evidence they are the same individual."
+            "Answer YES only when there is positive evidence of one identity: "
+            "a supported alias or nickname linking the two names, a reliable "
+            "name variant (shortened form, title change, minor spelling "
+            "difference) with compatible attributes, or contextual evidence "
+            "that both entries describe the same individual. "
+            "Answer NO when the book supports two distinct identities, when "
+            "the descriptions meaningfully contradict each other (roles, "
+            "relationships, or histories one person could not hold), or when "
+            "a deterministic constraint rules the pair out. "
+            "Similar descriptions alone never establish identity: different "
+            "people can share a surname, a role, and a description. "
+            "If the evidence is insufficient either way, score near the "
+            "middle of the scale rather than guessing — an unresolved pair "
+            "stays separate and is reviewed; it is not merged on a guess."
         )
         p_yes = self._ask_noul("same_person", _instructions,
                                "\n".join(_parts), label="merge")

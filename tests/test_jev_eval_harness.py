@@ -2,7 +2,7 @@
 
 The harness must judge pairs the way production judges them: the same
 state assembly (names + descriptions + evidence, same truncation) and,
-for the "legacy" variant, the production instruction text verbatim.
+for the "identity" variant, the production instruction text verbatim.
 These tests pin that mirror against the real DecisionValidator, pin the
 two prompt variants apart (instruction text is the ONLY difference),
 and pin the scoring maths — false merges and false splits are separate
@@ -39,7 +39,7 @@ pp = _load("process_portable_for_jev_eval", "process-portable.py")
 
 
 # ----------------------------------------------------------------------
-# Production mirror: state assembly + legacy instruction text
+# Production mirror: state assembly + production instruction text
 # ----------------------------------------------------------------------
 
 def _capture_production(name_a, desc_a, ev_a, name_b, desc_b, ev_b):
@@ -60,11 +60,11 @@ def _capture_production(name_a, desc_a, ev_a, name_b, desc_b, ev_b):
 
 
 class TestProductionMirror(unittest.TestCase):
-    def test_legacy_instructions_are_production_verbatim(self):
+    def test_production_instructions_are_verbatim(self):
         instructions, _ = _capture_production("A", "da", "ea",
                                               "B", "db", "eb")
-        self.assertEqual(instructions, em.LEGACY_INSTRUCTIONS)
-        self.assertEqual(instructions, em.PROMPT_VARIANTS["legacy"])
+        self.assertEqual(instructions, em.PRODUCTION_INSTRUCTIONS)
+        self.assertEqual(instructions, em.PROMPT_VARIANTS["identity"])
 
     def test_state_mirror_full_fields(self):
         _, state = _capture_production("A", "desc a", "ev a",
