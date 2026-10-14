@@ -767,7 +767,8 @@
     "desc_b": "A former detective now working with the Daemon, facing existential questions about civilization and his own life.",
     "evidence_a": "",
     "evidence_b": "Sebeck thought television held some clues.",
-    "source": "derived from hand labels (Sebeck, Pete Sebeck)=same and (Sebeck, Peter Sebeck)=same in merge-labels.json"
+    "source": "derived from hand labels (Sebeck, Pete Sebeck)=same and (Sebeck, Peter Sebeck)=same in merge-labels.json",
+    "scored": false
   },
   {
     "name_a": "Roy Merritt",

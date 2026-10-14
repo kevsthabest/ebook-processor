@@ -233,6 +233,13 @@ def _normalize_pair(entry, where):
         "evidence_a": entry.get("evidence_a") or "",
         "evidence_b": entry.get("evidence_b") or "",
         "source": entry.get("source") or "",
+        # "scored": false marks an EXHIBIT — judged and printed, but
+        # excluded from every metric. Scored ground truth must be
+        # observed, not inferred: a label derived by transitivity
+        # through a roster entry uses the very mechanism under
+        # evaluation, so it enters the scored set only with independent
+        # corroboration of that exact pair (Advisor ruling, 2026-10-14).
+        "scored": bool(entry.get("scored", True)),
     }
     if "stub_score" in entry:
         pair["stub_score"] = entry["stub_score"]
@@ -407,9 +414,25 @@ def main(argv=None):
         predicted = p_yes >= args.threshold
         correct = predicted == pair["expected"]
         mark = "✓" if correct else "✗"
+        if not pair.get("scored", True):
+            mark = "·"  # exhibit: judged and shown, never scored
         print(f"{mark} [{i+1}/{len(pairs)}] {pair['name_a']} vs "
               f"{pair['name_b']}: exp={pair['expected']} "
               f"pred={predicted} P={p_yes:.2f}")
+
+    # Exhibits (scored=false) are judged above but excluded from every
+    # metric below.
+    exhibits = [p for p in scored if not p.get("scored", True)]
+    scored = [p for p in scored if p.get("scored", True)]
+    if exhibits:
+        print(f"\nEXHIBITS (unscored — derived labels, shown for the "
+              f"record, excluded from all metrics): {len(exhibits)}")
+        for p in exhibits:
+            ptxt = "unanswered" if p["p_yes"] is None \
+                else f"P={p['p_yes']:.2f}"
+            print(f"  {p['name_a']} vs {p['name_b']} ({p['book']}): "
+                  f"derived label={p['expected']} {ptxt} — "
+                  f"{p.get('source') or 'no provenance recorded'}")
 
     # Primary-threshold results (the historical report shape).
     s = score_summary(scored, args.threshold)
@@ -422,7 +445,7 @@ def main(argv=None):
     print(f"Recall:    {s['recall']:.2%} (of true merges, "
           f"how many caught)")
     print(f"TP={s['tp']} TN={s['tn']} FP={s['fp']} FN={s['fn']}")
-    print(f"Unanswered: {s['unanswered']} of {len(pairs)} pairs "
+    print(f"Unanswered: {s['unanswered']} of {len(scored)} scored pairs "
           f"(excluded from the metrics above)")
 
     # Errors at the primary threshold.

@@ -362,6 +362,34 @@ class TestDryRun(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("legacy", out)
 
+    def test_unscored_exhibit_excluded_from_metrics(self):
+        # An exhibit whose stub score flatly contradicts its derived
+        # label must not move any metric: scored ground truth is
+        # observed, not inferred (Advisor ruling, 2026-10-14).
+        import tempfile
+        pairs = [
+            {"name_a": "True Pair", "name_b": "True Pair Alt",
+             "label": "same", "book": "Daemon",
+             "desc_a": "a detective", "stub_score": 0.9},
+            {"name_a": "Derived Pair", "name_b": "Derived Pair Alt",
+             "label": "different", "book": "Daemon",
+             "desc_a": "a detective", "stub_score": 0.95,
+             "scored": False,
+             "source": "derived from hand labels by transitivity"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "pairs.json"
+            path.write_text(json.dumps(pairs), encoding="utf-8")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = em.main(["--labels", str(path), "--dry-run"])
+        text = out.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("EXHIBITS (unscored", text)
+        self.assertIn("Derived Pair", text)
+        self.assertIn("Accuracy:  100.00% (1/1)", text)
+        self.assertIn("False merges (0)", text)
+
 
 # ----------------------------------------------------------------------
 # The shipped labelled pair set (eval/merge_pairs.json)
@@ -409,6 +437,17 @@ class TestShippedPairSet(unittest.TestCase):
         chris = self._find("Chris Sebeck", "Peter Sebeck")
         self.assertIsNotNone(chris)
         self.assertFalse(chris["expected"])
+
+    def test_derived_pair_scored_flags(self):
+        # Pete<->Peter rests on transitivity alone -> unscored exhibit.
+        # Chris<->Peter carries an independent classify_pair judgment
+        # of that exact pair -> stays scored. (Advisor ruling.)
+        pete = self._find("Pete Sebeck", "Peter Sebeck")
+        self.assertIsNotNone(pete)
+        self.assertFalse(pete["scored"])
+        chris = self._find("Chris Sebeck", "Peter Sebeck")
+        self.assertIsNotNone(chris)
+        self.assertTrue(chris["scored"])
 
     def test_fourth_wing_pairs_present(self):
         violet = self._find("Violet", "Violet Sorrengail")
