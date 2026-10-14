@@ -2526,7 +2526,9 @@ class LearnedState:
     when disabled or when the learn directory isn't writable."""
 
     def __init__(self, learn_dir=None, enabled=True):
-        self._lock = threading.Lock()
+        # RLock: load/save hold the lock while their helpers
+        # (_note_corrupt, _preserve_corrupt) record state under it.
+        self._lock = threading.RLock()
         self.enabled = enabled
         if learn_dir:
             self.dir = Path(learn_dir)
@@ -2534,6 +2536,11 @@ class LearnedState:
             self.dir = Path(os.path.expanduser("~")) / ".ebook-processor" / "learned"
         self._writable = True
         self._warned = False
+        # Files whose load failed (corrupt/unreadable): their original
+        # bytes are preserved as .corrupt backups before any overwrite,
+        # and pop_summary flags that prior state was not carried over.
+        self._corrupt_paths = set()
+        self._corrupt_seen = set()
         # In-memory state (mirrors the JSON files).
         self.nicknames = {}       # nkey -> {"full": nkey, "count": int, "books": [isbn]}
         self.titles = {}          # title -> {"count": int, "rests": [str]}
@@ -2567,15 +2574,60 @@ class LearnedState:
     def _path(self, name):
         return self.dir / name
 
-    def _load_json(self, name, default):
+    def _note_corrupt(self, path, err):
+        """Record a state file that failed to load and say so LOUDLY.
+
+        The store starts empty for that file — silently resetting
+        accumulated learning to a plausible fresh state (and then
+        overwriting the evidence on save) is how corruption used to
+        erase it without a trace. The original bytes are preserved
+        as a .corrupt backup before any overwrite (see
+        _preserve_corrupt)."""
+        path = Path(path)
+        with self._lock:
+            self._corrupt_paths.add(path)
+            first = path.name not in self._corrupt_seen
+            self._corrupt_seen.add(path.name)
+        if first:
+            print(f"  !! WARNING: learned-state file {path} could not "
+                  f"be loaded ({err}); starting that store EMPTY. The "
+                  f"original file will be preserved as a .corrupt "
+                  f"backup before it is overwritten.")
+
+    def _preserve_corrupt(self, path):
+        """Back up a corrupt state file's original bytes before it is
+        overwritten. Never clobbers an existing backup. No-op for
+        files that loaded fine."""
+        path = Path(path)
+        with self._lock:
+            if path not in self._corrupt_paths:
+                return
         try:
-            p = self._path(name)
-            if p.exists():
-                with open(p, encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception:
-            pass
-        return default
+            if path.exists():
+                dest = path.with_name(path.name + ".corrupt")
+                n = 1
+                while dest.exists():
+                    dest = path.with_name(f"{path.name}.corrupt-{n}")
+                    n += 1
+                shutil.copyfile(path, dest)
+                print(f"  !! Preserved corrupt learned-state file "
+                      f"as {dest}")
+            with self._lock:
+                self._corrupt_paths.discard(path)
+        except Exception as e:
+            print(f"  !! WARNING: could not preserve corrupt file "
+                  f"{path} ({e}); it will still be overwritten")
+
+    def _load_json(self, name, default):
+        p = self._path(name)
+        if not p.exists():
+            return default
+        try:
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            self._note_corrupt(p, e)
+            return default
 
     def _save_json(self, name, data):
         """Atomic write: temp file + os.replace. No-op when not writable."""
@@ -2583,6 +2635,7 @@ class LearnedState:
             return False
         try:
             p = self._path(name)
+            self._preserve_corrupt(p)
             tmp = p.with_suffix(p.suffix + ".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)
@@ -2897,18 +2950,34 @@ class LearnedState:
         safe = re.sub(r"\W+", "_", series_key)[:64].strip("_") or "unknown"
         return self.dir / "series" / (safe + ".json")
 
+    def _load_series_data(self, p):
+        """Load a series-roster file for a save-side merge. A corrupt
+        file starts empty LOUDLY and its bytes are preserved as a
+        .corrupt backup before the overwrite — the same rule as the
+        learned files (a silent reset here used to erase the roster
+        the merge was supposed to extend)."""
+        if not p.exists():
+            return {}
+        try:
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            self._note_corrupt(p, e)
+            return {}
+
     def load_series_hints(self, series_key):
         """Return {nkey: canonical_nkey} alias hints from prior books in
         the series. Empty dict when disabled/unknown."""
         if not self.enabled or not series_key:
             return {}
+        p = self._series_path(series_key)
+        if not p.exists():
+            return {}
         try:
-            p = self._series_path(series_key)
-            if not p.exists():
-                return {}
             with open(p, encoding="utf-8") as f:
                 data = json.load(f)
-        except Exception:
+        except Exception as e:
+            self._note_corrupt(p, e)
             return {}
         hints = {}
         for ch in data.get("characters", []):
@@ -2925,14 +2994,8 @@ class LearnedState:
         """Persist this book's character roster into the series bucket."""
         if not self.enabled or not series_key:
             return
-        try:
-            p = self._series_path(series_key)
-            data = {}
-            if p.exists():
-                with open(p, encoding="utf-8") as f:
-                    data = json.load(f)
-        except Exception:
-            data = {}
+        p = self._series_path(series_key)
+        data = self._load_series_data(p)
         data.setdefault("characters", [])
         data.setdefault("books", [])
         seen = {norm_name(c.get("name", "")) for c in data["characters"]}
@@ -2951,6 +3014,7 @@ class LearnedState:
             data["books"].append({"isbn": isbn, "title": title})
         # Atomic write.
         try:
+            self._preserve_corrupt(p)
             tmp = p.with_suffix(p.suffix + ".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)
@@ -2982,13 +3046,14 @@ class LearnedState:
         named series. Empty dict when disabled/unknown."""
         if not self.enabled or not series_key:
             return {}
+        p = self._named_series_path(series_key)
+        if not p.exists():
+            return {}
         try:
-            p = self._named_series_path(series_key)
-            if not p.exists():
-                return {}
             with open(p, encoding="utf-8") as f:
                 data = json.load(f)
-        except Exception:
+        except Exception as e:
+            self._note_corrupt(p, e)
             return {}
         hints = {}
         for ch in data.get("characters", []):
@@ -3006,15 +3071,12 @@ class LearnedState:
         """Persist this book's roster into the named-series bucket."""
         if not self.enabled or not series_key:
             return
+        p = self._named_series_path(series_key)
         try:
-            p = self._named_series_path(series_key)
             p.parent.mkdir(parents=True, exist_ok=True)
-            data = {}
-            if p.exists():
-                with open(p, encoding="utf-8") as f:
-                    data = json.load(f)
         except Exception:
-            data = {}
+            pass  # the write below surfaces the failure via _warn_once
+        data = self._load_series_data(p)
         data.setdefault("characters", [])
         data.setdefault("books", [])
         data["series"] = series_key
@@ -3035,6 +3097,7 @@ class LearnedState:
                                   "position": series_position})
         # Atomic write.
         try:
+            self._preserve_corrupt(p)
             tmp = p.with_suffix(p.suffix + ".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)
@@ -3068,9 +3131,19 @@ class LearnedState:
             if rj:
                 parts.append(f"{rj} trope rejection{'s' if rj != 1 else ''}")
             self._new.clear()
+            corrupt = sorted(self._corrupt_seen)
         if not parts:
             return ""
-        return "Learned: " + ", ".join(parts)
+        summary = "Learned: " + ", ".join(parts)
+        if corrupt:
+            # This run's counts are real, but the store they joined
+            # started empty for these files — the summary must not
+            # read as if the prior state had carried over.
+            summary += (f" (warning: {len(corrupt)} learned file(s) "
+                        f"failed to load this run — prior state not "
+                        f"carried over; originals preserved as .corrupt "
+                        f"backups)")
+        return summary
 
 
 # Module-level learning state, created in main() when --learn is on.
