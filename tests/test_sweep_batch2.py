@@ -357,7 +357,7 @@ class TestDedupeEmbedDegradation(_ConfigGuard):
         self.assertEqual([c["name"] for c in out],
                          ["Jon Pryce", "Jonathan Pryce"])
         self.assertEqual(report, [])
-        self.assertIn("UN-DEDUPED", buf.getvalue())
+        self.assertIn("DETERMINISTIC merges only", buf.getvalue())
 
     def test_embed_endpoint_failure_writes_undeduped(self):
         chars = self._chars()
@@ -372,7 +372,7 @@ class TestDedupeEmbedDegradation(_ConfigGuard):
                 chars, [], [])
         self.assertEqual(len(out), 2)
         self.assertEqual(report, [])
-        self.assertIn("UN-DEDUPED", buf.getvalue())
+        self.assertIn("DETERMINISTIC merges only", buf.getvalue())
 
     def test_embeddings_available_still_dedupes(self):
         chars = self._chars()
