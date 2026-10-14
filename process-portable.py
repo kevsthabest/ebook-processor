@@ -4119,6 +4119,806 @@ def cmd_staging_report(as_json=False, learn_dir=None, state=None):
         print(text)
 
 
+# ---------------------------------------------------------------------------
+# Option B — persisted per-work roster (design: eval/b-roster-design.md).
+#
+# Identity is a hypothesis with provenance, never a fact the store
+# asserts. A persisted link says "run N's entry X was judged the same
+# person as entity E, by tier T, on this evidence" — recorded,
+# reversible, and re-vetted against every later run's evidence. Names
+# are observations; identity is the thing observed. Unlike F's staging
+# store, this store holds authority (it can change WHO a row is
+# about), so it does not claim F's delay-only failure property: a
+# missing/corrupt store degrades to the stateless path (safe), and a
+# loadable-but-wrong store is countered by provenance, suspension,
+# anchors and the roster report — every exercise of the store's
+# authority is attributed and reversible.
+# ---------------------------------------------------------------------------
+
+_ROSTER_SIZE_WARN = 5 * 1024 * 1024
+
+
+class RosterVetoError(ValueError):
+    """A recorded union would contradict a human NO. Raised by
+    RosterStore itself (the invariant lives in the store, not in
+    callers, so no future code path can re-form a vetoed identity
+    by forgetting to check)."""
+
+
+def roster_desc_hash(text):
+    """Short hash of a run's best description for an entry/entity, so
+    description continuity is checkable across runs without storing
+    prose (design section 3)."""
+    import hashlib as _hl
+    if not text:
+        return ""
+    return _hl.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _roster_store_filename(work_key):
+    """Filesystem name for a work's roster store file. The work_key
+    itself is stored inside the file and is authoritative; the name
+    is a deterministic sanitization (plus a hash suffix whenever
+    sanitization changed anything, so distinct keys can't collide)."""
+    import hashlib as _hl
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(work_key)).strip("_")
+    if not safe:
+        safe = "work"
+    if safe != str(work_key):
+        safe = f"{safe}-{_hl.sha1(str(work_key).encode()).hexdigest()[:8]}"
+    return safe + ".json"
+
+
+class RosterStore:
+    """One work's persisted roster identity: minted entity IDs,
+    name observations with provenance, first-class link records,
+    curation anchors, merge tombstones and a suspension ledger.
+
+    One JSON file per work under <learn_dir>/rosters/, persistence
+    discipline copied from StagingState (F8: atomic save, loud
+    corruption with .corrupt preservation, RLock). NOT a
+    LearnedState file and NOT the staging file: cross-run roster
+    links live and die inside this per-work store and never become
+    cross-book learning (design section 7, D1 containment).
+    """
+
+    def __init__(self, learn_dir=None, work_key=None, enabled=True):
+        self._lock = threading.RLock()
+        self.enabled = enabled
+        if learn_dir:
+            base = Path(learn_dir)
+        else:
+            base = Path(os.path.expanduser("~")) / ".ebook-processor" \
+                / "learned"
+        self.dir = base / "rosters"
+        self.work_key = work_key
+        self._writable = True
+        self._warned = False
+        self._corrupt_paths = set()
+        self._corrupt_seen = set()
+        self.data = self._empty_data(work_key)
+        if self.enabled:
+            self._ensure_dir()
+            if work_key is not None:
+                self._load()
+
+    @staticmethod
+    def _empty_data(work_key):
+        return {"version": 1, "work_key": work_key, "work_id": None,
+                "title": "", "author": "", "runs_completed": 0,
+                "last_run_fingerprint": None, "next_entity_seq": 1,
+                "minted_total": 0, "entities": {}, "retired": {},
+                "no_pairs": [], "adoptions": []}
+
+    # -- setup / persistence (StagingState's F8 pattern) --------------
+    def _ensure_dir(self):
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            self._writable = False
+            self._warn_once(
+                f"  Roster dir not writable ({self.dir}); roster "
+                "persistence disabled for this run")
+
+    def _warn_once(self, msg):
+        with self._lock:
+            if self._warned:
+                return
+            self._warned = True
+        print(msg)
+
+    @property
+    def writable(self):
+        return self._writable
+
+    @property
+    def corrupt_at_load(self):
+        return bool(self._corrupt_seen)
+
+    @property
+    def path(self):
+        return self.dir / _roster_store_filename(self.work_key or "")
+
+    @property
+    def runs_completed(self):
+        return self.data["runs_completed"]
+
+    def _note_corrupt(self, path, err):
+        """Record a roster file that failed to load and say so LOUDLY.
+        The store starts EMPTY: the run degrades to the stateless path
+        (today's behaviour) and says so on its face. Identity history
+        is lost; correctness is not. Original bytes are preserved as a
+        .corrupt backup before any overwrite."""
+        path = Path(path)
+        with self._lock:
+            self._corrupt_paths.add(path)
+            first = path.name not in self._corrupt_seen
+            self._corrupt_seen.add(path.name)
+        if first:
+            print(f"  !! WARNING: roster store {path} could not be "
+                  f"loaded ({err}); starting this work's roster store "
+                  f"EMPTY (the run is stateless for this work). The "
+                  f"original file will be preserved as a .corrupt "
+                  f"backup before it is overwritten.")
+
+    def _preserve_corrupt(self, path):
+        path = Path(path)
+        with self._lock:
+            if path not in self._corrupt_paths:
+                return
+        try:
+            if path.exists():
+                dest = path.with_name(path.name + ".corrupt")
+                n = 1
+                while dest.exists():
+                    dest = path.with_name(f"{path.name}.corrupt-{n}")
+                    n += 1
+                shutil.copyfile(path, dest)
+                print(f"  !! Preserved corrupt roster store as {dest}")
+            with self._lock:
+                self._corrupt_paths.discard(path)
+        except Exception as e:
+            print(f"  !! WARNING: could not preserve corrupt file "
+                  f"{path} ({e}); it will still be overwritten")
+
+    def _load(self):
+        p = self.path
+        if not p.exists():
+            return
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) \
+                    or not isinstance(data.get("entities"), dict) \
+                    or not isinstance(data.get("retired"), dict):
+                raise ValueError("roster store has no entity maps")
+            empty = self._empty_data(self.work_key)
+            empty.update(data)
+            empty["work_key"] = self.work_key
+            self.data = empty
+        except Exception as e:
+            self._note_corrupt(p, e)
+            self.data = self._empty_data(self.work_key)
+
+    def save(self):
+        """Atomic write: temp file + os.replace. No-op when not
+        writable/enabled."""
+        if not self._writable or not self.enabled \
+                or self.work_key is None:
+            return False
+        with self._lock:
+            try:
+                p = self.path
+                self._preserve_corrupt(p)
+                tmp = p.with_suffix(p.suffix + ".tmp")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self.data, f, ensure_ascii=False, indent=1)
+                os.replace(tmp, p)
+                try:
+                    if p.stat().st_size > _ROSTER_SIZE_WARN:
+                        self._warn_once(
+                            f"  Roster store is large "
+                            f"({p.stat().st_size} bytes); run "
+                            "--roster-report to inspect it")
+                except OSError:
+                    pass
+                return True
+            except Exception as e:
+                self._writable = False
+                self._warn_once(
+                    f"  Roster store write failed ({e}); roster "
+                    "persistence disabled for this run")
+                return False
+
+    # -- entities -------------------------------------------------------
+    def mint_entity(self):
+        """Mint a fresh opaque entity ID. IDs are never derived from
+        a name, never reused, and never deleted (a merged-away ID
+        tombstones in retired with a redirect)."""
+        with self._lock:
+            eid = f"ent_{self.data['next_entity_seq']:04d}"
+            self.data["next_entity_seq"] += 1
+            self.data["minted_total"] += 1
+            self.data["entities"][eid] = {
+                "canonical": None, "canonical_source": None,
+                "status": "active", "split_from": None, "split_into": [],
+                "anchor": None, "observations": [], "links": []}
+            return eid
+
+    def get_entity(self, eid):
+        return self.data["entities"].get(eid)
+
+    def resolve_id(self, eid):
+        """Follow merged_into redirects to the surviving entity ID
+        (None when the ID is unknown). Split entities do not
+        redirect: their successors carry the observations, so
+        matching finds them directly."""
+        seen = set()
+        cur = eid
+        while cur in self.data["retired"]:
+            if cur in seen:
+                return None
+            seen.add(cur)
+            cur = self.data["retired"][cur].get("merged_into")
+        return cur if cur in self.data["entities"] else None
+
+    def set_canonical(self, eid, name, source):
+        with self._lock:
+            ent = self.data["entities"][eid]
+            ent["canonical"] = name
+            ent["canonical_source"] = source
+
+    # -- observations ---------------------------------------------------
+    def append_observation(self, eid, obs):
+        """Append one run's observation of an entity (at most one per
+        entity per run; the caller mints the run ordinal via
+        claim_run). Stored verbatim apart from the suspect/detached
+        flags, which default to False."""
+        with self._lock:
+            o = dict(obs)
+            o.setdefault("suspect", False)
+            o.setdefault("detached", False)
+            o["chapters"] = sorted(o.get("chapters") or [])
+            o["aliases"] = sorted(o.get("aliases") or [])
+            o["alias_keys"] = sorted(o.get("alias_keys") or [])
+            self.data["entities"][eid]["observations"].append(o)
+            return o
+
+    def claim_run(self, fingerprint):
+        """Claim the run ordinal for a completing run. Returns
+        (ordinal, repeat): when the roster fingerprint equals the
+        last completed run's, this is the SAME extraction completing
+        again (resume-after-crash at the seam boundary) — the ordinal
+        is reused, runs_completed does not advance, and the run's
+        prior records are purged so re-recording refreshes in place
+        instead of double-counting one extraction (design section 7).
+        """
+        with self._lock:
+            if fingerprint is not None \
+                    and fingerprint == self.data["last_run_fingerprint"] \
+                    and self.data["runs_completed"] > 0:
+                ordinal = self.data["runs_completed"]
+                self._purge_run(ordinal)
+                return ordinal, True
+            self.data["runs_completed"] += 1
+            self.data["last_run_fingerprint"] = fingerprint
+            return self.data["runs_completed"], False
+
+    def _purge_run(self, ordinal):
+        for ent in self.data["entities"].values():
+            ent["observations"] = [
+                o for o in ent["observations"] if o.get("run") != ordinal]
+            ent["links"] = [
+                l for l in ent["links"] if l.get("run") != ordinal]
+
+    # -- human NO (store-level invariant) --------------------------------
+    def record_no(self, form_a, form_b, source=""):
+        """Record a human NO: these two name forms are NOT the same
+        person. The store refuses any later union that would re-form
+        this pair's identity (links, folds, merge tombstones,
+        adoptions) — see union_veto."""
+        a, b = norm_name(form_a), norm_name(form_b)
+        if not a or not b or a == b:
+            return False
+        with self._lock:
+            if self.has_no(a, b):
+                return False
+            self.data["no_pairs"].append(
+                {"a": a, "b": b, "source": source or ""})
+            return True
+
+    def has_no(self, form_a, form_b):
+        a, b = norm_name(form_a), norm_name(form_b)
+        return any({p["a"], p["b"]} == {a, b}
+                   for p in self.data["no_pairs"])
+
+    def union_veto(self, forms_a, forms_b):
+        """The recorded NO a union of these two form sets would
+        contradict, or None. A union is contradicted when one side
+        of a NO pair sits in each set."""
+        sa = {norm_name(f) for f in forms_a if f}
+        sb = {norm_name(f) for f in forms_b if f}
+        for p in self.data["no_pairs"]:
+            if (p["a"] in sa and p["b"] in sb) \
+                    or (p["a"] in sb and p["b"] in sa):
+                return p
+        return None
+
+    def _entity_form_keys(self, eid, include_detached=False):
+        """Every form key an entity claims: observed primary forms,
+        observed alias keys, and its canonical key. Detached
+        observations (a human removed that form from this entity)
+        no longer speak for it."""
+        ent = self.data["entities"].get(eid)
+        if ent is None:
+            return set()
+        keys = set()
+        for o in ent["observations"]:
+            if o.get("detached") and not include_detached:
+                continue
+            keys.add(o["form_key"])
+            keys.update(o.get("alias_keys") or [])
+        if ent.get("canonical"):
+            keys.add(norm_name(ent["canonical"]))
+        anchor = ent.get("anchor")
+        if anchor:
+            keys.add(norm_name(anchor["name"]))
+            keys.update(norm_name(a) for a in anchor.get("aliases") or [])
+        return keys
+
+    def _check_union(self, forms_a, forms_b, what):
+        veto = self.union_veto(forms_a, forms_b)
+        if veto is not None:
+            raise RosterVetoError(
+                f"{what} refused: it would re-form an identity a human "
+                f"vetoed ({veto['a']!r} is not {veto['b']!r}"
+                f"{'; ' + veto['source'] if veto.get('source') else ''})")
+
+    # -- links ------------------------------------------------------------
+    def record_link(self, eid, link, entry_forms):
+        """Record a cross-run link between a run entry (entry_forms:
+        its form key + claimed alias keys) and an entity. Refused by
+        the store itself when the union contradicts a recorded NO.
+        The link record carries run, tier, state and a human-readable
+        evidence string — a link with no recorded basis does not
+        exist."""
+        with self._lock:
+            self._check_union(set(entry_forms),
+                              self._entity_form_keys(eid), "link")
+            rec = {"run": link.get("run"), "tier": link.get("tier"),
+                   "state": link.get("state", "active"),
+                   "evidence": link.get("evidence", ""),
+                   "form_key": link.get("form_key")}
+            self.data["entities"][eid]["links"].append(rec)
+            return rec
+
+    def suspend_link(self, eid, run, form_key, evidence):
+        """Suspend the active link(s) this run's entry (form_key)
+        made into the entity, and flag the observations that link
+        carried as suspect (A1: a suspended link's observations stop
+        voting — excluded from canonical weighting and tier-2 alias
+        evidence until a human resolves them). Returns how many
+        links were suspended."""
+        with self._lock:
+            ent = self.data["entities"].get(eid)
+            if ent is None:
+                return 0
+            n = 0
+            for link in ent["links"]:
+                if link.get("run") == run \
+                        and link.get("form_key") == form_key \
+                        and link.get("state") == "active":
+                    link["state"] = "suspended"
+                    link["evidence"] = (
+                        f"{link.get('evidence', '')} | suspended: "
+                        f"{evidence}").strip(" |")
+                    n += 1
+            if n:
+                self.flag_suspect_observations(eid, run, form_key)
+            return n
+
+    def suspension_ledger(self):
+        """Suspended links plus the entities they touch — reported
+        as its own line, OUTSIDE the ID partition (suspension is a
+        link state, not an entity status; design A4)."""
+        out = []
+        for eid, ent in self.data["entities"].items():
+            for link in ent["links"]:
+                if link.get("state") == "suspended":
+                    out.append({"entity": eid, "link": dict(link)})
+        return out
+
+    def flag_suspect_observations(self, eid, run, form_key):
+        with self._lock:
+            ent = self.data["entities"].get(eid)
+            if ent is None:
+                return
+            for o in ent["observations"]:
+                if o.get("run") == run \
+                        and o.get("form_key") == form_key:
+                    o["suspect"] = True
+
+    def resolve_suspect(self, eid, form_key):
+        """A human affirmed this form belongs to this entity: its
+        observations vote again."""
+        with self._lock:
+            ent = self.data["entities"].get(eid)
+            if ent is None:
+                return
+            for o in ent["observations"]:
+                if o.get("form_key") == form_key:
+                    o["suspect"] = False
+
+    # -- detach / split / merge -------------------------------------------
+    def detach_form(self, eid, form_key, run=None):
+        """A human removed this form from this entity (--roster-
+        unlink): the form's observations are flagged detached (they
+        stop speaking for the entity in every view, permanently
+        until a human re-links), and NOs are recorded between the
+        form and every other form the entity claims, so the union
+        cannot silently re-form. Returns the NO records added."""
+        form_key = norm_name(form_key)
+        added = []
+        with self._lock:
+            ent = self.data["entities"].get(eid)
+            if ent is None:
+                return added
+            others = self._entity_form_keys(eid) - {form_key}
+            for o in ent["observations"]:
+                if o.get("form_key") == form_key:
+                    o["detached"] = True
+                    o["suspect"] = False
+            for other in sorted(others):
+                if self.record_no(form_key, other,
+                                   source="--roster-unlink"):
+                    added.append({"a": form_key, "b": other})
+            return added
+
+    def record_merge(self, survivor_id, folded_id, run, reason):
+        """Tombstone folded_id into survivor_id: the folded entity
+        leaves `entities` and is recorded ONCE in `retired` with a
+        merged_into redirect; its observations and links are
+        preserved under the survivor. Refused by the store itself
+        when the union contradicts a recorded human NO."""
+        with self._lock:
+            if survivor_id == folded_id:
+                return False
+            surv = self.data["entities"].get(survivor_id)
+            fold = self.data["entities"].get(folded_id)
+            if surv is None or fold is None:
+                return False
+            self._check_union(self._entity_form_keys(survivor_id),
+                              self._entity_form_keys(folded_id),
+                              "merge")
+            surv["observations"].extend(fold["observations"])
+            surv["links"].extend(fold["links"])
+            if surv.get("anchor") is None and fold.get("anchor"):
+                surv["anchor"] = fold["anchor"]
+                surv["canonical"] = fold["canonical"]
+                surv["canonical_source"] = fold["canonical_source"]
+            self.data["retired"][folded_id] = {
+                "merged_into": survivor_id, "run": run,
+                "reason": reason}
+            del self.data["entities"][folded_id]
+            return True
+
+    def record_split(self, eid, form_keys, run=None):
+        """Partition an entity's observations by form: each listed
+        form's observations move to a fresh successor entity
+        (split_from = eid). When no observations remain, the
+        original tombstones as status `split` with split_into
+        naming the successors; otherwise it stays active with the
+        remainder. Returns {form_key: successor_id}."""
+        wanted = [norm_name(f) for f in form_keys]
+        out = {}
+        with self._lock:
+            ent = self.data["entities"].get(eid)
+            if ent is None:
+                return out
+            for fk in wanted:
+                mine = [o for o in ent["observations"]
+                        if o.get("form_key") == fk]
+                if not mine:
+                    continue
+                ent["observations"] = [
+                    o for o in ent["observations"]
+                    if o.get("form_key") != fk]
+                succ = self.mint_entity()
+                sent = self.data["entities"][succ]
+                sent["split_from"] = eid
+                sent["observations"] = mine
+                sent["canonical"] = mine[-1].get("form")
+                sent["canonical_source"] = "rule"
+                ent["split_into"].append(succ)
+                out[fk] = succ
+            if out and not ent["observations"]:
+                ent["status"] = "split"
+            return out
+
+    # -- anchors ------------------------------------------------------------
+    def seed_anchor(self, name, kind, source, run, aliases=()):
+        """Fetch-or-create the anchored entity for a human decision
+        (a preserved DB row, or a manual --alias). The anchor's key
+        set is closed and exact (A3): the anchor name's form_key
+        plus the form keys of the aliases recorded for it — no token
+        decomposition. Re-seeding refreshes seen_run. Returns the
+        entity ID."""
+        form_key = norm_name(name)
+        keyset = {form_key} | {norm_name(a) for a in aliases if a}
+        with self._lock:
+            for eid, ent in self.data["entities"].items():
+                anchor = ent.get("anchor")
+                if anchor:
+                    aset = {norm_name(anchor["name"])} | {
+                        norm_name(a) for a in anchor.get("aliases") or []}
+                    if aset & keyset:
+                        anchor["seen_run"] = run
+                        return eid
+            for eid, ent in self.data["entities"].items():
+                if ent.get("status") != "active":
+                    continue
+                primaries = {o["form_key"] for o in ent["observations"]
+                             if not o.get("detached")}
+                if primaries & keyset:
+                    ent["anchor"] = {
+                        "kind": kind, "name": name, "source": source,
+                        "aliases": sorted(aliases), "seen_run": run}
+                    ent["canonical"] = name
+                    ent["canonical_source"] = "anchor"
+                    return eid
+            eid = self.mint_entity()
+            ent = self.data["entities"][eid]
+            ent["anchor"] = {"kind": kind, "name": name,
+                             "source": source,
+                             "aliases": sorted(aliases),
+                             "seen_run": run}
+            ent["canonical"] = name
+            ent["canonical_source"] = "anchor"
+            return eid
+
+    def anchored_entities(self):
+        return {eid: ent["anchor"]
+                for eid, ent in self.data["entities"].items()
+                if ent.get("anchor")}
+
+    # -- views (matcher input) ----------------------------------------------
+    def entity_views(self):
+        """Per-entity matching views over ACTIVE entities. Primary
+        forms come from every non-detached observation; tier-2 alias
+        evidence (`alias_keys`) counts only attestations NOT carried
+        solely by suspect observations (A1), while `alias_keys_all`
+        keeps the full set for reporting. desc_hash is the latest
+        trusted (non-suspect) observation's."""
+        views = []
+        with self._lock:
+            for eid, ent in self.data["entities"].items():
+                if ent.get("status") != "active":
+                    continue
+                primary, alias_trusted, alias_all = set(), set(), set()
+                chapters = set()
+                appearances = 0
+                desc_hash = ""
+                for o in ent["observations"]:
+                    if o.get("detached"):
+                        continue
+                    primary.add(o["form_key"])
+                    alias_all.update(o.get("alias_keys") or [])
+                    chapters.update(o.get("chapters") or [])
+                    appearances += o.get("appearances") or 0
+                    if not o.get("suspect"):
+                        alias_trusted.update(o.get("alias_keys") or [])
+                        if o.get("desc_hash"):
+                            desc_hash = o["desc_hash"]
+                views.append({
+                    "id": eid,
+                    "canonical": ent.get("canonical"),
+                    "canonical_key": norm_name(ent["canonical"] or ""),
+                    "anchor": ent.get("anchor"),
+                    "primary_forms": primary,
+                    "alias_keys": alias_trusted,
+                    "alias_keys_all": alias_all,
+                    "chapters": chapters,
+                    "appearances": appearances,
+                    "desc_hash": desc_hash,
+                    "provisional": self._is_provisional(ent),
+                })
+            return views
+
+    @staticmethod
+    def _is_provisional(ent):
+        return sum(1 for o in ent["observations"]
+                   if not o.get("detached")) < 2
+
+    def is_provisional(self, eid):
+        ent = self.data["entities"].get(eid)
+        return bool(ent) and self._is_provisional(ent)
+
+    # -- adoption -------------------------------------------------------------
+    def adopt_store(self, src):
+        """Adopt another store's contents into this one (work-key
+        adoption on work_id resolution, design section 8): entities
+        are reminted under this store's sequence, redirects and
+        split_from are rewritten, NO records union in, and the
+        adoption is recorded on this store. Refused wholesale when
+        any entity on either side embodies a union the combined NO
+        set vetoes — adoption must not smuggle a vetoed identity
+        past the store-level invariant. Returns entities moved."""
+        with self._lock:
+            nos = list(self.data["no_pairs"]) + list(src.data["no_pairs"])
+            for store in (self, src):
+                for ent in store.data["entities"].values():
+                    forms = set()
+                    for o in ent["observations"]:
+                        forms.add(o["form_key"])
+                        forms.update(o.get("alias_keys") or [])
+                    for p in nos:
+                        if p["a"] in forms and p["b"] in forms:
+                            raise RosterVetoError(
+                                "adoption refused: an entity embodies "
+                                f"a vetoed union ({p['a']!r} is not "
+                                f"{p['b']!r})")
+            id_map = {}
+            for old_id in src.data["entities"]:
+                id_map[old_id] = self.mint_entity()
+                # mint_entity counted a fresh mint; adoption MOVES an
+                # identity, it does not mint one — the combined
+                # store's minted_total is the two stores' sum, set
+                # explicitly below.
+                self.data["minted_total"] -= 1
+            for old_id, ent in src.data["entities"].items():
+                new_ent = self.data["entities"][id_map[old_id]]
+                moved = json.loads(json.dumps(ent))
+                moved["split_from"] = id_map.get(ent.get("split_from"),
+                                                 ent.get("split_from"))
+                moved["split_into"] = [
+                    id_map.get(s, s) for s in ent.get("split_into") or []]
+                new_ent.update(moved)
+            n_retired = 0
+            for old_id, rec in src.data["retired"].items():
+                new_id = f"ent_{self.data['next_entity_seq']:04d}"
+                self.data["next_entity_seq"] += 1
+                n_retired += 1
+                self.data["retired"][new_id] = {
+                    "merged_into": id_map.get(rec.get("merged_into"),
+                                              rec.get("merged_into")),
+                    "run": rec.get("run"), "reason": rec.get("reason")}
+            for p in src.data["no_pairs"]:
+                self.record_no(p["a"], p["b"], source=p.get("source", ""))
+            self.data["minted_total"] += src.data["minted_total"]
+            self.data["runs_completed"] = max(
+                self.data["runs_completed"], src.data["runs_completed"])
+            if src.work_key:
+                self.data["adoptions"].append(
+                    {"from_key": src.work_key,
+                     "entities_moved": len(id_map) + n_retired})
+            return len(id_map) + n_retired
+
+    # -- accounting -----------------------------------------------------------
+    def accounting(self):
+        """The ID partition, closed in the open (F's accounting
+        discipline applied to IDs): minted = active + merged + split
+        with UNACCOUNTED: 0. Suspension is a link state and is NOT
+        part of this partition; it has its own ledger."""
+        with self._lock:
+            active = sum(1 for e in self.data["entities"].values()
+                         if e.get("status") == "active")
+            split = sum(1 for e in self.data["entities"].values()
+                        if e.get("status") == "split")
+            merged = len(self.data["retired"])
+            minted = self.data["minted_total"]
+            return {"minted": minted, "active": active,
+                    "merged": merged, "split": split,
+                    "unaccounted": minted - (active + merged + split)}
+
+
+def roster_store_paths(learn_dir=None):
+    """All roster store files under the learned dir's rosters/
+    (for --roster-report and the correction commands, which find a
+    work's store by scanning: the file's stored work_key is
+    authoritative, not its name)."""
+    if learn_dir:
+        base = Path(learn_dir)
+    else:
+        base = Path(os.path.expanduser("~")) / ".ebook-processor" \
+            / "learned"
+    rdir = base / "rosters"
+    if not rdir.is_dir():
+        return []
+    return sorted(rdir.glob("*.json"))
+
+
+def load_roster_store(learn_dir, work_key):
+    return RosterStore(learn_dir=learn_dir, work_key=work_key)
+
+
+def find_roster_store(learn_dir, work):
+    """Find the store for a <work> argument (exact work_key, else
+    work_id, else title — first unambiguous match). Returns
+    (RosterStore, None) or (None, error_message)."""
+    matches = []
+    for path in roster_store_paths(learn_dir):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        wk = data.get("work_key")
+        store = RosterStore(learn_dir=learn_dir, work_key=wk)
+        if work in (wk, data.get("work_id")):
+            return store, None
+        if work and _tnorm(work) == _tnorm(data.get("title") or ""):
+            matches.append(store)
+    if len(matches) == 1:
+        return matches[0], None
+    if len(matches) > 1:
+        return None, (f"work {work!r} matches {len(matches)} roster "
+                      "stores by title; use the work_id or work key")
+    return None, f"no roster store found for work {work!r}"
+
+
+def adopt_roster_store(learn_dir, work_id, title="", author="",
+                       isbn=None):
+    """Work-key adoption on work_id resolution (the F adopt_for
+    pattern, per-work files): a store recorded under a fallback key
+    (isbn / title|author) is adopted into the work_id store once a
+    run resolves the id — merged in when both files exist, renamed
+    when only the fallback does. Exact title+author match only.
+    Adoptions are recorded on the surviving store so the next
+    roster report lists them. Returns True when an adoption
+    happened."""
+    if not work_id:
+        return False
+    candidates = []
+    if isbn:
+        candidates.append(f"isbn:{isbn}")
+    candidates.append(f"title:{_tnorm(title)}|{_tnorm(author)}")
+    dst_key = str(work_id)
+    adopted = False
+    for cand in candidates:
+        if cand == dst_key:
+            continue
+        src = RosterStore(learn_dir=learn_dir, work_key=cand)
+        if not src.path.exists() or src.corrupt_at_load:
+            continue
+        if _tnorm(src.data.get("title")) != _tnorm(title) \
+                or _tnorm(src.data.get("author")) != _tnorm(author):
+            continue
+        dst = RosterStore(learn_dir=learn_dir, work_key=dst_key)
+        if not dst.path.exists():
+            # Rename: same store, new key — no reminting needed.
+            src.data["work_key"] = dst_key
+            src.data["work_id"] = str(work_id)
+            src.data["adoptions"].append(
+                {"from_key": cand, "entities_moved":
+                 len(src.data["entities"]) + len(src.data["retired"])})
+            old_path = src.path
+            src.work_key = dst_key  # .path now resolves to the new key
+            src.save()              # writes the store under the new key
+            try:
+                if old_path != src.path and old_path.exists():
+                    old_path.unlink()
+            except OSError:
+                pass
+            adopted = True
+            continue
+        try:
+            dst.adopt_store(src)
+        except RosterVetoError as e:
+            print(f"  Roster adoption refused for {cand}: {e}")
+            continue
+        if not dst.data.get("work_id"):
+            dst.data["work_id"] = str(work_id)
+        dst.save()
+        try:
+            src.path.unlink()
+        except OSError:
+            pass
+        adopted = True
+    return adopted
+
+
 # Module-level staging state, mirroring _learn(): _staging() always
 # returns a usable object (disabled stub when --staging-gate is off),
 # rooted at the learned-state directory so staging.json sits beside

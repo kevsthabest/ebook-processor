@@ -1,0 +1,427 @@
+"""Option B — persisted per-work roster, slice 1: RosterStore.
+
+Design: eval/b-roster-design.md (user-approved open choices as amended
+by the Security Advisor red-team, A1-A9). Identity is a hypothesis
+with provenance, never a fact the store asserts: every union the
+store records is attributed to a tier and a run, reversible, and
+refused outright when it contradicts a recorded human NO.
+
+Covered here (slice 1):
+  * per-work file persistence, F8 pattern (atomic save, loud
+    corruption, .corrupt preservation), RLock discipline;
+  * entity minting (opaque ent_<seq>, never reused, never derived
+    from a name);
+  * observation append + run-fingerprint idempotency (a repeated
+    extraction refreshes in place, never double-counts);
+  * merge tombstones (recorded ONCE in retired, with redirect;
+    observations preserved under the survivor);
+  * split into per-form successors (original accounts as split);
+  * suspension as a LINK state with its own ledger (outside the
+    ID partition);
+  * the store-level human-NO invariant: matcher links, folds,
+    merge tombstones and adoptions that would re-form a vetoed
+    union are refused by the store itself;
+  * accounting that closes: minted = active + merged + split,
+    UNACCOUNTED: 0, incl. randomized operation sequences.
+
+Stdlib unittest only. No network, no Supabase, no real ebook files.
+Run: python -m unittest discover -s tests -v
+"""
+import contextlib
+import importlib.util
+import io
+import json
+import random
+import tempfile
+import unittest
+from pathlib import Path
+
+_MOD_PATH = str(Path(__file__).resolve().parent.parent / "process-portable.py")
+_spec = importlib.util.spec_from_file_location("process_portable", _MOD_PATH)
+pp = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(pp)
+
+WK = "title:test book|some author"
+
+
+def _capture(fn, *args, **kwargs):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        out = fn(*args, **kwargs)
+    return out, buf.getvalue()
+
+
+def _obs(run, form, chapters=(1,), appearances=5, aliases=(),
+         desc_hash=""):
+    return {"run": run, "form": form, "form_key": pp.norm_name(form),
+            "chapters": sorted(chapters), "appearances": appearances,
+            "role_hint": None,
+            "aliases": sorted(aliases),
+            "alias_keys": sorted(pp.norm_name(a) for a in aliases),
+            "desc_hash": desc_hash}
+
+
+class _StoreCase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+
+    def _store(self, work_key=WK):
+        return pp.RosterStore(learn_dir=self.dir, work_key=work_key)
+
+
+class TestMintAndPersist(_StoreCase):
+    def test_ids_are_opaque_sequential_and_never_reused(self):
+        st = self._store()
+        a = st.mint_entity()
+        b = st.mint_entity()
+        self.assertEqual((a, b), ("ent_0001", "ent_0002"))
+        st.append_observation(a, _obs(1, "Violet Sorrengail"))
+        st.append_observation(b, _obs(1, "Xaden Riorson"))
+        st.record_merge(a, b, run=1, reason="within-run merge")
+        c = st.mint_entity()
+        self.assertEqual(c, "ent_0003")  # ent_0002 is never recycled
+
+    def test_round_trip_through_disk(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet", aliases=["Violet Sorrengail"]))
+        st.set_canonical(a, "Violet Sorrengail", "rule")
+        self.assertTrue(st.save())
+        st2 = self._store()
+        self.assertFalse(st2.corrupt_at_load)
+        e = st2.get_entity(a)
+        self.assertEqual(e["canonical"], "Violet Sorrengail")
+        self.assertEqual(len(e["observations"]), 1)
+        self.assertEqual(e["observations"][0]["alias_keys"],
+                         ["violet sorrengail"])
+
+    def test_one_file_per_work(self):
+        st1 = self._store("wk-one")
+        st1.mint_entity()
+        st1.save()
+        st2 = self._store("wk-two")
+        st2.mint_entity()
+        st2.save()
+        files = sorted(p.name for p in (self.dir / "rosters").glob("*.json"))
+        self.assertEqual(len(files), 2)
+        self.assertEqual(self._store("wk-one").data["work_key"], "wk-one")
+
+    def test_missing_store_is_empty_not_corrupt(self):
+        st = self._store()
+        self.assertFalse(st.corrupt_at_load)
+        self.assertEqual(st.accounting()["minted"], 0)
+
+
+class TestCorruption(_StoreCase):
+    def _write_garbage(self):
+        st = self._store()
+        path = st.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
+        return path
+
+    def test_corrupt_store_degrades_to_stateless_and_warns(self):
+        self._write_garbage()
+        st, out = _capture(self._store)
+        self.assertTrue(st.corrupt_at_load)
+        self.assertIn("WARNING", out)
+        self.assertEqual(st.accounting()["minted"], 0)
+
+    def test_corrupt_bytes_preserved_before_overwrite(self):
+        path = self._write_garbage()
+        st, _ = _capture(self._store)
+        st.mint_entity()
+        st.save()
+        backups = list(path.parent.glob(path.name + ".corrupt*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), "{not json")
+        # And the new file is valid.
+        json.loads(path.read_text(encoding="utf-8"))
+
+    def test_wrong_shape_is_corrupt(self):
+        st = self._store()
+        st.path.parent.mkdir(parents=True, exist_ok=True)
+        st.path.write_text(json.dumps({"entities": []}), encoding="utf-8")
+        st2, _ = _capture(self._store)
+        self.assertTrue(st2.corrupt_at_load)
+
+
+class TestRunFingerprint(_StoreCase):
+    def test_same_fingerprint_refreshes_in_place(self):
+        st = self._store()
+        ordinal, repeat = st.claim_run("fp-aaa")
+        self.assertEqual((ordinal, repeat), (1, False))
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet"))
+        st.record_link(a, {"run": 1, "tier": "exact-form",
+                           "state": "active", "evidence": "x",
+                           "form_key": "violet"},
+                       entry_forms={"violet"})
+        # The same extraction completing again (resume at the seam
+        # boundary): same fingerprint -> same ordinal, and the run's
+        # records are purged so re-recording cannot double-count.
+        ordinal2, repeat2 = st.claim_run("fp-aaa")
+        self.assertEqual((ordinal2, repeat2), (1, True))
+        self.assertEqual(st.runs_completed, 1)
+        self.assertEqual(st.get_entity(a)["observations"], [])
+        self.assertEqual(st.get_entity(a)["links"], [])
+        st.append_observation(a, _obs(1, "Violet"))
+        self.assertEqual(len(st.get_entity(a)["observations"]), 1)
+
+    def test_new_fingerprint_mints_new_ordinal(self):
+        st = self._store()
+        self.assertEqual(st.claim_run("fp-1"), (1, False))
+        self.assertEqual(st.claim_run("fp-2"), (2, False))
+        self.assertEqual(st.runs_completed, 2)
+
+
+class TestMergeTombstone(_StoreCase):
+    def test_merge_records_once_in_retired_and_preserves_observations(self):
+        st = self._store()
+        a = st.mint_entity()
+        b = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet Sorrengail"))
+        st.append_observation(b, _obs(1, "Violet"))
+        st.record_merge(a, b, run=1, reason="within-run merge")
+        self.assertIsNone(st.get_entity(b))
+        self.assertEqual(st.data["retired"][b]["merged_into"], a)
+        self.assertEqual(st.data["retired"][b]["reason"],
+                         "within-run merge")
+        forms = [o["form"] for o in st.get_entity(a)["observations"]]
+        self.assertEqual(forms, ["Violet Sorrengail", "Violet"])
+        self.assertEqual(st.resolve_id(b), a)
+
+    def test_resolve_id_follows_chains_and_unknown(self):
+        st = self._store()
+        a, b, c = st.mint_entity(), st.mint_entity(), st.mint_entity()
+        st.record_merge(b, a, run=1, reason="within-run merge")
+        st.record_merge(c, b, run=1, reason="within-run merge")
+        self.assertEqual(st.resolve_id(a), c)
+        self.assertIsNone(st.resolve_id("ent_9999"))
+
+
+class TestSuspension(_StoreCase):
+    def test_suspension_is_a_link_state_with_its_own_ledger(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet"))
+        st.record_link(a, {"run": 1, "tier": "alias-cross",
+                           "state": "active", "evidence": "mutual claim",
+                           "form_key": "violet"},
+                       entry_forms={"violet"})
+        n = st.suspend_link(a, run=1, form_key="violet",
+                            evidence="co-occurs with Violet Sorrengail")
+        self.assertEqual(n, 1)
+        ledger = st.suspension_ledger()
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger[0]["entity"], a)
+        self.assertEqual(ledger[0]["link"]["state"], "suspended")
+        # Suspension is NOT an entity status: the partition is
+        # untouched and the accounting still closes.
+        acc = st.accounting()
+        self.assertEqual(acc["active"], 1)
+        self.assertEqual(acc["unaccounted"], 0)
+        # The observation the suspended link carried is suspect (A1).
+        self.assertTrue(st.get_entity(a)["observations"][0]["suspect"])
+
+
+class TestSplit(_StoreCase):
+    def test_split_partitions_observations_by_form(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Dad", appearances=9))
+        st.append_observation(a, _obs(1, "Brennan Sorrengail",
+                                      appearances=30))
+        st.append_observation(a, _obs(2, "Dad", appearances=11))
+        out = st.record_split(a, ["dad", "brennan sorrengail"], run=2)
+        self.assertEqual(set(out), {"dad", "brennan sorrengail"})
+        orig = st.get_entity(a)
+        self.assertEqual(orig["status"], "split")
+        self.assertEqual(sorted(orig["split_into"]),
+                         sorted(out.values()))
+        dad = st.get_entity(out["dad"])
+        self.assertEqual([o["appearances"] for o in dad["observations"]],
+                         [9, 11])
+        self.assertEqual(dad["split_from"], a)
+        acc = st.accounting()
+        self.assertEqual(acc["split"], 1)
+        self.assertEqual(acc["active"], 2)
+        self.assertEqual(acc["unaccounted"], 0)
+
+    def test_partial_split_keeps_original_active(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Dad"))
+        st.append_observation(a, _obs(1, "Brennan Sorrengail"))
+        out = st.record_split(a, ["dad"], run=1)
+        orig = st.get_entity(a)
+        self.assertEqual(orig["status"], "active")
+        self.assertEqual([o["form"] for o in orig["observations"]],
+                         ["Brennan Sorrengail"])
+        self.assertEqual(st.get_entity(out["dad"])["split_from"], a)
+        self.assertEqual(st.accounting()["unaccounted"], 0)
+
+
+class TestHumanNoInvariant(_StoreCase):
+    def _two_entities(self, st):
+        a = st.mint_entity()
+        b = st.mint_entity()
+        st.append_observation(a, _obs(1, "Pete Sebeck"))
+        st.append_observation(b, _obs(1, "Chris Sebeck"))
+        return a, b
+
+    def test_recorded_no_refuses_merge(self):
+        st = self._store()
+        a, b = self._two_entities(st)
+        st.record_no("pete sebeck", "chris sebeck", source="test")
+        with self.assertRaises(pp.RosterVetoError):
+            st.record_merge(a, b, run=1, reason="within-run merge")
+        # Nothing was recorded: both entities survive.
+        self.assertIsNotNone(st.get_entity(b))
+        self.assertEqual(st.data["retired"], {})
+
+    def test_recorded_no_refuses_link(self):
+        st = self._store()
+        a, b = self._two_entities(st)
+        st.record_no("pete sebeck", "chris sebeck", source="test")
+        with self.assertRaises(pp.RosterVetoError):
+            st.record_link(b, {"run": 2, "tier": "exact-form",
+                               "state": "active", "evidence": "x",
+                               "form_key": "pete sebeck"},
+                           entry_forms={"pete sebeck"})
+
+    def test_union_veto_accessor(self):
+        st = self._store()
+        st.record_no("a form", "b form", source="test")
+        self.assertIsNotNone(st.union_veto({"a form"}, {"b form"}))
+        self.assertIsNotNone(st.union_veto({"b form"}, {"a form"}))
+        self.assertIsNone(st.union_veto({"a form"}, {"c form"}))
+        self.assertIsNone(st.union_veto({"a form"}, {"a form"}))
+
+    def test_no_pairs_survive_round_trip(self):
+        st = self._store()
+        st.record_no("a form", "b form", source="--roster-unlink")
+        st.save()
+        st2 = self._store()
+        self.assertTrue(st2.has_no("a form", "b form"))
+
+
+class TestAdoption(_StoreCase):
+    def test_adoption_remints_and_rewrites_redirects(self):
+        src = self._store("title:book|author")
+        x = src.mint_entity()
+        y = src.mint_entity()
+        src.append_observation(x, _obs(1, "Violet"))
+        src.append_observation(y, _obs(1, "Violet Sorrengail"))
+        src.record_merge(x, y, run=1, reason="within-run merge")
+        src.record_no("violet", "someone else", source="test")
+        dst = self._store("work-id-123")
+        z = dst.mint_entity()
+        dst.append_observation(z, _obs(1, "Xaden Riorson"))
+        moved = dst.adopt_store(src)
+        self.assertEqual(moved, 2)
+        acc = dst.accounting()
+        self.assertEqual(acc["minted"], 3)
+        self.assertEqual(acc["merged"], 1)
+        self.assertEqual(acc["unaccounted"], 0)
+        # Redirects point at reminted ids that exist in dst.
+        retired = dst.data["retired"]
+        self.assertEqual(len(retired), 1)
+        (old_id, rec), = retired.items()
+        self.assertIn(rec["merged_into"], dst.data["entities"])
+        self.assertTrue(dst.has_no("violet", "someone else"))
+        self.assertEqual(len(dst.data["adoptions"]), 1)
+
+    def test_adoption_refused_when_a_vetoed_union_is_embodied(self):
+        src = self._store("title:book|author")
+        x = src.mint_entity()
+        src.append_observation(x, _obs(1, "Pete Sebeck"))
+        src.append_observation(x, _obs(1, "Chris Sebeck"))
+        dst = self._store("work-id-9")
+        dst.record_no("pete sebeck", "chris sebeck", source="test")
+        with self.assertRaises(pp.RosterVetoError):
+            dst.adopt_store(src)
+        self.assertEqual(dst.accounting()["minted"], 0)
+
+
+class TestViews(_StoreCase):
+    def test_views_split_trusted_aliases_from_suspect(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet Sorrengail",
+                                      aliases=["Violet"]))
+        st.append_observation(a, _obs(2, "Violet", aliases=["Violence"],
+                                      desc_hash="h1"))
+        st.flag_suspect_observations(a, run=2, form_key="violet")
+        (view,) = st.entity_views()
+        self.assertEqual(view["id"], a)
+        self.assertIn("violet sorrengail", view["primary_forms"])
+        self.assertIn("violet", view["alias_keys"])
+        # 'violence' is attested ONLY by the suspect observation.
+        self.assertNotIn("violence", view["alias_keys"])
+        self.assertIn("violence", view["alias_keys_all"])
+        self.assertEqual(view["desc_hash"], "")  # latest TRUSTED obs
+
+    def test_detached_observations_leave_the_view(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet Sorrengail"))
+        st.append_observation(a, _obs(1, "Dad"))
+        st.detach_form(a, "dad", run=1)
+        (view,) = st.entity_views()
+        self.assertNotIn("dad", view["primary_forms"])
+        # And the detach recorded NOs against the entity's other forms.
+        self.assertTrue(st.has_no("dad", "violet sorrengail"))
+
+
+class TestAccountingRandomized(_StoreCase):
+    def test_accounting_closes_on_randomized_sequences(self):
+        rng = random.Random(20261014)
+        st = self._store()
+        forms = ["Alpha One", "Beta Two", "Gamma Three", "Delta Four",
+                 "Epsilon Five", "Zeta Six"]
+        live = []
+        for step in range(300):
+            op = rng.choice(["mint", "observe", "merge", "split",
+                             "link", "suspend"])
+            if op == "mint" or not live:
+                live.append(st.mint_entity())
+            elif op == "observe":
+                st.append_observation(
+                    rng.choice(live),
+                    _obs(rng.randint(1, 3), rng.choice(forms),
+                         appearances=rng.randint(1, 40)))
+            elif op == "merge" and len(live) >= 2:
+                a, b = rng.sample(live, 2)
+                st.record_merge(a, b, run=1, reason="within-run merge")
+                live.remove(b)
+            elif op == "split":
+                e = rng.choice(live)
+                ent = st.get_entity(e)
+                fks = sorted({o["form_key"]
+                              for o in ent["observations"]})
+                if fks:
+                    out = st.record_split(e, fks[:1], run=1)
+                    live.extend(out.values())
+            elif op == "link":
+                e = rng.choice(live)
+                st.record_link(
+                    e, {"run": 1, "tier": "exact-form", "state": "active",
+                        "evidence": "x", "form_key": "alpha one"},
+                    entry_forms={"alpha one"})
+            elif op == "suspend":
+                e = rng.choice(live)
+                st.suspend_link(e, run=1, form_key="alpha one",
+                                evidence="contradiction")
+            acc = st.accounting()
+            self.assertEqual(acc["unaccounted"], 0,
+                             f"step {step} ({op}): {acc}")
+            self.assertEqual(
+                acc["minted"],
+                acc["active"] + acc["merged"] + acc["split"])
+
+
+if __name__ == "__main__":
+    unittest.main()
