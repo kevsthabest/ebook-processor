@@ -687,6 +687,73 @@ def compare_dashboard(old_d, new_d, labels_data=None, labels_source=None):
         f"  Queue churn: tropes +{len(nt_ - ot)}/-{len(ot - nt_)}, "
         f"triggers +{len(ng - og)}/-{len(og - ng)} "
         f"(lists in the Tropes/Triggers sections above)")
+    lines += staging_section(old_d, new_d)
+    return lines
+
+
+def summary_gated_share(d):
+    """Share of a run's trope candidates that sat in the gate band
+    (below the auto band) — the claims the summary gate, not raw
+    frequency, decided. Derived from the recorded candidate counts
+    and the run's own auto band (max(3, chunks // 20), the seam's
+    formula). 'n/a' when the preview recorded no counts."""
+    counts = d.get("trope_candidate_counts") or {}
+    if not counts:
+        return "n/a (no candidate counts recorded)"
+    auto_min = max(3, (d.get("chunks") or 0) // 20)
+    gated = sum(1 for v in counts.values()
+                if isinstance(v, (int, float)) and v < auto_min)
+    pct = round(100 * gated / len(counts)) if counts else 0
+    return f"{gated}/{len(counts)} ({pct}% below the auto band)"
+
+
+def staging_section(old_d, new_d):
+    """Option F staged-set comparison, read off the two previews'
+    staging markers. Additions only: returns [] when neither run
+    used the staging gate, so the dashboard's legacy output is
+    byte-identical for unmarked previews."""
+    om = old_d.get("staging") or {}
+    nm = new_d.get("staging") or {}
+    if not om and not nm:
+        return []
+
+    def held(m):
+        return {s.get("key"): s for s in (m.get("staged") or [])}
+
+    def prom(m):
+        return {p.get("key"): p for p in (m.get("promoted") or [])}
+
+    oh, nh, np_ = held(om), held(nm), prom(nm)
+    stable = sorted(set(oh) & set(nh))
+    newly = sorted(set(nh) - set(oh) - set(np_))
+    promoted = sorted(set(np_) & set(oh))
+    released = sorted(set(oh) - set(nh) - set(np_))
+    lines = ["  Staging gate:"]
+
+    def _names(keys, src):
+        for k in keys[:MAX_LIST]:
+            lines.append(f"      - {src[k].get('display') or k}")
+        if len(keys) > MAX_LIST:
+            lines.append(f"      ... and {len(keys) - MAX_LIST} more")
+
+    lines.append(f"    stable traps (held in both runs): {len(stable)}")
+    _names(stable, nh)
+    lines.append(f"    newly staged (new run): {len(newly)}")
+    _names(newly, nh)
+    lines.append(f"    promoted between runs: {len(promoted)}")
+    for k in promoted[:MAX_LIST]:
+        # "promoted" is always paired with its via (design doctrine).
+        lines.append(f"      - {np_[k].get('display') or k} "
+                     f"(via {np_[k].get('via') or '?'})")
+    if len(promoted) > MAX_LIST:
+        lines.append(f"      ... and {len(promoted) - MAX_LIST} more")
+    lines.append(
+        f"    released (held in old, absent in new): {len(released)}")
+    _names(released, oh)
+    lines.append(f"    old run summary-gated share: "
+                 f"{summary_gated_share(old_d)}")
+    lines.append(f"    new run summary-gated share: "
+                 f"{summary_gated_share(new_d)}")
     return lines
 
 

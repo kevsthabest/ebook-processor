@@ -4043,6 +4043,82 @@ def staging_observe_result(parts, state, *, independent):
             "trigger_persistence": trigger_persistence}
 
 
+def _staging_report_text(state, today=None, data=None):
+    """The trapped report (design section 6 of the spec's reporting
+    surface): every staged claim named with its sightings and best
+    support, promotions with their via, form-changed promotions on
+    their own line (OC-6), expiries and adoptions listed, and the
+    accounting identity closed in the open. Pure over the read
+    model."""
+    if data is None:
+        data = staging_report_data(state, today=today)
+    lines = ["Staging report (local staging store):"]
+    if data["corrupt_at_load"]:
+        lines.append(
+            "  WARNING: staging.json failed to load and the store "
+            "started EMPTY (original preserved as a .corrupt backup). "
+            "Sightings were reset — store loss delays promotion, it "
+            "never causes one.")
+    t = data["totals"]
+    if not data["works"]:
+        lines.append("  Nothing trapped: the staging store is empty.")
+    lines.append(
+        f"  Totals: {t['works']} work(s), {t['staged_ever']} claim(s) "
+        f"ever staged, {t['promoted']} promoted, {t['staged']} still "
+        f"staged, {t['expired']} expired")
+    for w in data["works"]:
+        lines.append(
+            f"  {w['title'] or w['key']} by {w['author'] or '?'} "
+            f"[{w['key']}] — {w['runs_completed']} completed run(s)")
+        for c in w["claims"]:
+            if c["state"] == "staged":
+                stale = " STALE" if c["stale"] else ""
+                lines.append(
+                    f"    STAGED {c['class']}: {c['display']} — "
+                    f"sightings {c['sightings_count']}, best support "
+                    f"{c['best_chapters']} ch, last seen "
+                    f"{c['last_seen']}{stale}")
+        for c in w["claims"]:
+            if c["state"] == "promoted":
+                fc = (" [name form changed between sightings]"
+                      if c["promoted_form_changed"] else "")
+                lines.append(
+                    f"    PROMOTED {c['class']}: {c['display']} "
+                    f"(via {c['promoted_via']}){fc}")
+        if w["form_changed_promotions"]:
+            lines.append(
+                f"    Form-changed promotions: "
+                f"{w['form_changed_promotions']}")
+        for rec in w["expired_recent"]:
+            lines.append(
+                f"    EXPIRED {rec['class']}: {rec['display']} "
+                f"(sightings {rec['sightings']})")
+        for ad in w["adoptions"]:
+            lines.append(
+                f"    ADOPTED: {ad['claims_moved']} claim(s) from "
+                f"{ad['from_key']}")
+    lines.append(
+        f"  UNACCOUNTED: {data['unaccounted']} (must be 0: "
+        f"staged_ever = promoted + still staged + expired)")
+    return "\n".join(lines)
+
+
+def cmd_staging_report(as_json=False, learn_dir=None, state=None):
+    """Print the trapped report (for --staging-report). Adoptions are
+    listed once: they are consumed after being reported, so the next
+    report does not repeat them."""
+    if state is None:
+        state = StagingState(learn_dir=learn_dir, enabled=True)
+    data = staging_report_data(state)
+    text = None if as_json else _staging_report_text(state, data=data)
+    adoptions = state.consume_adoptions()
+    if as_json:
+        data["adoptions"] = adoptions
+        print(json.dumps(data, ensure_ascii=False, indent=1))
+    else:
+        print(text)
+
+
 # Module-level staging state, mirroring _learn(): _staging() always
 # returns a usable object (disabled stub when --staging-gate is off),
 # rooted at the learned-state directory so staging.json sits beside
@@ -11450,6 +11526,14 @@ def _build_parser():
     g_learn.add_argument("--learn-status", action="store_true",
                     help="print a summary of the learning system state "
                          "and exit (no books processed)")
+    g_learn.add_argument("--staging-report", action="store_true",
+                    help="print the staging gate's trapped report "
+                         "(staged/promoted/expired claims per work) "
+                         "and exit (no books processed); combine with "
+                         "--json for machine-readable output")
+    ap.add_argument("--json", action="store_true",
+                    help="emit JSON where a command supports it "
+                         "(currently --staging-report)")
     g_learn.add_argument("--import-labels", metavar="PATH", default="",
                     help="import hand-labeled merge pairs (label-merges.py output) "
                          "into the nickname dictionary, then continue")
@@ -11606,6 +11690,11 @@ def main():
     if args.learn_status:
         load_config()
         cmd_learn_status(args.learn_dir or None)
+        return
+    if args.staging_report:
+        load_config()
+        cmd_staging_report(as_json=args.json,
+                           learn_dir=args.learn_dir or None)
         return
 
     # Auto-update: check origin/master before doing any real work. On a

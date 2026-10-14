@@ -1246,3 +1246,77 @@ class TestPushPreviewConsistency(_E2EBase, _WriteBase):
                          1)
         # The push never touched the staging store.
         self.assertFalse((fresh.dir / "staging.json").exists())
+
+
+# ---------------------------------------------------------------------------
+# Slice 5: --staging-report command
+# ---------------------------------------------------------------------------
+
+class TestStagingReportCommand(_StoreCase):
+    def _report(self, st, as_json=False):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pp.cmd_staging_report(state=st, as_json=as_json)
+        return buf.getvalue()
+
+    def _loaded_state(self):
+        st = self._state()
+        a = {"name": "Alpha Trope", "n_ch": 2, "catalog_id": None}
+        b = {"name": "Beta Trope", "n_ch": 2, "catalog_id": None}
+        c = {"name": "Gamma Trope", "n_ch": 2, "catalog_id": None}
+        self._observe(st, tropes=[a, b, c])
+        self._observe(st, tropes=[a], today=D2)  # only Alpha promotes
+        return st
+
+    def test_text_report_lists_traps_promotions_and_accounting(self):
+        st = self._loaded_state()
+        out = self._report(st)
+        self.assertIn("PROMOTED trope: Alpha Trope (via persistence)",
+                      out)
+        self.assertIn("STAGED trope: Beta Trope", out)
+        self.assertIn("UNACCOUNTED: 0", out)
+
+    def test_report_lists_adoptions_once(self):
+        st = self._state()
+        a = {"name": "Alpha Trope", "n_ch": 2, "catalog_id": None}
+        self._observe(st, work_key=TITLE_KEY, work_id=None, tropes=[a])
+        st.adopt_for("wid", "Test Book", "Some Author")
+        out1 = self._report(st)
+        self.assertIn("ADOPTED", out1)
+        out2 = self._report(st)
+        self.assertNotIn("ADOPTED", out2)
+
+    def test_json_report(self):
+        st = self._loaded_state()
+        data = json.loads(self._report(st, as_json=True))
+        self.assertEqual(data["unaccounted"], 0)
+        self.assertEqual(data["totals"]["promoted"], 1)
+        self.assertEqual(data["totals"]["staged"], 2)
+        self.assertIn("adoptions", data)
+
+    def test_empty_store_report(self):
+        out = self._report(self._state())
+        self.assertIn("Nothing trapped", out)
+        self.assertIn("UNACCOUNTED: 0", out)
+
+    def test_form_changed_promotions_get_their_own_line(self):
+        st = self._state()
+        self._observe(st, tropes=[
+            {"name": "Enemies to Lovers", "n_ch": 2,
+             "catalog_id": "t-9"}], today="2026-01-01")
+        self._observe(st, tropes=[
+            {"name": "Enemies To Lovers!", "n_ch": 2,
+             "catalog_id": "t-9"}], today="2026-01-02")
+        out = self._report(st)
+        self.assertIn("Form-changed promotions: 1", out)
+
+    def test_corrupt_store_report_admits_it(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        (d / "staging.json").write_text("{broken", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            st = pp.StagingState(d)
+        out = self._report(st)
+        self.assertIn("failed to load", out)
+        self.assertIn("UNACCOUNTED: 0", out)
