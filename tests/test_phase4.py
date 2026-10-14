@@ -414,7 +414,13 @@ class TestReduce(unittest.TestCase):
         red = pp.v2_reduce({1: a1, 2: a2}, {}, roster,
                            [_ch(1, "A"), _ch(2, "B")])
         self.assertEqual(len(red["relationships"]), 1)
-        self.assertEqual(red["relationships"][0]["from"], "Shirley Jackson")
+        # Canonical form (direction convention): endpoints are stored in
+        # canonical order and the asymmetric type flips on reversal, so
+        # "Shirley Jackson is Laurie's parent" is stored as Laurie ->
+        # Shirley Jackson with type "child" (Laurie is her child).
+        self.assertEqual(red["relationships"][0]["from"], "Laurie")
+        self.assertEqual(red["relationships"][0]["to"], "Shirley Jackson")
+        self.assertEqual(red["relationships"][0]["type"], "child")
 
     def test_trope_candidate_union(self):
         bs = {1: _b(tropes=["Enemies to Lovers", "found family"]),
@@ -2914,8 +2920,12 @@ class TestAuthorRelationshipFilter(unittest.TestCase):
         red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
         _froms = {r["from"] for r in red["relationships"]}
         self.assertNotIn("Daniel Suarez", _froms)
-        # Non-author relationship survives.
-        self.assertTrue(any(r["from"] == "Peter Sebeck"
+        # Non-author relationship survives. Canonical form (direction
+        # convention): "Peter Sebeck is Chris Sebeck's parent" is stored
+        # as Chris -> Peter with type "child".
+        self.assertTrue(any(r["from"] == "Chris Sebeck"
+                            and r["to"] == "Peter Sebeck"
+                            and r["type"] == "child"
                             for r in red["relationships"]))
 
 

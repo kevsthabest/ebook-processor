@@ -257,6 +257,30 @@ elsewhere.
 - `--alias "Loki=Brian Gragg"` records a manual character alias: repeatable,
   stored as human-validated, applies cross-book.
 
+## Relationship direction
+
+One convention everywhere (also stated at `_canonical_pair` in
+`process-portable.py`, which is the authoritative copy):
+
+- An entry `{"from": A, "to": B, "type": T}` means **"A is the T of B"** —
+  the type always describes `from` in relation to `to`. Example:
+  `{"from": "Lilith Sorrengail", "to": "Violet Sorrengail", "type":
+  "parent"}` means Lilith is Violet's parent. Renderers should read the
+  type as `from`'s role.
+- Each pair is stored **once**, endpoints in canonical (case-insensitive
+  alphabetical) order. When a claim's direction is reversed to fit that
+  order, asymmetric types flip: `parent` ↔ `child`. Symmetric types
+  (spouse, sibling, friend, enemy, romantic, colleague, neighbor, rival,
+  ally, other) are unaffected.
+- One exception: `mentor` has no inverse in the type vocabulary, so mentor
+  pairs are stored in claim direction (mentor first) instead of canonical
+  order.
+- A family claim (spouse/parent/child/sibling) always wins its pair over a
+  conflicting non-family claim; the family claim itself is then arbitrated
+  by decision-model validation (keep / downgrade to `other` / drop).
+  Suppressed non-family claims are kept in the preview's
+  `dropped_relationships` with `"family_guard": "suppressed_by_family"`.
+
 ## Decision model & character merge
 
 The decision model handles judgment calls that rules can't:

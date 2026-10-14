@@ -1689,6 +1689,57 @@ _REL_PRECEDENCE = {"spouse": 0, "parent": 1, "child": 1, "sibling": 2,
                    "romantic": 3, "friend": 4, "colleague": 4, "enemy": 5}
 _REL_NONEXCLUSIVE = {"mentor", "rival", "ally", "neighbor", "other"}
 
+# ---------------------------------------------------------------------------
+# Relationship direction convention (AUTHORITATIVE — the app renders to this;
+# also documented in README.md, "Relationship direction").
+#
+# A relationship entry {"from": A, "to": B, "type": T} means "A is the T of
+# B": the type ALWAYS describes `from` in relation to `to`. Example:
+# {"from": "Lilith Sorrengail", "to": "Violet Sorrengail", "type": "parent"}
+# means Lilith is Violet's parent. The decision-model validator uses the
+# same reading ("is {from} the {type} of {to}?"), and write_claims stores
+# the entry on `from`'s character row as {"to": B, "type": T}.
+#
+# Canonical form: a pair is stored ONCE, with endpoints in canonical
+# (case-insensitive alphabetical) order. When a claim's direction is
+# reversed to fit canonical order, asymmetric types are flipped via
+# _REL_INVERSE (parent <-> child). Symmetric types (spouse, sibling,
+# friend, enemy, romantic, colleague, neighbor, rival, ally, other) are
+# unaffected by reversal. "mentor" is asymmetric but has NO inverse in the
+# type vocabulary, so mentor pairs are stored in claim direction (mentor
+# first) instead of canonical order — the one documented exception.
+# ---------------------------------------------------------------------------
+_REL_INVERSE = {"parent": "child", "child": "parent"}
+_REL_NO_INVERSE = {"mentor"}
+
+
+def _canonical_pair(frm, to, rtype):
+    """Normalize a relationship claim to canonical form (see convention
+    above). Returns (from, to, type) with the type lowercased, or None for
+    a self-pair (endpoints normalize to the same character)."""
+    if norm_name(frm) == norm_name(to):
+        return None
+    t = (rtype or "").lower()
+    if t in _REL_NO_INVERSE:
+        return frm, to, t
+    a, b = sorted([frm, to], key=lambda s: s.lower())
+    if frm == a:
+        return frm, to, t
+    return a, b, _REL_INVERSE.get(t, t)
+
+
+def _alias_shadowed(roster, self_key, alias_key):
+    """True if alias_key is the canonical/primary key of a DIFFERENT roster
+    entry. Such an alias is pollution (another character's name recorded as
+    this entry's alias) and must never resolve endpoints to this entry:
+    the real character wins over the alias claim."""
+    for k, e in roster.items():
+        if k == self_key:
+            continue
+        if alias_key == k or alias_key in e.get("primary_keys", set()):
+            return True
+    return False
+
 # Regex evidence gates for high-severity trigger claims. The evidence quote
 # must contain supporting language, not just mention the topic. Catches
 # false positives like "digital suicide" or a consensual dance tagged as
@@ -2890,7 +2941,7 @@ RULES:
 6. pov_character is ONLY someone who narrates this chapter. Most chapters have one; some have none (null).
 8. STATUS must be exactly one of: alive, dead, unknown, missing. Use "unknown" unless the chapter makes it clear. "missing" is for characters who vanished or whose fate is unresolved.
 7. RELATIONSHIPS: only list relationships EXPLICITLY shown or stated in this chapter. Do not infer.
-   - Direction matters: if A is B's parent, do NOT also list B as A's parent. Pick ONE direction.
+   - Direction matters: "type" describes "from" — if A is B's parent, write {"from": "A", "to": "B", "type": "parent"} (or equivalently {"from": "B", "to": "A", "type": "child"}). Pick ONE direction; never list both.
    - "spouse" means married or explicitly romantic partners. A character has at most ONE spouse. Dragons, mentors, and friends are NOT spouses.
    - "sibling" means they share parents. Cousins, friends, and squadmates are NOT siblings.
    - Every relationship needs a "to" that is a character IN THIS BOOK. Never use real-world names, author names, or names from other books.
@@ -3169,12 +3220,17 @@ def _roster_update(roster, characters, chapter_idx):
         e["last_seen"] = chapter_idx
         e["chapters"].add(chapter_idx)
         e["alias_keys"].add(nkey)
-        e["alias_keys"] |= alias_keys
+        # Alias pollution guard: never adopt an alias that is another roster
+        # character's own name — it would make _roster_canonical resolve
+        # that character's relationship endpoints to THIS entry.
+        e["alias_keys"] |= {ak for ak in alias_keys
+                            if not _alias_shadowed(roster, found, ak)}
         e["primary_keys"].add(nkey)
         for alias in {name} | set(c.get("aliases", [])):
             if not alias or alias == e["name"]:
                 continue
-            if _is_valid_alias(alias):
+            if _is_valid_alias(alias) and not _alias_shadowed(
+                    roster, found, norm_name(alias)):
                 e["aliases"].add(alias)
             else:
                 # Preserve rejected aliases as unresolved mentions (GPT audit:
@@ -3422,11 +3478,27 @@ def _v2_call_b_inner(call, chapter, n_chapters):
 
 
 def _roster_canonical(roster, name):
-    """Map any name/alias to the roster's canonical name (or the name itself)."""
+    """Map any name/alias to the roster's canonical name (or the name itself).
+
+    Two passes, in strict order:
+    1. Primary: an exact roster key or primary-key match. A real character's
+       own name ALWAYS wins — an entry's alias list can be polluted with
+       other people's names (LLM alias errors folded in by _roster_update /
+       _merge_roster_entries), and resolving "Lilith Sorrengail" via
+       Violet's polluted alias_keys collapsed Violet<->Lilith pairs into
+       Violet->Violet self-pairs.
+    2. Alias: alias_keys, but only when exactly ONE entry claims the key.
+       An alias claimed by two entries is ambiguous; leaving the name
+       unresolved is safer than guessing (false merges are worse than
+       unresolved duplicates)."""
     nkey = norm_name(name)
     for k, e in roster.items():
-        if nkey == k or nkey in e["alias_keys"]:
+        if nkey == k or nkey in e.get("primary_keys", set()):
             return e["name"]
+    hits = [e["name"] for e in roster.values()
+            if nkey in e.get("alias_keys", set())]
+    if len(hits) == 1:
+        return hits[0]
     return name
 
 
@@ -3471,6 +3543,11 @@ def _merge_roster_entries(roster, keep_key, drop_key):
     ke["_generic_keys"] = ke.get("_generic_keys", set()) | de.get(
         "_generic_keys", set())
     del roster[drop_key]
+    # Alias pollution guard: the union above can import alias keys that are
+    # a THIRD character's own name (the dropped entry's LLM alias errors).
+    # Drop those from the keeper; the real character's entry wins.
+    ke["alias_keys"] = {ak for ak in ke["alias_keys"]
+                        if not _alias_shadowed(roster, keep_key, ak)}
 
 
 def _roster_best_desc(entry):
@@ -3874,6 +3951,14 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                     _self_pairs_remapped += 1
                 continue
             rtype = r["type"]
+            # Canonical form (direction convention, see _canonical_pair):
+            # endpoints in canonical order, asymmetric types flipped on
+            # reversal, so claims from different chapters are scored as the
+            # same fact. Never None here: self-pairs were dropped above.
+            _cp = _canonical_pair(frm, to, rtype)
+            if _cp is None:
+                continue
+            frm, to, rtype = _cp
             _pair_key = tuple(sorted([frm.lower(), to.lower()]))
             _pair_chapters.setdefault(_pair_key, set()).add(idx)
             _pair_cands.setdefault(_pair_key, []).append({
@@ -3892,6 +3977,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
               f"{_self_pairs_remapped} created by canonical remap)")
 
     relationships = []
+    _guard_suppressed = []  # non-family claims suppressed by the family guard
     _CONF_RANK = {"high": 0, "medium": 1, "low": 2}
     _TYPE_SPEC_RANK = {"specific": 0, "moderate": 1, "vague": 2}
     for _pair_key, cands in _pair_cands.items():
@@ -3915,6 +4001,31 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # Best: highest confidence, then most specific type, then evidence,
         # then earliest chapter.
         _scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        # Family guard: a family claim (spouse/parent/child/sibling) is the
+        # canonical winner for its pair. Family types are all "specific"
+        # band, so a family claim's matrix confidence is never below medium
+        # — but a strong-evidence non-family claim (repeated "enemy") can
+        # still outrank a medium family claim on confidence alone. Family
+        # facts are high-stakes, and decision-model validation below
+        # arbitrates the family claim itself (keep / downgrade to "other" /
+        # drop), so when any family candidate exists the winner is chosen
+        # from the family pool. The suppressed non-family winner is kept
+        # for audit in dropped_relationships.
+        _fam = [s for s in _scored if s[7]["type"] in _REL_FAMILY_TYPES]
+        if _fam and _scored[0][7]["type"] not in _REL_FAMILY_TYPES:
+            _sup = _scored[0]
+            _sup_rel = {k: v for k, v in _sup[7].items()
+                        if not k.startswith("_")}
+            _sup_rel["confidence"] = _sup[4]
+            _sup_rel["evidence_count"] = _sup[5]
+            _sup_rel["cooccurrence_count"] = _sup[6]
+            _sup_rel["family_guard"] = "suppressed_by_family"
+            _sup_rel["suppressed_by_type"] = _fam[0][7]["type"]
+            _guard_suppressed.append(_sup_rel)
+            print(f"  Family guard: {_sup_rel['from']} / {_sup_rel['to']} "
+                  f"'{_sup_rel['type']}' suppressed by family claim "
+                  f"'{_fam[0][7]['type']}'")
+            _scored = _fam
         _, _, _, _, _conf, _nq, _co, _w = _scored[0]
         _rel = {k: v for k, v in _w.items() if not k.startswith("_")}
         _rel["confidence"] = _conf
@@ -3983,6 +4094,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         relationships = [r for r in relationships if id(r) not in _drop_ids]
         print(f"  Relationship validation: dropped "
               f"{len(_dropped_relationships)} hallucinated relationship(s)")
+    if _guard_suppressed:
+        # Audit trail only: these claims lost to a family claim for the
+        # same pair (family guard above); they were never emitted.
+        _dropped_relationships.extend(_guard_suppressed)
 
     if show_matrices:
         print(_rel_confidence_ascii(relationships))
@@ -7294,16 +7409,27 @@ def dedupe_characters(characters, relationships, povs):
                name_to_canon.get(norm_name(nm), nm)))
 
     new_rels, seen = [], set()
+    _n_self_dropped = 0
     for r in relationships:
         a, b, t = remap(r["from"]), remap(r["to"]), r["type"]
-        # Remap guard: merging two characters who had a relationship
-        # between them must not create a self-pair in the output.
-        if norm_name(a) == norm_name(b):
+        # Remapping can collapse both endpoints onto the same canonical
+        # character (a merge the pair straddled). That self-pair is a
+        # canonicalization artifact, not data — drop it (the field-
+        # leakage remap guard's intent, kept here with the drop counted
+        # and printed below). Canonical form also makes flipped
+        # duplicates of the same pair dedupe together.
+        _cp = _canonical_pair(a, b, t)
+        if _cp is None:
+            _n_self_dropped += 1
             continue
+        a, b, t = _cp
         key = (a.lower(), b.lower(), t.lower())
         if key not in seen:
             seen.add(key)
             new_rels.append({"from": a, "to": b, "type": t})
+    if _n_self_dropped:
+        print(f"  Dedup: dropped {_n_self_dropped} self-relationship(s) "
+              f"created by remapping")
 
     new_povs, seen_p = [], set()
     for p in povs:
@@ -8253,11 +8379,16 @@ def process_file(fpath, dry_run=False, preview=False):
             # relationships naming the author are dropped.
             if _rel_involves_author(rel, author):
                 continue
-            # Self-relationship guard: a character cannot have a
-            # relationship with themselves (same backstop as v2_reduce
-            # and the dedupe remap).
-            if norm_name(rel["from"]) == norm_name(rel["to"]):
+            # Canonical form (direction convention, see _canonical_pair):
+            # flipped duplicates of the same pair dedupe together and
+            # self-pairs are dropped — _canonical_pair returns None for a
+            # self-pair, which is the field-leakage self-relationship
+            # guard's drop (same backstop as v2_reduce and the dedupe
+            # remap), preserved here.
+            _cp = _canonical_pair(rel["from"], rel["to"], rel["type"])
+            if _cp is None:
                 continue
+            rel = dict(rel, **{"from": _cp[0], "to": _cp[1], "type": _cp[2]})
             k = (rel["from"].lower(), rel["to"].lower(), rel["type"].lower())
             if k not in rel_seen:
                 rel_seen.add(k)
