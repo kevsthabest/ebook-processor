@@ -1781,6 +1781,44 @@ def _filter_principals(characters, relationships, min_frequency=0.20):
                      and norm_name(r.get("to", "")) in principals]
     return principal_chars, minor_chars, filtered_rels
 
+
+def _drop_ghost_relationships(result):
+    """Move ghost-endpoint relationships out of result["relationships"]
+    into result["dropped_relationships"]; returns the count moved.
+
+    A ghost endpoint is a name with no character in the result's FINAL
+    character set (mentioned in prose or in a claim, but never
+    rostered — or filtered away upstream). Left in place, the two
+    directions fail differently and silently: a from-ghost entry is
+    keyed into the write path's rel_map under a name with no character
+    row and never consumed, while a to-ghost entry IS embedded in the
+    from-character's DB row, pointing at a character that has no row.
+    The preview shows both; the DB keeps at most one — a silent
+    preview/DB divergence. Accounting for them here (validation_note
+    "ghost_endpoint") makes the drop visible and keeps preview == DB.
+    With the principals filter on this is a no-op: surviving
+    relationships already have both endpoints in the set."""
+    names = {norm_name(c.get("name", ""))
+             for c in result.get("characters") or []
+             if isinstance(c, dict)}
+    names.discard("")
+    kept, ghosts = [], []
+    for r in result.get("relationships") or []:
+        if (norm_name(r.get("from", "")) in names
+                and norm_name(r.get("to", "")) in names):
+            kept.append(r)
+        else:
+            ghosts.append(r)
+    if not ghosts:
+        return 0
+    result["relationships"] = kept
+    dropped = result.setdefault("dropped_relationships", [])
+    for r in ghosts:
+        entry = dict(r)  # never annotate the caller's dict in place
+        entry["validation_note"] = "ghost_endpoint"
+        dropped.append(entry)
+    return len(ghosts)
+
 # Relationship dedupe: exclusive types resolve by precedence (lower wins).
 # Non-exclusive types are kept as extras only with evidence.
 _REL_PRECEDENCE = {"spouse": 0, "parent": 1, "child": 1, "sibling": 2,
@@ -9472,6 +9510,16 @@ def process_file_v2(fpath, dry_run=False, preview=False):
               f"(min_frequency={_min_freq})")
         if CONFIG.get("show_matrices"):
             print(_char_importance_ascii(_princs, _minors))
+
+    # Ghost-endpoint relationships: a claim can name a person who has
+    # no character row in the final set (with the principals filter
+    # off, nothing else removes those). Account for them in
+    # dropped_relationships instead of letting preview and DB diverge
+    # silently (see _drop_ghost_relationships).
+    _n_ghost = _drop_ghost_relationships(result)
+    if _n_ghost:
+        print(f"  Relationships: dropped {_n_ghost} with an endpoint "
+              f"outside the character set (ghost_endpoint)")
 
     # Cross-run learning: persist series roster + learned state. Runs in
     # preview/dry-run too (learning from a preview is the point).
