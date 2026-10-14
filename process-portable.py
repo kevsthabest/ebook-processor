@@ -1257,7 +1257,11 @@ def _spice_matrix_ascii(peak_band, freq_band, level):
                 cells.append(str(v).center(12))
         label = f">>{r}<<" if r == peak_band else f"  {r}"
         lines.append(f"{label:<14}" + "".join(cells))
-    if peak_band in ("none",) or freq_band in ("none",):
+    if level is None:
+        # Unknown level (no chapter reported one): not a measured 0.
+        lines.append("  -> Book spice: unknown (no chapter reported "
+                     "a level)")
+    elif peak_band in ("none",) or freq_band in ("none",):
         lines.append("  -> Book spice: 0 (no spicy content detected)")
     else:
         lines.append(f"  -> Book spice: {level} "
@@ -1325,7 +1329,11 @@ def _matrix_snapshot_data(chapter_as, chapter_bs):
             char_freq[seen_names[nk]] += 1
         rels = a.get("relationships", []) or []
         rel_count += sum(1 for r in rels if isinstance(r, dict))
-    spice_levels = [b.get("spice_level", 0) for b in (chapter_bs or {}).values()
+    # Display aggregate only: an unknown level (None) counts as
+    # no-known-spice here; the authoritative book level lives in
+    # v2_reduce, which excludes unknowns instead of zeroing them.
+    spice_levels = [(b.get("spice_level") or 0)
+                    for b in (chapter_bs or {}).values()
                     if isinstance(b, dict)]
     spice_peak = max(spice_levels) if spice_levels else 0
     spice_counts = {1: sum(1 for s in spice_levels if s >= 1),
@@ -1459,6 +1467,10 @@ def _preview_summary(result):
         # (an older/hand-built result): "(no spicy content)" would
         # be a false claim — print the level without a parenthetical.
         lines.append(f"  Spice: {spice_s}")
+    elif lvl is None:
+        # Unknown level (no chapter reported one): "(no spicy
+        # content)" would be a false claim in the other direction.
+        lines.append(f"  Spice: {spice_s} (unknown)")
     else:
         lines.append(f"  Spice: {spice_s} (no spicy content)")
 
@@ -3680,9 +3692,16 @@ def _sanitize_v2b(r):
             if q:
                 trigger_evidence[cat] = q
     try:
-        spice = max(0, min(5, int(float(r.get("spice_level", 0)))))
+        spice = max(0, min(5, int(float(r.get("spice_level")))))
     except (TypeError, ValueError):
-        spice = 0
+        # Absent or unparseable: the level is UNKNOWN (None), not 0.
+        # 0 is a measurement — a genuinely clean chapter — and folding
+        # unknowns in as 0 drags the book level to a false low that
+        # then overwrites works.spice_detected. Consumers that need a
+        # number (the per-chapter array) map None to 0 themselves;
+        # the book-level computation excludes unknowns, and a book
+        # with no known chapter keeps an unknown level.
+        spice = None
     tropes = [_s(t, 80) for t in _list(r.get("trope_candidates")) if _s(t, 80)]
     quotes = []
     for q in _list(r.get("quotes")):
@@ -4830,10 +4849,17 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     # Triggers warn that content EXISTS; spice level measures PERVASIVENESS
     # at the peak intensity. A single explicit scene in a long book is not
     # a 5, even if many chapters have mild content.
-    spices = [b["spice_level"] for b in chapter_bs.values() if b]
+    # Known chapters only: a chapter whose spice is unknown (None —
+    # the model omitted or garbled it) is excluded from both the
+    # levels and the frequency denominator, never folded in as a
+    # measured 0. No known chapter at all -> the book level is itself
+    # unknown (None) and the works.spice_detected write is skipped
+    # (write_claims already guards on None).
+    spices = [b["spice_level"] for b in chapter_bs.values()
+              if b and b.get("spice_level") is not None]
     spice_peak = max(spices) if spices else 0
-    spice_level = _spice_level_from_chapters(spices, n_successful_b)
-    _sb_peak, _sb_freq, _ = _spice_band_detail(spices, n_successful_b)
+    _sb_peak, _sb_freq, _spice_lvl = _spice_band_detail(spices, len(spices))
+    spice_level = _spice_lvl if spices else None
     if show_matrices:
         print(_spice_matrix_ascii(_sb_peak, _sb_freq, spice_level))
     # Per-chapter spice array (1-based; index 0 unused) for the Spice Forecast
@@ -6201,9 +6227,9 @@ def sanitize(r):
                 relationships.append({"from": a, "to": b, "type": ty, "evidence": ev})
 
     try:
-        spice = max(0, min(5, int(float(r.get("spice_level", 0)))))
+        spice = max(0, min(5, int(float(r.get("spice_level")))))
     except (TypeError, ValueError):
-        spice = 0
+        spice = None  # unknown, not a measured 0 (see _sanitize_v2b)
 
     povs = [p for p in (_s(x, 120) for x in _list(r.get("povs"))) if p]
 
@@ -9700,7 +9726,8 @@ def process_file(fpath, dry_run=False, preview=False):
         v_dropped += v.get("quotes_dropped", 0)
         povs.update(r["povs"])
         quotes.extend(r["quotes"][:3])
-        spice_votes.append(r["spice_level"])
+        if r["spice_level"] is not None:
+            spice_votes.append(r["spice_level"])
         if r["is_anthology"]:
             is_anth = True
             stories.extend(s for s in r["stories"] if s not in stories)
@@ -9732,7 +9759,9 @@ def process_file(fpath, dry_run=False, preview=False):
     characters = [dict(char_data[k], confidence=_confidence(h, ok))
                   for k, h in char_hits.most_common()]
     votes = sorted(spice_votes)
-    spice_level = votes[int(0.75 * (len(votes) - 1))] if votes else 0  # 75th percentile
+    # No known chapter levels -> the book level is unknown (None),
+    # not a measured 0; write_claims skips the spice overwrite on None.
+    spice_level = votes[int(0.75 * (len(votes) - 1))] if votes else None  # 75th percentile
     reading_mins = word_count // 250
 
     result = {
@@ -9878,7 +9907,9 @@ def save_preview(fpath, result):
     if t:
         md.append(f"**Tasks:** discipline {t.get('discipline', '?')}/{result.get('chunks', '?')} ok, "
                   f"identity {t.get('identity', '?')}/{result.get('chunks', '?')} ok")
-    md.append(f"**Spice:** {'🌶️' * result['spice_level'] or 'None'} ({result['spice_level']}/5)")
+    _spice_lvl = result.get("spice_level")
+    md.append(f"**Spice:** {'🌶️' * _spice_lvl if _spice_lvl else 'None'} "
+              f"({_spice_lvl if _spice_lvl is not None else '?'}/5)")
     _adr = result.get("avg_dialogue_ratio")
     if _adr is not None:
         md.append(f"**Dialogue:** {int(_adr * 100)}% of text is dialogue")
