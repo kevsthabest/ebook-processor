@@ -7020,19 +7020,272 @@ def _suggest_character_links(inserted_rows):
                data={"suggested_character_id": cid})
 
 
-def write_claims(work_id, result, trope_mappings=None):
-    """Insert only what is not already there. Returns the number of failed operations.
+# --- Replace-wholesale claim writes --------------------------------------
+# Reprocessing a work REPLACES the claims the processor previously wrote for
+# it (approved 2026-10-14). Processor rows are identified by the per-table
+# source_type marker below; rows with any other source_type are contributor/
+# human rows and are NEVER deleted. Rows with status='rejected' are human
+# rejection state: excluded from every DELETE, and the new run is deduped
+# against them so a rejected claim is never resurrected as a candidate.
+_CLAIM_TABLES = {
+    "book_trope_claims": {"id_col": "trope_id", "source": "ai"},
+    "book_trigger_claims": {"id_col": "warning", "source": "ai"},
+    "book_characters": {"id_col": "name", "source": "ai"},
+    "book_quotes": {"id_col": "quote", "source": "pipeline"},
+}
 
-    trope_mappings: optional dict {pipeline_trope_name: catalog_id} from
-    embedding-based mapping. Falls back to result["trope_catalog_map"], then
-    _trope_lookup (exact match). Unmapped tropes go to trope_proposals.
+_PROP_MIN_CONF = 0.7  # proposals: only propose at/above this confidence
+
+
+def _claim_rows(table, work_id):
+    """All claim rows for a work: id, identity column, status, source_type.
+    Returns None on DB error. (book_quotes has no status column.)"""
+    spec = _CLAIM_TABLES[table]
+    cols = f"id,{spec['id_col']},source_type"
+    if table != "book_quotes":
+        cols += ",status"
+    return sb(table, params=f"?work_id=eq.{quote(str(work_id), safe='')}"
+                            f"&select={cols}&limit=1000")
+
+
+def _claim_key(table, row):
+    """Dedupe identity for an existing claim row, matching the key the
+    insert builders use for new-run items."""
+    v = row.get(_CLAIM_TABLES[table]["id_col"], "")
+    if table == "book_quotes":
+        return (v or "")[:100]
+    return str(v if v is not None else "").lower()
+
+
+def _partition_claims(table, rows):
+    """Split existing rows into (preserved_keys, rejected_keys, deletable_n).
+
+    Preserved = contributor rows (source_type != processor marker) plus
+    rejected rows; new-run claims are deduped against preserved keys.
+    Deletable = processor rows that are not rejected.
+    """
+    src = _CLAIM_TABLES[table]["source"]
+    preserved, rejected, ndel = set(), set(), 0
+    for r in rows:
+        k = _claim_key(table, r)
+        if (r.get("status") or "") == "rejected":
+            rejected.add(k)
+            preserved.add(k)
+        elif (r.get("source_type") or "") == src:
+            ndel += 1
+        else:
+            preserved.add(k)
+    return preserved, rejected, ndel
+
+
+def _delete_processor_claims(table, work_id):
+    """Delete ONLY this work's processor-sourced, non-rejected rows.
+    The source_type condition is on every DELETE; claims tables also carry
+    status=neq.rejected so human rejection state is never removed.
+    Returns the number of rows deleted, or None on error."""
+    src = _CLAIM_TABLES[table]["source"]
+    params = (f"?work_id=eq.{quote(str(work_id), safe='')}"
+              f"&source_type=eq.{src}")
+    if table != "book_quotes":
+        params += "&status=neq.rejected"
+    gone = sb(table, method="DELETE", params=params)
+    return None if gone is None else len(gone)
+
+
+def _build_trope_rows(work_id, result, cat_map, trope_mappings, model, skip_ids):
+    """Build book_trope_claims rows for the new run. skip_ids holds the
+    lowercased trope_ids that survive in the DB (contributor/rejected) —
+    a new-run trope resolving to one is not re-inserted.
+    Returns (rows, unmatched_names)."""
+    conf_t = result.get("trope_confidence", {})
+    rows, unmatched, used = [], [], set(skip_ids)
+    for t in result["tropes"]:
+        tid = cat_map.get(_tnorm(t))
+        if tid is None and trope_mappings and t in trope_mappings:
+            tid = trope_mappings[t]
+        if tid is None:
+            tid = _trope_lookup(t)
+        if tid is None:
+            unmatched.append(t)
+            continue
+        if str(tid).lower() in used:
+            continue
+        used.add(str(tid).lower())
+        _chaps = (result.get("trope_chapters") or {}).get(_tnorm(t), [])
+        _tconf = conf_t.get(_tnorm(t), 0.7)
+        if not _chaps:
+            # No supporting chapters recorded: the claim has no
+            # evidence, so it must not carry real confidence.
+            _tconf = 0.0
+        rows.append({"work_id": work_id, "trope_id": tid, "status": "candidate",
+                     "confidence": _tconf,
+                     "source_type": "ai",
+                     "model": model,
+                     "evidence": {"source": "ebook-extraction",
+                                  "chapters": _chaps,
+                                  "chapter_count": len(_chaps)}})
+    return rows, unmatched
+
+
+def _build_trigger_rows(work_id, result, model, skip_warnings):
+    """Build book_trigger_claims rows, skipping warnings that survive in
+    the DB (contributor/rejected rows)."""
+    rows, seen = [], set(skip_warnings)
+    for t in result["triggers"]:
+        warn = t["warning"] if isinstance(t, dict) else t
+        if str(warn).lower() in seen:
+            continue
+        seen.add(str(warn).lower())
+        td = t if isinstance(t, dict) else {}
+        _tev = td.get("evidence") or []
+        _tconf = td.get("confidence", 0.7)
+        if not _tev:
+            # No textual evidence -> no real confidence.
+            _tconf = 0.0
+        rows.append({"work_id": work_id, "warning": warn, "status": "candidate",
+                     "confidence": _tconf,
+                     "source_type": "ai",
+                     "model": model,
+                     "evidence": {"source": "ebook-extraction",
+                                  "severity": td.get("severity", ""),
+                                  "severity_claimed": td.get("severity_claimed", ""),
+                                  "chapters": td.get("chapters", []),
+                                  "chapter_count": td.get("chapter_count", 0),
+                                  "frequency": td.get("frequency", 0),
+                                  "prominence": td.get("prominence", ""),
+                                  "quotes": td.get("evidence", [])}})
+    return rows
+
+
+def _build_rel_map(result):
+    """Map character name (lower) -> relationship list for DB promotion.
+    Evidence-less relationships stay in the preview JSON only.
+    Returns (rel_map, n_evidenceless)."""
+    rel_map, evidenceless = {}, 0
+    for r in result["relationships"]:
+        if not r.get("evidence"):
+            evidenceless += 1
+            continue
+        rel_map.setdefault(r["from"].lower(), []).append(
+            {"to": r["to"], "type": r["type"], "evidence": r.get("evidence", "")})
+    return rel_map, evidenceless
+
+
+def _build_character_rows(work_id, result, rel_map, skip_names):
+    """Build book_characters rows (relationships embedded per character),
+    skipping names that survive in the DB (contributor/rejected rows)."""
+    rows, seen = [], set(skip_names)
+    for c in result["characters"]:
+        if c["name"].lower() in seen:
+            continue
+        seen.add(c["name"].lower())
+        rows.append({"work_id": work_id, "name": c["name"], "role": c["role"],
+                     "description": c.get("description", ""),
+                     "appearance": c.get("appearance", ""),
+                     "vitality": c.get("status", "unknown"),
+                     "status": "candidate",
+                     "aliases": c.get("aliases", []),
+                     "first_appearance_chapter": c.get("first_appearance_chapter"),
+                     "relationships": rel_map.get(c["name"].lower(), []),
+                     "source_type": "ai",
+                     "confidence": c.get("confidence", 0.7)})
+    return rows
+
+
+def _build_quote_rows(work_id, result, skip_prefixes):
+    """Build book_quotes rows (cap 5), skipping quote prefixes that survive
+    in the DB (contributor rows)."""
+    qrows, seen_q = [], set(skip_prefixes)
+    for q in result.get("quotes", [])[:5]:  # cap at 5
+        qtext = q.get("text", "") if isinstance(q, dict) else str(q)
+        if not qtext or qtext[:100] in seen_q:
+            continue
+        seen_q.add(qtext[:100])
+        _spk = q.get("speaker") if isinstance(q, dict) else None
+        qrows.append({"work_id": work_id,
+                      "quote": qtext,
+                      "speaker_name": _spk,
+                      "source_type": "pipeline",
+                      "confidence": 0.7})
+    return qrows
+
+
+def _build_proposal_rows(result, unmatched, skip_keys):
+    """Build trope_proposals rows for unmapped tropes. skip_keys holds
+    name_keys that will still exist after the replace (other works'
+    proposals + this work's human-reviewed ones). Denylisted tropes
+    (static list + learned 3+-rejection denylist) and sub-threshold
+    tropes are never proposed."""
+    conf_t = result.get("trope_confidence", {})
+    rows, seen_keys = [], set(skip_keys)
+    for t in unmatched:
+        key = _tnorm(t)
+        if key in seen_keys:
+            continue
+        # Skip denylisted and low-confidence
+        if _is_denylisted_trope(t):
+            continue
+        if _learn().is_trope_denylisted(_trej_key(t)):
+            continue
+        if conf_t.get(key, 0.7) < _PROP_MIN_CONF:
+            continue
+        seen_keys.add(key)
+        row = {"name": t, "name_key": key,
+               "description": f"Detected by ebook processor in '{result.get('title', '')}'.",
+               "genres": [],
+               "book_key": result.get("isbn") or result.get("title", ""),
+               "status": "pending"}
+        uid = CONFIG.get("proposer_user_id")
+        if uid:
+            row["proposed_by"] = uid
+        rows.append(row)
+    return rows
+
+
+def _proposal_state(result):
+    """Proposal bookkeeping for one work. trope_proposals has no work_id or
+    source_type: a work's processor proposals are the rows carrying its
+    book_key with status='pending' (human-reviewed rows carry other
+    statuses and are preserved). Returns (all_name_keys, own_rows) or
+    (None, None) on DB error."""
+    all_rows = sb("trope_proposals", params="?select=name_key&limit=1000")
+    if all_rows is None:
+        return None, None
+    book_key = result.get("isbn") or result.get("title", "")
+    if not book_key:
+        return {r["name_key"] for r in all_rows}, []
+    own = sb("trope_proposals",
+             params=f"?book_key=eq.{quote(str(book_key), safe='')}"
+                    f"&select=id,name_key,status&limit=1000")
+    if own is None:
+        return None, None
+    return {r["name_key"] for r in all_rows}, own
+
+
+def write_claims(work_id, result, trope_mappings=None):
+    """Replace this work's processor-sourced claims with the new run's claims.
+
+    Replace-wholesale: existing processor claims for the work are deleted
+    and the new run's claims inserted, so run-to-run variance and bad
+    claims don't accumulate. Hard limits:
+      * Only processor rows are deleted — the per-table source_type marker
+        in _CLAIM_TABLES is a condition on every DELETE. Contributor/human
+        rows are untouched, and new claims dedupe against them.
+      * Human rejections survive: status='rejected' rows are excluded from
+        every DELETE (the rejection record itself is kept) and the new run
+        dedupes against them, so a rejected claim is never resurrected.
+    trope_proposals is scoped by book_key + status='pending' (it has no
+    source_type). works.spice_detected is already an overwrite; book_meta
+    is a shared merge store with no source marker and is NOT replaced.
+    Returns the number of failed operations.
     """
     errors = 0
     _models = {"ollama": CONFIG["ollama_model"], "openrouter": CONFIG["openrouter_model"],
                "openai": CONFIG.get("openai_model", "")}
     model = _models.get(CONFIG["llm"], "")
-    conf_t = result.get("trope_confidence", {})
     wrote = {"tropes": 0, "triggers": 0, "characters": 0, "proposals": 0, "quotes": 0}
+    deleted = {"tropes": 0, "triggers": 0, "characters": 0, "proposals": 0, "quotes": 0}
+    preserved_rej = 0
     # Merge explicit mappings with the in-pipeline catalog map.
     _cat = dict(result.get("trope_catalog_map", {}) or {})
     if trope_mappings:
@@ -7040,145 +7293,100 @@ def write_claims(work_id, result, trope_mappings=None):
     unmatched = []
 
     # Tropes (embedding-mapped when available, else exact lookup)
-    seen = _existing("book_trope_claims", "trope_id", work_id)
-    if seen is None:
+    _tstate = _claim_rows("book_trope_claims", work_id)
+    if _tstate is None:
         errors += 1
     else:
-        rows, used = [], set(seen)
-        for t in result["tropes"]:
-            tid = _cat.get(_tnorm(t))
-            if tid is None and trope_mappings and t in trope_mappings:
-                tid = trope_mappings[t]
-            if tid is None:
-                tid = _trope_lookup(t)
-            if tid is None:
-                unmatched.append(t)
-                continue
-            if str(tid).lower() in used:
-                continue
-            used.add(str(tid).lower())
-            _chaps = (result.get("trope_chapters") or {}).get(_tnorm(t), [])
-            _tconf = conf_t.get(_tnorm(t), 0.7)
-            if not _chaps:
-                # No supporting chapters recorded: the claim has no
-                # evidence, so it must not carry real confidence.
-                _tconf = 0.0
-            rows.append({"work_id": work_id, "trope_id": tid, "status": "candidate",
-                         "confidence": _tconf,
-                         "source_type": "ai",
-                         "model": model,
-                         "evidence": {"source": "ebook-extraction",
-                                      "chapters": _chaps,
-                                      "chapter_count": len(_chaps)}})
-        if rows:
+        _preserved, _rejected, _ndel = _partition_claims("book_trope_claims", _tstate)
+        preserved_rej += len(_rejected)
+        rows, unmatched = _build_trope_rows(
+            work_id, result, _cat, trope_mappings, model, _preserved)
+        _ok = True
+        if _ndel:
+            _gone = _delete_processor_claims("book_trope_claims", work_id)
+            if _gone is None:
+                errors += 1
+                _ok = False  # old rows remain; inserting would duplicate them
+            else:
+                deleted["tropes"] = _gone
+        if _ok and rows:
             if sb("book_trope_claims", method="POST", data=rows) is None:
                 errors += 1
             else:
                 wrote["tropes"] = len(rows)
 
     # Unmapped tropes -> trope_proposals (with book provenance).
-    # Drop sub-threshold: only propose if confidence meets the bar.
-    _PROP_MIN_CONF = 0.7
     if unmatched:
-        seen_prop = sb("trope_proposals", params="?select=name_key&limit=1000") or []
-        seen_keys = {r["name_key"] for r in seen_prop}
-        prop_rows = []
-        for t in unmatched:
-            key = _tnorm(t)
-            if key in seen_keys:
-                continue
-            # Skip denylisted and low-confidence
-            if _is_denylisted_trope(t):
-                continue
-            if _learn().is_trope_denylisted(_trej_key(t)):
-                continue
-            if conf_t.get(key, 0.7) < _PROP_MIN_CONF:
-                continue
-            seen_keys.add(key)
-            row = {"name": t, "name_key": key,
-                   "description": f"Detected by ebook processor in '{result.get('title', '')}'.",
-                   "genres": [],
-                   "book_key": result.get("isbn") or result.get("title", ""),
-                   "status": "pending"}
-            uid = CONFIG.get("proposer_user_id")
-            if uid:
-                row["proposed_by"] = uid
-            prop_rows.append(row)
-        if prop_rows:
-            if sb("trope_proposals", method="POST", data=prop_rows) is None:
-                errors += 1
-            else:
-                wrote["proposals"] = len(prop_rows)
+        _all_keys, _own = _proposal_state(result)
+        if _all_keys is None:
+            errors += 1
+        else:
+            _own_pending = {r["name_key"] for r in _own
+                            if (r.get("status") or "pending") == "pending"}
+            preserved_rej += sum(1 for r in _own
+                                 if (r.get("status") or "") == "rejected")
+            prop_rows = _build_proposal_rows(
+                result, unmatched, _all_keys - _own_pending)
+            _ok = True
+            if _own_pending:
+                _gone_rows = sb(
+                    "trope_proposals", method="DELETE",
+                    params=f"?book_key=eq.{quote(str(result.get('isbn') or result.get('title', '')), safe='')}"
+                           f"&status=eq.pending")
+                if _gone_rows is None:
+                    errors += 1
+                    _ok = False
+                else:
+                    deleted["proposals"] = len(_gone_rows)
+            if _ok and prop_rows:
+                if sb("trope_proposals", method="POST", data=prop_rows) is None:
+                    errors += 1
+                else:
+                    wrote["proposals"] = len(prop_rows)
 
     # Triggers
-    seen = _existing("book_trigger_claims", "warning", work_id)
-    if seen is None:
+    _gstate = _claim_rows("book_trigger_claims", work_id)
+    if _gstate is None:
         errors += 1
     else:
-        rows = []
-        for t in result["triggers"]:
-            warn = t["warning"] if isinstance(t, dict) else t
-            if str(warn).lower() in seen:
-                continue
-            seen.add(str(warn).lower())
-            td = t if isinstance(t, dict) else {}
-            _tev = td.get("evidence") or []
-            _tconf = td.get("confidence", 0.7)
-            if not _tev:
-                # No textual evidence -> no real confidence.
-                _tconf = 0.0
-            rows.append({"work_id": work_id, "warning": warn, "status": "candidate",
-                         "confidence": _tconf,
-                         "source_type": "ai",
-                         "model": model,
-                         "evidence": {"source": "ebook-extraction",
-                                      "severity": td.get("severity", ""),
-                                      "severity_claimed": td.get("severity_claimed", ""),
-                                      "chapters": td.get("chapters", []),
-                                      "chapter_count": td.get("chapter_count", 0),
-                                      "frequency": td.get("frequency", 0),
-                                      "prominence": td.get("prominence", ""),
-                                      "quotes": td.get("evidence", [])}})
-        if rows:
+        _preserved, _rejected, _ndel = _partition_claims("book_trigger_claims", _gstate)
+        preserved_rej += len(_rejected)
+        rows = _build_trigger_rows(work_id, result, model, _preserved)
+        _ok = True
+        if _ndel:
+            _gone = _delete_processor_claims("book_trigger_claims", work_id)
+            if _gone is None:
+                errors += 1
+                _ok = False
+            else:
+                deleted["triggers"] = _gone
+        if _ok and rows:
             if sb("book_trigger_claims", method="POST", data=rows) is None:
                 errors += 1
             else:
                 wrote["triggers"] = len(rows)
 
     # Characters (relationships are stored per character)
-    rel_map = {}
-    _evidenceless_rels = 0
-    for r in result["relationships"]:
-        # GPT audit: require evidence for DB promotion. Evidence-less relationships
-        # stay in the preview JSON but don't get written to the database.
-        if not r.get("evidence"):
-            _evidenceless_rels += 1
-            continue
-        rel_map.setdefault(r["from"].lower(), []).append(
-            {"to": r["to"], "type": r["type"], "evidence": r.get("evidence", "")})
+    rel_map, _evidenceless_rels = _build_rel_map(result)
     if _evidenceless_rels:
         print(f"  Skipped {_evidenceless_rels} evidence-less relationships (kept in preview)")
-    seen = _existing("book_characters", "name", work_id)
-    if seen is None:
+    _cstate = _claim_rows("book_characters", work_id)
+    if _cstate is None:
         errors += 1
     else:
-        pre_existing = set(seen)  # for backfill: names already in DB before this run
-        rows = []
-        for c in result["characters"]:
-            if c["name"].lower() in seen:
-                continue
-            seen.add(c["name"].lower())
-            rows.append({"work_id": work_id, "name": c["name"], "role": c["role"],
-                         "description": c.get("description", ""),
-                         "appearance": c.get("appearance", ""),
-                         "vitality": c.get("status", "unknown"),
-                         "status": "candidate",
-                         "aliases": c.get("aliases", []),
-                         "first_appearance_chapter": c.get("first_appearance_chapter"),
-                         "relationships": rel_map.get(c["name"].lower(), []),
-                         "source_type": "ai",
-                         "confidence": c.get("confidence", 0.7)})
-        if rows:
+        _preserved, _rejected, _ndel = _partition_claims("book_characters", _cstate)
+        preserved_rej += len(_rejected)
+        pre_existing = set(_preserved)  # surviving rows: backfill targets
+        rows = _build_character_rows(work_id, result, rel_map, _preserved)
+        _ok = True
+        if _ndel:
+            _gone = _delete_processor_claims("book_characters", work_id)
+            if _gone is None:
+                errors += 1
+                _ok = False
+            else:
+                deleted["characters"] = _gone
+        if _ok and rows:
             inserted = sb("book_characters", method="POST", data=rows)
             if inserted is None:
                 errors += 1
@@ -7189,47 +7397,49 @@ def write_claims(work_id, result, trope_mappings=None):
                     _suggest_character_links(inserted)
                 except Exception as e:
                     print(f"  (character link suggestions skipped: {e})")
-        # Backfill: existing rows never got the new columns (insert-only).
-        # PATCH NULL fields from the current extraction — never overwrite.
-        _backfilled = 0
-        for c in result["characters"]:
-            if c["name"].lower() not in pre_existing:
-                continue  # was just inserted above; only backfill pre-existing rows
-            patch = {}
-            if c.get("appearance"):
-                patch["appearance"] = c["appearance"]
-            if c.get("status"):
-                patch["vitality"] = c["status"]
-            if c.get("aliases"):
-                patch["aliases"] = c["aliases"]
-            if c.get("first_appearance_chapter") is not None:
-                patch["first_appearance_chapter"] = c["first_appearance_chapter"]
-            if not patch:
-                continue
-            # Only fill NULLs: fetch current values first
-            existing = sb("book_characters",
-                          params=f"?work_id=eq.{work_id}&name=ilike.{quote(c['name'], safe='')}"
-                                 f"&select=id,appearance,vitality,aliases,first_appearance_chapter"
-                                 f"&limit=1")
-            if not existing:
-                continue
-            row = existing[0]
-            null_patch = {k: v for k, v in patch.items() if row.get(k) is None}
-            # Empty aliases array counts as unset
-            if row.get("aliases") == [] and "aliases" in patch:
-                null_patch["aliases"] = patch["aliases"]
-            # Empty appearance string counts as unset (inserts write "", not NULL)
-            if row.get("appearance") == "" and "appearance" in patch:
-                null_patch["appearance"] = patch["appearance"]
-            if null_patch:
-                r = sb("book_characters", method="PATCH",
-                       params=f"?id=eq.{row['id']}", data=null_patch)
-                if r is None:
-                    errors += 1
-                else:
-                    _backfilled += 1
-        if _backfilled:
-            print(f"  Backfilled {_backfilled} existing characters (NULL fields only)")
+        # Backfill: surviving (contributor/rejected) rows keep insert-only
+        # semantics — PATCH NULL fields from the current extraction, never
+        # overwrite. (Processor rows were replaced above with full data.)
+        if _ok:
+            _backfilled = 0
+            for c in result["characters"]:
+                if c["name"].lower() not in pre_existing:
+                    continue  # only backfill rows that survived the replace
+                patch = {}
+                if c.get("appearance"):
+                    patch["appearance"] = c["appearance"]
+                if c.get("status"):
+                    patch["vitality"] = c["status"]
+                if c.get("aliases"):
+                    patch["aliases"] = c["aliases"]
+                if c.get("first_appearance_chapter") is not None:
+                    patch["first_appearance_chapter"] = c["first_appearance_chapter"]
+                if not patch:
+                    continue
+                # Only fill NULLs: fetch current values first
+                existing = sb("book_characters",
+                              params=f"?work_id=eq.{work_id}&name=ilike.{quote(c['name'], safe='')}"
+                                     f"&select=id,appearance,vitality,aliases,first_appearance_chapter"
+                                     f"&limit=1")
+                if not existing:
+                    continue
+                row = existing[0]
+                null_patch = {k: v for k, v in patch.items() if row.get(k) is None}
+                # Empty aliases array counts as unset
+                if row.get("aliases") == [] and "aliases" in patch:
+                    null_patch["aliases"] = patch["aliases"]
+                # Empty appearance string counts as unset (inserts write "", not NULL)
+                if row.get("appearance") == "" and "appearance" in patch:
+                    null_patch["appearance"] = patch["appearance"]
+                if null_patch:
+                    r = sb("book_characters", method="PATCH",
+                           params=f"?id=eq.{row['id']}", data=null_patch)
+                    if r is None:
+                        errors += 1
+                    else:
+                        _backfilled += 1
+            if _backfilled:
+                print(f"  Backfilled {_backfilled} existing characters (NULL fields only)")
 
     # Spice -> works.spice_detected
     spice = result.get("spice_level")
@@ -7268,35 +7478,132 @@ def write_claims(work_id, result, trope_mappings=None):
                 errors += 1
 
     # Quotes -> book_quotes (3-5 memorable per book, no speaker attribution yet)
-    quotes = result.get("quotes", [])
-    if quotes:
-        # Check existing to avoid duplicates
-        existing_q = sb("book_quotes", params=f"?work_id=eq.{work_id}&select=quote&limit=100")
-        seen_q = {r.get("quote", "")[:100] for r in (existing_q or [])}
-        qrows = []
-        for q in quotes[:5]:  # cap at 5
-            qtext = q.get("text", "") if isinstance(q, dict) else str(q)
-            if not qtext or qtext[:100] in seen_q:
-                continue
-            seen_q.add(qtext[:100])
-            _spk = q.get("speaker") if isinstance(q, dict) else None
-            qrows.append({"work_id": work_id,
-                          "quote": qtext,
-                          "speaker_name": _spk,
-                          "source_type": "pipeline",
-                          "confidence": 0.7})
-        if qrows:
-            if sb("book_quotes", method="POST", data=qrows) is None:
-                errors += 1
-            else:
-                wrote["quotes"] = len(qrows)
+    if result.get("quotes"):
+        _qstate = _claim_rows("book_quotes", work_id)
+        if _qstate is None:
+            errors += 1
+        else:
+            _preserved, _rejected, _ndel = _partition_claims("book_quotes", _qstate)
+            qrows = _build_quote_rows(work_id, result, _preserved)
+            _ok = True
+            if _ndel:
+                _gone = _delete_processor_claims("book_quotes", work_id)
+                if _gone is None:
+                    errors += 1
+                    _ok = False
+                else:
+                    deleted["quotes"] = _gone
+            if _ok and qrows:
+                if sb("book_quotes", method="POST", data=qrows) is None:
+                    errors += 1
+                else:
+                    wrote["quotes"] = len(qrows)
 
+    _tot_del = sum(deleted.values())
+    _tot_new = sum(wrote.values())
+    UI.status(f"  Replaced {_tot_del} processor claims with {_tot_new} new rows; "
+              f"preserved {preserved_rej} rejections")
     UI.status(f"  Wrote {wrote['tropes']} tropes, {wrote['triggers']} triggers, "
-                f"{wrote['characters']} characters, {wrote['proposals']} proposals, "
-                f"{wrote.get('quotes', 0)} quotes (new rows only)")
+              f"{wrote['characters']} characters, {wrote['proposals']} proposals, "
+              f"{wrote.get('quotes', 0)} quotes (new rows only)")
     # P7: stash for the end-of-run summary panel.
     _DIAG.wrote_stats = dict(wrote)
     return errors
+
+
+def plan_replace(work_id, result, trope_mappings=None):
+    """Read-only replace plan for preview mode: what write_claims WOULD do
+    for an already-in-DB work. GETs only — never POST/PATCH/DELETE.
+    Returns None when Supabase isn't configured (caller stays silent),
+    {} when a DB lookup fails, else {would_delete, would_insert,
+    rejections_preserved, existing}."""
+    if not work_id or not (CONFIG.get("supabase_url") and CONFIG.get("supabase_key")):
+        return None
+    _models = {"ollama": CONFIG["ollama_model"], "openrouter": CONFIG["openrouter_model"],
+               "openai": CONFIG.get("openai_model", "")}
+    model = _models.get(CONFIG["llm"], "")
+    _cat = dict(result.get("trope_catalog_map", {}) or {})
+    if trope_mappings:
+        _cat.update({_tnorm(k): v for k, v in trope_mappings.items()})
+    plan = {"would_delete": {}, "would_insert": {},
+            "rejections_preserved": 0, "existing": 0}
+    unmatched = []
+
+    _tstate = _claim_rows("book_trope_claims", work_id)
+    if _tstate is None:
+        return {}
+    _preserved, _rejected, _ndel = _partition_claims("book_trope_claims", _tstate)
+    plan["would_delete"]["book_trope_claims"] = _ndel
+    plan["existing"] += len(_tstate)
+    plan["rejections_preserved"] += len(_rejected)
+    _rows, unmatched = _build_trope_rows(
+        work_id, result, _cat, trope_mappings, model, _preserved)
+    plan["would_insert"]["tropes"] = len(_rows)
+
+    if unmatched:
+        _all_keys, _own = _proposal_state(result)
+        if _all_keys is None:
+            return {}
+        _own_pending = {r["name_key"] for r in _own
+                        if (r.get("status") or "pending") == "pending"}
+        plan["would_delete"]["trope_proposals"] = len(_own_pending)
+        plan["existing"] += len(_own)
+        plan["rejections_preserved"] += sum(
+            1 for r in _own if (r.get("status") or "") == "rejected")
+        plan["would_insert"]["proposals"] = len(_build_proposal_rows(
+            result, unmatched, _all_keys - _own_pending))
+
+    _gstate = _claim_rows("book_trigger_claims", work_id)
+    if _gstate is None:
+        return {}
+    _preserved, _rejected, _ndel = _partition_claims("book_trigger_claims", _gstate)
+    plan["would_delete"]["book_trigger_claims"] = _ndel
+    plan["existing"] += len(_gstate)
+    plan["rejections_preserved"] += len(_rejected)
+    plan["would_insert"]["triggers"] = len(
+        _build_trigger_rows(work_id, result, model, _preserved))
+
+    _cstate = _claim_rows("book_characters", work_id)
+    if _cstate is None:
+        return {}
+    _preserved, _rejected, _ndel = _partition_claims("book_characters", _cstate)
+    plan["would_delete"]["book_characters"] = _ndel
+    plan["existing"] += len(_cstate)
+    plan["rejections_preserved"] += len(_rejected)
+    _rel_map, _nev = _build_rel_map(result)
+    plan["would_insert"]["characters"] = len(
+        _build_character_rows(work_id, result, _rel_map, _preserved))
+
+    if result.get("quotes"):
+        _qstate = _claim_rows("book_quotes", work_id)
+        if _qstate is None:
+            return {}
+        _preserved, _rejected, _ndel = _partition_claims("book_quotes", _qstate)
+        plan["would_delete"]["book_quotes"] = _ndel
+        plan["existing"] += len(_qstate)
+        plan["would_insert"]["quotes"] = len(
+            _build_quote_rows(work_id, result, _preserved))
+    return plan
+
+
+def print_replace_plan(work_id, result, trope_mappings=None):
+    """Preview-mode audit line: log the replace plan for an in-DB work.
+    Read-only — preview mode never deletes or writes."""
+    plan = plan_replace(work_id, result, trope_mappings)
+    if plan is None:
+        return
+    if not plan:
+        print("  Replace plan: unavailable (DB lookup failed); preview made no writes")
+        return
+    _wd = sum(plan["would_delete"].values())
+    _wi = sum(plan["would_insert"].values())
+    if not plan["existing"]:
+        print(f"  Replace plan: no existing claims in DB — "
+              f"a write run would insert {_wi} fresh rows")
+        return
+    print(f"  Replace plan: would delete {_wd} processor claims, "
+          f"insert {_wi} new rows, preserve {plan['rejections_preserved']} "
+          f"rejections (preview — nothing written)")
 
 
 # --- Dedup (post-extraction character canonicalization) ---
@@ -8282,6 +8589,10 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if preview:
         save_preview(fpath, result)
         print(f"  Preview saved (pipeline=v2)")
+        if wid:
+            # Replace-wholesale validation gate: log what a write run
+            # would replace for this in-DB work (read-only).
+            print_replace_plan(wid, result)
         _checkpoint_clear(_ckpt_key)  # P8: run complete, checkpoints unneeded
         UI.run_summary(title or fpath.stem,
                        _run_summary_stats(result, True, time.time() - _t0))
@@ -8642,6 +8953,9 @@ def process_file(fpath, dry_run=False, preview=False):
 
     if preview:
         save_preview(fpath, result)
+        if wid:
+            # Replace-wholesale validation gate (read-only; see v2 path).
+            print_replace_plan(wid, result)
         return not aborted
     if dry_run:
         print("  [DRY] nothing written")
