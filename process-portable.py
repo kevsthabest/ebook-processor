@@ -5286,8 +5286,25 @@ _LINK_EVIDENCE = {
 }
 
 
+def _note_roster_suppression(store, marker, eid, tier, form_display):
+    """OC-3 (as amended): a rejected-anchor entity linked at tier 0
+    (anchor) or tier 1 (exact-form) is suppressed at row build —
+    the human rejected the person, not one spelling of them. Tier
+    2/3 links never suppress. Every suppression is an event in the
+    marker (and the report), never a silent drop."""
+    ent = store.get_entity(eid)
+    anchor = (ent or {}).get("anchor") or {}
+    if anchor.get("kind") == "rejected" \
+            and tier in ("anchor", "exact-form"):
+        marker["suppressed"].append({
+            "entity": eid, "form": form_display, "tier": tier,
+            "anchor_name": anchor.get("name", "")})
+        if eid not in marker["suppressed_entities"]:
+            marker["suppressed_entities"].append(eid)
+
+
 def roster_assign_entities(roster, store, *, anchors=None,
-                           extra_no_pairs=()):
+                           extra_no_pairs=(), alias_targets=None):
     """The Option B seam (design section 7): assign each final
     roster entry a stable entity ID, exactly once per run, after
     post_pass_merge and before v2_reduce. Annotates entries in
@@ -5358,7 +5375,21 @@ def roster_assign_entities(roster, store, *, anchors=None,
                     marker["folded"] += 1
         marker["linked"] = sum(1 for e in roster.values()
                                if e.get("entity_id"))
-        _roster_canonicalize(roster, store, marker, ordinal)
+        for entry in roster.values():
+            eid = entry.get("entity_id")
+            if not eid:
+                continue
+            ent = store.get_entity(eid)
+            for lnk in (ent or {}).get("links") or ():
+                if lnk.get("run") == ordinal and lnk.get(
+                        "form_key") == norm_name(
+                        entry.get("name") or ""):
+                    _note_roster_suppression(
+                        store, marker, eid, lnk.get("tier"),
+                        entry.get("name") or "")
+                    break
+        _roster_canonicalize(roster, store, marker, ordinal,
+                             alias_targets)
         store.save()
         return marker
 
@@ -5395,6 +5426,8 @@ def roster_assign_entities(roster, store, *, anchors=None,
             continue  # matcher pre-checked; a veto here is final
         entry["entity_id"] = eid
         marker["linked"] += 1
+        _note_roster_suppression(store, marker, eid, link["tier"],
+                                 entry.get("name") or "")
     for key in sorted(roster):
         if key in suspended_by_entry or "entity_id" in roster[key]:
             continue
@@ -5443,16 +5476,75 @@ def roster_assign_entities(roster, store, *, anchors=None,
             "a": roster[s["a"]].get("name") if s["a"] in roster
                  else s["a"],
             "b": ent.get("canonical") or s["b"], "why": s["why"]})
-    _roster_canonicalize(roster, store, marker, ordinal)
+    _roster_canonicalize(roster, store, marker, ordinal, alias_targets)
     store.save()
     return marker
 
 
-def _roster_canonicalize(roster, store, marker, ordinal):
-    """Slice 3 placeholder, replaced by the section 5 rule in
-    slice 4: an entity with no canonical yet takes its run form;
-    the marker's canonical_names map is what the write builders
-    resolve IDs through."""
+def compute_canonical_name(entity, alias_targets=None):
+    """The section 5 canonical rule: identity and display are
+    separate decisions. Returns (name, source) or (None, None) when
+    nothing may vote.
+
+    1. Anchor wins: an entity anchored to a DB row (canonical
+       locked at seed time) keeps the anchor's name, rule-proof.
+    2. Human override: a manual alias target observed among the
+       entity's forms beats the vote — the display used is the
+       target's own observed form (a target never observed has no
+       display form to ship and does not fire).
+    3. Deterministic vote over observed primary forms: greatest
+       total appearances; ties and near-ties (within 80% of the
+       leader) break toward the FULLEST form (most tokens, then
+       longest); remaining ties toward the most recently observed.
+    Suspect and detached observations do not vote (A1): a canonical
+    name never rests on evidence a suspended link carried in.
+    """
+    if entity.get("anchor") \
+            and entity.get("canonical_source") == "anchor":
+        return entity["anchor"]["name"], "anchor"
+    by_form = {}
+    for o in entity.get("observations") or ():
+        if o.get("suspect") or o.get("detached"):
+            continue
+        slot = by_form.setdefault(
+            o["form_key"], {"apps": 0, "display": o["form"],
+                            "last_run": o.get("run") or 0})
+        slot["apps"] += o.get("appearances") or 0
+        if (o.get("run") or 0) >= slot["last_run"]:
+            slot["last_run"] = o.get("run") or 0
+            slot["display"] = o["form"]
+    if not by_form:
+        return None, None
+    for src_key, tgt_key in (alias_targets or {}).items():
+        if src_key in by_form and tgt_key in by_form \
+                and src_key != tgt_key:
+            return by_form[tgt_key]["display"], "human"
+    leader = max(s["apps"] for s in by_form.values())
+    contenders = {k: s for k, s in by_form.items()
+                  if s["apps"] >= 0.8 * leader}
+    best = sorted(
+        contenders.values(),
+        key=lambda s: (-len(s["display"].split()),
+                       -len(s["display"]), -s["last_run"],
+                       s["display"]))[0]
+    return best["display"], "rule"
+
+
+_CANONICAL_REASONS = {
+    "anchor": "curation anchor name (rule-proof)",
+    "human": "manual alias override",
+    "rule": "appearance-weighted rule, fullest form on near-ties",
+}
+
+
+def _roster_canonicalize(roster, store, marker, ordinal,
+                         alias_targets=None):
+    """Recompute canonical names for the entities this run touched
+    (design section 5) and fill the marker's canonical_names map —
+    the map the write builders resolve IDs through. A canonical
+    that CHANGES from a previously shipped name is an event:
+    recorded in the marker with its reason, never silent, because
+    on the app surface it looks like a rename."""
     names = {}
     for e in roster.values():
         eid = e.get("entity_id")
@@ -5461,11 +5553,32 @@ def _roster_canonicalize(roster, store, marker, ordinal):
         ent = store.get_entity(eid)
         if ent is None:
             continue
-        if not ent.get("canonical"):
-            store.set_canonical(eid, e.get("name") or "", "rule")
-            ent = store.get_entity(eid)
-        names[eid] = ent["canonical"]
+        new, source = compute_canonical_name(ent, alias_targets)
+        if new is None:
+            new = ent.get("canonical") or e.get("name") or ""
+            source = source or ent.get("canonical_source") or "rule"
+        old = ent.get("canonical")
+        if new != old:
+            store.set_canonical(eid, new, source)
+            if old is not None:
+                marker["canonical_changes"].append({
+                    "entity": eid, "from": old, "to": new,
+                    "reason": _CANONICAL_REASONS.get(source, source)})
+        names[eid] = new
     marker["canonical_names"] = names
+
+
+def _roster_alias_targets():
+    """Manual --alias pairs from learned state, as {form_key:
+    target_form_key} for the canonical rule's human override.
+    LearnedState stores both sides normalized; only human-recorded
+    (manual) pairs count — learned merges are not overrides."""
+    ln = _learn()
+    if not ln.enabled:
+        return {}
+    return {short: ent.get("full")
+            for short, ent in (ln.nicknames or {}).items()
+            if ent.get("manual") and ent.get("full")}
 
 
 def _roster_record_dedupe_folds(store, pre_characters, report,
@@ -11861,7 +11974,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             _anchors = _roster_fetch_anchors(_seam_wid) \
                 if _seam_wid else []
             _roster_marker = roster_assign_entities(
-                roster, _roster_store, anchors=_anchors)
+                roster, _roster_store, anchors=_anchors,
+                alias_targets=_roster_alias_targets())
             if _roster_marker is not None:
                 _roster_ordinal = _roster_marker["run_ordinal"]
                 print(f"  Roster persistence: "
@@ -12089,6 +12203,18 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         _staging().adopt_for(wid, result.get("title") or "",
                              result.get("author") or "",
                              identifiers.get("isbn"))
+    if _roster_store is not None and wid:
+        # Option B (design section 8): the seam ran before the
+        # work_id existed (new works), so this run's store may sit
+        # under a fallback key; adopt it into the resolved work's
+        # key now and reopen on the surviving store so the dedupe
+        # tombstone hook below writes to the right file.
+        if adopt_roster_store(_learn().dir, wid,
+                               result.get("title") or "",
+                               result.get("author") or "",
+                               identifiers.get("isbn")):
+            _roster_store = RosterStore(learn_dir=_learn().dir,
+                                        work_key=str(wid))
     if how == "new":
         result["work_candidates"] = _title_candidates(title or fpath.stem)
         print("  Work: no match — NEW WORK would be created")

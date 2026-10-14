@@ -293,5 +293,251 @@ class TestDedupeFold(unittest.TestCase):
                 st.data["retired"][e1]["reason"], "within-run merge")
 
 
+def _obs(form, run, appearances, suspect=False, detached=False):
+    return {"run": run, "form": form, "form_key": pp.norm_name(form),
+            "chapters": [1], "appearances": appearances,
+            "role_hint": "", "aliases": [], "alias_keys": [],
+            "desc_hash": "", "suspect": suspect, "detached": detached}
+
+
+def _entity(observations, anchor=None, canonical_source="rule"):
+    return {"canonical": None, "canonical_source": canonical_source,
+            "status": "active", "split_from": None, "split_into": [],
+            "anchor": anchor, "observations": observations,
+            "links": []}
+
+
+class TestCanonicalRule(unittest.TestCase):
+    def test_appearance_weighting_clear_winner(self):
+        ent = _entity([_obs("Violet", 1, 40),
+                       _obs("Violet Sorrengail", 1, 10)])
+        name, src = pp.compute_canonical_name(ent)
+        self.assertEqual(name, "Violet")  # 10 < 80% of 40: no near-tie
+        self.assertEqual(src, "rule")
+
+    def test_near_tie_breaks_to_fullest_form(self):
+        ent = _entity([_obs("Violet", 1, 40),
+                       _obs("Violet Sorrengail", 1, 34)])
+        name, _ = pp.compute_canonical_name(ent)
+        self.assertEqual(name, "Violet Sorrengail")  # 34 >= 32: fullest
+
+    def test_exact_tie_breaks_to_most_recent(self):
+        ent = _entity([_obs("Geralt", 1, 20),
+                       _obs("Geralt of Rivia", 1, 20),
+                       _obs("Geralt", 2, 0)])
+        name, _ = pp.compute_canonical_name(ent)
+        # "Geralt of Rivia" is fullest AND tied — fullness wins first.
+        self.assertEqual(name, "Geralt of Rivia")
+        ent2 = _entity([_obs("Alys Rivers", 1, 20),
+                        _obs("Alys Rivers", 2, 20)])
+        self.assertEqual(pp.compute_canonical_name(ent2)[0],
+                         "Alys Rivers")
+
+    def test_suspect_observations_do_not_vote(self):
+        ent = _entity([_obs("Violet", 1, 5),
+                       _obs("Violetta Sorrengail", 2, 99, suspect=True)])
+        name, _ = pp.compute_canonical_name(ent)
+        self.assertEqual(name, "Violet")
+
+    def test_detached_observations_do_not_vote(self):
+        ent = _entity([_obs("Violet", 1, 5),
+                       _obs("Violetta", 2, 99, detached=True)])
+        self.assertEqual(pp.compute_canonical_name(ent)[0], "Violet")
+
+    def test_anchor_name_is_rule_proof(self):
+        anchor = {"kind": "confirmed", "name": "Violet Sorrengail",
+                  "source": "db", "aliases": [], "seen_run": 1}
+        ent = _entity([_obs("Violet", 1, 99)], anchor=anchor,
+                      canonical_source="anchor")
+        name, src = pp.compute_canonical_name(ent)
+        self.assertEqual((name, src), ("Violet Sorrengail", "anchor"))
+
+    def test_manual_alias_anchor_does_not_lock(self):
+        # lock_canonical=False seeding leaves canonical_source unset,
+        # so the rule still runs (the anchor name here would be a
+        # normalized key string, never a display form).
+        anchor = {"kind": "manual-alias", "name": "violet sorrengail",
+                  "source": "--alias", "aliases": ["violet"],
+                  "seen_run": 1}
+        ent = _entity([_obs("Violet", 1, 30),
+                       _obs("Violet Sorrengail", 1, 10)],
+                      anchor=anchor, canonical_source="")
+        name, src = pp.compute_canonical_name(ent)
+        self.assertEqual((name, src), ("Violet", "rule"))
+
+    def test_alias_override_picks_observed_target_form(self):
+        ent = _entity([_obs("Violet", 1, 90),
+                       _obs("Violet Sorrengail", 1, 5)])
+        name, src = pp.compute_canonical_name(
+            ent, alias_targets={"violet": "violet sorrengail"})
+        self.assertEqual((name, src), ("Violet Sorrengail", "human"))
+
+    def test_alias_override_unobserved_target_falls_through(self):
+        ent = _entity([_obs("Violet", 1, 90)])
+        name, src = pp.compute_canonical_name(
+            ent, alias_targets={"violet": "violet sorrengail"})
+        self.assertEqual((name, src), ("Violet", "rule"))
+
+
+class TestCanonicalChangeEvents(_SeamCase):
+    def test_canonical_change_is_an_event_not_a_silent_rename(self):
+        st = self._store()
+        roster1 = {"violet": _entry("Violet", appearances=90)}
+        pp.roster_assign_entities(roster1, st, anchors=[])
+        eid = roster1["violet"]["entity_id"]
+        st2 = self._store()
+        roster2 = {"violet sorrengail": _entry(
+            "Violet Sorrengail", appearances=95)}
+        marker = pp.roster_assign_entities(roster2, st2, anchors=[])
+        changes = [c for c in marker["canonical_changes"]
+                   if c["entity"] == eid]
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["from"], "Violet")
+        self.assertEqual(changes[0]["to"], "Violet Sorrengail")
+        self.assertIn("reason", changes[0])
+
+
+class TestRejectedAnchorSuppression(_SeamCase):
+    _REJECTED = [{"name": "Violet Sorrengail", "kind": "rejected",
+                  "source": "db", "aliases": [],
+                  "lock_canonical": True}]
+
+    def test_tier0_link_suppresses_at_row_build(self):
+        st = self._store()
+        roster = {"violet sorrengail": _entry("Violet Sorrengail")}
+        marker = pp.roster_assign_entities(
+            roster, st, anchors=list(self._REJECTED))
+        eid = roster["violet sorrengail"]["entity_id"]
+        self.assertEqual(marker["suppressed_entities"], [eid])
+        self.assertEqual(len(marker["suppressed"]), 1)
+        self.assertEqual(marker["suppressed"][0]["tier"], "anchor")
+        result = {"characters": [{"name": "Violet Sorrengail",
+                                  "entity_id": eid, "role": "major",
+                                  "description": "", "appearance": "",
+                                  "status": "alive", "aliases": [],
+                                  "first_appearance_chapter": 1,
+                                  "confidence": 0.9}],
+                  "relationships": [],
+                  "roster_persistence": marker}
+        rows = pp._build_character_rows("wid", result, {}, set())
+        self.assertEqual(rows, [])
+
+    def test_weaker_tiers_never_suppress(self):
+        # OC-3's tier condition, tested at the rule unit: only tier
+        # 0 (anchor) and tier 1 (exact-form) links suppress. (A
+        # tier-2 link to a DB-anchored entity is in fact unreachable
+        # through the seam — tier 2 must claim the entity's
+        # canonical, which for an anchored entity is the anchor
+        # name, and claiming that name is itself a tier-0 claim —
+        # so the carve-out is pinned here where the rule lives.)
+        st = self._store()
+        eid = st.seed_anchor("Violet Sorrengail", "rejected", "db", 1)
+        for tier in ("alias-cross", "subsequence", "fold", "human"):
+            marker = {"suppressed": [], "suppressed_entities": []}
+            pp._note_roster_suppression(st, marker, eid, tier,
+                                         "Violet")
+            self.assertEqual(marker["suppressed"], [], tier)
+            self.assertEqual(marker["suppressed_entities"], [], tier)
+        for tier in ("anchor", "exact-form"):
+            marker = {"suppressed": [], "suppressed_entities": []}
+            pp._note_roster_suppression(st, marker, eid, tier,
+                                         "Violet")
+            self.assertEqual(len(marker["suppressed"]), 1, tier)
+            self.assertEqual(marker["suppressed_entities"], [eid], tier)
+        # A non-rejected anchor never suppresses at any tier.
+        st2 = self._store()
+        eid2 = st2.seed_anchor("Violet Sorrengail", "confirmed", "db", 1)
+        marker = {"suppressed": [], "suppressed_entities": []}
+        pp._note_roster_suppression(st2, marker, eid2, "anchor",
+                                     "Violet Sorrengail")
+        self.assertEqual(marker["suppressed"], [])
+
+
+class TestAnchorFetch(_SeamCase):
+    def setUp(self):
+        super().setUp()
+        self._old_sb = pp.sb
+        self._old_learned = pp._LEARNED
+        pp._LEARNED = pp.LearnedState(learn_dir=self.dir / "learn",
+                                       enabled=True)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        pp.sb = self._old_sb
+        pp._LEARNED = self._old_learned
+
+    def _rows(self):
+        return [
+            {"id": "1", "name": "Confirmed Person", "status": "confirmed",
+             "source_type": "ai", "aliases": ["CP"]},
+            {"id": "2", "name": "Rejected Person", "status": "rejected",
+             "source_type": "ai", "aliases": []},
+            {"id": "3", "name": "Human Added", "status": "candidate",
+             "source_type": "human", "aliases": []},
+            {"id": "4", "name": "Processor Candidate",
+             "status": "candidate", "source_type": "ai", "aliases": []},
+        ]
+
+    def test_preserved_rows_become_anchors_candidates_do_not(self):
+        pp.sb = lambda table, **kw: self._rows()
+        anchors = pp._roster_fetch_anchors("wid-1")
+        by_name = {a["name"]: a for a in anchors}
+        self.assertEqual(by_name["Confirmed Person"]["kind"],
+                         "confirmed")
+        self.assertEqual(by_name["Rejected Person"]["kind"], "rejected")
+        self.assertEqual(by_name["Human Added"]["kind"], "contributor")
+        self.assertNotIn("Processor Candidate", by_name)
+        self.assertEqual(by_name["Confirmed Person"]["aliases"], ["CP"])
+
+    def test_fetch_failure_returns_none(self):
+        pp.sb = lambda table, **kw: None
+        self.assertIsNone(pp._roster_fetch_anchors("wid-1"))
+
+    def test_manual_alias_pairs_become_unlocked_anchors(self):
+        pp.sb = lambda table, **kw: []
+        pp._LEARNED.record_alias("Violet", "Violet Sorrengail")
+        anchors = pp._roster_fetch_anchors("wid-1")
+        manual = [a for a in anchors if a["kind"] == "manual-alias"]
+        self.assertEqual(len(manual), 1)
+        self.assertFalse(manual[0]["lock_canonical"])
+        self.assertEqual(manual[0]["aliases"], ["violet"])
+
+
+class TestNoOpSecondRunRows(_SeamCase):
+    """OC-6: a no-op second run ships rows byte-identical to the
+    flag-off rows — identity resolution changes names only when it
+    legitimately resolves a DIFFERENT form to the stable name."""
+
+    def _roster(self):
+        return {"geralt of rivia": _entry(
+                    "Geralt of Rivia", appearances=40,
+                    descriptions=["A witcher."],
+                    evidence="Geralt of Rivia drew his sword."),
+                "yennefer": _entry(
+                    "Yennefer", appearances=25,
+                    descriptions=["A sorceress."],
+                    evidence="Yennefer cast a spell.")}
+
+    def _rows(self, roster, marker):
+        red = pp.v2_reduce({}, {}, roster, [], preview=True,
+                           show_matrices=False, n_chapters_total=3)
+        result = {"characters": red["characters"],
+                  "relationships": red["relationships"]}
+        if marker is not None:
+            result["roster_persistence"] = marker
+        rel_map, _ = pp._build_rel_map(result)
+        return pp._build_character_rows("wid", result, rel_map, set())
+
+    def test_noop_second_run_rows_match_flag_off(self):
+        st = self._store()
+        pp.roster_assign_entities(self._roster(), st, anchors=[])
+        st2 = self._store()
+        roster2 = self._roster()
+        marker2 = pp.roster_assign_entities(roster2, st2, anchors=[])
+        rows_on = self._rows(roster2, marker2)
+        rows_off = self._rows(self._roster(), None)
+        self.assertEqual(rows_on, rows_off)
+
+
 if __name__ == "__main__":
     unittest.main()
