@@ -1,8 +1,11 @@
 # Option F — empty-evidence staging gate + persistence gate: design
 
-Status: DESIGN ONLY (no code). For manager + Security Advisor red-team and
-user approval. Rollout model follows the `--roster-reconcile` precedent:
-named flag, default OFF, flag-off = no code path and no preview key.
+Status: DESIGN ONLY (no code). Security Advisor red-team complete:
+PROCEED-WITH-CHANGES, amendments folded in (marked "red-team fold-in"
+inline; OC-7 elevated to a requirement). Awaiting user rulings on the
+§9 open choices as amended. Rollout model follows the
+`--roster-reconcile` precedent: named flag, default OFF, flag-off = no
+code path and no preview key.
 
 Doctrine, stated once and binding on everything below: **persistence is a
 stability filter, not truth.** A promoted claim is a claim that stopped
@@ -126,6 +129,14 @@ Why local:
   opposite lifecycle (entries expire; learning accumulates). Putting it
   in a LearnedState file would entangle F with D1's ruling. Separate
   file, separate class, same directory, same corruption discipline.
+  **Concurrency (red-team fold-in, binding):** books run concurrently
+  under `--jobs` (ThreadPoolExecutor), so `StagingState` serializes
+  observe+save under a lock, reusing the LearnedState pattern including
+  its RLock lesson (sweep F8) — or observe calls are serialized at the
+  seam. Concurrent load-modify-save without a lock would lose
+  sightings (last writer wins): delay-only, not a safety hole, but
+  promotion timing would go nondeterministic and the accounting could
+  silently undercount in production-shaped runs.
 
 **Runner-up: DB-side `status="staged"`.** It wins the day processing
 runs on more than one machine against the same library, or the user
@@ -262,9 +273,12 @@ State machine per claim entry: `staged → promoted` (terminal per work),
 never boosted — and the preview marker records
 `promoted: [{name, via: persistence|support|evidence, sightings: N}]`.
 The shipped DB row is an ordinary candidate; its evidence dict gains
-one transparency key, `"persistence": {"sightings": N, "via": …}`
-(OC-7), so a reviewer who opens the row can see *how* it got there.
-The word "verified" appears nowhere.
+one transparency key, `"persistence": {"sightings": N, "via": …}` —
+this stamp is a **requirement, not an option** (OC-7, elevated by the
+red-team: §7's containment claim depends on it — without the stamp, a
+promoted claim in the review queue is indistinguishable from a natural
+candidate). On every user-facing surface the word "promoted" is always
+paired with its `via` mechanism; the word "verified" appears nowhere.
 
 **Stickiness / oscillation.** Promotion is sticky per work: once
 promoted, later weak sightings ship (the claim's standing was earned;
@@ -274,6 +288,16 @@ replace-wholesale churn — absence is not demotion. The only exits from
 promoted are the pre-staging hard filters (denylist, rejection
 learning), which run before staging on every run and therefore apply
 to promoted claims exactly as to any other.
+
+**Flicker-down (red-team fold-in — stated here because it is the one
+place staging can remove a previously-shipped claim).** Observe tracks
+only stageable claims, so a claim first sighted in the AUTO band ships
+with no store entry. If a later run extracts it in the GATE band, it
+stages as a first sighting: its previously-shipped row is held back
+(replaced away by that write run) and persistence restarts from that
+run. That is the gate working — flicker damping cuts both ways — and
+it is the conservative direction, but it is a real removal, visible in
+practice via the summary-gated share and queue churn (§6).
 
 **Aging / expiry.** Expiry is driven by *absence evidence*, not the
 clock: a staged entry expires when **3 subsequent completed runs of the
@@ -332,17 +356,32 @@ staging_observe(result_parts, state, *, independent, mode)
   and `_preview_summary` gains the held-back count. Preview ≡ write:
   a preview run performs the same observe + split, so what a preview
   shows as staged is exactly what a write run would hold back.
+  A flag-on preview also declares its state write on its face
+  (red-team condition on OC-4 — the F18 doctrine: a preview that
+  writes state and doesn't say so is not a dry run): the `.md`
+  summary gains "this preview recorded N sightings."
+- `cmd_push_preview` on a preview saved WITHOUT the flag ships its
+  full recorded set (nothing was staged — flag-off semantics exactly);
+  on a flag-on preview it ships the recorded ship set regardless of
+  later store state, so store loss can never resurrect staged claims
+  into a push (red-team fold-in: stated because every reader asks).
 
 **Flag / config rollout.** `--staging-gate` → `CONFIG["staging_gate"]`,
 default OFF, not in built-in profiles, argparse + CONFIG wiring exactly
 as `--roster-reconcile` (:10734). The observe step also records
 sightings in **preview mode** — persistence can never accumulate if
 only write runs count, and preview runs are the program's measurement
-instrument (both A-experiment runs were previews). This is a deliberate
-difference from learned-state write gating and is flagged as OC-4
-because open decision D1 may rule otherwise for *learning*; staging
-sightings are bookkeeping about runs, not learned claims about books,
-and the recommendation is that D1's ruling should not reach them.
+instrument (both A-experiment runs were previews). This is flagged as
+OC-4 and framed precisely (red-team fold-in): staging sightings are
+**independent of D1's subject matter** — learning is cross-book state
+that shapes future *extraction*; sightings are per-work bookkeeping
+that only filters the *ship set* of what a run itself produced, and no
+path exists where preview sightings alone ship anything. The defence
+is disclosure + boundedness, not exemption: flag-on is an explicit
+opt-in, the store can only delay (never create output), previews
+declare recorded sightings on their face (§5), and deleting
+staging.json resets everything harmlessly. **If D1 rules broadly on
+preview state-writes, OC-4 reopens.**
 
 **Write-mode behaviour.** A write run ships promoted + never-staged
 claims through untouched `write_claims`; staged claims are absent from
@@ -416,6 +455,11 @@ named in advance):
      100% of still-staged claims with ages; any claim staged in run 1
      and re-extracted in run 2 has sightings == 2 (no resume-style
      double-count, no missed count).
+  Scorecard format (red-team fold-in): the summary-gated share is
+  reported **per book** alongside signal 2 (the price is a number per
+  book, not a vibe), the trapped claims are listed **by name**, and
+  `form_changed` promotions get their **own count/line** (§3/OC-6),
+  so the design's worst case is countable at a glance.
 
 ---
 
@@ -440,9 +484,15 @@ named in advance):
   runs), not bias. The design accepts this knowingly — it is the
   external reviews' own framing ("a stability filter, not truth") —
   and contains it: promotion requires the claim to have passed the
-  trope gate's judgment on each sighting, confidence is not inflated,
-  provenance is stamped, and the review queue still sees the claim
-  (as a candidate) with its persistence stamp visible.
+  trope gate's judgment on each sighting (the gate *resamples* the
+  judgment — same model, same summaries; it does not independently
+  corroborate), confidence is not inflated, provenance is stamped,
+  and the review queue still sees the claim (as a candidate) with its
+  persistence stamp visible. **That last containment is conditional
+  on OC-7 = yes** (red-team fold-in): without the in-row stamp, a
+  promoted claim in the queue is indistinguishable from a natural
+  candidate and containment reduces to out-of-band reports. OC-7 is
+  therefore a requirement (§4), not a preference.
 - **Corrupt staging store.** F8 pattern: loud warning, `.corrupt`
   preservation, store starts EMPTY. The failure direction is safe by
   construction: lost state means sightings reset, claims re-stage,
@@ -483,11 +533,14 @@ named in advance):
 ## 8. Build plan (slices in order; each independently testable)
 
 1. **`StagingState` store.** Load/save with the F8 pattern (atomic
-   write, loud corruption, `.corrupt` preservation), keying + ordinal
-   sightings + name→id folding (union semantics), expiry arithmetic,
-   trapped-report data model. Tests: corruption resets safely + warns;
-   fold unions ordinals without double-count; expiry at exactly 3
-   absences; `expired_recent` cap; store loss ⇒ nothing promotes.
+   write, loud corruption, `.corrupt` preservation), **observe+save
+   serialized under a lock** (red-team binding constraint — `--jobs`
+   runs books concurrently; include a two-thread contention test),
+   keying + ordinal sightings + name→id folding (union semantics),
+   expiry arithmetic, trapped-report data model. Tests: corruption
+   resets safely + warns; fold unions ordinals without double-count;
+   expiry at exactly 3 absences; `expired_recent` cap; store loss ⇒
+   nothing promotes; concurrent observes lose no sightings.
 2. **Trope observe/split behind `--staging-gate`.** Eligibility
    (gate band only, after denylist + rejection filters), sighting
    rules (independent runs only), promotion rules 1–2, ship-set split,
@@ -531,22 +584,29 @@ named in advance):
   measurement protocol (pairs of runs) and the external reviews'
   staging sketches; three costs another full reprocess per book for
   marginal filtering.
-- **OC-4 — Preview runs record sightings.** **Yes** (bookkeeping, not
-  learning; exempt from D1's eventual learning ruling) vs write-runs
-  only (persistence then can't accumulate during validation — the
-  gate in §6 becomes unmeasurable).
+- **OC-4 — Preview runs record sightings.** **Yes, with two
+  conditions** (red-team): (a) a flag-on preview declares recorded
+  sightings on its face (§5); (b) framed as *independent of D1's
+  subject matter* — if D1 rules broadly on preview state-writes,
+  OC-4 reopens (§5). Alternative: write-runs only (persistence then
+  can't accumulate during validation — the gate in §6 becomes
+  unmeasurable).
 - **OC-5 — Expiry.** **Absence-based (3 runs) + STALE flag at 180
   days, no wall-clock expiry** vs adding a hard wall-clock expiry
   (e.g. 365 days) for store hygiene.
 - **OC-6 — Name-form change under a catalog id.** **Flag in report +
-  `form_changed` marker, sightings kept** vs reset sightings on form
-  change (strictest against wrong-mapping promotion; costs legitimate
-  promotions when a paraphrase legitimately remaps).
-- **OC-7 — Provenance in the shipped row.** **Add
-  `evidence.persistence = {sightings, via}` on promoted claims** vs
-  keep provenance preview/report-only and the DB row byte-identical to
-  a natural candidate. (The evidence dict is a JSON blob; no app
-  change is needed either way.)
+  `form_changed` marker, sightings kept — with `form_changed`
+  promotions counted on their own line** in the trapped report and
+  the §6 scorecard (red-team strengthening) vs reset sightings on
+  form change (strictest against wrong-mapping promotion; costs
+  legitimate promotions when a paraphrase legitimately remaps).
+- **OC-7 — Provenance in the shipped row. RULED A REQUIREMENT by the
+  red-team (no longer an open choice):** promoted claims carry
+  `evidence.persistence = {sightings, via}` (§4, §7 — the correlated-
+  error containment depends on the stamp being in the row a reviewer
+  opens). The evidence dict is a JSON blob; no app change is needed.
 - **OC-8 — Fallback work-key adoption.** When a work first resolves a
   `work_id`, **adopt its fallback-key entries** (exact title+author
-  match) vs start fresh under the id key.
+  match), **with adoptions listed in the next trapped report**
+  (red-team: a wrong adoption must be visible to be correctable) vs
+  start fresh under the id key.
