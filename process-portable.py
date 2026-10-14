@@ -4220,7 +4220,9 @@ class RosterStore:
                 "title": "", "author": "", "runs_completed": 0,
                 "last_run_fingerprint": None, "next_entity_seq": 1,
                 "minted_total": 0, "entities": {}, "retired": {},
-                "no_pairs": [], "adoptions": []}
+                "no_pairs": [], "adoptions": [],
+                "suspects": [], "canonical_changes": [],
+                "collisions": []}
 
     # -- setup / persistence (StagingState's F8 pattern) --------------
     def _ensure_dir(self):
@@ -4579,6 +4581,58 @@ class RosterStore:
             for o in ent["observations"]:
                 if o.get("form_key") == form_key:
                     o["suspect"] = False
+
+    def affirm_form(self, eid, form_key):
+        """--roster-link: a human asserts this form belongs to this
+        entity. Its observations vote again AND speak for the entity
+        again (suspect + detached cleared). Returns how many
+        observations were affirmed."""
+        form_key = norm_name(form_key)
+        n = 0
+        with self._lock:
+            ent = self.data["entities"].get(eid)
+            if ent is None:
+                return 0
+            for o in ent["observations"]:
+                if o.get("form_key") == form_key:
+                    o["suspect"] = False
+                    o["detached"] = False
+                    n += 1
+            return n
+
+    def retire_no_pairs(self, form_key, other_forms):
+        """Remove recorded NOs between form_key and any of
+        other_forms. Used ONLY by the human --roster-link command:
+        the same authority that recorded the NO (directly or via
+        --roster-unlink) explicitly reverses it for this pair set.
+        Automatic paths never call this — for them a NO is final.
+        Returns how many pairs were retired."""
+        form_key = norm_name(form_key)
+        others = {norm_name(f) for f in other_forms}
+        with self._lock:
+            kept, removed = [], 0
+            for p in self.data["no_pairs"]:
+                pair = {p["a"], p["b"]}
+                if form_key in pair and pair & others \
+                        and pair != {form_key}:
+                    removed += 1
+                else:
+                    kept.append(p)
+            self.data["no_pairs"] = kept
+            return removed
+
+    @classmethod
+    def load_path(cls, path):
+        """Load a store from an enumerated file (report commands):
+        the filename is a sanitized work key, so read the content's
+        own work_key — the authoritative one — and construct
+        normally. Callers pre-check readability; a file whose
+        content cannot be parsed is reported by the caller, not
+        silently opened as an empty store."""
+        path = Path(path)
+        with open(path, encoding="utf-8") as f:
+            wk = json.load(f).get("work_key")
+        return cls(learn_dir=path.parent.parent, work_key=wk)
 
     # -- detach / split / merge -------------------------------------------
     def detach_form(self, eid, form_key, run=None):
@@ -4954,6 +5008,291 @@ def adopt_roster_store(learn_dir, work_id, title="", author="",
             pass
         adopted = True
     return adopted
+
+
+# ---------------------------------------------------------------------------
+# Option B report + correction commands (design sections 10-12):
+# read models and human assertions over the roster stores. The
+# corrections are the store's reason to exist in human terms — they
+# are attributed, recorded and reversible, and they are the ONLY
+# writers besides the seam itself.
+# ---------------------------------------------------------------------------
+
+def _roster_report_store(path):
+    """Load one store file for the report; a file that cannot be
+    parsed is reported as corrupt by the caller, never silently
+    opened as an empty store."""
+    try:
+        return RosterStore.load_path(path)
+    except Exception:
+        return None
+
+
+def _roster_cmd_learn_dir(learn_dir):
+    return Path(learn_dir) if learn_dir else _learn().dir
+
+
+def cmd_roster_report(learn_dir=None):
+    """--roster-report: every roster store, its accounting closed,
+    suspects loudest, then entities, links, suspensions,
+    suppressions, collisions, splits and canonical changes."""
+    paths = roster_store_paths(_roster_cmd_learn_dir(learn_dir))
+    if not paths:
+        print("No roster stores found. Roster stores are written by "
+              "runs with --persist-roster.")
+        return
+    print(f"Roster stores: {len(paths)} work(s)")
+    for path in paths:
+        store = _roster_report_store(path)
+        if store is None or store.corrupt_at_load:
+            print(f"\n!! CORRUPT roster store: {path}")
+            print("   Unreadable — preserved on disk. Runs against "
+                  "this work degrade to stateless behaviour until "
+                  "the file is repaired or removed.")
+            continue
+        d = store.data
+        acc = store.accounting()
+        print(f"\n=== {d.get('title') or '(untitled)'} — "
+              f"{d.get('author') or ''}")
+        print(f"    work_id: {d.get('work_id') or '(unresolved)'}   "
+              f"runs completed: {d.get('runs_completed', 0)}   "
+              f"store: {path.name}")
+        if d.get("work_id"):
+            try:
+                wid2, how2 = resolve_work(d.get("title") or "",
+                                          d.get("author") or "",
+                                          {}, False, create=False)
+                if how2 == "new" or (wid2 and str(wid2)
+                                     != str(d["work_id"])):
+                    print("    !! ORPHANED: the recorded work_id no "
+                          "longer resolves to this work "
+                          f"(resolution now: {how2})")
+            except Exception:
+                pass
+        # A1: suspect observations FIRST and loudest — a canonical
+        # or an alias resting on a suspended link is exactly the
+        # failure this report exists to catch.
+        suspects = [(eid, o) for eid, ent in d["entities"].items()
+                    for o in ent["observations"] if o.get("suspect")]
+        if suspects:
+            print("    !! SUSPECT OBSERVATIONS (under suspended "
+                  "links; excluded from canonical weighting and "
+                  "alias evidence until resolved):")
+            for eid, o in suspects:
+                print(f"       {eid} form '{o['form']}' (run "
+                      f"{o.get('run')}) — resolve with --roster-link"
+                      f" / --roster-split")
+        print(f"    Accounting: minted {acc['minted']} = "
+              f"active {acc['active']} + merged {acc['merged']} + "
+              f"split {acc['split']}   "
+              f"UNACCOUNTED: {acc['unaccounted']}")
+        ledger = store.suspension_ledger()
+        if ledger:
+            print(f"    Suspended links: {len(ledger)}")
+            for item in ledger:
+                lnk = item["link"]
+                print(f"       {item['entity']} form "
+                      f"'{lnk.get('form_key')}' run {lnk.get('run')}"
+                      f" — {lnk.get('evidence', '')}")
+        if d.get("no_pairs"):
+            print(f"    Recorded NOs (never the same person): "
+                  f"{len(d['no_pairs'])}")
+            for p in d["no_pairs"]:
+                print(f"       '{p['a']}' =/= '{p['b']}' "
+                      f"({p.get('source', '')})")
+        by_canonical = {}
+        for eid, ent in d["entities"].items():
+            if ent.get("status") == "active" and ent.get("canonical"):
+                by_canonical.setdefault(
+                    norm_name(ent["canonical"]), []).append(eid)
+        collisions = {k: v for k, v in by_canonical.items()
+                      if len(v) > 1}
+        if collisions:
+            print("    !! CANONICAL COLLISIONS (two live entities, "
+                  "one display name — the write still ships one "
+                  "row per entity; the report surfaces it):")
+            for key, eids in sorted(collisions.items()):
+                print(f"       '{key}': {', '.join(sorted(eids))}")
+        for eid in sorted(d["entities"]):
+            ent = d["entities"][eid]
+            anchor = ent.get("anchor") or {}
+            print(f"    {eid} [{ent.get('status')}] "
+                  f"canonical: {ent.get('canonical')!r} "
+                  f"({ent.get('canonical_source') or '?'})")
+            if anchor:
+                print(f"       anchor: {anchor.get('kind')} "
+                      f"'{anchor.get('name')}' "
+                      f"({anchor.get('source')})")
+            if ent.get("split_from"):
+                print(f"       split from: {ent['split_from']}")
+            forms = {}
+            for o in ent["observations"]:
+                forms.setdefault(o["form"], []).append(o.get("run"))
+            for form, runs in forms.items():
+                print(f"       observed '{form}' in run(s) "
+                      f"{sorted(runs)}")
+            tiers = {}
+            for lnk in ent["links"]:
+                tiers.setdefault(lnk.get("tier"), []).append(
+                    lnk.get("run"))
+            for tier, runs in tiers.items():
+                print(f"       links: {tier} in run(s) "
+                      f"{sorted(runs)}")
+            if anchor.get("kind") == "rejected" and any(
+                    lnk.get("tier") in ("anchor", "exact-form")
+                    and lnk.get("state") == "active"
+                    for lnk in ent["links"]):
+                print("       SUPPRESSED at row build (rejected "
+                      "anchor, tier 0/1 link)")
+        for rid, rec in sorted(d["retired"].items()):
+            print(f"    {rid} [merged -> {rec.get('merged_into')}] "
+                  f"run {rec.get('run')}: {rec.get('reason')}")
+        if d.get("suspects"):
+            print("    Split suspects (proposals only — never "
+                  "auto-linked):")
+            for s in d["suspects"]:
+                print(f"       run {s.get('run')}: '{s.get('a')}' "
+                      f"vs '{s.get('b')}' — {s.get('why')}")
+        if d.get("collisions"):
+            print("    Recorded collisions:")
+            for c in d["collisions"]:
+                print(f"       run {c.get('run')}: {c.get('kind')} "
+                      f"— {c.get('why')}")
+        if d.get("canonical_changes"):
+            print("    Canonical changes:")
+            for c in d["canonical_changes"]:
+                print(f"       run {c.get('run')}: {c.get('entity')} "
+                      f"'{c.get('from')}' -> '{c.get('to')}' "
+                      f"({c.get('reason')})")
+        if d.get("adoptions"):
+            print("    Adoptions:")
+            for a in d["adoptions"]:
+                print(f"       from {a.get('from_key')}: "
+                      f"{a.get('entities_moved')} entit(ies) moved")
+
+
+def _roster_cmd_store(work, learn_dir=None):
+    store, err = find_roster_store(_roster_cmd_learn_dir(learn_dir),
+                                   work)
+    if store is None:
+        print(f"{err} (stores are matched by work key, work_id, or "
+              f"exact title — see --roster-report).")
+    return store
+
+
+def cmd_roster_link(work, entity_id, form, learn_dir=None):
+    """--roster-link: a human asserts FORM belongs to ENTITY. The
+    form must already be observed in the entity (links assert
+    identity between recorded observations; they do not invent
+    forms). Clears the form's suspect/detached flags. When a
+    recorded NO stands between the form and the entity's other
+    forms, the explicit human assertion supersedes it for that
+    pair set — the retirement is printed and the link's evidence
+    records it. Automatic paths never supersede a NO."""
+    store = _roster_cmd_store(work, learn_dir)
+    if store is None:
+        return
+    eid = store.resolve_id(entity_id)
+    if eid is None:
+        print(f"Entity {entity_id} not found in this work's store "
+              f"(see --roster-report).")
+        return
+    if eid != entity_id:
+        print(f"Note: {entity_id} was merged into {eid}; the link "
+              f"is recorded against the survivor.")
+    ent = store.get_entity(eid)
+    form_key = norm_name(form)
+    observed = {o["form_key"] for o in ent["observations"]}
+    if form_key not in observed:
+        print(f"Refused: form '{form}' is not observed in entity "
+              f"{eid} (observed: "
+              f"{', '.join(sorted(observed)) or 'none'}). "
+              f"--roster-link asserts identity between recorded "
+              f"observations; it does not invent forms.")
+        return
+    others = store._entity_form_keys(eid) - {form_key}
+    retired = store.retire_no_pairs(form_key, others)
+    evidence = "human assertion (--roster-link)"
+    if retired:
+        evidence += (f"; supersedes {retired} recorded NO pair(s) "
+                     f"for this form")
+    store.record_link(eid, {"run": store.runs_completed,
+                            "tier": "human", "state": "active",
+                            "evidence": evidence,
+                            "form_key": form_key},
+                      entry_forms={form_key})
+    n = store.affirm_form(eid, form_key)
+    store.save()
+    print(f"Linked: form '{form}' affirmed in entity {eid} "
+          f"({n} observation(s) vote again).")
+    if retired:
+        print(f"Retired {retired} recorded NO pair(s) between this "
+              f"form and the entity's other forms — your explicit "
+              f"assertion supersedes them.")
+
+
+def cmd_roster_unlink(work, entity_id, form, learn_dir=None):
+    """--roster-unlink: a human removes FORM from ENTITY. The
+    form's observations are flagged detached and NOs are recorded
+    between the form and the entity's other forms, so the union
+    cannot silently re-form on the next run — the matcher, the
+    folds and the dedupe tombstone path all refuse it (A2)."""
+    store = _roster_cmd_store(work, learn_dir)
+    if store is None:
+        return
+    resolved = store.resolve_id(entity_id)
+    if resolved is None:
+        print(f"Entity {entity_id} not found in this work's store "
+              f"(see --roster-report).")
+        return
+    if resolved != entity_id:
+        print(f"Refused: {entity_id} was merged into {resolved}; "
+              f"unlink against the surviving entity instead.")
+        return
+    ent = store.get_entity(entity_id)
+    form_key = norm_name(form)
+    if form_key not in {o["form_key"] for o in ent["observations"]}:
+        print(f"Refused: form '{form}' is not observed in entity "
+              f"{entity_id}.")
+        return
+    added = store.detach_form(entity_id, form_key)
+    store.save()
+    print(f"Unlinked: form '{form}' detached from entity "
+          f"{entity_id}; {len(added)} NO pair(s) recorded — the "
+          f"form will not re-link to this entity automatically.")
+
+
+def cmd_roster_split(work, entity_id, forms, learn_dir=None):
+    """--roster-split: a human partitions ENTITY by form — each
+    listed form's observations move to a fresh successor entity
+    (split_from recorded). When nothing remains, the original
+    accounts as `split` in the report's accounting."""
+    store = _roster_cmd_store(work, learn_dir)
+    if store is None:
+        return
+    resolved = store.resolve_id(entity_id)
+    if resolved is None:
+        print(f"Entity {entity_id} not found in this work's store "
+              f"(see --roster-report).")
+        return
+    if resolved != entity_id:
+        print(f"Refused: {entity_id} was merged into {resolved}; "
+              f"split the surviving entity instead.")
+        return
+    out = store.record_split(entity_id, list(forms),
+                             run=store.runs_completed)
+    if not out:
+        print(f"Refused: none of the listed forms are observed in "
+              f"entity {entity_id}: {', '.join(forms)}.")
+        return
+    store.save()
+    for fk, succ in sorted(out.items()):
+        print(f"Split: form '{fk}' moved from {entity_id} to new "
+              f"entity {succ}.")
+    missing = [f for f in forms if norm_name(f) not in out]
+    if missing:
+        print(f"Not observed in {entity_id} (skipped): "
+              f"{', '.join(missing)}.")
 
 
 def _matcher_no_veto(no_pairs, entry_forms, view_forms):
@@ -5472,10 +5811,20 @@ def roster_assign_entities(roster, store, *, anchors=None,
             marker["folded"] += 1
     for s in match["suspects"]:
         ent = view_by_id.get(s["b"]) or {}
-        marker["suspects"].append({
+        _susp = {
             "a": roster[s["a"]].get("name") if s["a"] in roster
                  else s["a"],
-            "b": ent.get("canonical") or s["b"], "why": s["why"]})
+            "b": ent.get("canonical") or s["b"], "why": s["why"]}
+        marker["suspects"].append(_susp)
+        # Persisted (design section 10): split suspects are
+        # proposals for a human, and the report reads the store —
+        # a suspect that only existed in one run's preview JSON
+        # would never be seen again.
+        store.data["suspects"].append({"run": ordinal, **_susp})
+    store.data["suspects"] = store.data["suspects"][-100:]
+    for c in match["collisions"]:
+        store.data["collisions"].append({"run": ordinal, **c})
+    store.data["collisions"] = store.data["collisions"][-50:]
     _roster_canonicalize(roster, store, marker, ordinal, alias_targets)
     store.save()
     return marker
@@ -5561,9 +5910,14 @@ def _roster_canonicalize(roster, store, marker, ordinal,
         if new != old:
             store.set_canonical(eid, new, source)
             if old is not None:
-                marker["canonical_changes"].append({
+                _change = {
                     "entity": eid, "from": old, "to": new,
-                    "reason": _CANONICAL_REASONS.get(source, source)})
+                    "reason": _CANONICAL_REASONS.get(source, source)}
+                marker["canonical_changes"].append(_change)
+                store.data["canonical_changes"].append(
+                    {"run": ordinal, **_change})
+                store.data["canonical_changes"] = \
+                    store.data["canonical_changes"][-100:]
         names[eid] = new
     marker["canonical_names"] = names
 
@@ -13244,6 +13598,28 @@ def _build_parser():
                          "(staged/promoted/expired claims per work) "
                          "and exit (no books processed); combine with "
                          "--json for machine-readable output")
+    g_learn.add_argument("--roster-report", action="store_true",
+                    help="print the roster persistence report (option "
+                         "B: per-work entity accounting, suspect "
+                         "observations, links, suspensions, canonical "
+                         "changes) and exit (no books processed)")
+    g_learn.add_argument("--roster-link", nargs=3,
+                    metavar=("WORK", "ENTITY", "FORM"),
+                    help="assert FORM belongs to ENTITY in WORK's "
+                         "roster store (clears its suspect/detached "
+                         "flags) and exit")
+    g_learn.add_argument("--roster-unlink", nargs=3,
+                    metavar=("WORK", "ENTITY", "FORM"),
+                    help="detach FORM from ENTITY in WORK's roster "
+                         "store and record NOs against the entity's "
+                         "other forms, so the union cannot silently "
+                         "re-form, and exit")
+    g_learn.add_argument("--roster-split", nargs="+",
+                    metavar="ARG",
+                    help="split ENTITY in WORK's roster store by "
+                         "form: --roster-split WORK ENTITY FORM "
+                         "[FORM ...] moves each form's observations "
+                         "to a fresh successor entity, and exit")
     ap.add_argument("--json", action="store_true",
                     help="emit JSON where a command supports it "
                          "(currently --staging-report)")
@@ -13408,6 +13784,29 @@ def main():
         load_config()
         cmd_staging_report(as_json=args.json,
                            learn_dir=args.learn_dir or None)
+        return
+    if args.roster_report:
+        load_config()
+        cmd_roster_report(learn_dir=args.learn_dir or None)
+        return
+    if args.roster_link:
+        load_config()
+        cmd_roster_link(*args.roster_link,
+                        learn_dir=args.learn_dir or None)
+        return
+    if args.roster_unlink:
+        load_config()
+        cmd_roster_unlink(*args.roster_unlink,
+                          learn_dir=args.learn_dir or None)
+        return
+    if args.roster_split:
+        load_config()
+        if len(args.roster_split) < 3:
+            ap.error("--roster-split needs WORK ENTITY FORM "
+                     "[FORM ...]")
+        cmd_roster_split(args.roster_split[0], args.roster_split[1],
+                         args.roster_split[2:],
+                         learn_dir=args.learn_dir or None)
         return
 
     # Auto-update: check origin/master before doing any real work. On a

@@ -688,6 +688,7 @@ def compare_dashboard(old_d, new_d, labels_data=None, labels_source=None):
         f"triggers +{len(ng - og)}/-{len(og - ng)} "
         f"(lists in the Tropes/Triggers sections above)")
     lines += staging_section(old_d, new_d)
+    lines += entity_section(old_d, new_d)
     return lines
 
 
@@ -754,6 +755,63 @@ def staging_section(old_d, new_d):
                  f"{summary_gated_share(old_d)}")
     lines.append(f"    new run summary-gated share: "
                  f"{summary_gated_share(new_d)}")
+    return lines
+
+
+def entity_section(old_d, new_d):
+    """Option B entity comparison, read off the two previews'
+    roster markers + character/relationship identity annotations.
+    Additions only: returns [] when neither preview carries roster
+    data, so the dashboard's legacy output is byte-identical for
+    previews from flag-off runs. Names can churn while identity
+    holds (and vice versa); this section scores the identity."""
+    om = old_d.get("roster_persistence") or {}
+    nm = new_d.get("roster_persistence") or {}
+
+    def entities(d):
+        return {c.get("entity_id") for c in (d.get("characters") or [])
+                if c.get("entity_id")}
+
+    def principals(d):
+        return {c.get("entity_id") for c in (d.get("characters") or [])
+                if c.get("entity_id")
+                and (c.get("frequency") or 0) >= 0.20}
+
+    def triples(d):
+        out = set()
+        for r in (d.get("relationships") or []):
+            a, b = r.get("from_id"), r.get("to_id")
+            if a and b:
+                out.add((min(a, b), max(a, b), r.get("type") or ""))
+        return out
+
+    oe, ne = entities(old_d), entities(new_d)
+    if not om and not nm and not oe and not ne:
+        return []
+    lines = ["  Roster entities (option B):"]
+    lines.append(f"    entity-set Jaccard: {jaccard(oe, ne):.3f} "
+                 f"({len(oe)} old, {len(ne)} new, "
+                 f"{len(oe & ne)} shared)")
+    op, np_ = principals(old_d), principals(new_d)
+    lines.append(f"    principal entity Jaccard "
+                 f"(frequency >= 0.20): {jaccard(op, np_):.3f} "
+                 f"({len(op)} old, {len(np_)} new)")
+    ot, nt = triples(old_d), triples(new_d)
+    lines.append(f"    relationship endpoint-ID Jaccard: "
+                 f"{jaccard(ot, nt):.3f} ({len(ot)} old, "
+                 f"{len(nt)} new endpoint triples)")
+    oc = om.get("canonical_names") or {}
+    nc = nm.get("canonical_names") or {}
+    churn = sorted(e for e in (set(oc) & set(nc)) if oc[e] != nc[e])
+    lines.append(f"    canonical-name churn: {len(churn)} "
+                 f"entit(ies) renamed between runs")
+    for e in churn[:MAX_LIST]:
+        lines.append(f"      - {e}: {oc[e]!r} -> {nc[e]!r}")
+    if len(churn) > MAX_LIST:
+        lines.append(f"      ... and {len(churn) - MAX_LIST} more")
+    lines.append(f"    split suspects: old "
+                 f"{len(om.get('suspects') or [])}, new "
+                 f"{len(nm.get('suspects') or [])}")
     return lines
 
 
