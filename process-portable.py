@@ -534,9 +534,14 @@ def _resolve_book_isbn(identifiers, title, author):
     return None, "none"
 
 
-def _handle_missing_isbn(fpath):
+def _handle_missing_isbn(fpath, preview=False, dry_run=False):
     """Print skip/warning for a book with no ISBN. Returns True if processing
-    may continue (i.e. --allow-no-isbn), False if the book should be skipped."""
+    may continue (i.e. --allow-no-isbn), False if the book should be skipped.
+
+    The --rename-no-isbn rename is a filesystem write: it must never
+    fire in preview or dry-run mode (both promise files are not
+    moved). In those modes it prints what WOULD happen instead; the
+    skip decision itself is unchanged."""
     if CONFIG.get("allow_no_isbn"):
         print("")
         print("  \u26a0 WARNING: No ISBN found (metadata, --isbn, and Open Library lookup all failed).")
@@ -546,15 +551,20 @@ def _handle_missing_isbn(fpath):
     print(f"  \u23ed Skipping '{fpath.name}': no ISBN found. "
           f"Use --isbn to override or --allow-no-isbn to process anyway.")
     if CONFIG.get("rename_no_isbn"):
-        try:
-            new_name = fpath.parent / f"NO-ISBN-{fpath.name}"
-            if not new_name.exists():
-                fpath.rename(new_name)
-                print(f"  Renamed to '{new_name.name}'")
-            else:
-                print(f"  Rename skipped: '{new_name.name}' already exists")
-        except Exception as e:
-            print(f"  Rename failed: {e}")
+        new_name = fpath.parent / f"NO-ISBN-{fpath.name}"
+        if preview or dry_run:
+            mode = "preview" if preview else "dry-run"
+            print(f"  Rename skipped in {mode} mode: would rename to "
+                  f"'{new_name.name}'")
+        else:
+            try:
+                if not new_name.exists():
+                    fpath.rename(new_name)
+                    print(f"  Renamed to '{new_name.name}'")
+                else:
+                    print(f"  Rename skipped: '{new_name.name}' already exists")
+            except Exception as e:
+                print(f"  Rename failed: {e}")
     return False
 
 
@@ -1443,9 +1453,14 @@ def _preview_summary(result):
         detail = f"peak={peak_band}"
         if freq_band and freq_band != "none":
             detail += f", freq={freq_band}"
+        lines.append(f"  Spice: {spice_s} ({detail})")
+    elif lvl:
+        # The level says there IS spice but no peak data survived
+        # (an older/hand-built result): "(no spicy content)" would
+        # be a false claim — print the level without a parenthetical.
+        lines.append(f"  Spice: {spice_s}")
     else:
-        detail = "no spicy content"
-    lines.append(f"  Spice: {spice_s} ({detail})")
+        lines.append(f"  Spice: {spice_s} (no spicy content)")
 
     trigs = r.get("triggers") or []
     n_high = sum(1 for t in trigs
@@ -4220,7 +4235,7 @@ def _is_minor(role, description):
 
 
 def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
-              show_matrices=False):
+              show_matrices=False, n_chapters_total=None):
     """Deterministic reduce over per-chapter v2 results. Pure code, no LLM.
 
     chapter_as/bs: {chapter_index: result or None}. Returns a result dict
@@ -4232,6 +4247,13 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
 
     show_matrices: when True, print ASCII matrix visualizations (spice,
     relationship confidence) to the terminal during processing.
+
+    n_chapters_total: the book's true chapter count when `chapters`
+    is a --chunks subset. chapter_bs keys are ORIGINAL chapter
+    indices, so the per-chapter spice array must be bounded by the
+    total, not by len(chapters) — bounding by the subset size
+    silently zeroed every subset run's chapter_spice. Defaults to
+    len(chapters) (full runs).
     """
     n = len(chapters)
     idx_to_label = {c["index"]: c["label"] for c in chapters}
@@ -4742,8 +4764,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     if show_matrices:
         print(_spice_matrix_ascii(_sb_peak, _sb_freq, spice_level))
     # Per-chapter spice array (1-based; index 0 unused) for the Spice Forecast
-    # app feature and --recalibrate-spice.
-    chapter_spice = _chapter_spice_array(chapter_bs, n)
+    # app feature and --recalibrate-spice. Bounded by the book's true
+    # chapter count: chapter_bs keys are original indices, which a
+    # --chunks subset's len(chapters) would clip to zeroes.
+    chapter_spice = _chapter_spice_array(
+        chapter_bs, n_chapters_total if n_chapters_total else n)
 
     # --- Dialogue/narration ratio: regex-based, no LLM calls ---
     # Per-chapter fraction of characters inside quotes. Book-level average
@@ -6415,6 +6440,66 @@ def cmd_verify(preview_path):
             print(f"      ... and more")
 
 
+def _preview_shape_problems(result):
+    """Structural check of a preview dict against what the write path
+    direct-indexes. Returns a list of human-readable problems
+    ([] = pushable).
+
+    write_claims' builders index result["tropes"/"triggers"/
+    "relationships"/"characters"] and per-item c["name"]/c["role"],
+    r["from"]/r["to"]/r["type"], t["warning"] (dict triggers) without
+    guards, and sections replace sequentially — so a shape failure
+    discovered mid-push lands AFTER earlier sections' delete+insert:
+    a partial replace with a traceback. Validating up front turns
+    that into a clean refusal with zero writes. Only the fields the
+    builders actually require are demanded; everything else stays
+    optional (quotes included — the write path reads them via .get).
+    """
+    problems = []
+    for sec in ("tropes", "triggers", "relationships", "characters"):
+        v = result.get(sec)
+        if v is None:
+            problems.append(f"missing '{sec}' section")
+        elif not isinstance(v, list):
+            problems.append(f"'{sec}' section is not a list")
+
+    def _items(sec):
+        v = result.get(sec)
+        return v if isinstance(v, list) else []
+
+    for i, t in enumerate(_items("tropes")):
+        if not isinstance(t, str):
+            problems.append(f"tropes[{i}] is not a string")
+    for i, t in enumerate(_items("triggers")):
+        if isinstance(t, dict):
+            if "warning" not in t:
+                problems.append(f"triggers[{i}] missing 'warning'")
+        elif not isinstance(t, str):
+            problems.append(f"triggers[{i}] is not an object or string")
+    for i, r in enumerate(_items("relationships")):
+        if not isinstance(r, dict):
+            problems.append(f"relationships[{i}] is not an object")
+            continue
+        for k in ("from", "to", "type"):
+            if k not in r:
+                problems.append(f"relationships[{i}] missing '{k}'")
+            elif not isinstance(r[k], str):
+                problems.append(f"relationships[{i}] '{k}' is not a string")
+    for i, c in enumerate(_items("characters")):
+        if not isinstance(c, dict):
+            problems.append(f"characters[{i}] is not an object")
+            continue
+        for k in ("name", "role"):
+            if k not in c:
+                problems.append(f"characters[{i}] missing '{k}'")
+        if "name" in c and not isinstance(c["name"], str):
+            problems.append(f"characters[{i}] 'name' is not a string")
+    for i, q in enumerate(_items("quotes")):
+        if not isinstance(q, dict):
+            problems.append(f"quotes[{i}] is not an object")
+    return problems
+
+
 def cmd_push_preview(preview_path):
     """Push a preview JSON's data to Supabase without re-running the LLM.
     Resolves the work, then runs write_claims. Use for retrying failed writes.
@@ -6438,6 +6523,10 @@ def cmd_push_preview(preview_path):
         print(f"  Not found: {preview_path}")
         return
     result = json.load(open(preview_path, encoding="utf-8"))
+    if not isinstance(result, dict):
+        print(f"  Refusing to push {preview_path}: preview is not a JSON "
+              f"object — no writes made")
+        return
     title = result.get("title") or os.path.basename(preview_path)
     if result.get("aborted"):
         print(f"  Skipping {title}: preview is marked ABORTED (partial results)")
@@ -6445,6 +6534,21 @@ def cmd_push_preview(preview_path):
     if result.get("chapter_detection") == "fallback":
         print(f"  Skipping {title}: chapter detection used FALLBACK splitting "
               f"(unreliable chapters) — re-run from a clean EPUB")
+        return
+    # Shape gate: the write builders direct-index sections and item
+    # keys, and sections replace sequentially — a malformed preview
+    # must be refused HERE, before any work resolution or write, not
+    # discovered mid-push after earlier sections already replaced.
+    problems = _preview_shape_problems(result)
+    if problems:
+        print(f"  Refusing to push {title}: preview is missing data the "
+              f"write path requires (older or partial preview) — "
+              f"no writes made:")
+        for p in problems[:10]:
+            print(f"    - {p}")
+        if len(problems) > 10:
+            print(f"    - ... and {len(problems) - 10} more")
+        print("  Re-run the book to regenerate a complete preview.")
         return
     print(f"  Pushing: {title}")
     # Resolve work (create if needed).
@@ -6472,7 +6576,11 @@ def cmd_push_preview(preview_path):
         print(f"  Could not resolve work ({how})")
         return
     print(f"  Work ID: {wid} ({how})")
-    # Ensure the fields write_claims needs are present.
+    # The only backfills: both are semantically safe when absent —
+    # an empty catalog map just means per-trope DB lookups, an empty
+    # confidence map means the builders' documented defaults. Every
+    # other required field is validated, never fabricated (see
+    # _preview_shape_problems above).
     result.setdefault("trope_catalog_map", {})
     result.setdefault("trope_confidence", {})
     errors = write_claims(wid, result)
@@ -6525,6 +6633,13 @@ def cmd_retry_failed(preview_path):
     n_total = len(chapters)
     _checkpoint_save_meta(book_key, n_total)
     roster = cdata.get("roster") or {}
+    # The preview may predate core roster fields (see
+    # _ROSTER_CORE_DEFAULTS): complete the seed with the same census
+    # the checkpoint load applies, so the seeded roster.json is
+    # well-formed before resume ever reads it.
+    if isinstance(roster, dict):
+        for _entry in roster.values():
+            _roster_entry_complete(_entry)
     _checkpoint_save_roster(book_key, roster)
     for k, v in chapters.items():
         idx = int(k)
@@ -8238,7 +8353,19 @@ def dedupe_characters(characters, relationships, povs):
     thr = float(CONFIG.get("dedupe_threshold", 0.85))
     texts = [f"{names[i]}: {characters[i].get('description') or ''}"
              for i in range(len(characters))]
-    vecs = embed_vectors(CONFIG["embed_url"], CONFIG.get("embed_model", ""), texts)
+    try:
+        vecs = embed_vectors(CONFIG["embed_url"], CONFIG.get("embed_model", ""), texts)
+    except Exception as e:
+        # Embedding is an enhancement, not a gate (the trope-catalog
+        # path degrades the same way): an unconfigured or unreachable
+        # endpoint must not discard a completed extraction. Return the
+        # inputs UN-deduped — Signal 1 unions computed above are NOT
+        # applied, so the caller writes exactly what extraction
+        # produced. Only the embedding step degrades like this;
+        # genuine dedupe errors below still raise to the caller.
+        print(f"  WARNING: dedupe embeddings unavailable ({e}); "
+              f"writing UN-DEDUPED results — no characters merged")
+        return characters, relationships, povs, []
     for i in range(len(characters)):
         for j in range(i + 1, len(characters)):
             if s1_root[i] == s1_root[j]:
@@ -8531,23 +8658,56 @@ _ROSTER_SET_FIELDS = {"alias_keys", "alive_reports", "unresolved_mentions",
                       "_generic_keys"}
 _ROSTER_COUNTER_FIELDS = {"roles", "statuses"}
 
+# Core roster-entry fields: every entry _roster_update creates at birth
+# carries exactly these, with these canonical empty defaults. This is
+# the ONE census shared by every seam that ingests an external roster
+# (checkpoint load; the cmd_retry_failed seed — which then reaches the
+# same load on resume). Consumers (_merge_roster_entries, v2_reduce,
+# _roster_prompt) direct-index these fields, so an entry from an older
+# roster.json that predates one of them must be COMPLETED at the seam,
+# not discovered by a KeyError mid-run. Completion is schema, not data:
+# an empty set/Counter/list/str/0 asserts nothing about the book, and
+# present values are never altered.
+_ROSTER_CORE_DEFAULTS = (
+    ("name", str), ("aliases", set), ("alias_keys", set),
+    ("primary_keys", set), ("_generic_keys", set),
+    ("appearances", int), ("last_seen", int),
+    ("chapters", set), ("roles", Counter), ("descriptions", list),
+)
+
+
+def _roster_entry_complete(entry):
+    """Fill any ABSENT core roster fields with their canonical empty
+    defaults (see _ROSTER_CORE_DEFAULTS). Mutates and returns the
+    entry; present values are never altered."""
+    if isinstance(entry, dict):
+        for _f, _mk in _ROSTER_CORE_DEFAULTS:
+            if _f not in entry:
+                entry[_f] = _mk()
+    return entry
+
 
 def _ckpt_restore_roster_entry(entry):
-    """Coerce one checkpoint-rehydrated roster entry back to the
-    producer's canonical field types. Mutates and returns the entry.
+    """Normalize one externally-loaded roster entry back to the
+    producer's canonical shape. Mutates and returns the entry.
 
-    _ckpt_json_safe turns sets into sorted lists, Counters into dicts,
-    and description tuples into lists; _ckpt_json_restore only undoes
-    the four generic set fields. Left as JSON values, a resumed roster
-    crashed _merge_roster_entries (roles: dict += Counter -> TypeError)
-    and would crash v2_reduce instead on statuses.most_common(1) in a
+    Two halves. (1) Type coercion: _ckpt_json_safe turns sets into
+    sorted lists, Counters into dicts, and description tuples into
+    lists; _ckpt_json_restore only undoes the four generic set fields.
+    Left as JSON values, a resumed roster crashed
+    _merge_roster_entries (roles: dict += Counter -> TypeError) and
+    would crash v2_reduce instead on statuses.most_common(1) in a
     merge-free resumed run; statuses merged via Counter.update(dict)
     also silently replaced counts instead of summing. Only fields that
-    are present AND still of the JSON type are coerced — nothing is
-    invented. death_reports / appearances_desc are lists by design and
-    stay lists; descriptions stays a list, its 3-element entries
+    are present AND still of the JSON type are coerced.
+    death_reports / appearances_desc are lists by design and stay
+    lists; descriptions stays a list, its 3-element entries
     (chapter, text, has_evidence) become tuples again so the
     description selectors see the shape _roster_update appended.
+    (2) Schema completion (_roster_entry_complete): core fields ABSENT
+    entirely — a roster.json written before the field existed — get
+    their canonical empty defaults, so merge/reduce never KeyError on
+    a field the producer guarantees.
     """
     if not isinstance(entry, dict):
         return entry
@@ -8563,7 +8723,7 @@ def _ckpt_restore_roster_entry(entry):
         entry["descriptions"] = [
             tuple(d) if isinstance(d, list) and len(d) == 3 else d
             for d in descs]
-    return entry
+    return _roster_entry_complete(entry)
 
 
 def _checkpoint_save_meta(book_key, total_chapters):
@@ -8701,7 +8861,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     # ISBN resolution: --isbn flag > EPUB metadata > Open Library lookup.
     # Default is to skip books with no ISBN (see --allow-no-isbn).
     _isbn, _isbn_source = _resolve_book_isbn(identifiers, title, author)
-    if _isbn_source == "none" and not _handle_missing_isbn(fpath):
+    if _isbn_source == "none" and not _handle_missing_isbn(
+            fpath, preview=preview, dry_run=dry_run):
         return False
     # Reset the per-book decision-model call budget (merges + relationship
     # validation share it; merges run first).
@@ -8989,10 +9150,13 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         print(f"  Post-pass merge: {len(_pp_possible)} ambiguous pairs "
               f"left for review")
 
-    # Deterministic reduce (no LLM).
+    # Deterministic reduce (no LLM). n_chapters_total is the FULL
+    # chapter list's length: `indexed` may be a --chunks subset, but
+    # chapter_bs keys (and the spice array) live in original indices.
     red = v2_reduce(chapter_as, chapter_bs, roster,
                     [ch for _, ch in indexed], preview=preview,
-                    show_matrices=CONFIG.get("show_matrices", False))
+                    show_matrices=CONFIG.get("show_matrices", False),
+                    n_chapters_total=len(chapters))
 
     # Trope confirmation: frequency tiers, LLM gate only for the borderline.
     # Thresholds scale with book length (5% of chapters, min 3):
@@ -9085,6 +9249,19 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "self_pairs_dropped": red.get("self_pairs_dropped",
                                       {"extracted": 0, "remapped": 0}),
         "spice_level": red["spice_level"],
+        # Reduce-computed fields the consumers read from the RESULT
+        # (not from red): --recalibrate-spice needs chapter_spice +
+        # chapters_successful, _preview_summary needs the peak/freq
+        # bands, save_preview needs avg_dialogue_ratio. Forwarding
+        # none of them left recalibrate permanently at no_data and
+        # the summary claiming "(no spicy content)" for spicy books.
+        "spice_peak": red["spice_peak"],
+        "spice_peak_band": red["spice_peak_band"],
+        "spice_freq_band": red["spice_freq_band"],
+        "chapter_spice": red["chapter_spice"],
+        "chapters_successful": red["chapters_successful"],
+        "trigger_chapters": red["trigger_chapters"],
+        "avg_dialogue_ratio": red["avg_dialogue_ratio"],
         "povs": red["povs"], "quotes": red["quotes"],
         "chapter_summaries": red["chapter_summaries"],
         "is_anthology": False, "stories": [],
@@ -9301,7 +9478,8 @@ def process_file(fpath, dry_run=False, preview=False):
     # ISBN resolution: --isbn flag > EPUB metadata > Open Library lookup.
     # Default is to skip books with no ISBN (see --allow-no-isbn).
     _isbn, _isbn_source = _resolve_book_isbn(identifiers, title, author)
-    if _isbn_source == "none" and not _handle_missing_isbn(fpath):
+    if _isbn_source == "none" and not _handle_missing_isbn(
+            fpath, preview=preview, dry_run=dry_run):
         return False
     _series_name, _series_pos, _series_source = _detect_series(
         fpath, identifiers, title, author)
