@@ -160,15 +160,19 @@ class TestRunFingerprint(_StoreCase):
                            "form_key": "violet"},
                        entry_forms={"violet"})
         # The same extraction completing again (resume at the seam
-        # boundary): same fingerprint -> same ordinal, and the run's
-        # records are purged so re-recording cannot double-count.
+        # boundary): same fingerprint -> same ordinal, no advance,
+        # and the first completion's records STAND (the seam's
+        # repeat path refreshes observations via replace_observation
+        # instead of re-matching — no double count, no re-mint).
         ordinal2, repeat2 = st.claim_run("fp-aaa")
         self.assertEqual((ordinal2, repeat2), (1, True))
         self.assertEqual(st.runs_completed, 1)
-        self.assertEqual(st.get_entity(a)["observations"], [])
-        self.assertEqual(st.get_entity(a)["links"], [])
-        st.append_observation(a, _obs(1, "Violet"))
-        self.assertEqual(len(st.get_entity(a)["observations"]), 1)
+        self.assertEqual(st.run_assignments(1), {"violet": a})
+        st.replace_observation(a, _obs(1, "Violet", appearances=7))
+        obs = st.get_entity(a)["observations"]
+        self.assertEqual(len(obs), 1)
+        self.assertEqual(obs[0]["appearances"], 7)
+        self.assertEqual(len(st.get_entity(a)["links"]), 1)
 
     def test_new_fingerprint_mints_new_ordinal(self):
         st = self._store()

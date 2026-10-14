@@ -1491,6 +1491,18 @@ def _preview_summary(result):
         lines.append(f"  Staging: {len(_stg.get('staged') or [])} "
                      f"held back (staging gate)")
 
+    _rp = r.get("roster_persistence")
+    if _rp:
+        # OC-2: a preview that records observations declares it on
+        # its face — persistence state changed because of this run.
+        lines.append(
+            f"  Roster persistence: this run recorded "
+            f"{_rp.get('observations_recorded', 0)} roster "
+            f"observation(s) in the local roster store "
+            f"({_rp.get('linked', 0)} linked to prior entities, "
+            f"{_rp.get('minted', 0)} new entities, "
+            f"{_rp.get('folded', 0)} folded)")
+
     if minors:
         lines.append(f"  Minor characters: {len(minors)} (see preview JSON)")
 
@@ -4389,27 +4401,46 @@ class RosterStore:
         (ordinal, repeat): when the roster fingerprint equals the
         last completed run's, this is the SAME extraction completing
         again (resume-after-crash at the seam boundary) — the ordinal
-        is reused, runs_completed does not advance, and the run's
-        prior records are purged so re-recording refreshes in place
-        instead of double-counting one extraction (design section 7).
-        """
+        is reused and runs_completed does not advance. The seam's
+        repeat path refreshes the run's observations in place (see
+        replace_observation) instead of re-matching: the identity
+        assignment from the first completion stands, so one
+        extraction can never double-count or re-mint (design
+        section 7)."""
         with self._lock:
             if fingerprint is not None \
                     and fingerprint == self.data["last_run_fingerprint"] \
                     and self.data["runs_completed"] > 0:
-                ordinal = self.data["runs_completed"]
-                self._purge_run(ordinal)
-                return ordinal, True
+                return self.data["runs_completed"], True
             self.data["runs_completed"] += 1
             self.data["last_run_fingerprint"] = fingerprint
             return self.data["runs_completed"], False
 
-    def _purge_run(self, ordinal):
-        for ent in self.data["entities"].values():
+    def replace_observation(self, eid, obs):
+        """Refresh in place: replace the entity's existing
+        observation for (run, form_key) with this one, or append
+        when none exists. Used by the repeat-completion path."""
+        with self._lock:
+            ent = self.data["entities"][eid]
             ent["observations"] = [
-                o for o in ent["observations"] if o.get("run") != ordinal]
-            ent["links"] = [
-                l for l in ent["links"] if l.get("run") != ordinal]
+                o for o in ent["observations"]
+                if not (o.get("run") == obs.get("run")
+                        and o.get("form_key") == obs.get("form_key"))]
+            return self.append_observation(eid, obs)
+
+    def run_assignments(self, ordinal):
+        """{form_key: entity_id} from the observations recorded
+        under a run ordinal (non-detached). The repeat path's
+        identity map: which entity each form was assigned to when
+        this extraction first completed."""
+        out = {}
+        with self._lock:
+            for eid, ent in self.data["entities"].items():
+                for o in ent["observations"]:
+                    if o.get("run") == ordinal \
+                            and not o.get("detached"):
+                        out[o["form_key"]] = eid
+            return out
 
     # -- human NO (store-level invariant) --------------------------------
     def record_no(self, form_a, form_b, source=""):
@@ -4636,13 +4667,17 @@ class RosterStore:
             return out
 
     # -- anchors ------------------------------------------------------------
-    def seed_anchor(self, name, kind, source, run, aliases=()):
+    def seed_anchor(self, name, kind, source, run, aliases=(),
+                    lock_canonical=True):
         """Fetch-or-create the anchored entity for a human decision
         (a preserved DB row, or a manual --alias). The anchor's key
         set is closed and exact (A3): the anchor name's form_key
         plus the form keys of the aliases recorded for it — no token
         decomposition. Re-seeding refreshes seen_run. Returns the
-        entity ID."""
+        entity ID. lock_canonical=False for anchors whose name is a
+        normalized key rather than a display form (manual --alias):
+        the anchor still pins identity at tier 0, but the display
+        name is left to the canonical rule."""
         form_key = norm_name(name)
         keyset = {form_key} | {norm_name(a) for a in aliases if a}
         with self._lock:
@@ -4663,8 +4698,9 @@ class RosterStore:
                     ent["anchor"] = {
                         "kind": kind, "name": name, "source": source,
                         "aliases": sorted(aliases), "seen_run": run}
-                    ent["canonical"] = name
-                    ent["canonical_source"] = "anchor"
+                    if lock_canonical:
+                        ent["canonical"] = name
+                        ent["canonical_source"] = "anchor"
                     return eid
             eid = self.mint_entity()
             ent = self.data["entities"][eid]
@@ -4672,8 +4708,9 @@ class RosterStore:
                              "source": source,
                              "aliases": sorted(aliases),
                              "seen_run": run}
-            ent["canonical"] = name
-            ent["canonical_source"] = "anchor"
+            if lock_canonical:
+                ent["canonical"] = name
+                ent["canonical_source"] = "anchor"
             return eid
 
     def anchored_entities(self):
@@ -5199,6 +5236,351 @@ def roster_match_entries(entries, views, no_pairs=()):
     return {"links": links, "folds": folds,
             "suspensions": suspensions, "collisions": collisions,
             "suspects": suspects, "vetoed": vetoed}
+
+
+def roster_fingerprint(roster):
+    """Identity of one extraction, for run idempotency (design
+    section 7): a hash of the final roster's sorted form keys +
+    summed appearances + chapter count (A9 — form keys and chapter
+    count alone can coincide across two genuinely different
+    extractions). Two completions with the same fingerprint are the
+    same extraction completing again, never two sightings."""
+    import hashlib as _hl
+    form_keys = sorted(norm_name(e.get("name") or "") for e in
+                       roster.values())
+    appearances = sum(e.get("appearances") or 0
+                      for e in roster.values())
+    chapters = set()
+    for e in roster.values():
+        chapters |= set(e.get("chapters") or ())
+    payload = json.dumps([form_keys, appearances, len(chapters)])
+    return _hl.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _roster_entry_observation(entry, run):
+    """One run's observation of a roster entry (design section 3):
+    the form this run used, its chapter set and appearance count,
+    the aliases the run claimed, and a hash of the run's best
+    description (continuity checkable without storing prose)."""
+    roles = entry.get("roles") or Counter()
+    return {"run": run, "form": entry.get("name") or "",
+            "form_key": norm_name(entry.get("name") or ""),
+            "chapters": sorted(entry.get("chapters") or ()),
+            "appearances": entry.get("appearances") or 0,
+            "role_hint": roles.most_common(1)[0][0] if roles else None,
+            "aliases": sorted(entry.get("aliases") or ()),
+            "alias_keys": sorted(entry.get("alias_keys") or ()),
+            "desc_hash": roster_desc_hash(_roster_best_desc(entry))}
+
+
+_LINK_EVIDENCE = {
+    "anchor": "anchor key set claims the run form",
+    "exact-form": "run form matches a form this entity was "
+                  "observed under in a prior run",
+    "alias-cross": "mutual alias claim: the run form is in the "
+                   "entity's alias forms and the entity's canonical "
+                   "is in the run entry's claimed aliases",
+    "subsequence": "deterministic form signal (titles / spelling / "
+                   "nickname / unambiguous subsequence or prefix) "
+                   "against the entity's own observed forms",
+}
+
+
+def roster_assign_entities(roster, store, *, anchors=None,
+                           extra_no_pairs=()):
+    """The Option B seam (design section 7): assign each final
+    roster entry a stable entity ID, exactly once per run, after
+    post_pass_merge and before v2_reduce. Annotates entries in
+    place with "entity_id", folds disjoint dual-linked entries,
+    records observations + links in the store, saves it, and
+    returns the marker dict for the result (None when B disengages
+    under A8). Provisional entities (single observation) accept
+    links normally (OC-7).
+
+    anchors: freshly fetched anchor rows [{name, kind, source,
+    aliases}] — [] when the work has none. None means the anchor
+    FETCH FAILED (A8): a store already holding anchored entities
+    disengages B for the run (flag-off behaviour, loudly) rather
+    than matching against anchors it could not verify; a store
+    holding none proceeds with a warning.
+    """
+    if anchors is None:
+        if store.anchored_entities():
+            print("  !! Roster persistence DISENGAGED for this run: "
+                  "the anchor re-read failed and this work's store "
+                  "holds anchored entities — matching unanchored "
+                  "would void curation (A8). The run proceeds "
+                  "exactly as --persist-roster off.")
+            return None
+        print("  Roster persistence: anchor re-read failed; the "
+              "store holds no anchors yet, proceeding with a "
+              "warning (no curated substrate to protect)")
+        anchors = []
+    fingerprint = roster_fingerprint(roster)
+    ordinal, repeat = store.claim_run(fingerprint)
+    for a in anchors:
+        store.seed_anchor(a["name"], a["kind"], a.get("source", "db"),
+                          ordinal, a.get("aliases") or (),
+                          lock_canonical=a.get("lock_canonical", True))
+    marker = {"linked": 0, "folded": 0, "minted": 0, "suspects": [],
+              "suspended": [], "suppressed": [],
+              "canonical_changes": [], "canonical_names": {},
+              "suppressed_entities": [], "observations_recorded": 0,
+              "run_ordinal": ordinal, "repeat": repeat}
+    if repeat:
+        # The same extraction completing again: the first
+        # completion's identity assignment stands. Re-annotate from
+        # the recorded assignments and refresh observations in
+        # place — no re-matching, no new links, no re-minting.
+        assignments = store.run_assignments(ordinal)
+        by_entity = {}
+        for key in sorted(roster):
+            entry = roster[key]
+            eid = assignments.get(norm_name(entry.get("name") or ""))
+            if eid is None:
+                eid = store.mint_entity()
+                store.set_canonical(eid, entry.get("name") or "",
+                                     "rule")
+                marker["minted"] += 1
+            entry["entity_id"] = eid
+            store.replace_observation(
+                eid, _roster_entry_observation(entry, ordinal))
+            marker["observations_recorded"] += 1
+            by_entity.setdefault(eid, []).append(key)
+        for eid, keys in by_entity.items():
+            if len(keys) < 2:
+                continue
+            keep = max(keys, key=lambda k: roster[k].get(
+                "appearances") or 0)
+            for k in keys:
+                if k != keep:
+                    _merge_roster_entries(roster, keep, k)
+                    marker["folded"] += 1
+        marker["linked"] = sum(1 for e in roster.values()
+                               if e.get("entity_id"))
+        _roster_canonicalize(roster, store, marker, ordinal)
+        store.save()
+        return marker
+
+    views = store.entity_views()
+    entries = []
+    for key in sorted(roster):
+        e = roster[key]
+        entries.append({
+            "key": key, "name": e.get("name") or "",
+            "form_key": norm_name(e.get("name") or ""),
+            "alias_keys": set(e.get("alias_keys") or ()),
+            "chapters": set(e.get("chapters") or ()),
+            "appearances": e.get("appearances") or 0,
+            "desc_hash": roster_desc_hash(_roster_best_desc(e))})
+    no_pairs = [(p["a"], p["b"]) for p in store.data["no_pairs"]]
+    no_pairs += [(norm_name(a), norm_name(b))
+                 for a, b in extra_no_pairs]
+    match = roster_match_entries(entries, views, no_pairs)
+    view_by_id = {v["id"]: v for v in views}
+    suspended_by_entry = {s["entry"]: s for s in match["suspensions"]}
+
+    for key, link in match["links"].items():
+        entry = roster[key]
+        eid = link["entity"]
+        try:
+            store.record_link(eid, {
+                "run": ordinal, "tier": link["tier"],
+                "state": "active",
+                "evidence": _LINK_EVIDENCE.get(link["tier"], ""),
+                "form_key": norm_name(entry.get("name") or "")},
+                entry_forms={norm_name(entry.get("name") or "")}
+                | set(entry.get("alias_keys") or ()))
+        except RosterVetoError:
+            continue  # matcher pre-checked; a veto here is final
+        entry["entity_id"] = eid
+        marker["linked"] += 1
+    for key in sorted(roster):
+        if key in suspended_by_entry or "entity_id" in roster[key]:
+            continue
+        eid = store.mint_entity()
+        roster[key]["entity_id"] = eid
+        store.set_canonical(eid, roster[key].get("name") or "", "rule")
+        marker["minted"] += 1
+    # Observations: one per entry — under its entity, or (for a
+    # suspended weaker entry) under the contested entity, flagged
+    # suspect so it stops voting (A1).
+    for key in sorted(roster):
+        entry = roster[key]
+        obs = _roster_entry_observation(entry, ordinal)
+        if key in suspended_by_entry:
+            susp = suspended_by_entry[key]
+            obs["suspect"] = True
+            store.append_observation(susp["entity"], obs)
+            try:
+                store.record_link(susp["entity"], {
+                    "run": ordinal, "tier": "fold",
+                    "state": "suspended",
+                    "evidence": susp["evidence"],
+                    "form_key": obs["form_key"]},
+                    entry_forms={obs["form_key"]}
+                    | set(entry.get("alias_keys") or ()))
+            except RosterVetoError:
+                pass
+            marker["suspended"].append({
+                "entity": susp["entity"], "form": obs["form"],
+                "evidence": susp["evidence"]})
+        else:
+            store.append_observation(entry["entity_id"], obs)
+        marker["observations_recorded"] += 1
+    # Folds: merge the folded roster entries into their keeper.
+    for fold in match["folds"]:
+        keys = [k for k in fold["entries"] if k in roster]
+        if len(keys) < 2:
+            continue
+        keep = keys[0]
+        for drop in keys[1:]:
+            _merge_roster_entries(roster, keep, drop)
+            marker["folded"] += 1
+    for s in match["suspects"]:
+        ent = view_by_id.get(s["b"]) or {}
+        marker["suspects"].append({
+            "a": roster[s["a"]].get("name") if s["a"] in roster
+                 else s["a"],
+            "b": ent.get("canonical") or s["b"], "why": s["why"]})
+    _roster_canonicalize(roster, store, marker, ordinal)
+    store.save()
+    return marker
+
+
+def _roster_canonicalize(roster, store, marker, ordinal):
+    """Slice 3 placeholder, replaced by the section 5 rule in
+    slice 4: an entity with no canonical yet takes its run form;
+    the marker's canonical_names map is what the write builders
+    resolve IDs through."""
+    names = {}
+    for e in roster.values():
+        eid = e.get("entity_id")
+        if not eid:
+            continue
+        ent = store.get_entity(eid)
+        if ent is None:
+            continue
+        if not ent.get("canonical"):
+            store.set_canonical(eid, e.get("name") or "", "rule")
+            ent = store.get_entity(eid)
+        names[eid] = ent["canonical"]
+    marker["canonical_names"] = names
+
+
+def _roster_record_dedupe_folds(store, pre_characters, report,
+                                run_ordinal):
+    """Record dedupe_characters merges in the store (design
+    section 4): when two result characters carrying different
+    entity IDs merge, the folded ID tombstones into the survivor
+    with reason 'within-run merge' and its observations are
+    preserved under the survivor. The run's shipped rows are
+    unaffected — the veto governs the PERSISTED identity. Returns
+    the number of tombstones recorded."""
+    def _eid_of(name):
+        for c in pre_characters:
+            if c.get("entity_id") and (
+                    norm_name(c.get("name") or "") == norm_name(name)
+                    or (c.get("name") or "").lower()
+                    == (name or "").lower()):
+                return c["entity_id"]
+        return None
+
+    n = 0
+    for cluster in report or ():
+        survivor = _eid_of(cluster.get("canonical"))
+        if not survivor:
+            continue
+        for name in cluster.get("merged") or ():
+            folded = _eid_of(name)
+            if not folded or folded == survivor:
+                continue
+            try:
+                if store.record_merge(survivor, folded,
+                                      run=run_ordinal,
+                                      reason="within-run merge"):
+                    n += 1
+            except RosterVetoError as e:
+                print(f"  Roster store refused a dedupe tombstone: "
+                      f"{e} (the run's rows are unaffected; the "
+                      f"identities stay separate in the store)")
+    if n:
+        store.save()
+    return n
+
+
+def _roster_store_for(title, author, identifiers):
+    """Open the RosterStore for a book at the seam. The work_id is
+    resolved READ-ONLY here (the pipeline resolves for real after
+    result assembly): when it resolves, the store lives under the
+    work_id key from the start; when it doesn't (a brand-new work),
+    the fallback key applies and adoption on resolution moves the
+    store (design section 8). Returns (store, work_id-or-None);
+    (None, None) when the store can't be opened."""
+    wid = None
+    try:
+        wid, _how = resolve_work(title, author, identifiers, False,
+                                 create=False)
+    except Exception:
+        wid = None
+    key = staging_work_key(wid, (identifiers or {}).get("isbn"),
+                           title, author)
+    try:
+        store = RosterStore(learn_dir=_learn().dir, work_key=key)
+    except Exception:
+        return None, None
+    store.data["title"] = title or ""
+    store.data["author"] = author or ""
+    if wid:
+        store.data["work_id"] = str(wid)
+    return store, wid
+
+
+def _roster_fetch_anchors(work_id):
+    """Fetch a work's curation anchors (design section 8): every
+    preserved book_characters row (confirmed / rejected /
+    contributor, per _partition_claims) becomes an anchor, plus
+    manual --alias pairs from learned state. Returns a list of
+    {name, kind, source, aliases, lock_canonical}, or None on DB
+    error — the seam applies A8's failure discipline to None."""
+    rows = sb("book_characters",
+              params=f"?work_id=eq.{quote(str(work_id), safe='')}"
+                     f"&select=id,name,status,source_type,aliases"
+                     f"&limit=1000")
+    if rows is None:
+        return None
+    preserved, _rejected, _ndel = _partition_claims(
+        "book_characters", rows)
+    anchors = []
+    for r in rows:
+        if _claim_key("book_characters", r) not in preserved:
+            continue
+        status = r.get("status") or ""
+        if status == "rejected":
+            kind = "rejected"
+        elif status == "confirmed":
+            kind = "confirmed"
+        else:
+            kind = "contributor"
+        aliases = r.get("aliases") or []
+        if isinstance(aliases, str):
+            try:
+                aliases = json.loads(aliases)
+            except Exception:
+                aliases = []
+        anchors.append({
+            "name": r.get("name") or "", "kind": kind, "source": "db",
+            "aliases": [a for a in aliases if isinstance(a, str)],
+            "lock_canonical": True})
+    _ln = _learn()
+    if _ln.enabled:
+        for short, ent in (_ln.nicknames or {}).items():
+            if ent.get("manual"):
+                anchors.append({
+                    "name": ent.get("full") or "", "kind": "manual-alias",
+                    "source": "--alias", "aliases": [short],
+                    "lock_canonical": False})
+    return anchors
 
 
 # Module-level staging state, mirroring _learn(): _staging() always
@@ -6493,7 +6875,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         _det_role = _char_deterministic_role(n_ch, n_successful_b, _is_pov,
                                              _role_llm)
         _freq = round(n_ch / n_successful_b, 4) if n_successful_b else 0
-        characters.append({
+        _char = {
             "name": e["name"],
             "aliases": sorted(e["aliases"]),
             "unresolved_mentions": sorted(e.get("unresolved_mentions", set())),
@@ -6514,12 +6896,21 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             "frequency": _freq,
             "is_pov": _is_pov,
             "confidence": _v2_char_confidence(e["appearances"], bool(ev)),
-        })
+        }
+        # Option B: identity rides along only when the seam assigned
+        # it (flag on). Flag-off shapes gain no key — byte-identical.
+        if e.get("entity_id"):
+            _char["entity_id"] = e["entity_id"]
+        characters.append(_char)
 
     # --- Relationships: canonical-remap, self-guard, unordered-pair dedupe ---
     # Exclusive types resolve by precedence; non-exclusive kept as extras w/ evidence.
     _pair_cands = {}    # unordered (a, b) -> list of candidate dicts
     _pair_chapters = {}  # unordered (a, b) -> set of chapter indices
+    # Option B: roster display-name key -> entity_id, for endpoint
+    # threading (empty when the seam didn't run — flag off).
+    _name2entity = {norm_name(e["name"]): e["entity_id"]
+                    for e in roster.values() if e.get("entity_id")}
     _self_pairs_extracted = 0  # LLM emitted from == to verbatim
     _self_pairs_remapped = 0   # canonical remap collapsed a real pair
     # Author filter: the book's author is never a character, so relationships
@@ -6560,14 +6951,23 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             frm, to, rtype = _cp
             _pair_key = tuple(sorted([frm.lower(), to.lower()]))
             _pair_chapters.setdefault(_pair_key, set()).add(idx)
-            _pair_cands.setdefault(_pair_key, []).append({
+            _cand = {
                 "from": frm, "to": to, "type": rtype,
                 "evidence": r.get("evidence", ""),
                 "evidence_verified": bool(r.get("evidence")),
                 "evidence_offered": bool(r.get("evidence")),
                 "chapter": idx_to_label.get(idx, ""),
                 "_idx": idx,
-            })
+            }
+            # Option B: endpoint identity alongside the name strings,
+            # only for endpoints the seam assigned (flag on).
+            _fid = _name2entity.get(norm_name(frm))
+            if _fid:
+                _cand["from_id"] = _fid
+            _tid = _name2entity.get(norm_name(to))
+            if _tid:
+                _cand["to_id"] = _tid
+            _pair_cands.setdefault(_pair_key, []).append(_cand)
 
     if _self_pairs_extracted or _self_pairs_remapped:
         print(f"  Self-relationship guard: dropped "
@@ -9960,39 +10360,64 @@ def _build_trigger_rows(work_id, result, model, skip_warnings):
     return rows
 
 
+def _roster_canonical_names(result):
+    """Option B: {entity_id: canonical name} from the run's roster
+    marker ({} when the seam didn't run — flag off, rows resolve to
+    the run's own name strings exactly as before)."""
+    return (result.get("roster_persistence") or {}).get(
+        "canonical_names") or {}
+
+
 def _build_rel_map(result):
     """Map character name (lower) -> relationship list for DB promotion.
     Evidence-less relationships stay in the preview JSON only.
     Returns (rel_map, n_evidenceless)."""
+    _canon = _roster_canonical_names(result)
     rel_map, evidenceless = {}, 0
     for r in result["relationships"]:
         if not r.get("evidence"):
             evidenceless += 1
             continue
-        _entry = {"to": r["to"], "type": r["type"],
+        # Option B: IDs resolve to canonical names at row assembly;
+        # the name strings are the fallback (and the whole story
+        # when the seam didn't run).
+        _to = _canon.get(r.get("to_id")) or r["to"]
+        _from = _canon.get(r.get("from_id")) or r["from"]
+        _entry = {"to": _to, "type": r["type"],
                   "evidence": r.get("evidence", "")}
         if r.get("evidence_source"):
             _entry["evidence_source"] = r["evidence_source"]
-        rel_map.setdefault(r["from"].lower(), []).append(_entry)
+        rel_map.setdefault(_from.lower(), []).append(_entry)
     return rel_map, evidenceless
 
 
 def _build_character_rows(work_id, result, rel_map, skip_names):
     """Build book_characters rows (relationships embedded per character),
     skipping names that survive in the DB (contributor/rejected rows)."""
+    _canon = _roster_canonical_names(result)
+    _suppressed = set((result.get("roster_persistence") or {}).get(
+        "suppressed_entities") or ())
     rows, seen = [], set(skip_names)
     for c in result["characters"]:
-        if c["name"].lower() in seen:
+        # Option B (OC-3): a character whose entity is a rejected
+        # anchor, linked at tier 0/1, ships no candidate row under
+        # any observed form — the human rejected the person, not
+        # the spelling. The seam records those entity IDs in the
+        # marker's suppressed_entities (and lists every event).
+        if c.get("entity_id") and c["entity_id"] in _suppressed:
             continue
-        seen.add(c["name"].lower())
-        rows.append({"work_id": work_id, "name": c["name"], "role": c["role"],
+        _name = _canon.get(c.get("entity_id")) or c["name"]
+        if _name.lower() in seen:
+            continue
+        seen.add(_name.lower())
+        rows.append({"work_id": work_id, "name": _name, "role": c["role"],
                      "description": c.get("description", ""),
                      "appearance": c.get("appearance", ""),
                      "vitality": c.get("status", "unknown"),
                      "status": "candidate",
                      "aliases": c.get("aliases", []),
                      "first_appearance_chapter": c.get("first_appearance_chapter"),
-                     "relationships": rel_map.get(c["name"].lower(), []),
+                     "relationships": rel_map.get(_name.lower(), []),
                      "source_type": "ai",
                      "confidence": c.get("confidence", 0.7)})
     return rows
@@ -11419,6 +11844,37 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         print(f"  Post-pass merge: {len(_pp_possible)} ambiguous pairs "
               f"left for review")
 
+    # Option B seam (design section 7): ONE identity assignment
+    # point, after the post-pass merge and before the reduce, over
+    # the run's FINAL roster. Flag off (or dry-run, or an aborted
+    # run): skipped entirely — no store access, no marker,
+    # byte-identical behaviour. Flag on: entries are annotated with
+    # entity_id and every downstream consumer (reduce, builders,
+    # plan) inherits identity from that annotation.
+    _roster_marker = None
+    _roster_store = None
+    _roster_ordinal = None
+    if CONFIG.get("persist_roster") and not dry_run and not aborted:
+        _roster_store, _seam_wid = _roster_store_for(
+            title or fpath.stem, author, identifiers)
+        if _roster_store is not None and _roster_store.writable:
+            _anchors = _roster_fetch_anchors(_seam_wid) \
+                if _seam_wid else []
+            _roster_marker = roster_assign_entities(
+                roster, _roster_store, anchors=_anchors)
+            if _roster_marker is not None:
+                _roster_ordinal = _roster_marker["run_ordinal"]
+                print(f"  Roster persistence: "
+                      f"{_roster_marker['linked']} linked, "
+                      f"{_roster_marker['minted']} new entities, "
+                      f"{_roster_marker['folded']} folded, "
+                      f"{len(_roster_marker['suspects'])} split "
+                      f"suspects")
+            else:
+                _roster_store = None  # disengaged (A8): flag-off run
+        else:
+            _roster_store = None
+
     # Deterministic reduce (no LLM). n_chapters_total is the FULL
     # chapter list's length: `indexed` may be a --chunks subset, but
     # chapter_bs keys (and the spice array) live in original indices.
@@ -11606,6 +12062,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         result["roster_reconcile"] = _recon_stats
     if _staging_marker is not None:
         result["staging"] = _staging_marker
+    if _roster_marker is not None:
+        result["roster_persistence"] = _roster_marker
     if _trope_persistence:
         result["trope_persistence"] = _trope_persistence
     if _trigger_persistence:
@@ -11661,6 +12119,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
 
     if CONFIG.get("dedupe") and result["characters"]:
         n_before = len(result["characters"])
+        _pre_dedupe_chars = result["characters"]
         try:
             d_chars, d_rels, d_povs, dreport = dedupe_characters(
                 result["characters"], result["relationships"], result["povs"])
@@ -11672,6 +12131,16 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         result["dedup_merges"] = dreport
         print(f"  Dedup: {n_before} -> {len(d_chars)} characters "
               f"({len(dreport)} clusters merged)")
+        if _roster_store is not None and dreport:
+            # Option B (design section 4): a within-run merge of two
+            # entity-carrying characters tombstones the folded ID in
+            # the store; the run's shipped rows are unaffected.
+            _n_tomb = _roster_record_dedupe_folds(
+                _roster_store, _pre_dedupe_chars, dreport,
+                _roster_ordinal)
+            if _n_tomb:
+                print(f"  Roster persistence: {_n_tomb} dedupe "
+                      f"fold(s) tombstoned in the store")
 
     # Principal filter (default on): keep only significant characters.
     # Non-principals are preserved in result["minor_characters"] for
@@ -12625,6 +13094,13 @@ def _build_parser():
                          "recurs across independent runs, grows into "
                          "the auto band, or gains evidence (default "
                          "off; see eval/f-staging-design.md)")
+    g_merge.add_argument("--persist-roster", action="store_true",
+                    help="option B (v2): persist per-work roster "
+                         "identity across runs — stable minted entity "
+                         "IDs in a local store, names as observations, "
+                         "curation anchors; cross-run form flips stop "
+                         "flickering (default off; see "
+                         "eval/b-roster-design.md)")
 
     g_learn = ap.add_argument_group("Learning")
     g_learn.add_argument("--learn", dest="learn", action="store_true", default=True,
@@ -12915,6 +13391,8 @@ def main():
         CONFIG["roster_reconcile"] = True
     if args.staging_gate:
         CONFIG["staging_gate"] = True
+    if args.persist_roster:
+        CONFIG["persist_roster"] = True
     if args.preview_summary:
         CONFIG["preview_summary"] = True
     if args.resume:
