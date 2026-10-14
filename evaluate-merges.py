@@ -43,6 +43,7 @@ counted and excluded from every denominator.
 
 import argparse
 import json
+from pathlib import Path
 import math
 import os
 import sys
@@ -128,21 +129,59 @@ def build_same_person_state(name_a, desc_a, ev_a, name_b, desc_b, ev_b):
     return "\n".join(parts)
 
 
-def resolve_provider(provider, base_url, model):
+def _config_openrouter_key(config_path=None):
+    """Read the OpenRouter key from config.json, production-style.
+
+    Mirrors process-portable.py: config.json lives beside the script
+    (Path(__file__).parent); the working directory is also checked, as
+    the two coincide in the normal checkout layout. Returns "" when no
+    config file exists or it carries no key. The key is never logged.
+    """
+    candidates = []
+    if config_path is not None:
+        candidates.append(Path(config_path))
+    else:
+        candidates.append(Path(__file__).resolve().parent / "config.json")
+        candidates.append(Path.cwd() / "config.json")
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            with open(path, encoding="utf-8-sig") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            continue
+        key = (cfg.get("openrouter_api_key", "") or
+               cfg.get("openrouter_key", ""))
+        if key:
+            return key
+    return ""
+
+
+def resolve_provider(provider, base_url, model, config_path=None):
     """Resolve decision-model connection details.
 
     Returns (base_url, model, api_key, extra_headers). Raises ValueError
-    when the openrouter provider lacks an API key; the key is never logged.
-    The key comes from environment variables only (never the command line):
-    OPENROUTER_API_KEY, openrouter_api_key, or openrouter_key.
+    when the openrouter provider lacks an API key; the key is never
+    logged and never taken from the command line.
+
+    Key resolution mirrors process-portable.py's precedence, so the
+    harness accepts every credential source production does, in the
+    same order: config.json "openrouter_api_key", then config.json
+    "openrouter_key", then the OPENROUTER_API_KEY environment variable
+    — with the harness's historical extra env spellings
+    (openrouter_api_key, openrouter_key) as final fallbacks.
     """
     if provider == "openrouter":
-        key = (os.environ.get("OPENROUTER_API_KEY", "") or
+        key = (_config_openrouter_key(config_path) or
+               os.environ.get("OPENROUTER_API_KEY", "") or
                os.environ.get("openrouter_api_key", "") or
                os.environ.get("openrouter_key", ""))
         if not key:
             raise ValueError(
-                "provider 'openrouter' needs an API key: set OPENROUTER_API_KEY "
+                "provider 'openrouter' needs an API key: set "
+                "\"openrouter_api_key\" in config.json (beside this script "
+                "or in the working directory), or set OPENROUTER_API_KEY "
                 "(or openrouter_api_key / openrouter_key) in the environment")
         return (OPENROUTER_SYSTEMONE_BASE,
                 model or OPENROUTER_DECISION_MODEL,

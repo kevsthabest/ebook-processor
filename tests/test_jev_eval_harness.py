@@ -14,6 +14,7 @@ Run: python -m unittest discover -s tests -v
 """
 import importlib.util
 import io
+import os
 import json
 import tempfile
 import unittest
@@ -456,6 +457,90 @@ class TestShippedPairSet(unittest.TestCase):
         mira = self._find("Mira Sorrengail", "Violet Sorrengail")
         self.assertIsNotNone(mira)
         self.assertFalse(mira["expected"])
+
+
+class TestConfigKeyResolution(unittest.TestCase):
+    """The harness accepts the same credential sources as production:
+    config.json (openrouter_api_key, then openrouter_key) before the
+    environment, mirroring process-portable.py's precedence. A key in
+    config.json must work with NO environment key set — the live
+    failure this class exists to prevent."""
+
+    ENV_KEYS = ("OPENROUTER_API_KEY", "openrouter_api_key",
+                "openrouter_key")
+
+    def _clean_env(self):
+        old = {k: os.environ.get(k) for k in self.ENV_KEYS}
+        for k in self.ENV_KEYS:
+            os.environ.pop(k, None)
+        self.addCleanup(self._restore_env, old)
+
+    def _restore_env(self, old):
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _config(self, td, data):
+        path = Path(td) / "config.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return str(path)
+
+    def test_config_openrouter_api_key_resolves_without_env(self):
+        self._clean_env()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td, {"openrouter_api_key": "sk-cfg-1"})
+            _, _, key, _ = em.resolve_provider(
+                "openrouter", "", "", config_path=cfg)
+        self.assertEqual(key, "sk-cfg-1")
+
+    def test_config_openrouter_key_fallback(self):
+        self._clean_env()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td, {"openrouter_key": "sk-cfg-2"})
+            _, _, key, _ = em.resolve_provider(
+                "openrouter", "", "", config_path=cfg)
+        self.assertEqual(key, "sk-cfg-2")
+
+    def test_config_beats_env_production_order(self):
+        self._clean_env()
+        os.environ["OPENROUTER_API_KEY"] = "sk-env"
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td, {"openrouter_api_key": "sk-cfg-1"})
+            _, _, key, _ = em.resolve_provider(
+                "openrouter", "", "", config_path=cfg)
+        self.assertEqual(key, "sk-cfg-1")
+
+    def test_env_still_works_without_config(self):
+        self._clean_env()
+        os.environ["OPENROUTER_API_KEY"] = "sk-env"
+        with tempfile.TemporaryDirectory() as td:
+            missing = str(Path(td) / "config.json")
+            _, _, key, _ = em.resolve_provider(
+                "openrouter", "", "", config_path=missing)
+        self.assertEqual(key, "sk-env")
+
+    def test_missing_everywhere_raises_updated_error(self):
+        self._clean_env()
+        with tempfile.TemporaryDirectory() as td:
+            missing = str(Path(td) / "config.json")
+            with self.assertRaises(ValueError) as ctx:
+                em.resolve_provider("openrouter", "", "",
+                                    config_path=missing)
+        msg = str(ctx.exception)
+        self.assertIn("config.json", msg)
+        self.assertIn("OPENROUTER_API_KEY", msg)
+        self.assertNotIn("--api-key", msg)
+
+    def test_key_never_printed(self):
+        self._clean_env()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._config(td, {"openrouter_api_key": "sk-secret-9"})
+            out = io.StringIO()
+            with redirect_stdout(out):
+                em.resolve_provider("openrouter", "", "", config_path=cfg)
+        self.assertNotIn("sk-secret-9", out.getvalue())
 
 
 if __name__ == "__main__":
