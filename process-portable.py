@@ -7350,18 +7350,42 @@ def _dot(a, b):
     return sum(x * y for x, y in zip(a, b))
 
 
+# The text shape embedded for trope catalog entries ("name: description").
+# Part of the trope-vector cache namespace: bump this whenever the
+# embedded text format changes — vectors produced from a different text
+# shape (or a different model) live in a different space and must never
+# be mixed with current ones.
+EMBED_TEXT_FORMAT = "name-desc-v1"
+
+
 def trope_catalog_vectors():
     """Load trope catalog with embeddings. Fetches from Supabase `tropes`,
     embeds name+description via the dedupe embedding endpoint, caches to
-    CONFIG['trope_map_cache']. Returns [(id, name, vector)]."""
+    CONFIG['trope_map_cache']. Returns [(id, name, vector)].
+
+    The cache file is namespaced by (embed_model, EMBED_TEXT_FORMAT) —
+    {"model": ..., "format": ..., "vectors": {id: vector}}. A cache
+    written under any other model or text format, including the legacy
+    bare {id: vector} shape, is invalidated wholesale and re-embedded:
+    cosine comparisons across different vector spaces are meaningless.
+    """
     import os
     cache_path = CONFIG.get("trope_map_cache", "trope-vectors.json")
+    model = CONFIG.get("embed_model", "")
     cached = {}
     if os.path.exists(cache_path):
         try:
-            cached = json.load(open(cache_path, encoding="utf-8"))
+            raw_cache = json.load(open(cache_path, encoding="utf-8"))
         except Exception:
-            pass
+            raw_cache = None
+        if (isinstance(raw_cache, dict)
+                and raw_cache.get("model") == model
+                and raw_cache.get("format") == EMBED_TEXT_FORMAT
+                and isinstance(raw_cache.get("vectors"), dict)):
+            cached = raw_cache["vectors"]
+        else:
+            print("  trope vector cache invalidated (model/format "
+                  "changed); re-embedding catalog")
     rows = []
     if CONFIG.get("supabase_url"):
         rows = sb("tropes", params="?select=id,name,description&order=id")
@@ -7375,12 +7399,13 @@ def trope_catalog_vectors():
     missing = [r for r in rows if r["id"] not in cached]
     if missing:
         texts = [f"{r['name']}: {r.get('description') or ''}" for r in missing]
-        vecs = embed_vectors(CONFIG["embed_url"], CONFIG.get("embed_model", ""),
-                             texts)
+        vecs = embed_vectors(CONFIG["embed_url"], model, texts)
         for r, v in zip(missing, vecs):
             cached[r["id"]] = v
         try:
-            json.dump(cached, open(cache_path, "w", encoding="utf-8"))
+            json.dump({"model": model, "format": EMBED_TEXT_FORMAT,
+                       "vectors": cached},
+                      open(cache_path, "w", encoding="utf-8"))
         except Exception as e:
             print(f"  warning: could not write vector cache: {e}")
     # Return normalized vectors so callers can use _dot() for fast comparison.
@@ -9516,29 +9541,33 @@ def dedupe_characters(characters, relationships, povs):
     except Exception as e:
         # Embedding is an enhancement, not a gate (the trope-catalog
         # path degrades the same way): an unconfigured or unreachable
-        # endpoint must not discard a completed extraction. Return the
-        # inputs UN-deduped — Signal 1 unions computed above are NOT
-        # applied, so the caller writes exactly what extraction
-        # produced. Only the embedding step degrades like this;
+        # endpoint must not discard a completed extraction. But the
+        # Signal 1 unions computed above are exact normalized-name
+        # matches — the safest merge class in the system — and a
+        # transient embedding failure is no reason to throw them away.
+        # Degrade to DETERMINISTIC merges only: fall through to
+        # clustering with vecs = None, skipping the Signal 2 loop
+        # entirely. Only the embedding step degrades like this;
         # genuine dedupe errors below still raise to the caller.
         print(f"  WARNING: dedupe embeddings unavailable ({e}); "
-              f"writing UN-DEDUPED results — no characters merged")
-        return characters, relationships, povs, []
-    for i in range(len(characters)):
-        for j in range(i + 1, len(characters)):
-            if s1_root[i] == s1_root[j]:
-                continue  # already merged by signal 1
-            _allowed, _reason = _dedupe_guard(
-                names[i], names[j],
-                characters[i].get("description"),
-                characters[j].get("description"))
-            if not _allowed:
-                if CONFIG.get("explain_blocks"):
-                    print(f"  Merge blocked: '{names[i]}' vs "
-                          f"'{names[j]}' \u2014 {_reason}")
-                continue
-            if _cos(vecs[i], vecs[j]) >= thr:
-                union(i, j)
+              f"applying DETERMINISTIC merges only — no embedding-based merges")
+        vecs = None
+    if vecs is not None:
+        for i in range(len(characters)):
+            for j in range(i + 1, len(characters)):
+                if s1_root[i] == s1_root[j]:
+                    continue  # already merged by signal 1
+                _allowed, _reason = _dedupe_guard(
+                    names[i], names[j],
+                    characters[i].get("description"),
+                    characters[j].get("description"))
+                if not _allowed:
+                    if CONFIG.get("explain_blocks"):
+                        print(f"  Merge blocked: '{names[i]}' vs "
+                              f"'{names[j]}' \u2014 {_reason}")
+                    continue
+                if _cos(vecs[i], vecs[j]) >= thr:
+                    union(i, j)
 
     clusters = {}
     for i in range(len(characters)):
