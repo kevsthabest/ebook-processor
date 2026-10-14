@@ -1811,6 +1811,190 @@ def _alias_shadowed(roster, self_key, alias_key):
             return True
     return False
 
+
+# --- Pair-evidence mining --------------------------------------------------
+# Deterministic search for a sentence naming BOTH endpoints of a
+# relationship pair. Two uses in v2_reduce: (a) family validation — an
+# establishing sentence may replace the topical quote the validator
+# judges; (b) write evidence for claims extracted without any. Grades
+# are categorical and never blended:
+#   binding       a kinship marker syntactically bound to an endpoint,
+#                 with the pair's other endpoint equated with the
+#                 relative the construction defines;
+#   co-occurrence both endpoints + a kinship marker, not bound;
+#   plain         both endpoints, no kinship marker.
+_PAIR_MARKERS = (
+    "father", "fathers", "mother", "mothers", "dad", "dads", "mom",
+    "moms", "mum", "mums", "son", "sons", "daughter", "daughters",
+    "brother", "brothers", "sister", "sisters", "sibling", "siblings",
+    "husband", "husbands", "wife", "wives", "spouse", "spouses",
+    "parent", "parents", "child", "children",
+)
+_PAIR_MARKER_ALT = r"(?i:\b(?:" + "|".join(_PAIR_MARKERS) + r"))"
+_PAIR_MARKER_RE = re.compile(_PAIR_MARKER_ALT + r"\b", re.IGNORECASE)
+_PAIR_PRONOUN_ALT = r"(?i:my|his|her|their)"
+# "Sentences" longer than this are splitting failures (unsplittable
+# text blocks), not evidence quotes.
+_PAIR_MAX_SENTENCE = 1000
+
+
+def _pair_name_forms(name, roster):
+    """Name forms an endpoint may appear under in chapter text: the
+    roster entry's canonical name and aliases, plus the first name —
+    but only when that first name is unique across the roster (a
+    shared first name could denote the other character and is never
+    used). Without a roster entry, only the full name is trusted."""
+    forms = {name} if name else set()
+    if not roster or not name:
+        return forms
+    entry = None
+    for e in roster.values():
+        if norm_name(e.get("name", "")) == norm_name(name):
+            entry = e
+            break
+    if entry is None:
+        return forms
+    forms.add(entry["name"])
+    forms.update(a for a in entry.get("aliases", []) if a)
+    parts = entry["name"].split()
+    first = parts[0] if parts else ""
+    if first and first != entry["name"]:
+        shared = False
+        for e in roster.values():
+            if e is entry:
+                continue
+            ename = e.get("name", "")
+            eparts = ename.split()
+            if eparts and eparts[0] == first:
+                shared = True
+                break
+            for a in e.get("aliases", []):
+                aparts = a.split()
+                if a == first or (aparts and aparts[0] == first):
+                    shared = True
+                    break
+            if shared:
+                break
+        if not shared:
+            forms.add(first)
+    return forms
+
+
+def _forms_re(forms):
+    """Case-sensitive word-boundary regex matching any of the forms
+    (longest first, so a full name wins over its own first name).
+    Names are matched case-sensitively: a lowercase common word that
+    happens to spell a first name is not a mention."""
+    ordered = sorted((f for f in forms if f), key=len, reverse=True)
+    if not ordered:
+        return None
+    return re.compile(r"(?<!\w)(?:"
+                      + "|".join(re.escape(f) for f in ordered)
+                      + r")(?!\w)")
+
+
+def _split_sentences(text):
+    """Deterministic sentence split (after terminal punctuation).
+    Every returned sentence is a verbatim substring of `text`: pieces
+    are contiguous slices and only surrounding whitespace is trimmed.
+    Sentences are never joined or rewritten."""
+    out = []
+    for piece in re.split(r"(?<=[.!?])\s+", text):
+        s = piece.strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _pair_binding(sentence, re_anchor, re_other):
+    """True when a kinship-marker construction anchored at one endpoint
+    equates the pair's OTHER endpoint with the relative it defines:
+      possessive ("Xaden's father") or of-construction ("son of Fen
+      Riorson"), equated by apposition ("Xaden's father, Fen Riorson,
+      ...", "Fen Riorson, Xaden's father, ...") or copula ("Fen was
+      Xaden's father", "Xaden's father is Fen"); or a pronoun
+      possessive equating an adjacent endpoint ("her brother Brennan",
+      "Brennan, her brother") — the pronoun's referent is taken to be
+      the pair's other endpoint, which the caller has established is
+      also present in the sentence.
+    A marker bound to a third party, or defining a relative who is
+    not the other endpoint, does NOT count: mere presence of both
+    names near a marker is co-occurrence, not binding."""
+    poss = re_anchor.pattern + r"['’]s\s+" + _PAIR_MARKER_ALT + r"\b"
+    ofph = (_PAIR_MARKER_ALT + r"\s+of\s+(?:the\s+)?"
+            + re_anchor.pattern)
+    for phrase in (poss, ofph):
+        for m in re.finditer(phrase, sentence):
+            before, after = sentence[:m.start()], sentence[m.end():]
+            if re.match(r"[\s,]+" + re_other.pattern, after):
+                return True  # apposition after the phrase
+            if re.search(re_other.pattern + r"[\s,]+$", before):
+                return True  # apposition before the phrase
+            if re.match(r"\s+(?i:is|was|became)\s+(?:the\s+)?"
+                        + re_other.pattern, after):
+                return True  # "Xaden's father is Fen"
+            if re.search(re_other.pattern
+                         + r"\s+(?i:is|was|became)\s+(?:the\s+)?$",
+                         before):
+                return True  # "Fen was Xaden's father"
+    pron = _PAIR_PRONOUN_ALT + r"\s+" + _PAIR_MARKER_ALT + r"\b"
+    either = r"(?:" + re_anchor.pattern + r"|" + re_other.pattern + r")"
+    for m in re.finditer(pron, sentence):
+        before, after = sentence[:m.start()], sentence[m.end():]
+        if re.match(r"\s*,?\s*" + either, after):
+            return True  # "her brother Brennan" / "my sister, Violet"
+        if re.search(either + r"[\s,]+$", before):
+            return True  # "Brennan, her brother"
+    return False
+
+
+def _pair_sentence_grade(sentence, re_a, re_b):
+    """Grade one candidate sentence (both endpoints already known to
+    appear): binding > co-occurrence > plain."""
+    if not _PAIR_MARKER_RE.search(sentence):
+        return "plain"
+    if (_pair_binding(sentence, re_a, re_b)
+            or _pair_binding(sentence, re_b, re_a)):
+        return "binding"
+    return "co-occurrence"
+
+
+def _mine_pair_evidence(from_name, to_name, chapters, roster=None):
+    """Mine chapter texts for the best sentence naming BOTH endpoints
+    of a pair. chapters: dicts with "index" and "text" (the caller
+    excludes ToC/front matter). Returns {"sentence", "grade",
+    "chapter"} or None. The sentence is always a verbatim substring
+    of its chapter text.
+
+    Deterministic ranking: grade first (binding > co-occurrence >
+    plain), then earliest chapter, then shortest sentence, then
+    earliest position in the chapter."""
+    re_a = _forms_re(_pair_name_forms(from_name, roster))
+    re_b = _forms_re(_pair_name_forms(to_name, roster))
+    if re_a is None or re_b is None:
+        return None
+    _rank = {"binding": 0, "co-occurrence": 1, "plain": 2}
+    best = None  # (key, hit)
+    for c in chapters or []:
+        text = c.get("text", "") or ""
+        if not text:
+            continue
+        # Cheap pre-filter: both endpoints must appear in the chapter.
+        if not (re_a.search(text) and re_b.search(text)):
+            continue
+        idx = c.get("index", 0)
+        for pos, sentence in enumerate(_split_sentences(text)):
+            if len(sentence) > _PAIR_MAX_SENTENCE:
+                continue
+            if not (re_a.search(sentence) and re_b.search(sentence)):
+                continue
+            grade = _pair_sentence_grade(sentence, re_a, re_b)
+            key = (_rank[grade], idx, len(sentence), pos)
+            if best is None or key < best[0]:
+                best = (key, {"sentence": sentence, "grade": grade,
+                              "chapter": idx})
+    return best[1] if best else None
+
 # Regex evidence gates for high-severity trigger claims. The evidence quote
 # must contain supporting language, not just mention the topic. Catches
 # false positives like "digital suicide" or a consensual dance tagged as
@@ -4133,11 +4317,41 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     # In preview mode scores/notes are recorded but nothing is changed.
     # Draws from the shared per-book decision-model budget (merges first).
     _dropped_relationships = []
+    # Pair-evidence mining: a family claim's single extracted quote is
+    # often topical rather than establishing, and the validator can
+    # only judge what it is shown (FW -13: Fen->Xaden parent dropped
+    # at P=0.04 on a non-establishing quote, while Mira->Violet
+    # sibling was kept at P=0.96 on an establishing one). Before
+    # judging, mine the chapter texts for a sentence naming both
+    # endpoints; only a binding-grade sentence may replace the quote
+    # the validator sees. Co-occurrence/plain hits never upgrade
+    # validation evidence. The claim's original quote is never
+    # altered; what the validator judged is recorded on the claim as
+    # evidence_mined / evidence_grade. ToC and front/back matter are
+    # excluded, as for all other evidence. Results are cached: the
+    # write-evidence pass below reuses them.
+    _mine_chapters = [c for c in chapters
+                      if c["index"] not in _skip_evidence_idx]
+    _mine_cache = {}
+
+    def _mine(frm, to):
+        _k = (frm.lower(), to.lower())
+        if _k not in _mine_cache:
+            _mine_cache[_k] = _mine_pair_evidence(
+                frm, to, _mine_chapters, roster)
+        return _mine_cache[_k]
+
     for rel in relationships:
         _rt = rel.get("type", "")
         if _rt not in _REL_FAMILY_TYPES:
             continue
         _ev = (rel.get("evidence") or "").strip()
+        _mined = _mine(rel["from"], rel["to"])
+        if _mined:
+            rel["evidence_grade"] = _mined["grade"]
+            if _mined["grade"] == "binding":
+                rel["evidence_mined"] = _mined["sentence"]
+                _ev = _mined["sentence"]
         if not _ev:
             # No evidence: downgrade without spending a decision-model call.
             rel["validation_p"] = None
@@ -4178,6 +4392,35 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # Audit trail only: these claims lost to a family claim for the
         # same pair (family guard above); they were never emitted.
         _dropped_relationships.extend(_guard_suppressed)
+
+    # --- Mined write evidence for evidence-less survivors ---
+    # A surviving claim with no extracted quote would be skipped at
+    # write (kept in the preview only). When the miner found a
+    # sentence naming both endpoints, it can serve as the write
+    # evidence instead: family claims require a binding-grade
+    # sentence (the same bar as validation); non-family claims accept
+    # any both-names sentence (it evidences the interaction itself).
+    # Claims that went through family validation keep the family bar
+    # even after a downgrade changed their type to "other" (their
+    # validation_note is the trace). Mined evidence is marked
+    # evidence_source="mined" so provenance survives into the preview
+    # and the write payload; claims with original evidence are
+    # untouched.
+    for rel in relationships:
+        if (rel.get("evidence") or "").strip():
+            continue
+        _mined = _mine(rel["from"], rel["to"])
+        if not _mined:
+            continue
+        _family_bar = (rel.get("type") in _REL_FAMILY_TYPES
+                       or "validation_note" in rel)
+        if _family_bar and _mined["grade"] != "binding":
+            continue
+        rel["evidence"] = _mined["sentence"]
+        rel["evidence_source"] = "mined"
+        rel["evidence_grade"] = _mined["grade"]
+        if _mined["grade"] == "binding":
+            rel.setdefault("evidence_mined", _mined["sentence"])
 
     if show_matrices:
         print(_rel_confidence_ascii(relationships))
@@ -7183,8 +7426,11 @@ def _build_rel_map(result):
         if not r.get("evidence"):
             evidenceless += 1
             continue
-        rel_map.setdefault(r["from"].lower(), []).append(
-            {"to": r["to"], "type": r["type"], "evidence": r.get("evidence", "")})
+        _entry = {"to": r["to"], "type": r["type"],
+                  "evidence": r.get("evidence", "")}
+        if r.get("evidence_source"):
+            _entry["evidence_source"] = r["evidence_source"]
+        rel_map.setdefault(r["from"].lower(), []).append(_entry)
     return rel_map, evidenceless
 
 

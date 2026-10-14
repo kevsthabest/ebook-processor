@@ -1,0 +1,186 @@
+{
+  "purpose": "Labelled family-claim set for the pair-evidence mining experiment: reprocess Fourth Wing with the mining build and compare per-pair outcomes against the -13 baseline recorded here. Survival = the pair is present in the new run's relationships (i.e. NOT in dropped_relationships).",
+  "book": "Fourth Wing (The Empyrean #1) - Rebecca Yarros",
+  "work_id": "a42e27eb-f5c4-4082-be90-31ef9c6183e7",
+  "source_artefact": "Fourth_Wing_-_The_Empyrean__1_--_Rebecca_Yarros_--_Shrewsbury__PA__2023_--_Entangled_Publishing__LLC_--_isbn13_9781649374080_--_9020776428adf8e33943739a4dcc8b95_--_Anna_s_Archive-13.json",
+  "pair_form": "from/to/type as stored in the -13 artefact (post-canonicalization; type describes `from`).",
+  "baseline_run": {
+    "processor": "Portable v2.9.0 (pre-mining)",
+    "relationships_in_preview": 23,
+    "evidence_less_relationships": 18,
+    "relationship_entries_written_to_db": 5
+  },
+  "acceptance_signals": [
+    "true_pairs survival (not dropped) UP vs baseline: baseline 2/5 survive (Brennan downgraded to 'other', Mira kept); target >= 4/5 survive, with parent types intact where the mined evidence is binding.",
+    "false_pairs survival ~ UNCHANGED vs baseline: baseline 0/13 survive (all dropped); mining must not resurrect them (target <= 1/13, and any survivor must be a downgrade to 'other', never the claimed family type).",
+    "evidence-less write skips DOWN: baseline 18 evidence-less relationships in preview; target <= 8 after mined write evidence (count via the run's 'Skipped N evidence-less relationships' line / _build_rel_map on the new artefact)."
+  ],
+  "true_pairs": [
+    {
+      "from": "General Sorrengail",
+      "to": "Violet Sorrengail",
+      "type": "parent",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.16
+      }
+    },
+    {
+      "from": "Dad Sorrengail",
+      "to": "Violet Sorrengail",
+      "type": "parent",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.14
+      }
+    },
+    {
+      "from": "Fen Riorson",
+      "to": "Xaden Riorson",
+      "type": "parent",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.04
+      }
+    },
+    {
+      "from": "Brennan Sorrengail",
+      "to": "Violet Sorrengail",
+      "type": "sibling",
+      "baseline": {
+        "outcome": "downgraded",
+        "validation_p": 0.32,
+        "surviving_type": "other"
+      }
+    },
+    {
+      "from": "Mira Sorrengail",
+      "to": "Violet Sorrengail",
+      "type": "sibling",
+      "baseline": {
+        "outcome": "kept",
+        "validation_p": 0.96,
+        "surviving_type": "sibling"
+      }
+    }
+  ],
+  "false_pairs": [
+    {
+      "from": "Rhiannon Matthias",
+      "to": "Violet Sorrengail",
+      "type": "parent",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.03
+      }
+    },
+    {
+      "from": "General Melgren",
+      "to": "Violet Sorrengail",
+      "type": "parent",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.02
+      }
+    },
+    {
+      "from": "King Tauri",
+      "to": "Violet Sorrengail",
+      "type": "parent",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.06
+      }
+    },
+    {
+      "from": "Tairneanach",
+      "to": "Violet Sorrengail",
+      "type": "sibling",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.05
+      }
+    },
+    {
+      "from": "Andarna",
+      "to": "Violet Sorrengail",
+      "type": "spouse",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.05
+      }
+    },
+    {
+      "from": "Sgaeyl",
+      "to": "Violet Sorrengail",
+      "type": "spouse",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.03
+      }
+    },
+    {
+      "from": "Brown Clubtail",
+      "to": "Imogen",
+      "type": "sibling",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.02
+      }
+    },
+    {
+      "from": "Brown Clubtail",
+      "to": "Heaton",
+      "type": "sibling",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.03
+      }
+    },
+    {
+      "from": "Brown Clubtail",
+      "to": "Emery",
+      "type": "sibling",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.03
+      }
+    },
+    {
+      "from": "Jack Barlowe",
+      "to": "Orange Scorpiontail",
+      "type": "sibling",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.03
+      }
+    },
+    {
+      "from": "Liam Mairi",
+      "to": "Mira Sorrengail",
+      "type": "child",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.05
+      }
+    },
+    {
+      "from": "Liam Mairi",
+      "to": "Tairneanach",
+      "type": "sibling",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.03
+      }
+    },
+    {
+      "from": "Andarna",
+      "to": "Rhiannon Matthias",
+      "type": "sibling",
+      "baseline": {
+        "outcome": "dropped",
+        "validation_p": 0.03
+      }
+    }
+  ]
+}
