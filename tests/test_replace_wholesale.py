@@ -44,21 +44,42 @@ class _StatefulSB:
             key, val = part.split("=", 1)
             if key in ("select", "limit", "on_conflict", "order"):
                 continue
+            if key == "or":
+                # or=(col.op.val,col.op.val,...) — any condition may match.
+                inner = val.strip()
+                if inner.startswith("(") and inner.endswith(")"):
+                    inner = inner[1:-1]
+                conds = [c for c in inner.split(",") if c]
+                if not any(self._match_cond(row, c) for c in conds):
+                    return False
+                continue
             op, _, v = val.partition(".")
-            v = unquote(v)
-            cell = row.get(key)
-            if op == "eq":
-                if str(cell) != v:
-                    return False
-            elif op == "neq":
-                if str(cell) == v:
-                    return False
-            elif op == "ilike":
-                if str(cell or "").lower() != v.lower():
-                    return False
-            else:
-                return False  # unknown operator matches nothing
+            if not self._match_val(row.get(key), op, unquote(v)):
+                return False
         return True
+
+    def _match_cond(self, row, cond):
+        col, _, rest = cond.partition(".")
+        op, _, v = rest.partition(".")
+        return self._match_val(row.get(col), op, unquote(v))
+
+    @staticmethod
+    def _match_val(cell, op, v):
+        # PostgREST/SQL semantics: a comparison against NULL never
+        # matches (not even neq) — only is.null tests for NULL.
+        if op == "is":
+            if v == "null":
+                return cell is None
+            return cell is not None and str(cell).lower() == v
+        if cell is None:
+            return False
+        if op == "eq":
+            return str(cell) == v
+        if op == "neq":
+            return str(cell) != v
+        if op == "ilike":
+            return str(cell).lower() == v.lower()
+        return False  # unknown operator matches nothing
 
     def __call__(self, table, params=None, method="GET", data=None, prefer=None):
         self.calls.append((table, method, params or "", data))
@@ -439,6 +460,165 @@ class TestFreshWorkInsertOnly(_ReplaceBase):
         self.assertEqual(len(fake.tables["book_trigger_claims"]), 1)
         self.assertEqual(len(fake.tables["book_characters"]), 1)
         self.assertEqual(len(fake.tables["book_quotes"]), 1)
+
+
+class TestProposalScopingStructural(_ReplaceBase):
+    """F1: the trope_proposals replace must be scoped to the processor's
+    OWN rows structurally (proposed_by), not incidentally via key
+    formats. App suggestions carry a real user uuid in proposed_by;
+    processor rows carry NULL (or the configured proposer_user_id)."""
+
+    _APP_UID = "aaaaaaaa-1111-2222-3333-444444444444"
+
+    def test_app_proposals_survive_reprocess(self):
+        fake = self.install(_StatefulSB({
+            "trope_proposals": [
+                # App-shaped: prefixed key, foreign proposer.
+                {"id": 1, "name": "App Suggested", "name_key": "app suggested",
+                 "book_key": "isbn:9780000000001",
+                 "proposed_by": self._APP_UID, "status": "pending"},
+                # Same bare book_key as the processor + foreign proposer:
+                # the future key-alignment hazard — must survive too.
+                {"id": 2, "name": "Aligned Key", "name_key": "aligned key",
+                 "book_key": "9780000000001",
+                 "proposed_by": self._APP_UID, "status": "pending"},
+                # The processor's own pending proposal — replaced.
+                {"id": 3, "name": "Stale Own Trope",
+                 "name_key": pp._tnorm("Stale Own Trope"),
+                 "book_key": "9780000000001",
+                 "proposed_by": None, "status": "pending"},
+            ],
+        }))
+        res = _result(
+            tropes=["Stale Own Trope", "Fresh Own Trope"],
+            trope_confidence={pp._tnorm("Stale Own Trope"): 0.95,
+                              pp._tnorm("Fresh Own Trope"): 0.95},
+        )
+        errors = pp.write_claims(1, res)  # no mappings -> proposals path
+        self.assertEqual(errors, 0)
+
+        props = fake.tables["trope_proposals"]
+        # Both app rows survive untouched, ids and all.
+        self.assertEqual(
+            sorted(r["id"] for r in props
+                   if r.get("proposed_by") == self._APP_UID),
+            [1, 2])
+        # Own stale proposal was replaced: exactly one row, a new id.
+        own = [r for r in props
+               if r["name_key"] == pp._tnorm("Stale Own Trope")]
+        self.assertEqual(len(own), 1)
+        self.assertNotEqual(own[0]["id"], 3)
+        # The fresh trope was proposed alongside.
+        self.assertEqual(
+            len([r for r in props
+                 if r["name_key"] == pp._tnorm("Fresh Own Trope")]), 1)
+        # The DELETE itself carries the structural proposer scope.
+        dels = fake.deletes_for("trope_proposals")
+        self.assertEqual(len(dels), 1)
+        self.assertIn("proposed_by=is.null", dels[0][2])
+
+    def test_configured_proposer_scopes_to_own_rows(self):
+        old_uid = pp.CONFIG.get("proposer_user_id")
+        pp.CONFIG["proposer_user_id"] = "proc-user-uuid"
+        try:
+            fake = self.install(_StatefulSB({
+                "trope_proposals": [
+                    # Own row under the configured proposer — replaced.
+                    {"id": 1, "name": "Stale Own Trope",
+                     "name_key": pp._tnorm("Stale Own Trope"),
+                     "book_key": "9780000000001",
+                     "proposed_by": "proc-user-uuid", "status": "pending"},
+                    # Legacy own row (NULL proposer) — also replaced.
+                    {"id": 2, "name": "Legacy Own Trope",
+                     "name_key": pp._tnorm("Legacy Own Trope"),
+                     "book_key": "9780000000001",
+                     "proposed_by": None, "status": "pending"},
+                    # Another user's suggestion, same book_key — survives.
+                    {"id": 3, "name": "Foreign Trope",
+                     "name_key": pp._tnorm("Foreign Trope"),
+                     "book_key": "9780000000001",
+                     "proposed_by": "other-user-uuid", "status": "pending"},
+                ],
+            }))
+            res = _result(
+                tropes=["Stale Own Trope"],
+                trope_confidence={pp._tnorm("Stale Own Trope"): 0.95},
+            )
+            errors = pp.write_claims(1, res)
+            self.assertEqual(errors, 0)
+
+            props = fake.tables["trope_proposals"]
+            # Foreign suggestion survives untouched.
+            foreign = [r for r in props
+                       if r.get("proposed_by") == "other-user-uuid"]
+            self.assertEqual([r["id"] for r in foreign], [3])
+            # Legacy own row is gone and was not re-proposed.
+            self.assertNotIn(pp._tnorm("Legacy Own Trope"),
+                             [r["name_key"] for r in props])
+            # Stale own trope re-proposed exactly once, under the
+            # configured proposer id.
+            own = [r for r in props
+                   if r["name_key"] == pp._tnorm("Stale Own Trope")]
+            self.assertEqual(len(own), 1)
+            self.assertEqual(own[0].get("proposed_by"), "proc-user-uuid")
+            # The DELETE carries the or-scope over both own shapes.
+            dels = fake.deletes_for("trope_proposals")
+            self.assertEqual(len(dels), 1)
+            self.assertIn(
+                "or=(proposed_by.is.null,proposed_by.eq.proc-user-uuid)",
+                dels[0][2])
+        finally:
+            if old_uid is None:
+                pp.CONFIG.pop("proposer_user_id", None)
+            else:
+                pp.CONFIG["proposer_user_id"] = old_uid
+
+
+class TestNullStatusPreserved(_ReplaceBase):
+    """F2: partition and DELETE must agree about NULL-status rows.
+    PostgREST status=neq.rejected never matches NULL, so a NULL-status
+    processor row survives the DELETE — it must sit in the preserved
+    set, or the re-proposed claim inserts a duplicate beside it."""
+
+    def test_null_status_row_not_duplicated_on_reprocess(self):
+        fake = self.install(_StatefulSB({
+            "book_trope_claims": [
+                {"id": 1, "work_id": 1, "trope_id": "cat-a",
+                 "status": None, "source_type": "ai"}],
+        }))
+        res = _result(tropes=["Mind Game"],
+                      trope_chapters={pp._tnorm("Mind Game"): ["Ch 1"]})
+        errors = pp.write_claims(1, res, trope_mappings={"Mind Game": "cat-a"})
+        self.assertEqual(errors, 0)
+        # The NULL-status row survives AND is not duplicated: the
+        # re-detected claim dedupes against it.
+        rows = [r for r in fake.tables["book_trope_claims"]
+                if r["trope_id"] == "cat-a"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], 1)
+        # No DELETE was issued for a row the DELETE cannot match.
+        self.assertEqual(fake.deletes_for("book_trope_claims"), [])
+
+    def test_plan_would_delete_excludes_null_and_empty_status(self):
+        fake = self.install(_StatefulSB({
+            "book_trope_claims": [
+                {"id": 1, "work_id": 1, "trope_id": "cat-a",
+                 "status": None, "source_type": "ai"},
+                {"id": 2, "work_id": 1, "trope_id": "cat-b",
+                 "status": "", "source_type": "ai"}],
+        }))
+        pp.CONFIG["supabase_url"] = "http://example.invalid"
+        pp.CONFIG["supabase_key"] = "test-key"
+        res = _result(tropes=["Mind Game"],
+                      trope_chapters={pp._tnorm("Mind Game"): ["Ch 1"]})
+        plan = pp.plan_replace(1, res, trope_mappings={"Mind Game": "cat-a"})
+        self.assertTrue(plan)
+        # Neither NULL- nor empty-status rows are deletable, so the
+        # plan's would-delete count is truthful: zero.
+        self.assertEqual(plan["would_delete"]["book_trope_claims"], 0)
+        # And the re-detected trope is not planned for re-insert either.
+        self.assertEqual(plan["would_insert"]["tropes"], 0)
+        self.assertEqual(fake.mutating_calls(), [])
 
 
 if __name__ == "__main__":

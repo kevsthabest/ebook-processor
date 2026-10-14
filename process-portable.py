@@ -7062,17 +7062,26 @@ def _partition_claims(table, rows):
 
     Preserved = contributor rows (source_type != processor marker) plus
     rejected rows; new-run claims are deduped against preserved keys.
-    Deletable = processor rows that are not rejected.
+    Deletable = processor rows with a non-empty, non-rejected status.
+    A NULL/empty-status processor row is NOT deletable: the DELETE's
+    status=neq.rejected filter never matches NULL in PostgREST, so the
+    row would survive the delete while its key left the preserved set
+    and a re-proposed claim would insert a duplicate beside it.
+    (book_quotes has no status column; partition == delete there.)
     """
     src = _CLAIM_TABLES[table]["source"]
     preserved, rejected, ndel = set(), set(), 0
     for r in rows:
         k = _claim_key(table, r)
-        if (r.get("status") or "") == "rejected":
+        status = r.get("status") or ""
+        if status == "rejected":
             rejected.add(k)
             preserved.add(k)
         elif (r.get("source_type") or "") == src:
-            ndel += 1
+            if table != "book_quotes" and not status:
+                preserved.add(k)
+            else:
+                ndel += 1
         else:
             preserved.add(k)
     return preserved, rejected, ndel
@@ -7242,12 +7251,29 @@ def _build_proposal_rows(result, unmatched, skip_keys):
     return rows
 
 
+def _proposal_scope():
+    """PostgREST condition limiting trope_proposals to THIS processor's
+    own rows, structurally: proposed_by NULL (no proposer configured /
+    legacy rows) or the configured proposer_user_id — the only values
+    the processor ever writes (see _build_proposal_rows). App-written
+    suggestions carry a real user uuid and must never fall inside a
+    processor fetch-for-replace or DELETE, whatever key format either
+    side uses."""
+    uid = CONFIG.get("proposer_user_id")
+    if uid:
+        return ("or=(proposed_by.is.null,proposed_by.eq."
+                f"{quote(str(uid), safe='')})")
+    return "proposed_by=is.null"
+
+
 def _proposal_state(result):
     """Proposal bookkeeping for one work. trope_proposals has no work_id or
     source_type: a work's processor proposals are the rows carrying its
-    book_key with status='pending' (human-reviewed rows carry other
-    statuses and are preserved). Returns (all_name_keys, own_rows) or
-    (None, None) on DB error."""
+    book_key with status='pending' AND the processor's proposer scope
+    (_proposal_scope) — app suggestions (foreign proposed_by) are never
+    'own' rows, even if key formats align. Human-reviewed rows carry
+    other statuses and are preserved. Returns (all_name_keys, own_rows)
+    or (None, None) on DB error."""
     all_rows = sb("trope_proposals", params="?select=name_key&limit=1000")
     if all_rows is None:
         return None, None
@@ -7256,7 +7282,8 @@ def _proposal_state(result):
         return {r["name_key"] for r in all_rows}, []
     own = sb("trope_proposals",
              params=f"?book_key=eq.{quote(str(book_key), safe='')}"
-                    f"&select=id,name_key,status&limit=1000")
+                    f"&{_proposal_scope()}"
+                    f"&select=id,name_key,status,proposed_by&limit=1000")
     if own is None:
         return None, None
     return {r["name_key"] for r in all_rows}, own
@@ -7274,8 +7301,9 @@ def write_claims(work_id, result, trope_mappings=None):
       * Human rejections survive: status='rejected' rows are excluded from
         every DELETE (the rejection record itself is kept) and the new run
         dedupes against them, so a rejected claim is never resurrected.
-    trope_proposals is scoped by book_key + status='pending' (it has no
-    source_type). works.spice_detected is already an overwrite; book_meta
+    trope_proposals is scoped by book_key + status='pending' +
+    _proposal_scope() (it has no source_type, so proposed_by is the
+    structural own-rows boundary). works.spice_detected is already an overwrite; book_meta
     is a shared merge store with no source marker and is NOT replaced.
     Returns the number of failed operations.
     """
@@ -7332,7 +7360,7 @@ def write_claims(work_id, result, trope_mappings=None):
                 _gone_rows = sb(
                     "trope_proposals", method="DELETE",
                     params=f"?book_key=eq.{quote(str(result.get('isbn') or result.get('title', '')), safe='')}"
-                           f"&status=eq.pending")
+                           f"&status=eq.pending&{_proposal_scope()}")
                 if _gone_rows is None:
                     errors += 1
                     _ok = False
