@@ -317,7 +317,13 @@ run's mistake overrule this run's text.
    read here even though D1 leaves its *learned-state* effect
    undecided; a recorded human NO is a veto in B regardless of
    D1's ruling on replay), or a `--roster-unlink` correction
-   recorded in the store (§9).
+   recorded in the store (§9). **V1 status: the `--roster-unlink`
+   source is live; the `--import-labels` source is unavailable in
+   v1 — `import_labels` persists nothing for False labels, and
+   wiring it would change learned-state behaviour (D1's territory).
+   The integration point is the seam's `extra_no_pairs`; veto 4's
+   import-labels coverage lands with D1, and the §10 scorecard
+   claims no coverage the build does not have.**
 
 **The human NO is a store-level invariant, not a matcher
 courtesy.** The store refuses to record ANY union contradicting
