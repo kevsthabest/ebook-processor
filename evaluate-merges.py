@@ -10,15 +10,15 @@ description/evidence run in name-only mode and are reported as such —
 name-only scores measure a judge production never runs.
 
 Two instruction variants, selectable with --prompt:
-  legacy    the production instruction text, verbatim (the default);
-  identity  a candidate rewrite implementing the identity-evidence
-            rule (positive identity evidence required; similar
-            descriptions alone never establish identity; insufficient
-            evidence scores mid-scale instead of forcing a side).
+  identity  the production instruction text, verbatim (the default
+            since the 2026-10-14 swap — see the variant block below);
+  legacy    the pre-swap production text, kept as a historical
+            variant so the 2026-10-14 experiment stays replicable.
 The payload surrounding the instructions is identical for both, so a
-run pair isolates the instruction text as the only variable. Per the
-quality-loop discipline, the identity variant ships nowhere until a
-live run on labeled pairs beats legacy on held-out books.
+run pair isolates the instruction text as the only variable. The
+identity text shipped only after the live evaluation recorded in
+eval/jev-prompt-eval-2026-10-14.md: equal accuracy @0.5, fewer false
+merges @0.5, and zero false merges at the 0.85 production bar.
 
 Usage:
     python3 evaluate-merges.py --labels eval/merge_pairs.json \
@@ -57,30 +57,23 @@ OPENROUTER_ATTRIBUTION_TITLE = "ebook-processor"
 
 
 # --- Prompt variants ---------------------------------------------------
-# DRIFT RISK: the legacy text below duplicates the instruction literal
-# in DecisionValidator.ask_same_person (process-portable.py) verbatim.
-# This script is a standalone artefact (hyphenated module name, run
-# directly against any checkout), so it cannot import the portable
-# script; instead tests/test_jev_eval_harness.py captures the REAL
-# production instructions + state via a stubbed _ask_noul and pins them
-# against these constants. If production text changes, that test fails
-# and this copy must be updated in the same commit.
-LEGACY_INSTRUCTIONS = (
-    "Are these two character entries referring to the same person? "
-    "Answer YES when: the names are variants of each other (nickname, "
-    "shortened form, title + name matching a fuller name, minor "
-    "spelling differences) AND the descriptions are compatible. "
-    "Answer NO when: different first names, different people sharing "
-    "a surname (siblings, parent/child), incompatible descriptions "
-    "or roles, or insufficient evidence they are the same individual."
-)
-
-# Candidate rewrite: identity evidence, not first-name equality. YES
-# needs positive evidence of one identity; NO needs positive evidence
-# of two identities (or a contradiction / deterministic exclusion);
-# anything else is explicitly an intermediate score, not a forced
-# side. Deliberately contains no nickname-vs-first-names contradiction.
-IDENTITY_INSTRUCTIONS = (
+# DRIFT RISK: PRODUCTION_INSTRUCTIONS below duplicates the instruction
+# literal in DecisionValidator.ask_same_person (process-portable.py)
+# verbatim. This script is a standalone artefact (hyphenated module
+# name, run directly against any checkout), so it cannot import the
+# portable script; instead tests/test_jev_eval_harness.py captures the
+# REAL production instructions + state via a stubbed _ask_noul and
+# pins them against this constant. If production text changes, that
+# test fails and this copy must be updated in the same commit.
+#
+# 2026-10-14 SWAP: production used LEGACY_INSTRUCTIONS until that
+# date. A live evaluation over 112 scored labeled pairs
+# (eval/jev-prompt-eval-2026-10-14.md) compared the two texts: equal
+# accuracy @0.5 (83.04%); identity fewer false merges @0.5 (6 vs 7);
+# @0.85 (the production merge bar) identity ZERO false merges vs
+# legacy's one (MPITA @ 0.88). The identity text was approved and
+# shipped as production; it is the default variant below.
+PRODUCTION_INSTRUCTIONS = (
     "Are these two character entries referring to the same person? "
     "Answer YES only when there is positive evidence of one identity: "
     "a supported alias or nickname linking the two names, a reliable "
@@ -96,6 +89,29 @@ IDENTITY_INSTRUCTIONS = (
     "If the evidence is insufficient either way, score near the "
     "middle of the scale rather than guessing — an unresolved pair "
     "stays separate and is reviewed; it is not merged on a guess."
+)
+
+# The shipped text began as the "identity" candidate variant:
+# identity evidence, not first-name equality. YES needs positive
+# evidence of one identity; NO needs positive evidence of two
+# identities (or a contradiction / deterministic exclusion); anything
+# else is explicitly an intermediate score, not a forced side.
+# Deliberately contains no nickname-vs-first-names contradiction.
+# The name is kept so --prompt identity and past run records still
+# refer to the same text — which is now production itself.
+IDENTITY_INSTRUCTIONS = PRODUCTION_INSTRUCTIONS
+
+# Historical variant: the production text until 2026-10-14. Kept
+# selectable (--prompt legacy) so the swap experiment can be re-run
+# and earlier results replicated. NOT what production runs.
+LEGACY_INSTRUCTIONS = (
+    "Are these two character entries referring to the same person? "
+    "Answer YES when: the names are variants of each other (nickname, "
+    "shortened form, title + name matching a fuller name, minor "
+    "spelling differences) AND the descriptions are compatible. "
+    "Answer NO when: different first names, different people sharing "
+    "a surname (siblings, parent/child), incompatible descriptions "
+    "or roles, or insufficient evidence they are the same individual."
 )
 
 PROMPT_VARIANTS = {
@@ -197,10 +213,11 @@ def ask_same_person(base_url, model, api_key, name_a, name_b, timeout=30,
 
     The payload state is the production shape (build_same_person_state)
     and the default instructions are the production text verbatim; pass
-    instructions=PROMPT_VARIANTS["identity"] for the candidate rewrite.
+    instructions=PROMPT_VARIANTS["legacy"] for the pre-swap historical
+    text.
     """
     if instructions is None:
-        instructions = LEGACY_INSTRUCTIONS
+        instructions = PRODUCTION_INSTRUCTIONS
     payload = json.dumps({
         "model": model or "default",
         "state": build_same_person_state(name_a, desc_a, ev_a,
@@ -395,10 +412,10 @@ def main(argv=None):
     ap.add_argument('--model', default='')
     ap.add_argument('--threshold', type=float, default=0.5)
     ap.add_argument('--prompt', choices=sorted(PROMPT_VARIANTS),
-                    default='legacy',
-                    help="instruction variant: 'legacy' (production "
-                         "text, verbatim) or 'identity' (candidate "
-                         "identity-evidence rewrite)")
+                    default='identity',
+                    help="instruction variant: 'identity' (production "
+                         "text, verbatim — the default) or 'legacy' "
+                         "(pre-2026-10-14 production text, historical)")
     ap.add_argument('--dry-run', action='store_true',
                     help="stubbed endpoint, no network: prove the "
                          "plumbing with deterministic synthetic scores")
