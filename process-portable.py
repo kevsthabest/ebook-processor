@@ -3780,7 +3780,18 @@ def _merge_roster_entries(roster, keep_key, drop_key):
     for attr in ("statuses",):
         if de.get(attr):
             ke.setdefault(attr, Counter()).update(de[attr])
-    for attr in ("death_reports", "alive_reports", "unresolved_mentions"):
+    # death_reports is a LIST (chapter indices appended by _roster_update;
+    # the sticky-death consumer takes min() over it) — merge it with
+    # order-preserving dedupe. alive_reports / unresolved_mentions are
+    # sets and keep set semantics. (Lumping all three into one set loop
+    # crashed with AttributeError whenever the keeper already carried
+    # death reports and a merge folded another entry into it.)
+    if de.get("death_reports"):
+        _kd = ke.setdefault("death_reports", [])
+        for _idx in de["death_reports"]:
+            if _idx not in _kd:
+                _kd.append(_idx)
+    for attr in ("alive_reports", "unresolved_mentions"):
         if de.get(attr):
             ke.setdefault(attr, set()).update(de[attr])
     for attr in ("appearances_desc",):
