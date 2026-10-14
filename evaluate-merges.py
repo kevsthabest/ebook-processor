@@ -10,6 +10,7 @@ Reports accuracy, precision, recall, and per-threshold analysis.
 
 import argparse
 import json
+import math
 import os
 import sys
 import urllib.request
@@ -81,7 +82,19 @@ def ask_same_person(base_url, model, api_key, name_a, name_b, timeout=30,
         ans = result["answers"]["same_person"]
         p_yes = ans.get("noul")
         if p_yes is None:
-            p_yes = ans.get("probabilities", {}).get("yes", 0)
+            p_yes = ans.get("probabilities", {}).get("yes")
+        # Strict score handling, matching the production validator
+        # (DecisionValidator._ask_noul): a missing or malformed score
+        # makes the pair UNANSWERED (None, excluded from accuracy) —
+        # never a silent 0.0 "no" that poisons the denominator.
+        if p_yes is None:
+            raise ValueError("response missing score")
+        if isinstance(p_yes, bool) or not isinstance(p_yes, (int, float)):
+            raise ValueError(f"non-numeric score: {p_yes!r}")
+        if math.isnan(p_yes) or math.isinf(p_yes):
+            raise ValueError(f"non-finite score: {p_yes}")
+        if not 0 <= p_yes <= 1:
+            raise ValueError(f"score out of range [0,1]: {p_yes}")
         return float(p_yes)
     except Exception as e:
         print(f"  ERROR for {name_a}/{name_b}: {e}")
@@ -114,12 +127,14 @@ def main():
           f"provider={args.provider} model={model or 'default'}\n")
 
     results = []
+    n_unanswered = 0
     for i, (key, lbl) in enumerate(pairs):
         expected = lbl['same_person']
         p_yes = ask_same_person(
             base_url, model, api_key,
             lbl['a'], lbl['b'], extra_headers=extra_headers)
         if p_yes is None:
+            n_unanswered += 1
             continue
         predicted = p_yes >= args.threshold
         correct = predicted == expected
@@ -143,6 +158,8 @@ def main():
     print(f"Precision: {prec:.2%} (of predicted merges, how many correct)")
     print(f"Recall:    {rec:.2%} (of true merges, how many caught)")
     print(f"TP={tp} TN={tn} FP={fp} FN={fn}")
+    print(f"Unanswered: {n_unanswered} of {len(pairs)} pairs "
+          f"(excluded from the metrics above)")
 
     # Show errors
     errors = [(e, p, s, l) for e, p, s, l in results if e != p]

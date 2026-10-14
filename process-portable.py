@@ -449,7 +449,10 @@ def _ol_request(url, timeout=10):
         req = urllib.request.Request(url, headers={"User-Agent": "ebook-processor/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", "ignore"))
-    except Exception:
+    except Exception as e:
+        # Notice, not silence: an outage must be distinguishable
+        # from "no match" (callers route books on the difference).
+        print(f"  Open Library request failed ({e}); treating as no match")
         return None
 
 
@@ -686,8 +689,9 @@ def extract_mobi_identifiers(path):
                 elif rtype == 113 and not ids["asin"]:
                     ids["asin"] = val
             pos += rlen
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  MOBI identifier extraction failed for "
+              f"{Path(path).name} ({e}); no ISBN/ASIN read")
     return ids
 
 
@@ -6552,13 +6556,26 @@ def cmd_verify(preview_path):
         return
     print(f"  Verifying '{title}' against work {wid[:8]} ({how})")
 
-    db_chars = (sb("book_characters",
-                   params=f"?work_id=eq.{wid}&select=name,role,vitality,status&limit=500") or [])
-    db_tropes = (sb("book_trope_claims",
-                    params=f"?work_id=eq.{wid}&select=trope_id,status&limit=200") or [])
-    db_trig = {r["warning"]: r["status"] for r in (
-        sb("book_trigger_claims",
-           params=f"?work_id=eq.{wid}&select=warning,status&limit=100") or [])}
+    _raw_chars = sb("book_characters",
+                    params=f"?work_id=eq.{wid}&select=name,role,vitality,status&limit=500")
+    _raw_tropes = sb("book_trope_claims",
+                     params=f"?work_id=eq.{wid}&select=trope_id,status&limit=200")
+    _raw_trig = sb("book_trigger_claims",
+                   params=f"?work_id=eq.{wid}&select=warning,status&limit=100")
+    if _raw_chars is None or _raw_tropes is None or _raw_trig is None:
+        # sb() returns None on error: a failed read is a DB failure,
+        # not an empty DB — reporting "everything differs" (or
+        # "nothing to compare") off a failed read would be fiction.
+        _failed = [t for t, r in (("book_characters", _raw_chars),
+                                  ("book_trope_claims", _raw_tropes),
+                                  ("book_trigger_claims", _raw_trig))
+                   if r is None]
+        print(f"  DB read failed for {', '.join(_failed)} — cannot "
+              f"verify '{title}' (a failed read is not an empty DB)")
+        return
+    db_chars = _raw_chars
+    db_tropes = _raw_tropes
+    db_trig = {r["warning"]: r["status"] for r in _raw_trig}
     pv_trope_names = {t.get("name", "").lower() if isinstance(t, dict) else str(t).lower()
                       for t in result.get("tropes", [])}
     pv_trig = {t.get("warning") if isinstance(t, dict) else t
@@ -7663,12 +7680,21 @@ def _existing(table, col, work_id):
     return {str(r.get(col, "")).lower() for r in rows}
 
 
+class TropeLookupError(RuntimeError):
+    """The trope catalog lookup itself failed (sb() returned None —
+    a DB error), as opposed to the trope genuinely not being in the
+    catalog (which returns None). Diverting a trope to proposals on
+    a lookup failure would file a catalogued trope as uncatalogued."""
+
+
 def _trope_lookup(name):
     # Exact, case-insensitive match. Strip LIKE/PostgREST wildcard characters first.
     clean = re.sub(r"[*%_\\]", "", name).strip()
     if not clean:
         return None
     rows = sb("tropes", params=f"?name=ilike.{quote(clean, safe='')}&select=id&limit=1")
+    if rows is None:
+        raise TropeLookupError(f"trope catalog lookup failed for {name!r}")
     return rows[0]["id"] if rows else None
 
 
@@ -7810,15 +7836,21 @@ def _build_trope_rows(work_id, result, cat_map, trope_mappings, model, skip_ids)
     """Build book_trope_claims rows for the new run. skip_ids holds the
     lowercased trope_ids that survive in the DB (contributor/rejected) —
     a new-run trope resolving to one is not re-inserted.
-    Returns (rows, unmatched_names)."""
+    Returns (rows, unmatched_names, lookup_failed_names). A trope whose
+    catalog lookup FAILED (DB error) is in neither rows nor unmatched:
+    it is an error for the book, never a proposal."""
     conf_t = result.get("trope_confidence", {})
-    rows, unmatched, used = [], [], set(skip_ids)
+    rows, unmatched, lookup_failed, used = [], [], [], set(skip_ids)
     for t in result["tropes"]:
         tid = cat_map.get(_tnorm(t))
         if tid is None and trope_mappings and t in trope_mappings:
             tid = trope_mappings[t]
         if tid is None:
-            tid = _trope_lookup(t)
+            try:
+                tid = _trope_lookup(t)
+            except TropeLookupError:
+                lookup_failed.append(t)
+                continue
         if tid is None:
             unmatched.append(t)
             continue
@@ -7838,7 +7870,7 @@ def _build_trope_rows(work_id, result, cat_map, trope_mappings, model, skip_ids)
                      "evidence": {"source": "ebook-extraction",
                                   "chapters": _chaps,
                                   "chapter_count": len(_chaps)}})
-    return rows, unmatched
+    return rows, unmatched, lookup_failed
 
 
 def _build_trigger_rows(work_id, result, model, skip_warnings):
@@ -8037,8 +8069,16 @@ def write_claims(work_id, result, trope_mappings=None):
     else:
         _preserved, _rejected, _ndel = _partition_claims("book_trope_claims", _tstate)
         preserved_rej += len(_rejected)
-        rows, unmatched = _build_trope_rows(
+        rows, unmatched, _lookup_failed = _build_trope_rows(
             work_id, result, _cat, trope_mappings, model, _preserved)
+        if _lookup_failed:
+            # A failed catalog read is an error for this book — those
+            # tropes are neither claimed nor filed as proposals.
+            errors += len(_lookup_failed)
+            print(f"  Trope catalog lookup failed for "
+                  f"{len(_lookup_failed)} trope(s) "
+                  f"({', '.join(_lookup_failed[:3])}); counted as "
+                  f"errors, not filed as proposals")
         _ok = True
         if _ndel:
             _gone = _delete_processor_claims("book_trope_claims", work_id)
@@ -8290,8 +8330,13 @@ def plan_replace(work_id, result, trope_mappings=None):
     plan["would_delete"]["book_trope_claims"] = _ndel
     plan["existing"] += len(_tstate)
     plan["rejections_preserved"] += len(_rejected)
-    _rows, unmatched = _build_trope_rows(
+    _rows, unmatched, _lookup_failed = _build_trope_rows(
         work_id, result, _cat, trope_mappings, model, _preserved)
+    if _lookup_failed:
+        print(f"  Trope catalog lookup failed for "
+              f"{len(_lookup_failed)} trope(s) "
+              f"({', '.join(_lookup_failed[:3])}); excluded from the "
+              f"plan (a failed read is not 'uncatalogued')")
     plan["would_insert"]["tropes"] = len(_rows)
 
     # Mirrors write_claims: the proposals replace is unconditional,
@@ -9156,7 +9201,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             UI.advance(_book_key)  # A unit already done
         else:
             UI.viz_chapter(_book_key, ch["label"], ch["text"],
-                           chap_idx=i + 1, chap_total=n)
+                           chap_idx=i, chap_total=n)
             a, fell_back = v2_call_a(call, roster, ch, n)
             chapter_as[i] = a
             if a is None:
@@ -9386,7 +9431,10 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "series_name": _series_name, "series_position": _series_pos,
         "series_source": _series_source,  # "flag"|"epub"|"filename"|"openlibrary"|"none"
         "word_count": word_count, "reading_time_mins": reading_mins,
-        "chunks": n, "chunks_failed": a_failed,
+        # Same A+B definition as the abort decision above: a persisted
+        # A-only count showed zero failures for books whose content
+        # calls mostly failed.
+        "chunks": n, "chunks_failed": a_failed + b_failed,
         "pipeline": "v2",
         "tropes": tropes, "trope_confidence": trope_conf,
         "triggers": red["triggers"], "characters": red["characters"],

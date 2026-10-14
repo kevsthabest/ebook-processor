@@ -65,10 +65,19 @@ state_path = os.path.expanduser("~/workspace/ebook-processor/.overnight-watch.js
 def parse(q):
     try: return {r['tbl' if 'tbl' in r else 'k']: r['n'] for r in json.loads(q)}
     except Exception: return {}
+counts = parse(sys.argv[1])
+new_rows = parse(sys.argv[2])
+if not counts or not new_rows:
+    # Malformed sb-query payload: detection above already alerted on
+    # the raw output, so skip persisting — an empty-count history
+    # entry would read as "all tables empty" in the morning summary.
+    print("overnight-watch: malformed sb-query payload; "
+          "history entry skipped", file=sys.stderr)
+    sys.exit(0)
 entry = {
     "ts": __import__('datetime').datetime.now().isoformat(),
-    "counts": parse(sys.argv[1]),
-    "new_rows": parse(sys.argv[2]),
+    "counts": counts,
+    "new_rows": new_rows,
     "alert": sys.argv[3].strip(),
 }
 hist = []
