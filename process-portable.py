@@ -4174,22 +4174,15 @@ def post_pass_merge(roster, validator=None):
             _sig = _merge_pair_signal(ka, kb)
             if _sig:
                 _cands.append((_sig, ka, kb))
-    # Strongest signals first; cap total decision-model calls via the shared
-    # per-book budget (relationship validation later draws from the same pool).
+    # Strongest signals first. The shared per-book budget (relationship
+    # validation later draws from the same pool) is claimed per ACTUAL
+    # call, immediately before it — never up front for the whole
+    # candidate list. Pairs the validator never sees (decision model
+    # off, or an endpoint merged away by an earlier Tier 3 decision)
+    # must not consume budget they never spend; the old up-front
+    # partition drained the pool on validator-off runs and starved
+    # relationship validation on merged-away pairs.
     _cands.sort(key=lambda x: -x[0])
-    _in_budget, _over_cap = [], []
-    for _c in _cands:
-        (_in_budget if _dm_budget_claim(1) else _over_cap).append(_c)
-    _cands = _in_budget
-    # Pairs beyond the cap are listed for manual review, not silently dropped.
-    for _sig, ka, kb in _over_cap:
-        if ka not in roster or kb not in roster:
-            continue
-        ea, eb = roster[ka], roster[kb]
-        possible_merges.append({
-            "name_a": ea.get("name", ka), "name_b": eb.get("name", kb),
-            "p_yes": None, "reason": "unresolved (Tier 3 cap reached)"})
-
     _dm_off = validator is None or getattr(validator, "disabled", False)
     for _sig, ka, kb in _cands:
         if ka not in roster or kb not in roster:
@@ -4200,6 +4193,13 @@ def post_pass_merge(roster, validator=None):
             possible_merges.append({
                 "name_a": _na, "name_b": _nb, "p_yes": None,
                 "reason": "unresolved (decision model disabled)"})
+            continue
+        if not _dm_budget_claim(1):
+            # Pairs beyond the cap are listed for manual review,
+            # not silently dropped.
+            possible_merges.append({
+                "name_a": _na, "name_b": _nb, "p_yes": None,
+                "reason": "unresolved (Tier 3 cap reached)"})
             continue
         _merged, _p = validator.ask_same_person(
             _na, _roster_best_desc(ea), ea.get("evidence", ""),
@@ -4773,6 +4773,15 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                     _q = _ev.get("quote", "")
                     _ctx = _extract_quote_context(
                         _label_to_text.get(_ev.get("chapter", ""), ""), _q)
+                    if not _dm_budget_claim(1):
+                        # Budget exhausted mid-gate: this category is
+                        # NOT judged — take the regex-gate fallback,
+                        # exactly as on a validator error. The claim is
+                        # per actual call (this gate never claimed at
+                        # all before, so merge/validation accounting
+                        # understated real spend by every trigger call).
+                        _dv_error = True
+                        break
                     _v, _p = _DECISION_VALIDATOR.validate(cat, _q, _ctx)
                     if _v is None:
                         _dv_error = True
