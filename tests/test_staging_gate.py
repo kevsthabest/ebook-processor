@@ -731,7 +731,10 @@ class _StagingBackend:
             "relationships": [], "pov_character": "Mira Solace"})
 
 
-class TestStagingE2E(unittest.TestCase):
+class _E2EBase:
+    """Shared e2e machinery (not a TestCase itself, so subclasses
+    don't re-run each other's tests)."""
+
     def _epub_for(self, stem):
         # Stable path per stem: the checkpoint key derives from the
         # file path, so a second run of the same stem must reuse the
@@ -747,7 +750,8 @@ class TestStagingE2E(unittest.TestCase):
             cache[stem] = epub
         return cache[stem]
 
-    def _run(self, stem, extra_config, state, resolve=None):
+    def _run(self, stem, extra_config, state, resolve=None,
+             backend=None):
         epub = self._epub_for(stem)
         preview_json = pp.SCRIPT_DIR / "preview" / f"{stem}.json"
         preview_md = pp.SCRIPT_DIR / "preview" / f"{stem}.md"
@@ -762,7 +766,8 @@ class TestStagingE2E(unittest.TestCase):
         old_state = pp._STAGING_STATE
         pp._STAGING_STATE = state
         self.addCleanup(lambda: setattr(pp, "_STAGING_STATE", old_state))
-        with mock.patch.object(pp, "llm_ollama", _StagingBackend()), \
+        with mock.patch.object(pp, "llm_ollama",
+                               backend or _StagingBackend()), \
                 mock.patch.object(pp, "_lookup_series_openlibrary",
                                   lambda *a, **k: (None, None)), \
                 mock.patch.object(pp, "resolve_work", resolve), \
@@ -778,6 +783,8 @@ class TestStagingE2E(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         return pp.StagingState(Path(tmp.name))
 
+
+class TestStagingE2E(_E2EBase, unittest.TestCase):
     def test_flag_off_no_marker_no_store_no_md_line(self):
         st = self._tmp_state()
         result, md = self._run("stageoff", {}, st)
@@ -854,3 +861,132 @@ class TestStagingE2E(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Slice 3: trigger observe/split
+# ---------------------------------------------------------------------------
+
+class TestStagingTriggerHelper(_StoreCase):
+    def _tparts(self, triggers):
+        return _parts(trope_auto=[], trope_gated=[], trope_counts={},
+                      trope_ship=[], trope_conf={}, triggers=triggers)
+
+    def test_evidenceless_trigger_stages_then_promotes(self):
+        st = self._state()
+        trig = [{"warning": "war", "evidence": []}]
+        out1 = pp.staging_observe_result(self._tparts(trig), st,
+                                         independent=True)
+        self.assertEqual(out1["ship_triggers"], [])
+        self.assertEqual(out1["marker"]["staged"][0]["class"],
+                         "trigger")
+        out2 = pp.staging_observe_result(self._tparts(trig), st,
+                                         independent=True)
+        self.assertEqual(len(out2["ship_triggers"]), 1)
+        self.assertEqual(out2["trigger_persistence"],
+                         {"war": {"sightings": 2,
+                                  "via": "persistence"}})
+
+    def test_evidenced_trigger_never_stages(self):
+        st = self._state()
+        trig = [{"warning": "murder",
+                 "evidence": [{"quote": "q", "chapter": "Chapter 1"}]}]
+        out = pp.staging_observe_result(self._tparts(trig), st,
+                                        independent=True)
+        self.assertEqual(len(out["ship_triggers"]), 1)
+        self.assertEqual(st.data["works"]["w-1"]["claims"], {})
+
+    def test_evidence_arrival_promotes_stamp_free_then_stamps(self):
+        st = self._state()
+        bare = [{"warning": "war", "evidence": []}]
+        pp.staging_observe_result(self._tparts(bare), st,
+                                  independent=True)
+        evidenced = [{"warning": "war",
+                      "evidence": [{"quote": "q",
+                                    "chapter": "Chapter 1"}]}]
+        out2 = pp.staging_observe_result(self._tparts(evidenced), st,
+                                         independent=True)
+        self.assertEqual(len(out2["ship_triggers"]), 1)
+        self.assertEqual(out2["marker"]["promoted"][0]["via"],
+                         "evidence")
+        # Ships on this run's own evidence: no persistence stamp yet.
+        self.assertEqual(out2["trigger_persistence"], {})
+        out3 = pp.staging_observe_result(self._tparts(bare), st,
+                                         independent=True)
+        self.assertEqual(len(out3["ship_triggers"]), 1)
+        self.assertEqual(out3["trigger_persistence"],
+                         {"war": {"sightings": 3, "via": "evidence"}})
+
+
+class _TriggerBackend:
+    """War claimed (mentioned) in chapters 1-2 with NO quote — the
+    evidence-less trigger shape. Murder claimed on_page in the same
+    chapters WITH a quote (control: evidenced triggers never stage).
+    War evidence is switchable for the evidence-arrival case."""
+
+    def __init__(self, war_evidence=False):
+        self.war_evidence = war_evidence
+
+    def __call__(self, prompt, chunk, i, n):
+        if prompt == pp.PROMPT_V2_CONTENT:
+            trig, tev = {}, {}
+            if "FFMARK" in chunk:
+                trig = {"war": "mentioned", "murder": "on_page"}
+                # Evidence quotes must be verbatim chapter text or
+                # the pipeline drops them as fabricated — use the
+                # book's own filler sentence.
+                tev = {"murder": "The valley was quiet and the river "
+                                 "ran cold and bright under a wide "
+                                 "northern sky full of slow clouds."}
+                if self.war_evidence:
+                    tev["war"] = ("Mira Solace drew her sword and "
+                                  "faced the dawn.")
+            return json.dumps({
+                "summary": "A chapter summary.", "spice_level": 0,
+                "triggers": trig, "trigger_evidence": tev,
+                "trope_candidates": [], "quotes": []})
+        return json.dumps({
+            "characters": [{
+                "name": "Mira Solace", "role": "protagonist",
+                "description": "A swordswoman of the valley.",
+                "evidence": "Mira Solace drew her sword."}],
+            "relationships": [], "pov_character": "Mira Solace"})
+
+
+def _warnings(result):
+    return sorted(t["warning"] for t in result["triggers"])
+
+
+class TestStagingTriggerE2E(_E2EBase, unittest.TestCase):
+    def test_evidenceless_trigger_held_then_promoted(self):
+        st = self._tmp_state()
+        cfg = {"staging_gate": True}
+        be = _TriggerBackend()
+        r1, _ = self._run("trigstage", cfg, st, backend=be)
+        self.assertEqual(_warnings(r1), ["murder"])
+        claims = st.data["works"]["isbn:9780306406157"]["claims"]
+        self.assertEqual(list(claims), ["trigger:war"])
+        r2, _ = self._run("trigstage", cfg, st, backend=be)
+        self.assertEqual(_warnings(r2), ["murder", "war"])
+        self.assertEqual(r2["trigger_persistence"],
+                         {"war": {"sightings": 2,
+                                  "via": "persistence"}})
+
+    def test_evidence_arrival_promotes_via_evidence(self):
+        st = self._tmp_state()
+        cfg = {"staging_gate": True}
+        r1, _ = self._run("trigev", cfg, st,
+                          backend=_TriggerBackend(False))
+        self.assertEqual(_warnings(r1), ["murder"])
+        r2, _ = self._run("trigev", cfg, st,
+                          backend=_TriggerBackend(True))
+        self.assertEqual(_warnings(r2), ["murder", "war"])
+        self.assertEqual(r2["staging"]["promoted"][0]["via"],
+                         "evidence")
+        self.assertNotIn("war", r2.get("trigger_persistence") or {})
+
+    def test_flag_off_evidenceless_trigger_ships_immediately(self):
+        st = self._tmp_state()
+        r1, _ = self._run("trigoff", {}, st, backend=_TriggerBackend())
+        self.assertEqual(_warnings(r1), ["murder", "war"])
+        self.assertNotIn("staging", r1)
