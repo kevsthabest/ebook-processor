@@ -990,3 +990,259 @@ class TestStagingTriggerE2E(_E2EBase, unittest.TestCase):
         r1, _ = self._run("trigoff", {}, st, backend=_TriggerBackend())
         self.assertEqual(_warnings(r1), ["murder", "war"])
         self.assertNotIn("staging", r1)
+
+
+# ---------------------------------------------------------------------------
+# Slice 4: write-path honoring (stamps, proposals, plan, push-preview)
+# ---------------------------------------------------------------------------
+
+_rw_spec = importlib.util.spec_from_file_location(
+    "test_replace_wholesale",
+    str(Path(__file__).resolve().parent / "test_replace_wholesale.py"))
+_rw = importlib.util.module_from_spec(_rw_spec)
+_rw_spec.loader.exec_module(_rw)
+_StatefulSB = _rw._StatefulSB
+
+
+def _wresult(**over):
+    r = {"title": "Write Test Book", "isbn": "9780000000002",
+         "tropes": [], "trope_confidence": {}, "trope_catalog_map": {},
+         "trope_chapters": {}, "triggers": [], "characters": [],
+         "relationships": [], "quotes": []}
+    r.update(over)
+    return r
+
+
+_MARKER = {
+    "staged": [
+        {"key": "trope:name:held trope", "display": "Held Trope",
+         "class": "trope", "sightings": 1},
+        {"key": "trigger:war", "display": "war", "class": "trigger",
+         "sightings": 1}],
+    "promoted": [], "trapped_total": 2, "expired_this_run": 0,
+    "sightings_recorded": 2, "trapped_store_total": 2}
+
+_STAMP = {"sightings": 2, "via": "persistence"}
+
+
+def _trig(warning, evidence, conf=0.0):
+    return {"warning": warning, "severity": "mentioned",
+            "severity_claimed": "mentioned", "chapters": ["A"],
+            "chapter_count": 1, "frequency": 0.5, "prominence": "low",
+            "evidence": evidence, "confidence": conf}
+
+
+class _WriteBase(unittest.TestCase):
+    def setUp(self):
+        self._old_sb = pp.sb
+        self._old_cfg = {k: pp.CONFIG.get(k)
+                         for k in ("supabase_url", "supabase_key")}
+        pp.CONFIG["supabase_url"] = "http://fake"
+        pp.CONFIG["supabase_key"] = "fake"
+
+    def tearDown(self):
+        pp.sb = self._old_sb
+        for k, v in self._old_cfg.items():
+            if v is None:
+                pp.CONFIG.pop(k, None)
+            else:
+                pp.CONFIG[k] = v
+
+    def install(self, tables=None):
+        fake = _StatefulSB(tables or {})
+        pp.sb = fake
+        return fake
+
+
+class TestWriteStamps(_WriteBase):
+    def test_trope_row_carries_persistence_stamp(self):
+        fake = self.install()
+        res = _wresult(
+            tropes=["Found Family"],
+            trope_confidence={"found family": 0.75},
+            trope_catalog_map={"found family": "cat-1"},
+            trope_chapters={"found family": ["Chapter 1",
+                                             "Chapter 2"]},
+            trope_persistence={"found family": dict(_STAMP)})
+        self.assertEqual(pp.write_claims(1, res), 0)
+        rows = fake.tables["book_trope_claims"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["evidence"]["persistence"], _STAMP)
+        # Promotion never boosts confidence.
+        self.assertEqual(rows[0]["confidence"], 0.75)
+
+    def test_trope_row_without_stamp_has_no_persistence_key(self):
+        fake = self.install()
+        res = _wresult(
+            tropes=["Found Family"],
+            trope_confidence={"found family": 0.75},
+            trope_catalog_map={"found family": "cat-1"},
+            trope_chapters={"found family": ["Chapter 1"]})
+        self.assertEqual(pp.write_claims(1, res), 0)
+        rows = fake.tables["book_trope_claims"]
+        self.assertNotIn("persistence", rows[0]["evidence"])
+
+    def test_trigger_row_carries_persistence_stamp(self):
+        fake = self.install()
+        res = _wresult(
+            triggers=[_trig("war", [])],
+            trigger_persistence={"war": dict(_STAMP)})
+        self.assertEqual(pp.write_claims(1, res), 0)
+        rows = fake.tables["book_trigger_claims"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["evidence"]["persistence"], _STAMP)
+
+
+class TestStagedProposalInterception(_WriteBase):
+    def test_staged_unmapped_trope_produces_no_rows_anywhere(self):
+        fake = self.install()
+        # The seam already removed the held trope from the ship set;
+        # it must not leak back in as a proposal.
+        res = _wresult(tropes=[], staging=dict(_MARKER))
+        self.assertEqual(pp.write_claims(1, res), 0)
+        self.assertEqual(fake.tables.get("book_trope_claims", []), [])
+        self.assertEqual(fake.tables.get("trope_proposals", []), [])
+
+    def test_same_trope_shipped_produces_a_proposal(self):
+        fake = self.install()
+        res = _wresult(tropes=["Held Trope"])
+        self.assertEqual(pp.write_claims(1, res), 0)
+        self.assertEqual(len(fake.tables.get("trope_proposals", [])),
+                         1)
+
+
+class TestPlanHeldBack(_WriteBase):
+    def _seeded(self):
+        return self.install({"book_trope_claims": [
+            {"id": 1, "work_id": 1, "trope_id": "cat-old",
+             "status": "candidate", "source_type": "ai"}]})
+
+    def test_plan_reports_held_back_from_marker(self):
+        self._seeded()
+        res = _wresult(
+            tropes=["Found Family"],
+            trope_catalog_map={"found family": "cat-1"},
+            trope_chapters={"found family": ["Chapter 1"]},
+            staging=dict(_MARKER))
+        plan = pp.plan_replace(1, res, {"Found Family": "cat-1"})
+        self.assertEqual(plan["held_back"],
+                         {"tropes": 1, "triggers": 1})
+        self.assertEqual(plan["would_insert"]["tropes"], 1)
+
+    def test_plan_without_marker_has_no_held_back(self):
+        self._seeded()
+        res = _wresult(
+            tropes=["Found Family"],
+            trope_catalog_map={"found family": "cat-1"},
+            trope_chapters={"found family": ["Chapter 1"]})
+        plan = pp.plan_replace(1, res, {"Found Family": "cat-1"})
+        self.assertNotIn("held_back", plan)
+
+    def test_print_replace_plan_shows_held_back(self):
+        self._seeded()
+        res = _wresult(
+            tropes=["Found Family"],
+            trope_catalog_map={"found family": "cat-1"},
+            trope_chapters={"found family": ["Chapter 1"]},
+            staging=dict(_MARKER))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            pp.print_replace_plan(1, res, {"Found Family": "cat-1"})
+        self.assertIn("held back", buf.getvalue())
+
+
+class TestCurationUntouchedByStaging(_WriteBase):
+    def test_confirmed_and_rejected_rows_stand(self):
+        fake = self.install({"book_trope_claims": [
+            {"id": 1, "work_id": 1, "trope_id": "cat-1",
+             "status": "rejected", "source_type": "ai"},
+            {"id": 2, "work_id": 1, "trope_id": "cat-2",
+             "status": "confirmed", "source_type": "contributor"}]})
+        res = _wresult(
+            tropes=["Found Family", "Other Trope"],
+            trope_confidence={"found family": 0.75,
+                               "other trope": 0.8},
+            trope_catalog_map={"found family": "cat-1",
+                               "other trope": "cat-2"},
+            trope_chapters={"found family": ["Chapter 1"],
+                            "other trope": ["Chapter 1"]},
+            staging=dict(_MARKER),
+            trope_persistence={"found family": dict(_STAMP)})
+        self.assertEqual(pp.write_claims(1, res), 0)
+        rows = fake.tables["book_trope_claims"]
+        # Both curated rows stand exactly; the promoted duplicate of
+        # the rejected claim is deduped, not resurrected, and the
+        # confirmed claim is not re-inserted.
+        self.assertEqual(sorted(r["id"] for r in rows), [1, 2])
+        self.assertEqual(rows[0]["status"], "rejected")
+        self.assertEqual(rows[1]["status"], "confirmed")
+
+
+class TestFamilyUntouchedByStaging(_WriteBase):
+    _CHARS = [{"name": "Mira Solace", "role": "protagonist"},
+              {"name": "Lilith Solace", "role": "supporting"}]
+    _RELS = [{"from": "Lilith Solace", "to": "Mira Solace",
+              "type": "parent",
+              "evidence": "Lilith Solace was the mother of "
+                          "Mira Solace."}]
+
+    def _rows(self, with_marker):
+        fake = self.install()
+        over = {"characters": [dict(c) for c in self._CHARS],
+                "relationships": [dict(r) for r in self._RELS]}
+        if with_marker:
+            over["staging"] = dict(_MARKER)
+        self.assertEqual(pp.write_claims(1, _wresult(**over)), 0)
+        rows = fake.tables["book_characters"]
+        return sorted((r["name"], json.dumps(r.get("relationships"),
+                                              sort_keys=True,
+                                              default=str))
+                      for r in rows)
+
+    def test_relationship_output_identical_with_staging_marker(self):
+        plain = self._rows(False)
+        staged = self._rows(True)
+        self.assertEqual(plain, staged)
+        # Sanity: the family relationship really is in the output
+        # (the comparison is not vacuous).
+        self.assertTrue(any("parent" in ev for _, ev in plain))
+
+
+class TestPushPreviewConsistency(_E2EBase, _WriteBase):
+    def test_preview_pushes_its_recorded_ship_set(self):
+        st = self._tmp_state()
+        cfg = {"staging_gate": True}
+        self._run("pushprev", cfg, st)
+        # Snapshot run 1's preview (Found Family held -> empty ship
+        # set) before run 2 overwrites it.
+        p1 = pp.SCRIPT_DIR / "preview" / "pushprev.json"
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        snap1 = Path(tmp.name) / "run1.json"
+        snap1.write_bytes(p1.read_bytes())
+        self._run("pushprev", cfg, st)  # promotes in the store
+        snap2 = Path(tmp.name) / "run2.json"
+        snap2.write_bytes(p1.read_bytes())
+        # Store sabotaged after the fact: push must not consult it.
+        fresh = pp.StagingState(Path(tmp.name) / "fresh")
+        old_state = pp._STAGING_STATE
+        pp._STAGING_STATE = fresh
+        self.addCleanup(
+            lambda: setattr(pp, "_STAGING_STATE", old_state))
+        fake = self.install()
+        with mock.patch.object(pp, "resolve_work",
+                               lambda *a, **k: (1, "test")):
+            pp.cmd_push_preview(str(snap1))
+        # Run 1's recorded ship set is empty: nothing leaks in even
+        # though the store has since promoted the claim.
+        self.assertEqual(fake.tables.get("trope_proposals", []), [])
+        self.assertEqual(fake.tables.get("book_trope_claims", []), [])
+        with mock.patch.object(pp, "resolve_work",
+                               lambda *a, **k: (1, "test")):
+            pp.cmd_push_preview(str(snap2))
+        # Run 2's recorded ship set carries the (unmapped) trope: it
+        # lands as a proposal, exactly as the preview recorded.
+        self.assertEqual(len(fake.tables.get("trope_proposals", [])),
+                         1)
+        # The push never touched the staging store.
+        self.assertFalse((fresh.dir / "staging.json").exists())

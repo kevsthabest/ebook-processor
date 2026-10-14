@@ -8723,13 +8723,21 @@ def _build_trope_rows(work_id, result, cat_map, trope_mappings, model, skip_ids)
             # No supporting chapters recorded: the claim has no
             # evidence, so it must not carry real confidence.
             _tconf = 0.0
+        _ev = {"source": "ebook-extraction",
+               "chapters": _chaps,
+               "chapter_count": len(_chaps)}
+        # Option F (OC-7, a requirement): a claim shipping via the
+        # persistence gate carries its stamp in the row, so a reviewer
+        # can tell it apart from a natural candidate. The confidence
+        # above is the pipeline's own value — never boosted.
+        _stamp = (result.get("trope_persistence") or {}).get(_tnorm(t))
+        if _stamp:
+            _ev["persistence"] = dict(_stamp)
         rows.append({"work_id": work_id, "trope_id": tid, "status": "candidate",
                      "confidence": _tconf,
                      "source_type": "ai",
                      "model": model,
-                     "evidence": {"source": "ebook-extraction",
-                                  "chapters": _chaps,
-                                  "chapter_count": len(_chaps)}})
+                     "evidence": _ev})
     return rows, unmatched, lookup_failed
 
 
@@ -8748,18 +8756,24 @@ def _build_trigger_rows(work_id, result, model, skip_warnings):
         if not _tev:
             # No textual evidence -> no real confidence.
             _tconf = 0.0
+        _ev = {"source": "ebook-extraction",
+               "severity": td.get("severity", ""),
+               "severity_claimed": td.get("severity_claimed", ""),
+               "chapters": td.get("chapters", []),
+               "chapter_count": td.get("chapter_count", 0),
+               "frequency": td.get("frequency", 0),
+               "prominence": td.get("prominence", ""),
+               "quotes": td.get("evidence", [])}
+        # Option F (OC-7): persistence stamp, as in _build_trope_rows.
+        _stamp = (result.get("trigger_persistence") or {}).get(
+            str(warn).lower())
+        if _stamp:
+            _ev["persistence"] = dict(_stamp)
         rows.append({"work_id": work_id, "warning": warn, "status": "candidate",
                      "confidence": _tconf,
                      "source_type": "ai",
                      "model": model,
-                     "evidence": {"source": "ebook-extraction",
-                                  "severity": td.get("severity", ""),
-                                  "severity_claimed": td.get("severity_claimed", ""),
-                                  "chapters": td.get("chapters", []),
-                                  "chapter_count": td.get("chapter_count", 0),
-                                  "frequency": td.get("frequency", 0),
-                                  "prominence": td.get("prominence", ""),
-                                  "quotes": td.get("evidence", [])}})
+                     "evidence": _ev})
     return rows
 
 
@@ -9245,6 +9259,18 @@ def plan_replace(work_id, result, trope_mappings=None):
     plan["existing"] += len(_qstate)
     plan["would_insert"]["quotes"] = len(
         _build_quote_rows(work_id, result, _preserved))
+
+    # Option F: held-back counts come from the run's staging marker —
+    # the plan reads the seam's decision, it does not re-derive it
+    # (a second gated copy is how plans learn to understate).
+    _stg = result.get("staging")
+    if _stg:
+        _staged = _stg.get("staged") or []
+        plan["held_back"] = {
+            "tropes": sum(1 for s in _staged
+                          if s.get("class") == "trope"),
+            "triggers": sum(1 for s in _staged
+                            if s.get("class") == "trigger")}
     return plan
 
 
@@ -9259,6 +9285,11 @@ def print_replace_plan(work_id, result, trope_mappings=None):
         return
     _wd = sum(plan["would_delete"].values())
     _wi = sum(plan["would_insert"].values())
+    _hb = plan.get("held_back") or {}
+    if _hb.get("tropes") or _hb.get("triggers"):
+        print(f"  Staging: {_hb.get('tropes', 0)} trope(s), "
+              f"{_hb.get('triggers', 0)} trigger(s) held back by the "
+              f"staging gate (not in the counts below)")
     if not plan["existing"]:
         print(f"  Replace plan: no existing claims in DB — "
               f"a write run would insert {_wi} fresh rows")
