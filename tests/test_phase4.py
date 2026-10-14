@@ -4491,7 +4491,14 @@ class TestCheckpoints(unittest.TestCase):
         ch, roster = pp._checkpoint_resume_check("bk3", 2)
         self.assertIsNotNone(ch)
         self.assertEqual(len(ch), 2)
-        self.assertEqual(roster, {"a": {}})
+        # BAR-MOVE (sweep F13, Advisor-approved): resume returns the
+        # completed entry — core-field census defaults are filled at
+        # load (transport plus completion), exact equality as before.
+        self.assertEqual(roster, {"a": {
+            "name": "", "aliases": set(), "alias_keys": set(),
+            "primary_keys": set(), "_generic_keys": set(),
+            "appearances": 0, "chapters": set(), "roles": Counter(),
+            "descriptions": [], "last_seen": 0}})
 
     def test_resume_check_flags_mismatch_noninteractive(self):
         # Non-tty stdin -> refuses to resume on mismatch, clears checkpoints.

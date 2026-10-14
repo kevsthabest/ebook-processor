@@ -232,7 +232,16 @@ class TestCmdRetryFailed(_ConfigGuard):
         self.assertEqual(saved[0], ({"x": 1}, {"y": 1}))
         self.assertEqual(saved[1], ({"x": 1}, None))
         self.assertEqual(saved[2], ({"x": 2}, {"y": 2}))
-        self.assertEqual(saved_roster, roster)
+        # BAR-MOVE (sweep F13, Advisor-approved): the seeded roster is
+        # completed at the checkpoint seam — an entry gains the
+        # core-field census defaults, the same completion applied to
+        # any older roster entry. Exact equality now pins transport
+        # PLUS completion; the fixture above stays the raw input.
+        self.assertEqual(saved_roster, {"Hero": {
+            "appearances": 4, "name": "", "aliases": set(),
+            "alias_keys": set(), "primary_keys": set(),
+            "_generic_keys": set(), "chapters": set(),
+            "roles": pp.Counter(), "descriptions": [], "last_seen": 0}})
 
     def test_all_ok_does_not_run(self):
         chapters = {"0": {"a": {"x": 1}, "b": {"y": 1}}}
