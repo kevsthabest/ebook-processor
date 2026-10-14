@@ -842,6 +842,35 @@ class TestStagingE2E(_E2EBase, unittest.TestCase):
         self.assertEqual(r2["staging"]["sightings_recorded"], 0)
         self.assertNotIn("Found Family", r2["tropes"])
 
+    def test_aborted_run_records_nothing(self):
+        # Every extraction call fails -> the run aborts; an aborted
+        # run's partial extraction is not an observation, so the
+        # store must stay untouched (no works, no sightings).
+        st = self._tmp_state()
+        epub = self._epub_for("stageabort")
+
+        class _ExplodingBackend:
+            # Unparseable output for every call: the sanitizers turn
+            # it into failed chapters, which is how a run aborts.
+            def __call__(self, prompt, chunk, i, n):
+                return "this is not json at all"
+
+        old_state = pp._STAGING_STATE
+        pp._STAGING_STATE = st
+        self.addCleanup(
+            lambda: setattr(pp, "_STAGING_STATE", old_state))
+        with mock.patch.object(pp, "llm_ollama", _ExplodingBackend()), \
+                mock.patch.object(pp, "_lookup_series_openlibrary",
+                                  lambda *a, **k: (None, None)), \
+                mock.patch.object(pp, "resolve_work",
+                                  lambda *a, **k: (None, "test")), \
+                mock.patch.dict(pp.CONFIG,
+                                {"llm": "ollama", "staging_gate": True}):
+            ok = pp.process_file_v2(Path(epub), preview=True)
+        self.assertFalse(ok)
+        self.assertEqual(st.data["works"], {})
+        self.assertFalse((st.dir / "staging.json").exists())
+
     def test_adoption_into_resolved_work_id(self):
         st = self._tmp_state()
         cfg = {"staging_gate": True}
