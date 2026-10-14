@@ -150,14 +150,15 @@ def _ask_payloads(instructions_a, instructions_b):
 
 
 class TestPromptVariants(unittest.TestCase):
-    def test_default_instructions_are_legacy_production_text(self):
-        payloads = _ask_payloads(em.LEGACY_INSTRUCTIONS,
-                                 em.LEGACY_INSTRUCTIONS)
+    def test_default_instructions_are_current_production_text(self):
+        payloads = _ask_payloads(em.PRODUCTION_INSTRUCTIONS,
+                                 em.PRODUCTION_INSTRUCTIONS)
         instr = payloads[0]["questions"]["same_person"]["instructions"]
-        self.assertEqual(instr, em.LEGACY_INSTRUCTIONS)
-        # The production literal, not the old drifted paraphrase.
+        self.assertEqual(instr, em.PRODUCTION_INSTRUCTIONS)
+        # The current production literal (identity text since the
+        # 2026-10-14 swap), not the old drifted paraphrase.
         self.assertIn("character entries", instr)
-        self.assertIn("AND the descriptions are compatible", instr)
+        self.assertIn("positive evidence of one identity", instr)
 
     def test_variants_differ_only_in_instructions(self):
         legacy, identity = _ask_payloads(
