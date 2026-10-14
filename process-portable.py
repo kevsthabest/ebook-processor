@@ -786,6 +786,67 @@ def _is_toc_chapter(text):
                 if l[-1] in ".!?\"'" "\u201d\u2019" or "," in l or ";" in l)
     return punct / len(lines) < 0.3
 
+
+# Front/back matter chapter tagging. The unit-drop heuristics above remove
+# whole spine units before indexing, but front/back matter that survives
+# them (generic spine names, single-signal content, fallback splits) used
+# to be processed as story chapters — a dedication page produced a
+# character named "Author", and About-the-Author bios became trope
+# evidence. Tagging (not dropping) keeps positional slots: chapter
+# indices feed chapter_spice, first_appearance, and trigger
+# chapter_indices downstream, so tagged chapters are skipped for
+# extraction/evidence but never removed from the sequence.
+_FRONTMATTER_HEADING_RE = re.compile(
+    r"^(?:dedications?|dedicated\s+to\b.*|acknowledg(?:e)?ments?|"
+    r"about\s+the\s+author|"
+    r"(?:also\s+by|books\s+by|other\s+books\s+by|more\s+by|"
+    r"by\s+the\s+same\s+author)\b.*|"
+    r"copyright(?:\s+page)?|colophon)$", re.IGNORECASE)
+_FRONTMATTER_MAX_CHARS = 8000  # fm pages are short; real chapters are not
+_FRONTMATTER_EDGE = 3          # only the first/last N chapters can be fm
+
+
+def _fm_heading(line):
+    """Normalize a candidate heading line, or None if it can't be one.
+
+    A heading is short and carries no sentence punctuation; a prose line
+    that merely starts with a front-matter word ("Dedicated to her, he
+    raised the sword.") is not a heading.
+    """
+    h = re.sub(r"[-_]+", " ", (line or "").strip().lower()).strip(" .:! ")
+    if not h or len(h) > 60 or "," in h or ";" in h:
+        return None
+    return h
+
+
+def _is_frontmatter_chapter(label, text, index, n_chapters):
+    """True if a chapter is front/back matter, not story content.
+
+    Conservative — precision over recall, because a false tag loses a
+    real chapter while a missed tag only wastes some extraction. ALL
+    must hold: position (first/last _FRONTMATTER_EDGE chapters),
+    heading (the label or the first text line is a standalone
+    front/back-matter heading), and length (<= _FRONTMATTER_MAX_CHARS —
+    back matter merged into a full-length final chapter must not take
+    the real chapter down with it).
+    """
+    if not (index <= _FRONTMATTER_EDGE
+            or index > n_chapters - _FRONTMATTER_EDGE):
+        return False
+    text = text or ""
+    if len(text) > _FRONTMATTER_MAX_CHARS:
+        return False
+    lines = text.split("\n")
+    first_line = next((l for l in lines if l.strip()), "")
+    heads = [h for h in (_fm_heading(label), _fm_heading(first_line)) if h]
+    if not any(_FRONTMATTER_HEADING_RE.match(h) for h in heads):
+        return False
+    # Merge-forward guard: a chapter heading later in the text means
+    # front matter was merged into a real chapter — it stays content.
+    if len(lines) > 1 and _CHAPTER_HEADING_RE.search("\n".join(lines[1:])):
+        return False
+    return True
+
 # Chapter-detection fallback flag lives on _DIAG (threading.local) because
 # --jobs runs books in a ThreadPoolExecutor. See _DIAG definition above.
 
@@ -841,7 +902,9 @@ def _fallback_heading_split(units):
 def split_chapters(units):
     """Turn raw spine units into chapter-sized units for the v2 pipeline.
 
-    - Drops front/back matter by filename heuristic.
+    - Drops front/back matter by filename heuristic; front/back matter
+      that survives is tagged is_frontmatter (slots kept, see
+      _is_frontmatter_chapter).
     - Merges units under MIN_CHAPTER_CHARS into the next unit.
     - Splits units over the configured max (v2_max_chapter_chars, default
       MAX_CHAPTER_CHARS) on paragraph boundaries.
@@ -907,9 +970,17 @@ def split_chapters(units):
             clen += len(p)
         if cur:
             out.append(_chapter_part(u, "\n\n".join(cur), part))
-    return [{"index": i, "label": u["label"], "text": u["text"],
-             "is_toc": _is_toc_chapter(u["text"])}
-            for i, u in enumerate(out, 1)]
+    chapters = [{"index": i, "label": u["label"], "text": u["text"],
+                 "is_toc": _is_toc_chapter(u["text"])}
+                for i, u in enumerate(out, 1)]
+    # Tag front/back matter that survived the unit-drop heuristics.
+    # Tagged chapters keep their slots (indices are positional and
+    # consumed downstream); the v2 pipeline skips them for extraction
+    # and evidence instead of renumbering.
+    for c in chapters:
+        c["is_frontmatter"] = _is_frontmatter_chapter(
+            c["label"], c["text"], c["index"], len(chapters))
+    return chapters
 
 
 # --- v2 pipeline: chapter-level map/reduce ---
@@ -3823,6 +3894,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     # candidates would be inferred from other chapters' titles, so they are
     # excluded from trope/trigger evidence collection below.
     _toc_idx = {c["index"] for c in chapters if c.get("is_toc")}
+    # Front/back matter chapters (dedication, about-the-author, ...) are
+    # not story content either: excluded from the same evidence
+    # collection as ToC chapters (trope/trigger evidence, quotes, POVs).
+    _fm_idx = {c["index"] for c in chapters if c.get("is_frontmatter")}
+    _skip_evidence_idx = _toc_idx | _fm_idx
     _label_to_text = {c["label"]: c.get("text", "") for c in chapters}
     # Extraction coverage: chapters with successful Call B results. Failed
     # chapters are NOT treated as "no content" — frequency denominators use
@@ -3834,6 +3910,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     # (Computed here because character importance needs is_pov.)
     pov_counts = Counter()
     for idx in sorted(chapter_as):
+        if idx in _fm_idx:
+            continue  # front/back matter: not a story POV source
         a = chapter_as[idx]
         if a and a.get("pov_character"):
             pov_counts[_roster_canonical(roster, a["pov_character"])] += 1
@@ -3933,6 +4011,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         a = chapter_as[idx]
         if not a:
             continue
+        if idx in _fm_idx:
+            continue  # front/back matter: not relationship evidence
         for r in a["relationships"]:
             frm = _roster_canonical(roster, r["from"])
             to = _roster_canonical(roster, r["to"])
@@ -4109,8 +4189,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         b = chapter_bs[idx]
         if not b:
             continue
-        if idx in _toc_idx:
-            continue  # ToC chapter: titles, not trigger evidence
+        if idx in _skip_evidence_idx:
+            continue  # ToC/front matter: titles/bios, not trigger evidence
         for cat in TRIGGER_CATEGORIES:
             sev = _SEVERITY_ORDER[b["triggers"][cat]]
             if sev > 0:
@@ -4271,8 +4351,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         b = chapter_bs[idx]
         if not b:
             continue
-        if idx in _toc_idx:
-            continue  # ToC chapter: titles, not trope evidence
+        if idx in _skip_evidence_idx:
+            continue  # ToC/front matter: titles/bios, not trope evidence
         seen_this_chapter = set()
         for t in b["trope_candidates"]:
             k = _tnorm(t)
@@ -4327,8 +4407,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                     b = chapter_bs[idx]
                     if not b:
                         continue
-                    if idx in _toc_idx:
-                        continue  # ToC chapter: titles, not trope evidence
+                    if idx in _skip_evidence_idx:
+                        continue  # ToC/front matter: not trope evidence
                     seen_this_chapter = set()
                     for t in b["trope_candidates"]:
                         k = _tnorm(t)
@@ -4378,6 +4458,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         b = chapter_bs[idx]
         if not b:
             continue
+        if idx in _fm_idx:
+            continue  # quotes are never drawn from front/back matter
         _ch_label = idx_to_label.get(idx, "")
         _sum_tokens = _qtokens(b.get("summary", ""))
         for q in b["quotes"]:
@@ -7751,6 +7833,13 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     else:
         UI.status(f"  {len(chapters)} chapters, LLM: {CONFIG['llm']}")
     n = len(indexed)
+    # Front/back matter chapters keep their slots but are never story
+    # content: no Call A/B is spent on them and they contribute no
+    # roster entries or evidence (v2_reduce also excludes them).
+    _fm_idx_v2 = {i for i, ch in indexed if ch.get("is_frontmatter")}
+    if _fm_idx_v2:
+        UI.status(f"  Skipping {len(_fm_idx_v2)} front/back-matter "
+                  f"chapter(s) (no extraction)")
     # 2 work units per chapter (Call A identity + Call B content)
     UI.book_start(_book_key, f"📖 {title or fpath.stem}", total=2 * n)
 
@@ -7788,6 +7877,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if _resumed_roster:
         roster.update(_resumed_roster)
     for _ri, _rpair in sorted(_resumed_chapters.items()):
+        if _ri in _fm_idx_v2:
+            continue  # front/back matter: stale checkpoint results dropped
         _ra, _rb = _rpair
         if _ra is not None and _rb is not None:
             chapter_as[_ri] = _ra
@@ -7795,6 +7886,11 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             a_ok += 1
             b_ok += 1
             UI.advance(_book_key, 2)  # both work units already done
+    # Front/back matter slots: present in chapter_data (indices must not
+    # shift) but permanently empty — no calls, no results, in every mode.
+    for _fi in _fm_idx_v2:
+        chapter_as[_fi] = None
+        chapter_bs[_fi] = None
     interleave = CONFIG.get("v2_prompt_cache") and batch_size > 1
     # Single-slot prompt-cache: run B inline right after A (cache is hottest).
     inline_b = CONFIG.get("v2_prompt_cache") and batch_size <= 1
@@ -7811,6 +7907,13 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             UI.book_done(_book_key)
             print("  Checkpoint saved. Run with --resume to continue.")
             return False
+        if i in _fm_idx_v2:
+            # No Call A/B for front/back matter. Advance the work units
+            # this chapter would have consumed in the current mode (in
+            # sequential mode Pass 2 advances the B unit via _skipped_b,
+            # since chapter_bs is pre-seeded above).
+            UI.advance(_book_key, 2 if (interleave or inline_b) else 1)
+            continue
         if _ckpt_complete(i):
             continue  # resumed: A+B already done, roster restored
         _saved_a, _saved_b = _resumed_chapters.get(i, (None, None))
