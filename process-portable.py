@@ -4786,28 +4786,34 @@ class RosterStore:
     # -- views (matcher input) ----------------------------------------------
     def entity_views(self):
         """Per-entity matching views over ACTIVE entities. Primary
-        forms come from every non-detached observation; tier-2 alias
-        evidence (`alias_keys`) counts only attestations NOT carried
-        solely by suspect observations (A1), while `alias_keys_all`
-        keeps the full set for reporting. desc_hash is the latest
-        trusted (non-suspect) observation's."""
+        forms (`primary_forms`) count only forms attested by at
+        least one NON-suspect observation (B-F1): a form carried
+        solely by a suspended link's observations must not claim
+        tier 1 / tier 3 for the entity — the same A1 exclusion the
+        canonical vote and tier-2 alias evidence already apply.
+        `primary_forms_all` keeps every non-detached form for the
+        reporting / split-suspect surface, mirroring
+        `alias_keys_all`. desc_hash is the latest trusted
+        (non-suspect) observation's."""
         views = []
         with self._lock:
             for eid, ent in self.data["entities"].items():
                 if ent.get("status") != "active":
                     continue
-                primary, alias_trusted, alias_all = set(), set(), set()
+                primary, primary_all = set(), set()
+                alias_trusted, alias_all = set(), set()
                 chapters = set()
                 appearances = 0
                 desc_hash = ""
                 for o in ent["observations"]:
                     if o.get("detached"):
                         continue
-                    primary.add(o["form_key"])
+                    primary_all.add(o["form_key"])
                     alias_all.update(o.get("alias_keys") or [])
                     chapters.update(o.get("chapters") or [])
                     appearances += o.get("appearances") or 0
                     if not o.get("suspect"):
+                        primary.add(o["form_key"])
                         alias_trusted.update(o.get("alias_keys") or [])
                         if o.get("desc_hash"):
                             desc_hash = o["desc_hash"]
@@ -4817,6 +4823,7 @@ class RosterStore:
                     "canonical_key": norm_name(ent["canonical"] or ""),
                     "anchor": ent.get("anchor"),
                     "primary_forms": primary,
+                    "primary_forms_all": primary_all,
                     "alias_keys": alias_trusted,
                     "alias_keys_all": alias_all,
                     "chapters": chapters,
@@ -5083,8 +5090,9 @@ def cmd_roster_report(learn_dir=None):
                     for o in ent["observations"] if o.get("suspect")]
         if suspects:
             print("    !! SUSPECT OBSERVATIONS (under suspended "
-                  "links; excluded from canonical weighting and "
-                  "alias evidence until resolved):")
+                  "links; excluded from canonical weighting, "
+                  "alias evidence and primary-form authority "
+                  "until resolved):")
             for eid, o in suspects:
                 print(f"       {eid} form '{o['form']}' (run "
                       f"{o.get('run')}) — resolve with --roster-link"
@@ -5317,11 +5325,24 @@ def _matcher_no_veto(no_pairs, entry_forms, view_forms):
     return None
 
 
+def _view_primary_forms_all(view):
+    """Every primary form the view's entity was observed under,
+    including forms attested only by suspect observations. This is
+    the claims / proposal surface (veto checks, contested ground,
+    split suspects): a suspended link's form still marks the
+    ground, it just cannot LINK (tiers 1/3 read `primary_forms`,
+    which entity_views now restricts to trusted attestations —
+    B-F1). Hand-built views without the key fall back to
+    `primary_forms`."""
+    return set(view.get("primary_forms_all")
+               or view.get("primary_forms") or ())
+
+
 def _view_form_keys(view):
     """Every form key an entity view claims: observed primaries, all
     observed alias keys, its canonical key, and its anchor's closed
     key set."""
-    forms = set(view.get("primary_forms") or ())
+    forms = _view_primary_forms_all(view)
     forms |= set(view.get("alias_keys_all") or ())
     if view.get("canonical_key"):
         forms.add(view["canonical_key"])
@@ -5429,7 +5450,7 @@ def roster_match_entries(entries, views, no_pairs=()):
         for v in views:
             if v["id"] == candidate["id"]:
                 continue
-            if e["form_key"] in (set(v.get("primary_forms") or ())
+            if e["form_key"] in (_view_primary_forms_all(v)
                                  | set(v.get("alias_keys_all") or ())):
                 out.append(v)
         return out
@@ -5572,7 +5593,7 @@ def roster_match_entries(entries, views, no_pairs=()):
                 continue
             why = None
             if first and any(f.split()[0] == first
-                             for f in (v.get("primary_forms") or ())):
+                             for f in _view_primary_forms_all(v)):
                 if set(e.get("chapters") or ()) \
                         & set(v.get("chapters") or ()):
                     why = ("shared first token + overlapping "

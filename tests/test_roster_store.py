@@ -380,6 +380,48 @@ class TestViews(_StoreCase):
         self.assertTrue(st.has_no("dad", "violet sorrengail"))
 
 
+class TestSuspectPrimaryForms(_StoreCase):
+    """Fix-queue batch 2, item 1 (B-F1): primary-form authority
+    follows the A1 exclusion — the same one the canonical vote
+    (compute_canonical_name) and tier-2 alias evidence already
+    apply. A form attested ONLY by suspect observations must not
+    claim tier 1 / tier 3 for its entity: that is a suspended link
+    silently resolving itself. The form stays visible in
+    primary_forms_all, the reporting / split-suspect surface."""
+
+    def _store_with_suspect_long_form(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet"))
+        st.append_observation(a, _obs(2, "Violet Sorrengail"))
+        st.flag_suspect_observations(a, run=2,
+                                     form_key="violet sorrengail")
+        return st, a
+
+    def test_suspect_only_form_carries_no_primary_authority(self):
+        st, a = self._store_with_suspect_long_form()
+        (view,) = st.entity_views()
+        self.assertIn("violet", view["primary_forms"])
+        self.assertNotIn("violet sorrengail", view["primary_forms"])
+        self.assertIn("violet sorrengail", view["primary_forms_all"])
+
+    def test_form_with_a_trusted_attestation_stays_primary(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet Sorrengail"))
+        st.append_observation(a, _obs(2, "Violet Sorrengail"))
+        st.flag_suspect_observations(a, run=2,
+                                     form_key="violet sorrengail")
+        (view,) = st.entity_views()
+        self.assertIn("violet sorrengail", view["primary_forms"])
+
+    def test_resolved_suspect_form_votes_again(self):
+        st, a = self._store_with_suspect_long_form()
+        st.resolve_suspect(a, "violet sorrengail")
+        (view,) = st.entity_views()
+        self.assertIn("violet sorrengail", view["primary_forms"])
+
+
 class TestAccountingRandomized(_StoreCase):
     def test_accounting_closes_on_randomized_sequences(self):
         rng = random.Random(20261014)
