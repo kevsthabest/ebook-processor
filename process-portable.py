@@ -118,6 +118,8 @@ DEFAULT_CONFIG = {
     "v2_enable_thinking_a": None,  # Call A override; None = use llm_enable_thinking
     "v2_enable_thinking_b": None,  # Call B override; None = use llm_enable_thinking
     "trope_map_threshold": 0.78,  # cosine threshold for catalog mapping
+    "evidence_retrieval_floor": 0.25,  # Option G (OC-3): cosine floor for
+    # retrieval candidates; a named tunable, reported in the run marker
     "trope_map_cache": "trope-vectors.json",  # cached catalog embeddings
     "v2_prompt_cache": False,  # put chapter first for llama.cpp KV cache reuse
     "proposer_user_id": "",  # Supabase users.id for trope_proposals.proposed_by
@@ -4206,6 +4208,233 @@ def cmd_staging_report(as_json=False, learn_dir=None, state=None):
         print(json.dumps(data, ensure_ascii=False, indent=1))
     else:
         print(text)
+
+
+# ---------------------------------------------------------------------------
+# Option G — targeted evidence retrieval for trope/trigger claims
+# (design: eval/g-evidence-design.md; user-approved open choices
+# OC-1..OC-7 as amended, Advisor amendments G1-G5, Trope Review seat
+# amendments A/B). Doctrine, binding on everything in this section:
+# retrieval finds passages; it does not manufacture support. Every
+# attached passage is a literal span of the book's own text, produced
+# by the retriever and re-verified before attach; a passage attaches
+# only when the local-model judge rules it "supports" (depiction,
+# not topic). G never raises a claim's confidence, never drops a
+# claim, and never draws on the decision-model budget — the judge
+# is the pipeline's local model, batched like the trope gate.
+# ---------------------------------------------------------------------------
+
+_EVIDENCE_METHOD = "targeted-v1"
+_EVIDENCE_WINDOW_CHARS = 600     # attached-passage cap (OC-3)
+_EVIDENCE_MAX_PASSAGES = 3       # attached passages per claim (OC-3)
+_EVIDENCE_JUDGE_BATCH = 10       # claims per judge call (design §4)
+_EVIDENCE_MAX_CLAIMS = 250       # per-book claim cap (design §7)
+_EVIDENCE_MAX_WINDOWS = 5000     # per-book embedded-window cap (§7)
+_EVIDENCE_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "by",
+    "for", "with", "from", "as", "is", "are", "was", "were", "be",
+    "been", "it", "its", "this", "that", "these", "those", "who",
+    "whom", "when", "where", "while", "into", "over", "under",
+    "about", "after", "before", "their", "they", "them", "then",
+    "than", "but", "not", "no", "yes", "one", "two", "all", "any",
+})
+
+
+def _evidence_tokens(text):
+    """Content tokens for the lexical prefilter: lowercase alpha
+    tokens of length >= 3, minus a small stopword set. One tokenizer
+    for query terms and window text alike, so the prefilter compares
+    like with like."""
+    return {t for t in re.findall(r"[a-z][a-z0-9']*",
+                                  (text or "").lower())
+            if len(t) >= 3 and t not in _EVIDENCE_STOPWORDS}
+
+
+def evidence_query_terms(name, description=None):
+    """Lexical-prefilter terms for a claim (design §3 stage 1):
+    content tokens from the claim name, plus — for catalog-mapped
+    claims — content tokens from the catalog description."""
+    terms = _evidence_tokens(name)
+    if description:
+        terms |= _evidence_tokens(description)
+    return terms
+
+
+def evidence_query_text(name, description=None, summaries=None):
+    """The embedding query for a claim, in a deliberately chosen
+    text shape (design §3 stage 2). Mapped claims embed in the
+    catalog's own shape — "name: description" (EMBED_TEXT_FORMAT) —
+    never as a bare name: cosine against prose windows must measure
+    trope presence, not name-mention. Unmapped claims (OC-7) use
+    the name plus the gate's own summaries of the claim's support
+    chapters, the richest honest description available."""
+    if description:
+        return f"{name}: {description}"
+    if summaries:
+        joined = " ".join(s.strip() for s in summaries if s and s.strip())
+        if joined:
+            return f"{name}: {joined}"
+    return name or ""
+
+
+def _sentence_spans(text):
+    """(start, end) offsets of the sentences _split_sentences would
+    return. Sentences are verbatim substrings; offsets are located
+    by a forward scan, so a repeated sentence resolves to successive
+    occurrences. The offsets are provenance (Trope amendment A);
+    the spans themselves are always literal slices."""
+    spans = []
+    pos = 0
+    for piece in re.split(r"(?<=[.!?])\s+", text or ""):
+        s = piece.strip()
+        if not s:
+            continue
+        start = text.find(s, pos)
+        if start == -1:
+            continue
+        spans.append((start, start + len(s)))
+        pos = start + len(s)
+    return spans
+
+
+def _evidence_windows(text):
+    """Sentence-anchored candidate windows over one chapter's text:
+    greedy runs of whole sentences up to _EVIDENCE_WINDOW_CHARS,
+    overlapping by one sentence when a window holds three or more
+    (a passage straddling a boundary is still whole somewhere). A
+    single sentence longer than the cap is hard-cut at the cap —
+    still a literal span. Every window is text[offset:offset+len],
+    an exact substring of the chapter."""
+    spans = _sentence_spans(text)
+    windows = []
+    prev = None
+    i = 0
+    while i < len(spans):
+        start = spans[i][0]
+        j = i
+        while j + 1 < len(spans) \
+                and spans[j + 1][1] - start <= _EVIDENCE_WINDOW_CHARS:
+            j += 1
+        end = spans[j][1]
+        if end - start > _EVIDENCE_WINDOW_CHARS:
+            end = start + _EVIDENCE_WINDOW_CHARS
+        # A window fully contained in its predecessor (the overlap
+        # tail at a chapter's end) adds no new span — its text is
+        # already covered, and as a standalone candidate its brevity
+        # would game the cosine rank.
+        if prev is None or start < prev[0] or end > prev[1]:
+            windows.append({"offset": start, "text": text[start:end]})
+            prev = (start, end)
+        n_sent = j - i + 1
+        i += (n_sent - 1) if n_sent >= 3 else n_sent
+    return windows
+
+
+def _resolve_support_chapters(refs, chapters):
+    """Resolve a claim's support-chapter references to chapter
+    dicts. References arrive as chapter LABELS from the reduce's
+    trope_chapters map, or as chapter INDICES from the seam's
+    fallback construction; both resolve, unknown refs are skipped,
+    order follows the refs, duplicates collapse."""
+    by_label = {c.get("label"): c for c in chapters}
+    by_index = {c.get("index"): c for c in chapters}
+    out, seen = [], set()
+    for ref in refs or []:
+        ch = None
+        if isinstance(ref, str) and ref in by_label:
+            ch = by_label[ref]
+        elif ref in by_index:
+            ch = by_index[ref]
+        elif isinstance(ref, str) and ref.isdigit() \
+                and int(ref) in by_index:
+            ch = by_index[int(ref)]
+        if ch is not None and id(ch) not in seen:
+            seen.add(id(ch))
+            out.append(ch)
+    return out
+
+
+def _select_judge_candidates(candidates, limit=_EVIDENCE_MAX_PASSAGES):
+    """The windows the judge sees for a claim (design §3/§4): the
+    top `limit` by score, chosen with a distinct-chapter preference
+    — the best window per chapter first, then fillers by score — so
+    three windows from one paragraph cannot impersonate book-wide
+    support at the judging stage either."""
+    picked, picked_keys, seen_ch = [], set(), set()
+    for p in candidates:
+        if len(picked) >= limit:
+            break
+        if p["chapter"] not in seen_ch:
+            picked.append(p)
+            picked_keys.add((p["chapter"], p["offset"]))
+            seen_ch.add(p["chapter"])
+    for p in candidates:
+        if len(picked) >= limit:
+            break
+        if (p["chapter"], p["offset"]) not in picked_keys:
+            picked.append(p)
+            picked_keys.add((p["chapter"], p["offset"]))
+    return picked
+
+
+def retrieve_claim_candidates(claim, embedder, cache, floor=None):
+    """Two-stage targeted retrieval over a claim's OWN support
+    chapters (design §3): lexical prefilter, then embedding rank
+    against the claim's query. No whole-book scan: if the passages
+    are not in the support chapters, that absence is the finding
+    (the judge stage turns it into a recorded abstention).
+
+    claim: {"key", "name", "query_text", "terms", "support":
+    [chapter dicts {"label", "index", "text"}]}. embedder(texts)
+    -> [vectors] (the embed_vectors shape). cache is the per-run
+    window-embedding cache (amendment G5: in-memory only, keyed by
+    chapter label + window offset, shared across claims, discarded
+    when the run ends — never persisted, never the catalog cache).
+
+    Returns {"candidates": [passage, ...], "verify_failures": n}
+    with passages score-ranked and shaped {"quote", "chapter",
+    "chapter_index", "offset", "score"} — chapter + location
+    provenance on every passage (Trope amendment A). Every returned
+    span is re-verified as a literal span of its chapter before it
+    may attach; a verification failure is a build bug, dropped and
+    counted, never shipped."""
+    if floor is None:
+        floor = CONFIG.get("evidence_retrieval_floor", 0.25)
+    terms = claim.get("terms") or set()
+    cand = []
+    for ch in claim.get("support") or []:
+        for w in _evidence_windows(ch.get("text", "")):
+            if _evidence_tokens(w["text"]) & terms:
+                cand.append((ch, w))
+    if not cand:
+        return {"candidates": [], "verify_failures": 0}
+    qvec = _normalize(embedder([claim["query_text"]])[0])
+    missing = [(ch, w) for ch, w in cand
+               if (ch.get("label"), w["offset"]) not in cache]
+    if missing:
+        vecs = embedder([w["text"] for _, w in missing])
+        for (ch, w), v in zip(missing, vecs):
+            cache[(ch.get("label"), w["offset"])] = _normalize(v)
+    scored, vfails = [], 0
+    for ch, w in cand:
+        vec = cache.get((ch.get("label"), w["offset"]))
+        if vec is None:
+            continue
+        score = _dot(qvec, vec)
+        if score < floor:
+            continue
+        if not verify_evidence(w["text"], ch.get("text", "")):
+            vfails += 1
+            continue
+        scored.append({"quote": w["text"],
+                       "chapter": ch.get("label"),
+                       "chapter_index": ch.get("index"),
+                       "offset": w["offset"],
+                       "score": round(score, 4)})
+    scored.sort(key=lambda p: (-p["score"], p["chapter_index"]
+                               if p["chapter_index"] is not None
+                               else 0, p["offset"]))
+    return {"candidates": scored, "verify_failures": vfails}
 
 
 # ---------------------------------------------------------------------------
