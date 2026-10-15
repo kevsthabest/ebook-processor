@@ -4233,7 +4233,7 @@ class RosterStore:
                 "minted_total": 0, "entities": {}, "retired": {},
                 "no_pairs": [], "adoptions": [],
                 "suspects": [], "canonical_changes": [],
-                "collisions": []}
+                "collisions": [], "anchor_retirements": []}
 
     # -- setup / persistence (StagingState's F8 pattern) --------------
     def _ensure_dir(self):
@@ -4688,13 +4688,22 @@ class RosterStore:
                               "merge")
             surv["observations"].extend(fold["observations"])
             surv["links"].extend(fold["links"])
-            if surv.get("anchor") is None and fold.get("anchor"):
-                surv["anchor"] = fold["anchor"]
+            fold_anchor = fold.get("anchor")
+            both_anchored = bool(surv.get("anchor") and fold_anchor)
+            if surv.get("anchor") is None and fold_anchor:
+                surv["anchor"] = fold_anchor
                 surv["canonical"] = fold["canonical"]
                 surv["canonical_source"] = fold["canonical_source"]
-            self.data["retired"][folded_id] = {
-                "merged_into": survivor_id, "run": run,
-                "reason": reason}
+            tombstone = {"merged_into": survivor_id, "run": run,
+                         "reason": reason}
+            if both_anchored:
+                # Both sides curated: the survivor keeps its OWN
+                # anchor, and the folded side's is preserved on
+                # the tombstone — never silently dropped — so a
+                # later split, unlink or report can see the
+                # conflict and a human can rule on it.
+                tombstone["anchor"] = fold_anchor
+            self.data["retired"][folded_id] = tombstone
             del self.data["entities"][folded_id]
             return True
 
@@ -4738,7 +4747,9 @@ class RosterStore:
         (a preserved DB row, or a manual --alias). The anchor's key
         set is closed and exact (A3): the anchor name's form_key
         plus the form keys of the aliases recorded for it — no token
-        decomposition. Re-seeding refreshes seen_run. Returns the
+        decomposition. Re-seeding an existing anchor reconciles
+        kind/source/aliases from the fresh row (the curation may
+        have changed since the first fetch). Returns the
         entity ID. lock_canonical=False for anchors whose name is a
         normalized key rather than a display form (manual --alias):
         the anchor still pins identity at tier 0, but the display
@@ -4752,6 +4763,17 @@ class RosterStore:
                     aset = {norm_name(anchor["name"])} | {
                         norm_name(a) for a in anchor.get("aliases") or []}
                     if aset & keyset:
+                        # Reconcile with the freshly fetched row:
+                        # kind, source and aliases are the row's
+                        # CURRENT curation, not the first fetch's —
+                        # a row that flipped confirmed -> rejected
+                        # must start suppressing, and one whose
+                        # aliases grew must claim the new forms.
+                        # (The name is the identity key the match
+                        # was made on and stays.)
+                        anchor["kind"] = kind
+                        anchor["source"] = source
+                        anchor["aliases"] = sorted(aliases)
                         anchor["seen_run"] = run
                         return eid
             for eid, ent in self.data["entities"].items():
@@ -4782,6 +4804,29 @@ class RosterStore:
         return {eid: ent["anchor"]
                 for eid, ent in self.data["entities"].items()
                 if ent.get("anchor")}
+
+    def retire_unclaimed_anchors(self, claimed_ids, run):
+        """Retire every anchor this run's anchor re-read did NOT
+        claim (claimed_ids: the entity IDs seed_anchor returned
+        for the fetched rows). The re-read is the authority: a
+        preserved DB row that was deleted, or a manual alias that
+        was removed, means the curation is gone — the anchor
+        clears (a deleted rejected row must STOP suppressing) and
+        the retirement is tombstoned in `anchor_retirements` for
+        the report. Returns [(entity_id, anchor)] retired. Only
+        ever called after a SUCCESSFUL re-read: a failed fetch
+        disengages the seam under A8 before this can run, so a
+        transient DB error can never retire anything."""
+        out = []
+        with self._lock:
+            for eid, ent in self.data["entities"].items():
+                anchor = ent.get("anchor")
+                if anchor and eid not in claimed_ids:
+                    self.data["anchor_retirements"].append(
+                        {"entity": eid, "run": run, "anchor": anchor})
+                    ent["anchor"] = None
+                    out.append((eid, anchor))
+            return out
 
     # -- views (matcher input) ----------------------------------------------
     def entity_views(self):
@@ -5162,6 +5207,12 @@ def cmd_roster_report(learn_dir=None):
         for rid, rec in sorted(d["retired"].items()):
             print(f"    {rid} [merged -> {rec.get('merged_into')}] "
                   f"run {rec.get('run')}: {rec.get('reason')}")
+            if rec.get("anchor"):
+                _ra = rec["anchor"]
+                print(f"       folded anchor preserved on the "
+                      f"tombstone: {_ra.get('kind')} "
+                      f"'{_ra.get('name')}' ({_ra.get('source')}) "
+                      f"— the survivor kept its own anchor")
         if d.get("suspects"):
             print("    Split suspects (proposals only — never "
                   "auto-linked):")
@@ -5184,6 +5235,14 @@ def cmd_roster_report(learn_dir=None):
             for a in d["adoptions"]:
                 print(f"       from {a.get('from_key')}: "
                       f"{a.get('entities_moved')} entit(ies) moved")
+        if d.get("anchor_retirements"):
+            print("    Anchor retirements (the curated row was "
+                  "gone at re-read; the anchor stopped applying):")
+            for t in d["anchor_retirements"]:
+                _ta = t.get("anchor") or {}
+                print(f"       run {t.get('run')}: {t.get('entity')} "
+                      f"anchor {_ta.get('kind')} "
+                      f"'{_ta.get('name')}' ({_ta.get('source')})")
 
 
 def _roster_cmd_store(work, learn_dir=None):
@@ -5706,10 +5765,22 @@ def roster_assign_entities(roster, store, *, anchors=None,
         anchors = []
     fingerprint = roster_fingerprint(roster)
     ordinal, repeat = store.claim_run(fingerprint)
+    claimed = set()
     for a in anchors:
-        store.seed_anchor(a["name"], a["kind"], a.get("source", "db"),
-                          ordinal, a.get("aliases") or (),
-                          lock_canonical=a.get("lock_canonical", True))
+        claimed.add(store.seed_anchor(
+            a["name"], a["kind"], a.get("source", "db"),
+            ordinal, a.get("aliases") or (),
+            lock_canonical=a.get("lock_canonical", True)))
+    # The re-read succeeded (a failure returned under A8 above):
+    # any stored anchor it did not claim backs a curated row that
+    # is gone — retire it, tombstoned, so revocations take effect.
+    for eid, anchor in store.retire_unclaimed_anchors(claimed,
+                                                      ordinal):
+        print(f"  Roster: anchor '{anchor.get('name')}' "
+              f"({anchor.get('kind')}, {anchor.get('source')}) on "
+              f"{eid} was not in this run's anchor re-read — the "
+              f"curated row is gone; anchor retired (see "
+              f"--roster-report).")
     marker = {"linked": 0, "folded": 0, "minted": 0, "suspects": [],
               "suspended": [], "suppressed": [],
               "canonical_changes": [], "canonical_names": {},

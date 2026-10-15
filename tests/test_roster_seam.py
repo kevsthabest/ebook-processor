@@ -204,6 +204,30 @@ class TestA8(_SeamCase):
         self.assertIn("entity_id", roster["violet sorrengail"])
 
 
+class TestAnchorRetirement(_SeamCase):
+    """Fix-queue batch 2, item 2 at the seam: the anchor re-read
+    is authoritative. A preserved row deleted between runs must
+    retire the stored anchor on the next SUCCESSFUL fetch (the
+    A8 failure path disengages before this can run)."""
+
+    def test_anchor_row_deleted_between_runs_retires_anchor(self):
+        st = self._store()
+        roster1 = {"violet sorrengail": _entry("Violet Sorrengail")}
+        anchors = [{"name": "Violet Sorrengail", "kind": "rejected",
+                    "source": "db", "aliases": [],
+                    "lock_canonical": True}]
+        pp.roster_assign_entities(roster1, st, anchors=anchors)
+        eid = roster1["violet sorrengail"]["entity_id"]
+        self.assertEqual(st.get_entity(eid)["anchor"]["kind"],
+                         "rejected")
+        # Run 2: the re-read succeeds and the row is gone.
+        roster2 = {"violet sorrengail": _entry("Violet Sorrengail")}
+        pp.roster_assign_entities(roster2, st, anchors=[])
+        self.assertIsNone(st.get_entity(eid)["anchor"])
+        self.assertEqual(len(st.data["anchor_retirements"]), 1)
+        self.assertEqual(st.anchored_entities(), {})
+
+
 class TestThreading(unittest.TestCase):
     def _roster(self, annotated):
         e = _entry("Violet Sorrengail", chapters=(1, 2), appearances=20)

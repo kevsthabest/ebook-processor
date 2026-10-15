@@ -422,6 +422,91 @@ class TestSuspectPrimaryForms(_StoreCase):
         self.assertIn("violet sorrengail", view["primary_forms"])
 
 
+class TestAnchorLifecycle(_StoreCase):
+    """Fix-queue batch 2, item 2: the anchor lifecycle. An anchor
+    is a fetched curation fact, and the fetch changes: rows flip
+    kind, gain aliases, and get deleted. Re-seeding must reconcile
+    the stored anchor with the fresh row; a row the re-read no
+    longer claims must retire its anchor (tombstoned), or a
+    revocation can never take effect; and a merge of two anchored
+    entities must not silently drop the folded side's anchor."""
+
+    def test_reseed_reconciles_kind_source_and_aliases(self):
+        st = self._store()
+        eid = st.seed_anchor("Violet Sorrengail", "confirmed", "db",
+                             run=1, aliases=["Violet"])
+        again = st.seed_anchor("Violet Sorrengail", "rejected", "db",
+                               run=2, aliases=["Violet", "Violence"])
+        self.assertEqual(again, eid)
+        anchor = st.get_entity(eid)["anchor"]
+        # The row flipped confirmed -> rejected between runs: the
+        # stored anchor must follow, or suppression (which reads
+        # kind off the anchor) can never start.
+        self.assertEqual(anchor["kind"], "rejected")
+        self.assertEqual(anchor["aliases"], ["Violence", "Violet"])
+        self.assertEqual(anchor["seen_run"], 2)
+        marker = {"suppressed": [], "suppressed_entities": []}
+        pp._note_roster_suppression(st, marker, eid, "anchor",
+                                    "Violet Sorrengail")
+        self.assertEqual(len(marker["suppressed"]), 1)
+
+    def test_unclaimed_anchor_is_retired_with_a_tombstone(self):
+        st = self._store()
+        gone = st.seed_anchor("Violet Sorrengail", "rejected", "db",
+                              run=1)
+        keep = st.seed_anchor("Xaden Riorson", "confirmed", "db",
+                              run=1)
+        # Run 2's re-read succeeds and no longer carries Violet's
+        # row (deleted): only Xaden's anchor is claimed.
+        claimed = {st.seed_anchor("Xaden Riorson", "confirmed", "db",
+                                  run=2)}
+        retired = st.retire_unclaimed_anchors(claimed, run=2)
+        self.assertEqual([e for e, _a in retired], [gone])
+        self.assertIsNone(st.get_entity(gone)["anchor"])
+        self.assertEqual(set(st.anchored_entities()), {keep})
+        (tomb,) = st.data["anchor_retirements"]
+        self.assertEqual(tomb["entity"], gone)
+        self.assertEqual(tomb["run"], 2)
+        self.assertEqual(tomb["anchor"]["kind"], "rejected")
+        # A deleted rejected row stops suppressing.
+        marker = {"suppressed": [], "suppressed_entities": []}
+        pp._note_roster_suppression(st, marker, gone, "anchor",
+                                    "Violet Sorrengail")
+        self.assertEqual(marker["suppressed"], [])
+        # Retirement is durable across a save/load round trip.
+        st.save()
+        st2 = self._store()
+        self.assertIsNone(st2.get_entity(gone)["anchor"])
+        self.assertEqual(len(st2.data["anchor_retirements"]), 1)
+
+    def test_merge_of_two_anchored_entities_preserves_folded_anchor(self):
+        st = self._store()
+        a = st.seed_anchor("Violet Sorrengail", "confirmed", "db", 1)
+        b = st.seed_anchor("Xaden Riorson", "rejected", "db", 1)
+        st.record_merge(a, b, run=2, reason="within-run merge")
+        # The survivor keeps its OWN anchor; the folded side's is
+        # preserved on the tombstone, not silently dropped.
+        self.assertEqual(st.get_entity(a)["anchor"]["name"],
+                         "Violet Sorrengail")
+        tomb = st.data["retired"][b]
+        self.assertEqual(tomb["anchor"]["name"], "Xaden Riorson")
+        self.assertEqual(tomb["anchor"]["kind"], "rejected")
+
+    def test_merge_transfers_single_anchor_to_survivor(self):
+        # Pre-existing behaviour, pinned: only the folded side
+        # anchored -> the survivor inherits anchor + canonical,
+        # and no anchor lands on the tombstone.
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet"))
+        b = st.seed_anchor("Violet Sorrengail", "confirmed", "db", 1)
+        st.record_merge(a, b, run=1, reason="within-run merge")
+        surv = st.get_entity(a)
+        self.assertEqual(surv["anchor"]["name"], "Violet Sorrengail")
+        self.assertEqual(surv["canonical"], "Violet Sorrengail")
+        self.assertNotIn("anchor", st.data["retired"][b])
+
+
 class TestAccountingRandomized(_StoreCase):
     def test_accounting_closes_on_randomized_sequences(self):
         rng = random.Random(20261014)
