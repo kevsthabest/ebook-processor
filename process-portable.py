@@ -12022,9 +12022,10 @@ def _checkpoint_load(book_key):
             idx = int(cp.stem.split("_")[1])
         except (IndexError, ValueError):
             continue
-        if isinstance(_total, int) and _total > 0 and idx >= _total:
-            # Beyond the meta's own chapter count: not this book's
-            # checkpoint (left by a longer book sharing the stem).
+        if isinstance(_total, int) and _total > 0 and idx > _total:
+            # Chapter indices are 1-based, so idx == total is the
+            # book's own last chapter; anything beyond it was left by
+            # a longer book sharing the stem — not this book's.
             continue
         data = json.load(open(cp, encoding="utf-8"))
         a = _ckpt_json_restore(data.get("a"))

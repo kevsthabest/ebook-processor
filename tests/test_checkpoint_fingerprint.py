@@ -174,11 +174,14 @@ class TestPurgeStale(_CheckpointDirCase):
 
 class TestLoadHonoursMetaTotal(_CheckpointDirCase):
     def test_chapters_beyond_meta_total_ignored(self):
+        # Chapter indices are 1-based: with total=2 the book's own
+        # chapters are 1 and 2; a file at index 3 belongs to a longer
+        # book that shared the stem and must not load.
         pp._checkpoint_save_meta("book", 2, fingerprint=_fp(TEXT_A))
-        for i in range(3):
+        for i in (1, 2, 3):
             pp._checkpoint_save_chapter("book", i, {"x": i}, {"y": i})
         _meta, _roster, chapters = pp._checkpoint_load("book")
-        self.assertEqual(sorted(chapters), [0, 1])
+        self.assertEqual(sorted(chapters), [1, 2])
 
 
 if __name__ == "__main__":
