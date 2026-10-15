@@ -609,5 +609,235 @@ class TestRowAttach(unittest.TestCase):
                 {"source", "chapters", "chapter_count"})
 
 
+# --- slice 4: trigger retrieval + F interplay ------------------------------
+
+import tempfile
+
+
+class MarkerJudgeCall:
+    """Judge stub ruling by content markers: first matching
+    (marker, verdict) rule wins; default contradicts."""
+
+    def __init__(self, rules, default="contradicts"):
+        self.rules = rules
+        self.default = default
+        self.calls = 0
+
+    def __call__(self, prompt, chunk, i, n):
+        self.calls += 1
+        verdicts = []
+        for m in _re.finditer(
+                r"PASSAGE (\d+)\.(\d+) \(from [^)]*\): (.*?)(?=\nPASSAGE "
+                r"\d+\.\d+ |\nCLAIM \d+: |\Z)", prompt, _re.S):
+            text = m.group(3)
+            v = self.default
+            for marker, verdict in self.rules:
+                if marker in text:
+                    v = verdict
+                    break
+            verdicts.append({"claim": int(m.group(1)),
+                             "passage": int(m.group(2)), "verdict": v})
+        return json.dumps({"verdicts": verdicts})
+
+
+class TestStagingEvidenceRule4(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state = pp.StagingState(learn_dir=self.tmp)
+        self.key = "title:test book|some author"
+
+    def _observe(self, name="Betrayal", n_ch=2, independent=True):
+        return self.state.observe_work(
+            work_key=self.key, title="Test Book",
+            author="Some Author",
+            tropes=[{"name": name, "n_ch": n_ch,
+                     "catalog_id": None}],
+            triggers=[], auto_min=3, independent=independent)
+
+    def _entry(self, name="Betrayal"):
+        w = self.state.data["works"][self.key]
+        return w["claims"][pp.staging_claim_key("trope", name=name)]
+
+    def test_g2_lag_record_then_promote_at_next_observe(self):
+        # Run N: the claim stages; retrieval records strong
+        # evidence AFTER the observe. It must NOT promote in run N.
+        out = self._observe()
+        self.assertEqual(out["trope_actions"][0]["action"], "hold")
+        self.assertTrue(self.state.record_trope_evidence(
+            self.key, "Betrayal", None, "strong"))
+        entry = self._entry()
+        self.assertEqual(entry["state"], "staged")
+        self.assertTrue(entry["evidence_ever"])
+        self.assertEqual(entry["evidence_grade"], "strong")
+        # Run N+1's observe: promotion fires, via evidence (OC-7
+        # stamp names the mechanism).
+        out2 = self._observe()
+        act = out2["trope_actions"][0]
+        self.assertEqual(act["action"], "ship")
+        self.assertEqual(act["stamp"]["via"], "evidence")
+        self.assertEqual(out2["promoted"][0]["via"], "evidence")
+        self.assertEqual(self._entry()["state"], "promoted")
+
+    def test_single_support_records_but_never_promotes(self):
+        self._observe()
+        self.assertTrue(self.state.record_trope_evidence(
+            self.key, "Betrayal", None, "single"))
+        out = self._observe()  # second sighting lands here
+        act = out["trope_actions"][0]
+        # It ships — but via persistence (2 sightings), proving the
+        # single grade itself never promotes via evidence.
+        self.assertEqual(act["action"], "ship")
+        self.assertEqual(act["stamp"]["via"], "persistence")
+        self.assertEqual(self._entry()["evidence_grade"], "single")
+
+    def test_record_requires_a_staged_entry(self):
+        self.assertFalse(self.state.record_trope_evidence(
+            self.key, "Betrayal", None, "strong"))
+        self._observe(n_ch=5)  # auto band: ships, never stages
+        self.assertFalse(self.state.record_trope_evidence(
+            self.key, "Betrayal", None, "strong"))
+
+    def test_recorded_grade_is_sticky_upward(self):
+        self._observe()
+        self.state.record_trope_evidence(self.key, "Betrayal",
+                                         None, "single")
+        self.state.record_trope_evidence(self.key, "Betrayal",
+                                         None, "strong")
+        self.state.record_trope_evidence(self.key, "Betrayal",
+                                         None, "single")
+        self.assertEqual(self._entry()["evidence_grade"], "strong")
+
+    def test_fold_carries_the_grade(self):
+        dst = {"sightings": [1], "name_forms": ["Betrayal"],
+               "best_chapters": 2, "evidence_ever": False,
+               "first_seen": "2026-10-01", "last_seen": "2026-10-01",
+               "state": "staged", "promoted_run": None,
+               "promoted_via": None, "promoted_form_changed": False}
+        src = {"sightings": [2], "name_forms": ["Betrayal"],
+               "best_chapters": 3, "evidence_ever": True,
+               "evidence_grade": "strong",
+               "first_seen": "2026-10-02", "last_seen": "2026-10-02",
+               "state": "staged", "promoted_run": None,
+               "promoted_via": None, "promoted_form_changed": False}
+        pp.StagingState._fold_entry_into(dst, src)
+        self.assertEqual(dst["evidence_grade"], "strong")
+        self.assertTrue(dst["evidence_ever"])
+
+
+class _TriggerEmbedder:
+    """Two-dim fake: [harm, metaphor]. The query (suicide +
+    definition) is pure harm; a depicting window is harm-dense; the
+    metaphor window mixes both."""
+
+    def __call__(self, texts):
+        out = []
+        for t in texts:
+            low = (t or "").lower()
+            harm = sum(low.count(w) for w in
+                       ("overdose", "pills", "swallowed", "suicide"))
+            meta = 1.0 if "would be suicide" in low else 0.0
+            out.append([float(harm), meta])
+        return out
+
+
+_CH9_FILLER = [
+    "The house above the harbour kept its shutters closed all winter.",
+    "Maren swept the steps each morning before the light came up.",
+    "The garden wall had lost two stones to the frost that year.",
+    "Boats knocked softly against the pier in the dark hours.",
+    "The kettle sang at six and the dog asked to be let out.",
+    "Letters from the capital arrived on Thursdays, weather permitting.",
+    "The roof leaked over the pantry and nowhere else in the house.",
+    "Salt dried on the window glass in white, branching patterns.",
+]
+CH9 = _chapter(9, "Chapter Nine", " ".join(
+    ["Anna counted out the pills and swallowed them all, an "
+     "overdose she had planned for weeks; her intent was clear, "
+     "and she meant to kill herself before morning."]
+    + _CH9_FILLER
+    + ["The meeting dragged so long that Tomas joked it would be "
+       "suicide to schedule another one."]))
+
+
+def _suicide_trigger():
+    return {"warning": "suicide", "severity": "graphic",
+            "severity_claimed": "graphic",
+            "chapters": ["Chapter Nine"], "chapter_count": 1,
+            "frequency": 0.01, "prominence": "low",
+            "evidence": [], "confidence": 0.0}
+
+
+class TestTriggerRetrieval(unittest.TestCase):
+    def test_regex_disqualified_window_never_attaches(self):
+        td = _suicide_trigger()
+        out = pp.evidence_retrieve_triggers(
+            [td], [CH9],
+            call=MarkerJudgeCall([("overdose", "supports")]),
+            embedder=_TriggerEmbedder())
+        self.assertTrue(td["evidence"])
+        for ev in td["evidence"]:
+            self.assertEqual(ev["decision_gate"], "retrieval")
+            self.assertIn("overdose", ev["quote"])
+            # The metaphor window would have ranked and might even
+            # have been judged — the category's negative regex
+            # disqualifies it outright, before judging.
+            self.assertNotIn("would be suicide", ev["quote"])
+        rec = out["trigger_retrieval"]["suicide"]
+        self.assertEqual(rec["support"], "single")
+        self.assertEqual(out["marker"]["totals"]["attempted"], 1)
+
+    def test_severity_and_confidence_untouched(self):
+        td = _suicide_trigger()
+        pp.evidence_retrieve_triggers(
+            [td], [CH9],
+            call=MarkerJudgeCall([("overdose", "supports")]),
+            embedder=_TriggerEmbedder())
+        self.assertEqual(td["severity"], "graphic")
+        self.assertEqual(td["confidence"], 0.0)
+
+    def test_evidenced_trigger_is_not_reprocessed(self):
+        td = _suicide_trigger()
+        td["evidence"] = [{"quote": "earlier extraction quote",
+                           "chapter": "Chapter Nine",
+                           "decision_gate": "regex"}]
+        out = pp.evidence_retrieve_triggers(
+            [td], [CH9],
+            call=MarkerJudgeCall([("overdose", "supports")]),
+            embedder=_TriggerEmbedder())
+        self.assertEqual(len(td["evidence"]), 1)
+        self.assertEqual(td["evidence"][0]["decision_gate"], "regex")
+        self.assertEqual(out["trigger_retrieval"], {})
+        self.assertEqual(out["marker"]["totals"]["attempted"], 0)
+
+    def test_trigger_row_carries_retrieval_stamp(self):
+        result = {"triggers": [_suicide_trigger()],
+                  "trigger_retrieval": {"suicide": {
+                      "support": "single",
+                      "chapters_with_support": 1, "passages": 2}}}
+        rows = pp._build_trigger_rows("w1", result, "m", set())
+        self.assertEqual(rows[0]["evidence"]["retrieval"],
+                         {"method": "targeted-v1",
+                          "support": "single", "passages": 2,
+                          "chapters_with_support": 1})
+        result2 = {"triggers": [_suicide_trigger()]}
+        rows2 = pp._build_trigger_rows("w1", result2, "m", set())
+        self.assertNotIn("retrieval", rows2[0]["evidence"])
+
+    def test_trigger_half_draws_zero_decision_budget(self):
+        def explode(n=1):
+            raise AssertionError("_dm_budget_claim called on G path")
+        orig = pp._dm_budget_claim
+        pp._dm_budget_claim = explode
+        try:
+            td = _suicide_trigger()
+            pp.evidence_retrieve_triggers(
+                [td], [CH9],
+                call=MarkerJudgeCall([("overdose", "supports")]),
+                embedder=_TriggerEmbedder())
+        finally:
+            pp._dm_budget_claim = orig
+        self.assertTrue(td["evidence"])
+
+
 if __name__ == "__main__":
     unittest.main()
