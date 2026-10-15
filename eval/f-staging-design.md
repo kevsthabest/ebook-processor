@@ -610,3 +610,37 @@ named in advance):
   match), **with adoptions listed in the next trapped report**
   (red-team: a wrong adoption must be visible to be correctable) vs
   start fresh under the id key.
+
+---
+
+## Addendum (2026-10-15) — seam correction: canonical-first observe keying
+
+The §5 seam as first built observed under the fallback work key
+unconditionally and relied on OC-8 adoption, after resolution, to
+fold the entry into the canonical work-id entry. Live gate runs
+exposed the flaw: an ingested work resolves on *every* run, so
+adoption fired on every run and deleted the fallback entry each
+time. Every observe therefore started a virgin fallback entry at
+run ordinal 1, and the persistence check (2+ sightings at decision
+time) could never be true on a resolved work — promotion by
+persistence and absence-expiry were structurally unreachable live,
+while stores accumulated correctly-keyed sightings nobody ever
+observed. Failure direction stayed delay-only throughout: traps,
+accounting and the store itself were never wrong.
+
+Correction: the seam now resolves the work read-only
+(`resolve_work(..., create=False)` — no write in preview or write
+mode; the creating resolution after result assembly is unchanged)
+before observing. When a work_id resolves, the observe lands on
+the canonical entry directly, so sightings decide promotions and
+absences on the entry that accumulates them. When nothing resolves
+(a genuinely new work), the original wiring is untouched: fallback
+keying, then OC-8 adoption when a later run resolves — adoption
+remains the safety net for that path, with its ordinal-shift
+semantics unchanged. Stores already holding accumulated canonical
+sightings (e.g. [1, 2] in state "staged") promote on the next
+canonical observe, with the OC-7 stamp on the shipped row.
+Regression coverage: `TestStagingResolvedWorkWiring` in
+tests/test_staging_gate.py (resolved-work promotion, resolved-work
+absence expiry, accumulated-store promotion, new-work fallback
+path preserved).
