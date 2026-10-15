@@ -4736,6 +4736,37 @@ class RosterStore:
                 sent["canonical_source"] = "rule"
                 ent["split_into"].append(succ)
                 out[fk] = succ
+            if out and ent.get("anchor"):
+                # The anchor follows its sightings: when the
+                # anchor's own name form moved, the anchor moves
+                # to that successor — left behind, it would sit
+                # on an entity tier 0 cannot see (views are
+                # active-only) while anchored_entities kept
+                # listing it. When the split empties the original
+                # and the anchor's form was never among the
+                # observations (a fetch-minted anchor), the anchor
+                # follows the largest share of the sightings
+                # rather than stranding on the tombstone.
+                anchor = ent["anchor"]
+                target = out.get(norm_name(anchor.get("name") or ""))
+                if target is None and not ent["observations"]:
+                    target = max(
+                        out.values(),
+                        key=lambda s: sum(
+                            o.get("appearances") or 0
+                            for o in self.data["entities"][s]
+                            ["observations"]))
+                if target is not None:
+                    sent = self.data["entities"][target]
+                    sent["anchor"] = anchor
+                    if ent.get("canonical_source") == "anchor":
+                        sent["canonical"] = anchor["name"]
+                        sent["canonical_source"] = "anchor"
+                        if ent["observations"]:
+                            ent["canonical"] = \
+                                ent["observations"][-1].get("form")
+                            ent["canonical_source"] = "rule"
+                    ent["anchor"] = None
             if out and not ent["observations"]:
                 ent["status"] = "split"
             return out
@@ -4758,6 +4789,13 @@ class RosterStore:
         keyset = {form_key} | {norm_name(a) for a in aliases if a}
         with self._lock:
             for eid, ent in self.data["entities"].items():
+                if ent.get("status") != "active":
+                    # A split tombstone's anchor is stranded
+                    # legacy state: matching it here would shadow
+                    # re-attachment to the active successor that
+                    # carries the sightings (it retires via
+                    # retire_unclaimed_anchors instead).
+                    continue
                 anchor = ent.get("anchor")
                 if anchor:
                     aset = {norm_name(anchor["name"])} | {
@@ -4801,9 +4839,14 @@ class RosterStore:
             return eid
 
     def anchored_entities(self):
+        """{entity_id: anchor} over ACTIVE entities only. A
+        non-active (split) entity's anchor is stranded legacy
+        state — tier 0 cannot claim it (views are active-only),
+        so it must not hold the A8 disengagement set hostage."""
         return {eid: ent["anchor"]
                 for eid, ent in self.data["entities"].items()
-                if ent.get("anchor")}
+                if ent.get("anchor")
+                and ent.get("status") == "active"}
 
     def retire_unclaimed_anchors(self, claimed_ids, run):
         """Retire every anchor this run's anchor re-read did NOT

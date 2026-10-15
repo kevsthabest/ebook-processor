@@ -268,6 +268,102 @@ class TestSplit(_StoreCase):
         self.assertEqual(st.accounting()["unaccounted"], 0)
 
 
+class TestSplitAnchor(_StoreCase):
+    """Fix-queue batch 2, item 4: an anchor follows its sightings
+    across a split. record_split used to leave the anchor on the
+    emptied original — invisible to entity_views (tier 0 starved)
+    yet still listed by anchored_entities, so A8 kept
+    disengaging on a phantom, and seed_anchor's existing-anchor
+    branch shadowed re-attachment to the twin."""
+
+    def test_anchor_follows_its_name_form_to_the_successor(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet Sorrengail",
+                                      appearances=30))
+        st.append_observation(a, _obs(1, "Violet", appearances=10))
+        self.assertEqual(
+            st.seed_anchor("Violet Sorrengail", "confirmed", "db",
+                           run=1), a)
+        out = st.record_split(a, ["violet sorrengail"], run=2)
+        twin = out["violet sorrengail"]
+        self.assertEqual(st.get_entity(twin)["anchor"]["name"],
+                         "Violet Sorrengail")
+        self.assertEqual(st.get_entity(twin)["canonical"],
+                         "Violet Sorrengail")
+        self.assertEqual(st.get_entity(twin)["canonical_source"],
+                         "anchor")
+        self.assertIsNone(st.get_entity(a)["anchor"])
+        self.assertEqual(set(st.anchored_entities()), {twin})
+        # Tier 0 can claim the twin: its view carries the anchor.
+        views = {v["id"]: v for v in st.entity_views()}
+        self.assertIsNotNone(views[twin]["anchor"])
+        # The original keeps the remainder under a rule canonical.
+        self.assertEqual(st.get_entity(a)["status"], "active")
+        self.assertEqual(st.get_entity(a)["canonical"], "Violet")
+        self.assertEqual(st.accounting()["unaccounted"], 0)
+
+    def test_anchor_moves_when_split_empties_the_original(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet Sorrengail"))
+        st.append_observation(a, _obs(1, "Violet"))
+        st.seed_anchor("Violet Sorrengail", "confirmed", "db", run=1)
+        out = st.record_split(a, ["violet", "violet sorrengail"],
+                              run=2)
+        self.assertEqual(st.get_entity(a)["status"], "split")
+        self.assertIsNone(st.get_entity(a)["anchor"])
+        twin = out["violet sorrengail"]
+        self.assertEqual(st.get_entity(twin)["anchor"]["name"],
+                         "Violet Sorrengail")
+        self.assertEqual(set(st.anchored_entities()), {twin})
+
+    def test_anchor_fallback_when_its_form_was_never_observed(self):
+        # A branch-3 seed (anchor minted its entity) whose form
+        # never appears among the observations: when a split
+        # empties the original, the anchor follows the largest
+        # share of the sightings rather than stranding.
+        st = self._store()
+        a = st.seed_anchor("Violet Sorrengail", "confirmed", "db", 1)
+        st.append_observation(a, _obs(1, "Dad", appearances=9))
+        st.append_observation(a, _obs(1, "Brennan Sorrengail",
+                                      appearances=30))
+        out = st.record_split(a, ["dad", "brennan sorrengail"],
+                              run=2)
+        self.assertEqual(st.get_entity(a)["status"], "split")
+        self.assertIsNone(st.get_entity(a)["anchor"])
+        self.assertEqual(
+            st.get_entity(out["brennan sorrengail"])["anchor"]["name"],
+            "Violet Sorrengail")
+
+    def test_anchored_entities_never_lists_split_entities(self):
+        # Legacy stores can hold an anchor stranded on a split
+        # entity (the pre-fix record_split shape); the A8
+        # disengagement set must not contain the phantom.
+        st = self._store()
+        a = st.seed_anchor("Violet Sorrengail", "confirmed", "db", 1)
+        st.data["entities"][a]["status"] = "split"
+        self.assertEqual(st.anchored_entities(), {})
+
+    def test_seed_anchor_reattaches_to_the_active_twin(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet Sorrengail"))
+        st.seed_anchor("Violet Sorrengail", "confirmed", "db", run=1)
+        # Legacy stranding: the sightings moved to a successor
+        # but the anchor stayed behind on the emptied original.
+        twin = st.mint_entity()
+        st.get_entity(twin)["observations"] = \
+            st.get_entity(a)["observations"]
+        st.get_entity(a)["observations"] = []
+        st.get_entity(a)["status"] = "split"
+        got = st.seed_anchor("Violet Sorrengail", "confirmed", "db",
+                             run=2)
+        self.assertEqual(got, twin)
+        self.assertEqual(st.get_entity(twin)["anchor"]["name"],
+                         "Violet Sorrengail")
+
+
 class TestHumanNoInvariant(_StoreCase):
     def _two_entities(self, st):
         a = st.mint_entity()
