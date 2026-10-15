@@ -6595,6 +6595,35 @@ def _roster_update(roster, characters, chapter_idx):
                                   if pk.split(" ")[0] == _tok_full]
                         if len(set(_cands)) == 1:
                             found = _cands[0]
+            if found is not None:
+                # Learned-hit cannot-link check: the tiered path below
+                # runs only when the learned lookup missed, so a
+                # learned YES used to short-circuit the Tier 1 hard NO
+                # entirely — a pair this chapter lists as two separate
+                # characters could still merge on a prior book's
+                # say-so. Check the hit against this book's
+                # cannot-links first, using the tier function's own
+                # verdict (Tier 2 still beats Tier 1: a strip /
+                # spelling / nickname pair is Call A inconsistency,
+                # not two people). A refused hit falls through to the
+                # tiered path exactly like a learned miss.
+                _refused = None
+                for _pk in roster[found].get("primary_keys", {found}):
+                    if _pk != nkey and _pk in _chapter_keys and \
+                            _merge_tier(nkey, _pk,
+                                        chapter_keys=_chapter_keys,
+                                        roster_keys=set(primaries)) \
+                            == "no":
+                        _refused = _pk
+                        break
+                if _refused is not None:
+                    UI.viz_event(
+                        getattr(_DIAG, "viz_book_key", None),
+                        '✗ Filtered: "%s" (learned merge refused: '
+                        'Tier 1 cannot-link — co-listed with "%s" '
+                        'this chapter)'
+                        % (name[:40], roster[found]["name"][:40]))
+                    found = None
             if found is None:
                 # Tiered deterministic merge (replaces the old _names_overlap
                 # substring heuristic): Tier 1 hard NO for same-chapter
