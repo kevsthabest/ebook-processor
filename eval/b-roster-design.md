@@ -1001,3 +1001,68 @@ default.
   them — and are listed loudest in the roster report (§9),
   so a provisional link that goes wrong stops voting at once
   and shows up first.
+
+## Addendum — fix-queue batch 2 (deep-review dispositions)
+
+Four Security Advisor deep-review findings against the shipped
+store, dispositioned as one gated batch. The semantics below are
+now the record; the code comments cite the finding IDs.
+
+- **B-F1 — suspect sightings fed primary forms (§4, §9).**
+  `entity_views` built `primary_forms` from every non-detached
+  observation, so a form attested only by a suspended link's
+  observations could claim tier 1 / tier 3 and silently resolve
+  the suspension — A1's exclusion covered canonical weighting
+  (§5) and tier-2 alias evidence only. Disposition:
+  `primary_forms` counts only forms attested by at least one
+  non-suspect observation, mirroring the canonical vote; the
+  full set survives as `primary_forms_all` for the claims /
+  proposal surfaces (veto checks, contested ground, split
+  suspects), which keep their previous behaviour. A resolved
+  suspect's forms vote again (`resolve_suspect` /
+  `affirm_form`). Deterministic sightings are ungated, as
+  before.
+- **Anchor lifecycle (§8).** `seed_anchor`'s existing-anchor
+  branch refreshed only `seen_run` and discarded the fetched
+  row: a kind flip (confirmed → rejected) never started
+  suppressing and alias growth never claimed new forms.
+  Re-seeding now reconciles kind/source/aliases from the fresh
+  row (the name is the match key and stays). Nothing cleared an
+  anchor whose DB row was deleted; the seam now collects the
+  entities its successful re-read claimed and
+  `retire_unclaimed_anchors` clears the rest, tombstoned in the
+  store's `anchor_retirements` ledger and printed in
+  `--roster-report` — a failed fetch still disengages under A8
+  before any retirement can run. `record_merge` with both sides
+  anchored no longer drops the folded anchor: the survivor
+  keeps its own, and the folded side's is preserved on the
+  `retired` tombstone (report-visible) for a human ruling.
+- **Adoption fingerprint (§7, §8).** `adopt_store` dropped
+  `last_run_fingerprint` (the rename path moves the whole
+  record and keeps it), so re-completing the source extraction
+  against the combined store failed the repeat guard and
+  double-counted sightings. The combined store now carries the
+  fingerprint of whichever store completed more runs — the
+  store whose ordinal `runs_completed` records — with ties to
+  the source (its last extraction is the one that may complete
+  again mid-adoption). Ordinal verdict: `claim_run` compares
+  fingerprints by equality, so no `<` vs `<=` comparison exists
+  to relax; the invariant is fingerprint ↔ `runs_completed` ↔
+  the assignments recorded under that ordinal, pinned by a
+  combined adoption × re-completion test.
+- **Split anchors (§4, §8).** `record_split` left the anchor on
+  the emptied original: invisible to `entity_views` (tier 0
+  starved), still listed by `anchored_entities` (A8 disengaging
+  on a phantom), and shadowing re-attachment via
+  `seed_anchor`'s first branch. The anchor now follows its
+  sightings — to the successor that received its name form,
+  carrying the anchor-locked canonical; when a split empties
+  the original and the anchor's form was never observed, to
+  the largest share of the sightings. Transfer was chosen over
+  re-seeding the twin from the DB: the store already holds the
+  fetched row, and a split can happen in a correction command
+  with no fetch in flight. `anchored_entities` lists active
+  entities only, and `seed_anchor`'s existing-anchor branch
+  skips non-active entities, so a legacy stranded anchor
+  cannot shadow the twin — it retires on the next successful
+  re-read.
