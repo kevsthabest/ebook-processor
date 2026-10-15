@@ -264,5 +264,166 @@ class TestSupportResolution(unittest.TestCase):
                                          [SEA_CH]), [])
 
 
+# --- slice 2: support judge ----------------------------------------------
+
+import re as _re
+
+
+class FakeJudgeCall:
+    """call(prompt, chunk, i, n) -> JSON string, the _run_task shape.
+    Rules on passage CONTENT markers, as a depiction judge should:
+    the betrayal scene supports; the council discussion is adjacent;
+    anything else contradicts. Records call count."""
+
+    def __init__(self, omit=()):
+        self.calls = 0
+        self.omit = set(omit)  # (claim_idx, passage_idx) to skip
+
+    def __call__(self, prompt, chunk, i, n):
+        self.calls += 1
+        verdicts = []
+        for m in _re.finditer(
+                r"PASSAGE (\d+)\.(\d+) \(from [^)]*\): (.*?)(?=\nPASSAGE "
+                r"\d+\.\d+ |\nCLAIM \d+: |\Z)", prompt, _re.S):
+            ci, pi, text = int(m.group(1)), int(m.group(2)), m.group(3)
+            if (ci, pi) in self.omit:
+                continue
+            if "betrayed the watch" in text:
+                v = "supports"
+            elif "council debated" in text:
+                v = "adjacent"
+            else:
+                v = "contradicts"
+            verdicts.append({"claim": ci, "passage": pi, "verdict": v})
+        return json.dumps({"verdicts": verdicts})
+
+
+def _job(key, name, passages, definition=""):
+    return {"key": key, "name": name, "definition": definition,
+            "passages": passages}
+
+
+def _passage(quote, chapter, idx, score=0.9):
+    return {"quote": quote, "chapter": chapter, "chapter_index": idx,
+            "offset": 0, "score": score}
+
+
+SCENE_P = _passage("He betrayed the watch and the guard.", "Ch 2", 2)
+SCENE_P2 = _passage("Betrayed, the garrison fell.", "Ch 5", 5)
+TALK_P = _passage("The council debated betrayal as law.", "Ch 3", 3)
+SEA_P = _passage("The fleet rode out the storm.", "Ch 1", 1)
+
+
+class TestJudge(unittest.TestCase):
+    def test_verdict_classes_flow_through(self):
+        jobs = [_job("betrayal", "Betrayal", [SCENE_P, TALK_P, SEA_P],
+                     "A trusted ally betrays the group.")]
+        verdicts, failed = pp.judge_evidence_batch(FakeJudgeCall(),
+                                                   jobs)
+        self.assertEqual(failed, set())
+        self.assertEqual(verdicts["betrayal"],
+                         {0: "supports", 1: "adjacent",
+                          2: "contradicts"})
+
+    def test_batching_caps_claims_per_call(self):
+        call = FakeJudgeCall()
+        jobs = [_job(f"c{i}", f"C{i}", [SEA_P]) for i in range(11)]
+        pp.judge_evidence_batch(call, jobs)
+        self.assertEqual(call.calls, 2)
+
+    def test_judge_failure_is_fail_open(self):
+        def dead_call(prompt, chunk, i, n):
+            return None
+        verdicts, failed = pp.judge_evidence_batch(
+            dead_call, [_job("x", "X", [SCENE_P])])
+        self.assertEqual(verdicts, {})
+        self.assertEqual(failed, {"x"})
+
+    def test_unjudged_claim_in_a_batch_is_failed_not_abstained(self):
+        # The model returns verdicts for claim 0 only: claim 1 was
+        # never judged, so it must surface as failed (infrastructure
+        # honesty), not as a judged abstention.
+        def partial_call(prompt, chunk, i, n):
+            return json.dumps({"verdicts": [
+                {"claim": 0, "passage": 0, "verdict": "supports"}]})
+        jobs = [_job("a", "A", [SCENE_P]), _job("b", "B", [SCENE_P])]
+        verdicts, failed = pp.judge_evidence_batch(partial_call, jobs)
+        self.assertEqual(verdicts.get("a"), {0: "supports"})
+        self.assertEqual(failed, {"b"})
+
+    def test_zero_decision_budget_on_the_g_path(self):
+        # Design section 9.3 pin: _dm_budget_claim is never called on
+        # G's path — trope evidence must not starve family validation.
+        def explode(n=1):
+            raise AssertionError("_dm_budget_claim called on G path")
+        orig = pp._dm_budget_claim
+        pp._dm_budget_claim = explode
+        try:
+            claim = _claim(
+                "Betrayal",
+                pp.evidence_query_text("Betrayal", "Ally betrays."),
+                pp.evidence_query_terms("Betrayal", "Ally betrays."),
+                [SCENE_CH, TALK_CH])
+            out = pp.retrieve_claim_candidates(
+                claim, FakeEmbedder(), {}, floor=0.3)
+            cands = pp._select_judge_candidates(out["candidates"])
+            jobs = [_job("betrayal", "Betrayal", cands)]
+            verdicts, failed = pp.judge_evidence_batch(
+                FakeJudgeCall(), jobs)
+        finally:
+            pp._dm_budget_claim = orig
+        self.assertEqual(failed, set())
+        self.assertIn("supports", verdicts["betrayal"].values())
+
+
+class TestClassify(unittest.TestCase):
+    def test_strong_grade_needs_two_distinct_chapters(self):
+        out = pp.classify_evidence(
+            [SCENE_P, SCENE_P2], {0: "supports", 1: "supports"})
+        self.assertEqual(out["support"], "strong")
+        self.assertEqual(out["outcome"], "supported-strong")
+        self.assertEqual(out["chapters_with_support"], 2)
+        self.assertEqual(len(out["attached"]), 2)
+
+    def test_single_chapter_support_is_single_grade(self):
+        out = pp.classify_evidence(
+            [SCENE_P, TALK_P], {0: "supports", 1: "adjacent"})
+        self.assertEqual(out["support"], "single")
+        self.assertEqual(out["outcome"], "supported-single")
+        self.assertEqual([p["quote"] for p in out["attached"]],
+                         [SCENE_P["quote"]])
+
+    def test_adjacent_never_attaches(self):
+        out = pp.classify_evidence([TALK_P], {0: "adjacent"})
+        self.assertEqual(out["outcome"], "adjacent-only")
+        self.assertEqual(out["support"], "none")
+        self.assertEqual(out["attached"], [])
+        self.assertEqual(out["adjacent"], 1)
+
+    def test_no_support_is_abstention(self):
+        out = pp.classify_evidence([SEA_P], {0: "contradicts"})
+        self.assertEqual(out["outcome"], "abstained")
+        self.assertEqual(out["support"], "none")
+        self.assertEqual(out["attached"], [])
+
+    def test_missing_verdict_is_not_support(self):
+        # A passage the judge never ruled on must not attach
+        # (fail-closed for attachment).
+        out = pp.classify_evidence([SCENE_P, SCENE_P2],
+                                   {0: "supports"})
+        self.assertEqual([p["quote"] for p in out["attached"]],
+                         [SCENE_P["quote"]])
+        self.assertEqual(out["support"], "single")
+
+    def test_attach_cap_and_distinct_chapter_preference(self):
+        ps = [_passage(f"q{i}", f"Ch {1 + (i % 2)}", 1 + (i % 2),
+                       score=0.9 - i * 0.01) for i in range(5)]
+        for i, p in enumerate(ps):
+            p["offset"] = i * 100  # real passages have distinct offsets
+        out = pp.classify_evidence(ps, {i: "supports" for i in range(5)})
+        self.assertEqual(len(out["attached"]), 3)
+        self.assertEqual(out["support"], "strong")
+
+
 if __name__ == "__main__":
     unittest.main()

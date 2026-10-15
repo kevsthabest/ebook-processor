@@ -4437,6 +4437,138 @@ def retrieve_claim_candidates(claim, embedder, cache, floor=None):
     return {"candidates": scored, "verify_failures": vfails}
 
 
+PROMPT_EVIDENCE_JUDGE = """You are checking whether passages from a book actually SHOW a claimed trope or content warning happening, for a book-catalog pipeline. Judge each passage on its own text only. Return ONLY valid JSON. No commentary, no markdown.
+
+VERDICTS:
+- "supports": the passage itself DEPICTS the claim's defining dynamic or event — a reader shown only this passage would say it is happening here.
+- "adjacent": the passage is merely ABOUT the claim's neighbourhood: the topic is mentioned, discussed, remembered as backstory, hypothesised, or negated ("she would never..."), or only a single ingredient is present. A discussion of betrayal is not a betrayal scene.
+- "contradicts": the passage is unrelated, or shows the claim is not happening.
+
+Claims and passages:
+{claims}
+
+{
+  "verdicts": [{"claim": 0, "passage": 0, "verdict": "supports|adjacent|contradicts"}]
+}
+
+RULES:
+1. One verdict per listed passage, using the claim and passage numbers shown.
+2. Judge ONLY from the passage text — never from the chapter title, the claim name alone, or the claim's plausibility elsewhere in the book.
+3. When torn between "supports" and "adjacent", choose "adjacent": evidence must depict, not suggest."""
+
+
+def _sanitize_evidence_judge(r):
+    """Coerce the judge's raw JSON to {"verdicts": [{claim, passage,
+    verdict}]} with integer indices and verdicts from the three
+    classes; anything else is dropped."""
+    if not isinstance(r, dict):
+        return None
+    verdicts = []
+    for v in _list(r.get("verdicts")):
+        if not isinstance(v, dict):
+            continue
+        try:
+            ci = int(v.get("claim"))
+            pi = int(v.get("passage"))
+        except (TypeError, ValueError):
+            continue
+        verdict = _s(v.get("verdict"), 12).lower()
+        if verdict in ("supports", "adjacent", "contradicts"):
+            verdicts.append({"claim": ci, "passage": pi,
+                             "verdict": verdict})
+    return {"verdicts": verdicts}
+
+
+def judge_evidence_batch(call, jobs):
+    """Batched local-model support verdicts (design §4, OC-2).
+
+    jobs: [{"key", "name", "definition", "passages": [passage]}] —
+    the judge is the pipeline's own local model on the same channel
+    as v2_trope_gate, batched _EVIDENCE_JUDGE_BATCH claims per call.
+    It NEVER claims decision-model budget: _dm_budget_claim is not
+    called anywhere on the G path (pinned by test, design §9.3).
+
+    Returns (verdicts, failed): verdicts {key: {passage_index:
+    verdict}}; failed is the set of claim keys that were not judged
+    (their batch errored, or the judge returned no verdict for the
+    claim at all). A claim whose batch succeeded but which is
+    missing a verdict for SOME passage was judged — the missing
+    passage simply does not support (fail-closed for attachment).
+    Failure is fail-open: failed claims proceed with no evidence,
+    counted as failed, never stamped as abstentions."""
+    verdicts, failed = {}, set()
+    for bi in range(0, len(jobs), _EVIDENCE_JUDGE_BATCH):
+        batch = jobs[bi:bi + _EVIDENCE_JUDGE_BATCH]
+        blocks = []
+        for ci, job in enumerate(batch):
+            head = f"CLAIM {ci}: {job['name']}"
+            if job.get("definition"):
+                head += f" — {job['definition']}"
+            blocks.append(head)
+            for pi, p in enumerate(job["passages"]):
+                blocks.append(f"PASSAGE {ci}.{pi} "
+                              f"(from {p['chapter']}): {p['quote']}")
+        prompt = PROMPT_EVIDENCE_JUDGE.replace(
+            "{claims}", "\n".join(blocks))
+        out = _run_task(
+            call, prompt, "", 1, 1,
+            f"evidence-judge-b{bi // _EVIDENCE_JUDGE_BATCH + 1}",
+            sanitize_fn=_sanitize_evidence_judge)
+        if not out or not out.get("verdicts"):
+            failed.update(j["key"] for j in batch)
+            continue
+        for v in out["verdicts"]:
+            if 0 <= v["claim"] < len(batch):
+                job = batch[v["claim"]]
+                if 0 <= v["passage"] < len(job["passages"]):
+                    verdicts.setdefault(job["key"], {})[
+                        v["passage"]] = v["verdict"]
+        for job in batch:
+            if job["key"] not in verdicts:
+                failed.add(job["key"])
+    return verdicts, failed
+
+
+def classify_evidence(passages, verdicts):
+    """Deterministic support grade + outcome for one judged claim
+    (design §4). Only "supports" passages attach; "adjacent" is a
+    named, counted outcome that never attaches — adjacency is the
+    laundering vector, so it must be visible to be governed.
+
+    Returns {"outcome": "supported-strong"|"supported-single"|
+    "adjacent-only"|"abstained", "support": "strong"|"single"|
+    "none", "attached": [passage] (cap _EVIDENCE_MAX_PASSAGES,
+    distinct-chapter preference), "chapters_with_support": n,
+    "adjacent": n, "supports": n, "contradicts": n}. The judge's
+    verdict rides as counts — metadata only; it never becomes a
+    confidence (design §6)."""
+    supports = [p for i, p in enumerate(passages)
+                if verdicts.get(i) == "supports"]
+    n_adjacent = sum(1 for v in verdicts.values() if v == "adjacent")
+    n_contra = sum(1 for v in verdicts.values()
+                   if v == "contradicts")
+    chapters = {p["chapter"] for p in supports}
+    if len(chapters) >= 2:
+        grade = "strong"
+    elif chapters:
+        grade = "single"
+    else:
+        grade = "none"
+    attached = _select_judge_candidates(
+        supports, limit=_EVIDENCE_MAX_PASSAGES) if supports else []
+    if supports:
+        outcome = f"supported-{grade}"
+    elif n_adjacent:
+        outcome = "adjacent-only"
+    else:
+        outcome = "abstained"
+    return {"outcome": outcome, "support": grade,
+            "attached": attached,
+            "chapters_with_support": len(chapters),
+            "adjacent": n_adjacent, "supports": len(supports),
+            "contradicts": n_contra}
+
+
 # ---------------------------------------------------------------------------
 # Option B — persisted per-work roster (design: eval/b-roster-design.md).
 #
