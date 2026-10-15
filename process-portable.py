@@ -3554,11 +3554,14 @@ class StagingState:
         return moved
 
     def adopt_for(self, work_id, title="", author="", isbn=None):
-        """Post-resolution adoption (OC-8) for callers that learn the
-        work_id only AFTER observing under a fallback key — the
-        pipeline resolves works after extraction, so the observe seam
-        never has the id. Creates no entry when nothing waits to be
-        adopted. Returns True when an adoption happened."""
+        """Post-resolution adoption (OC-8), the net for works whose
+        observe ran under a fallback key: the staging seam resolves
+        read-only BEFORE observing and observes under the canonical
+        key whenever the work already exists, so adoption now fires
+        only for works that resolve later (genuinely new works, or a
+        seam resolution that missed and the creating resolution
+        caught). Creates no entry when nothing waits to be adopted.
+        Returns True when an adoption happened."""
         if not work_id or not self.enabled:
             return False
         with self._lock:
