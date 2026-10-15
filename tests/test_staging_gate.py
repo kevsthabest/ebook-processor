@@ -150,7 +150,8 @@ class TestStagingStoreBasics(_StoreCase):
         act = out["trope_actions"][0]
         self.assertEqual(act["action"], "ship")
         self.assertEqual(act["stamp"], {"sightings": 2,
-                                        "via": "persistence"})
+                                        "via": "persistence",
+                                        "sighting_runs": [1, 2]})
         self.assertEqual(len(out["promoted"]), 1)
         self.assertEqual(out["promoted"][0]["via"], "persistence")
         self.assertEqual(out["promoted"][0]["sightings"], 2)
@@ -177,7 +178,7 @@ class TestStagingStoreBasics(_StoreCase):
             {"name": "Quest", "n_ch": 2, "catalog_id": None}], today=D2)
         self.assertEqual(out3["trope_actions"][0]["action"], "ship")
         self.assertEqual(out3["trope_actions"][0]["stamp"],
-                         {"sightings": 3, "via": "support"})
+                         {"sightings": 3, "via": "support", "sighting_runs": [1, 2, 3]})
         self.assertEqual(out3["promoted"], [])
         _assert_accounting_closes(self, st, "w-1")
 
@@ -266,7 +267,8 @@ class TestStagingTriggers(_StoreCase):
         act = out2["trigger_actions"][0]
         self.assertEqual(act["action"], "ship")
         self.assertEqual(act["stamp"], {"sightings": 2,
-                                        "via": "persistence"})
+                                        "via": "persistence",
+                                        "sighting_runs": [1, 2]})
         _assert_accounting_closes(self, st, "w-1")
 
     def test_evidenced_trigger_never_stages(self):
@@ -312,7 +314,7 @@ class TestStagingNonIndependent(_StoreCase):
         out3 = self._observe(st, tropes=obs, today=D2)
         self.assertEqual(out3["trope_actions"][0]["action"], "ship")
         self.assertEqual(out3["trope_actions"][0]["stamp"],
-                         {"sightings": 2, "via": "persistence"})
+                         {"sightings": 2, "via": "persistence", "sighting_runs": [1, 2]})
 
     def test_nonindependent_run_creates_no_entries(self):
         st = self._state()
@@ -421,7 +423,7 @@ class TestStagingAdoption(_StoreCase):
         # The adopted sighting counts: this run is the second one.
         self.assertEqual(out["trope_actions"][0]["action"], "ship")
         self.assertEqual(out["trope_actions"][0]["stamp"],
-                         {"sightings": 2, "via": "persistence"})
+                         {"sightings": 2, "via": "persistence", "sighting_runs": [1, 2]})
         _assert_accounting_closes(self, st, "w-1")
 
     def test_adoption_requires_exact_title_author_match(self):
@@ -591,7 +593,8 @@ class TestStagingObserveResult(_StoreCase):
         self.assertEqual(out2["ship_tropes"], ["Found Family"])
         self.assertEqual(out2["trope_persistence"],
                          {"found family": {"sightings": 2,
-                                           "via": "persistence"}})
+                                           "via": "persistence",
+                                           "sighting_runs": [1, 2]}})
         self.assertEqual(out2["marker"]["promoted"][0]["via"],
                          "persistence")
 
@@ -827,7 +830,8 @@ class TestStagingE2E(_E2EBase, unittest.TestCase):
         self.assertIn("Found Family", r2["tropes"])
         self.assertEqual(r2["trope_persistence"],
                          {"found family": {"sightings": 2,
-                                           "via": "persistence"}})
+                                           "via": "persistence",
+                                           "sighting_runs": [1, 2]}})
         self.assertIn("promoted (via persistence)", md2)
         self.assertEqual(r2["staging"]["promoted"][0]["via"],
                          "persistence")
@@ -938,7 +942,8 @@ class TestStagingResolvedWorkWiring(_E2EBase, unittest.TestCase):
         self.assertIn("Found Family", r2["tropes"])
         self.assertEqual(r2["trope_persistence"],
                          {"found family": {"sightings": 2,
-                                           "via": "persistence"}})
+                                           "via": "persistence",
+                                           "sighting_runs": [1, 2]}})
         self.assertEqual(r2["staging"]["promoted"][0]["via"],
                          "persistence")
         _assert_accounting_closes(self, st, "work-xyz")
@@ -1000,7 +1005,8 @@ class TestStagingResolvedWorkWiring(_E2EBase, unittest.TestCase):
         self.assertIn("Found Family", r["tropes"])
         self.assertEqual(r["trope_persistence"],
                          {"found family": {"sightings": 3,
-                                           "via": "persistence"}})
+                                           "via": "persistence",
+                                           "sighting_runs": [1, 2, 3]}})
         entry = st.data["works"]["work-xyz"]["claims"][
             "trope:name:found family"]
         self.assertEqual(entry["state"], "promoted")
@@ -1127,7 +1133,8 @@ class TestStagingTriggerHelper(_StoreCase):
         self.assertEqual(len(out2["ship_triggers"]), 1)
         self.assertEqual(out2["trigger_persistence"],
                          {"war": {"sightings": 2,
-                                  "via": "persistence"}})
+                                  "via": "persistence",
+                                  "sighting_runs": [1, 2]}})
 
     def test_evidenced_trigger_never_stages(self):
         st = self._state()
@@ -1157,7 +1164,7 @@ class TestStagingTriggerHelper(_StoreCase):
                                          independent=True)
         self.assertEqual(len(out3["ship_triggers"]), 1)
         self.assertEqual(out3["trigger_persistence"],
-                         {"war": {"sightings": 3, "via": "evidence"}})
+                         {"war": {"sightings": 3, "via": "evidence", "sighting_runs": [1, 2, 3]}})
 
 
 class _TriggerBackend:
@@ -1212,7 +1219,8 @@ class TestStagingTriggerE2E(_E2EBase, unittest.TestCase):
         self.assertEqual(_warnings(r2), ["murder", "war"])
         self.assertEqual(r2["trigger_persistence"],
                          {"war": {"sightings": 2,
-                                  "via": "persistence"}})
+                                  "via": "persistence",
+                                  "sighting_runs": [1, 2]}})
 
     def test_evidence_arrival_promotes_via_evidence(self):
         st = self._tmp_state()
@@ -1264,7 +1272,7 @@ _MARKER = {
     "promoted": [], "trapped_total": 2, "expired_this_run": 0,
     "sightings_recorded": 2, "trapped_store_total": 2}
 
-_STAMP = {"sightings": 2, "via": "persistence"}
+_STAMP = {"sightings": 2, "via": "persistence", "sighting_runs": [1, 2]}
 
 
 def _trig(warning, evidence, conf=0.0):
@@ -1333,6 +1341,74 @@ class TestWriteStamps(_WriteBase):
         rows = fake.tables["book_trigger_claims"]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["evidence"]["persistence"], _STAMP)
+
+
+class TestWriteStampDedupe(_WriteBase):
+    """Fix-queue batch 3, item 3 — the queue-side half: a promotion
+    shipping a (work, trope) that ALREADY has an AI candidate row
+    must not produce a duplicate. Replace-wholesale already covers
+    it (the AI candidate is deletable, never preserved, and the new
+    row replaces it); these tests pin that behaviour and the full
+    chain from a live staging promotion to the row a reviewer reads.
+    """
+
+    def test_promotion_replaces_existing_ai_candidate_no_duplicate(
+            self):
+        fake = self.install({"book_trope_claims": [
+            {"id": 7, "work_id": 1, "trope_id": "cat-1",
+             "status": "candidate", "source_type": "ai",
+             "confidence": 0.75,
+             "evidence": {"source": "ebook-extraction",
+                          "chapters": ["Chapter 9"],
+                          "chapter_count": 1}}]})
+        res = _wresult(
+            tropes=["Found Family"],
+            trope_confidence={"found family": 0.75},
+            trope_catalog_map={"found family": "cat-1"},
+            trope_chapters={"found family": ["Chapter 1",
+                                             "Chapter 2"]},
+            trope_persistence={"found family": dict(_STAMP)})
+        self.assertEqual(pp.write_claims(1, res), 0)
+        rows = fake.tables["book_trope_claims"]
+        # Exactly one row for the (work, trope): the old candidate
+        # was deleted and the promoted row replaced it — no pair of
+        # AI rows for a reviewer to double-count.
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertNotEqual(row["id"], 7)
+        self.assertEqual(row["evidence"]["persistence"], _STAMP)
+        self.assertEqual(
+            row["evidence"]["persistence"]["sighting_runs"], [1, 2])
+        self.assertEqual(row["evidence"]["chapters"],
+                         ["Chapter 1", "Chapter 2"])
+
+    def test_promotion_stamp_flows_from_staging_to_written_row(self):
+        # The whole Item-3 chain, live-shaped: two staging observes
+        # promote the claim; the resulting stamp map feeds a write;
+        # the written row's evidence carries sightings, via AND the
+        # runs that sighted it.
+        import tempfile as _tf
+        fake = self.install()
+        with _tf.TemporaryDirectory() as td:
+            st = pp.StagingState(learn_dir=Path(td), enabled=True)
+            pp.staging_observe_result(_parts(), st, independent=True)
+            out2 = pp.staging_observe_result(_parts(), st,
+                                             independent=True)
+        self.assertEqual(out2["ship_tropes"], ["Found Family"])
+        res = _wresult(
+            tropes=out2["ship_tropes"],
+            trope_confidence={"found family": 0.75},
+            trope_catalog_map={"found family": "cat-1"},
+            trope_chapters={"found family": ["Chapter 1",
+                                             "Chapter 2"]},
+            trope_persistence=out2["trope_persistence"])
+        self.assertEqual(pp.write_claims(1, res), 0)
+        rows = fake.tables["book_trope_claims"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0]["evidence"]["persistence"],
+            {"sightings": 2, "via": "persistence",
+             "sighting_runs": [1, 2]})
 
 
 class TestStagedProposalInterception(_WriteBase):

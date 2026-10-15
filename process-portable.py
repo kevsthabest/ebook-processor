@@ -3777,6 +3777,22 @@ class StagingState:
             entry["name_forms"].append(name)
         return recorded
 
+    @staticmethod
+    def _persistence_stamp(entry, via):
+        """The OC-7 stamp a promoted claim's shipped row carries:
+        how many independent sightings earned the ship, the
+        mechanism, and — since fix-queue batch 3 item 3 — WHICH runs
+        sighted it (`sighting_runs`: the entry's sighting ordinals).
+        The count alone evaporated at the reviewer's desk: a queue
+        row showed only the claim's own evidence, with the
+        persistence signal nowhere in it. Per-run CHAPTER support
+        cannot ride along — the entry retains no per-run chapter
+        lists (only best_chapters, a max across sightings); the
+        row's evidence.chapters carries the shipping run's support,
+        and sighting_runs names the runs to compare it against."""
+        return {"sightings": len(entry["sightings"]), "via": via,
+                "sighting_runs": list(entry["sightings"])}
+
     def _promote(self, work, entry, ordinal, via, form_changed, out,
                  display):
         entry["state"] = "promoted"
@@ -3826,8 +3842,8 @@ class StagingState:
             if n_ch < auto_min:
                 # Gate-band ship explained by earned standing alone:
                 # the stamp is how a reviewer sees that (OC-7).
-                stamp = {"sightings": len(entry["sightings"]),
-                         "via": entry["promoted_via"]}
+                stamp = self._persistence_stamp(
+                    entry, entry["promoted_via"])
             return {"action": "ship", "key": key, "stamp": stamp,
                     "form_changed": False}
         # Staged entry: promotion rules (independent sightings only;
@@ -3846,8 +3862,7 @@ class StagingState:
             item = self._promote(work, entry, ordinal, "persistence",
                                  form_changed, out, name)
             item["key"] = key
-            stamp = {"sightings": len(entry["sightings"]),
-                     "via": "persistence"}
+            stamp = self._persistence_stamp(entry, "persistence")
             return {"action": "ship", "key": key, "stamp": stamp,
                     "form_changed": form_changed}
         out["staged"].append(
@@ -3890,8 +3905,8 @@ class StagingState:
         if entry["state"] == "promoted":
             stamp = None
             if not has_ev:
-                stamp = {"sightings": len(entry["sightings"]),
-                         "via": entry["promoted_via"]}
+                stamp = self._persistence_stamp(
+                    entry, entry["promoted_via"])
             return {"action": "ship", "key": key, "stamp": stamp,
                     "form_changed": False}
         if independent and has_ev:
@@ -3904,8 +3919,7 @@ class StagingState:
             item = self._promote(work, entry, ordinal, "persistence",
                                  False, out, warning)
             item["key"] = key
-            stamp = {"sightings": len(entry["sightings"]),
-                     "via": "persistence"}
+            stamp = self._persistence_stamp(entry, "persistence")
             return {"action": "ship", "key": key, "stamp": stamp,
                     "form_changed": False}
         out["staged"].append(
