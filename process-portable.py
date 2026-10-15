@@ -4926,10 +4926,6 @@ def roster_store_paths(learn_dir=None):
     return sorted(rdir.glob("*.json"))
 
 
-def load_roster_store(learn_dir, work_key):
-    return RosterStore(learn_dir=learn_dir, work_key=work_key)
-
-
 def find_roster_store(learn_dir, work):
     """Find the store for a <work> argument (exact work_key, else
     work_id, else title — first unambiguous match). Returns
@@ -10593,13 +10589,6 @@ def _title_candidates(title):
     rows = sb("works", params=f"?title=ilike.*{quote(key, safe='')}*"
                               f"&select=id,title,authors&limit=5")
     return rows or []
-
-
-def _existing(table, col, work_id):
-    rows = sb(table, params=f"?work_id=eq.{quote(str(work_id), safe='')}&select={col}")
-    if rows is None:
-        return None
-    return {str(r.get(col, "")).lower() for r in rows}
 
 
 class TropeLookupError(RuntimeError):
