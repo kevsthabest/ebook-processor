@@ -12453,11 +12453,32 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if CONFIG.get("staging_gate") and not dry_run and not aborted:
         _st = _staging()
         if _st.enabled and _st.writable:
+            # Resolve the work READ-ONLY before observing (the read
+            # the roster seam also performs): when the work already
+            # exists, the observe must land on its canonical entry.
+            # Observing under the fallback key and adopting after
+            # the fact restarts the fallback entry at ordinal 1 on
+            # every run (adoption deletes it), so the persistence
+            # check could never fire on a resolved work and staged
+            # claims neither promoted nor absence-expired. With
+            # create=False this adds no write in either mode; the
+            # real resolution (creation, on corrected metadata)
+            # still runs after result assembly, and OC-8 adoption
+            # below remains the net for works that only resolve
+            # there. A failed or empty resolution keeps the
+            # fallback key — delay-only, as before.
+            _sg_wid = None
+            try:
+                _sg_wid, _sg_how = resolve_work(
+                    title or fpath.stem, author, identifiers, False,
+                    create=False)
+            except Exception:
+                _sg_wid = None
             _sg = staging_observe_result({
                 "work_key": staging_work_key(
-                    None, identifiers.get("isbn"),
+                    _sg_wid, identifiers.get("isbn"),
                     title or fpath.stem, author),
-                "work_id": None, "title": title or fpath.stem,
+                "work_id": _sg_wid, "title": title or fpath.stem,
                 "author": author, "isbn": identifiers.get("isbn"),
                 "auto_min": max(3, n // 20),
                 "trope_auto": _sb_auto, "trope_gated": _sb_gated,
