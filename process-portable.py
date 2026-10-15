@@ -9505,21 +9505,39 @@ def _dot(a, b):
 EMBED_TEXT_FORMAT = "name-desc-v1"
 
 
+def _trope_text_hash(text):
+    """Content hash of one catalog entry's embedded text. The vector
+    cache is keyed by row id, but an id alone cannot prove the cached
+    vector was embedded from the CURRENT text: editing a trope's
+    name/description under the same id must turn the entry into a
+    miss. The stored hash is that proof."""
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def trope_catalog_vectors():
     """Load trope catalog with embeddings. Fetches from Supabase `tropes`,
     embeds name+description via the dedupe embedding endpoint, caches to
     CONFIG['trope_map_cache']. Returns [(id, name, vector)].
 
     The cache file is namespaced by (embed_model, EMBED_TEXT_FORMAT) —
-    {"model": ..., "format": ..., "vectors": {id: vector}}. A cache
-    written under any other model or text format, including the legacy
-    bare {id: vector} shape, is invalidated wholesale and re-embedded:
+    {"model": ..., "format": ..., "vectors": {id: vector},
+    "hashes": {id: sha256 of the embedded text}}. A cache written
+    under any other model or text format, including the legacy bare
+    {id: vector} shape, is invalidated wholesale and re-embedded:
     cosine comparisons across different vector spaces are meaningless.
+    Within a valid namespace, an entry is a hit only when its stored
+    hash matches the current catalog row's text — a same-id content
+    edit re-embeds, a hashless entry (pre-hash cache) migrates by
+    re-embedding once, and ids absent from the catalog are pruned.
+    The write is atomic (temp file + os.replace, the codebase's
+    _save_json idiom): a crash mid-write leaves the old cache intact.
     """
     import os
     cache_path = CONFIG.get("trope_map_cache", "trope-vectors.json")
     model = CONFIG.get("embed_model", "")
     cached = {}
+    hashes = {}
     if os.path.exists(cache_path):
         try:
             raw_cache = json.load(open(cache_path, encoding="utf-8"))
@@ -9530,6 +9548,8 @@ def trope_catalog_vectors():
                 and raw_cache.get("format") == EMBED_TEXT_FORMAT
                 and isinstance(raw_cache.get("vectors"), dict)):
             cached = raw_cache["vectors"]
+            if isinstance(raw_cache.get("hashes"), dict):
+                hashes = raw_cache["hashes"]
         else:
             print("  trope vector cache invalidated (model/format "
                   "changed); re-embedding catalog")
@@ -9542,22 +9562,44 @@ def trope_catalog_vectors():
         else:
             print("  WARNING: could not load tropes from Supabase")
         return []
-    # Embed any catalog entries missing from cache.
-    missing = [r for r in rows if r["id"] not in cached]
+
+    def _text(r):
+        return f"{r['name']}: {r.get('description') or ''}"
+
+    live_ids = {r["id"] for r in rows}
+    valid = {}
+    stale = 0
+    for r in rows:
+        if r["id"] in cached \
+                and hashes.get(r["id"]) == _trope_text_hash(_text(r)):
+            valid[r["id"]] = cached[r["id"]]
+        elif r["id"] in cached:
+            stale += 1
+    pruned = [i for i in cached if i not in live_ids]
+    missing = [r for r in rows if r["id"] not in valid]
+    if stale:
+        print(f"  trope vector cache: {stale} catalog entr"
+              f"{'y' if stale == 1 else 'ies'} changed text under "
+              f"the same id; re-embedding")
     if missing:
-        texts = [f"{r['name']}: {r.get('description') or ''}" for r in missing]
-        vecs = embed_vectors(CONFIG["embed_url"], model, texts)
+        vecs = embed_vectors(CONFIG["embed_url"], model,
+                             [_text(r) for r in missing])
         for r, v in zip(missing, vecs):
-            cached[r["id"]] = v
+            valid[r["id"]] = v
+    if missing or pruned:
+        out_hashes = {r["id"]: _trope_text_hash(_text(r))
+                      for r in rows if r["id"] in valid}
         try:
-            json.dump({"model": model, "format": EMBED_TEXT_FORMAT,
-                       "vectors": cached},
-                      open(cache_path, "w", encoding="utf-8"))
+            tmp_path = cache_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump({"model": model, "format": EMBED_TEXT_FORMAT,
+                           "vectors": valid, "hashes": out_hashes}, f)
+            os.replace(tmp_path, cache_path)
         except Exception as e:
             print(f"  warning: could not write vector cache: {e}")
     # Return normalized vectors so callers can use _dot() for fast comparison.
-    return [(r["id"], r["name"], _normalize(cached[r["id"]]))
-            for r in rows if r["id"] in cached]
+    return [(r["id"], r["name"], _normalize(valid[r["id"]]))
+            for r in rows if r["id"] in valid]
 
 
 # Names that are known noise (hallucinations, family generics). "jason" is a
