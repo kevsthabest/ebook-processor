@@ -8876,7 +8876,7 @@ def _response_format_candidates():
     if fmt == "none":
         return [None]  # explicit: no constraint at all
     cands = []
-    if CONFIG.get("llm_json_schema", True) and _JSON_SCHEMA_OK is not False:
+    if CONFIG.get("llm_json_schema", False) and _JSON_SCHEMA_OK is not False:
         cands.append({"type": "json_schema",
                       "json_schema": {"name": "extraction",
                                       "schema": {"type": "object"},
