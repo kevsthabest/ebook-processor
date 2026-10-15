@@ -234,6 +234,18 @@ class TestRetrievalCore(unittest.TestCase):
         # Only the second claim's query text is newly embedded.
         self.assertEqual(second, [c2["query_text"]])
 
+    def test_prefilter_matches_morphological_variants(self):
+        # The depicting window's only hit is "betrayed"; the query
+        # term is "betrayal". Stage 1 is recall-oriented by design —
+        # a variant miss here is unrecoverable downstream.
+        ch = _chapter(5, "Chapter Five",
+                      "He had betrayed the watch for gold, and the "
+                      "garrison paid for it that night.")
+        claim = _claim("Betrayal", "Betrayal", {"betrayal"}, [ch])
+        out = pp.retrieve_claim_candidates(claim, FakeEmbedder(), {},
+                                           floor=0.3)
+        self.assertTrue(out["candidates"])
+
     def test_judge_candidate_selection_prefers_distinct_chapters(self):
         cands = [
             {"quote": "a", "chapter": "Ch 1", "chapter_index": 1,
@@ -423,6 +435,178 @@ class TestClassify(unittest.TestCase):
         out = pp.classify_evidence(ps, {i: "supports" for i in range(5)})
         self.assertEqual(len(out["attached"]), 3)
         self.assertEqual(out["support"], "strong")
+
+
+# --- slice 3: trope seam + row attach -------------------------------------
+
+SCENE2_CH = _chapter(5, "Chapter Five",
+                     "Years later Petr admitted the truth in the "
+                     "square. He had betrayed the watch for the same "
+                     "gold, and the garrison had paid for it.")
+
+
+def _orchestrator(claims, chapters, call=None, embedder=None,
+                  catalog=None, summaries=None):
+    return pp.evidence_retrieve_result(
+        {"claims": claims, "catalog": catalog or {},
+         "summaries": summaries or {}},
+        chapters, call=call or FakeJudgeCall(),
+        embedder=embedder or FakeEmbedder())
+
+
+class TestTropeSeam(unittest.TestCase):
+    CHAPTERS = [SEA_CH, SCENE_CH, TALK_CH, SCENE2_CH]
+
+    def test_supported_claim_attaches_only_depicting_passages(self):
+        out = _orchestrator(
+            [{"name": "Betrayal",
+              "support_refs": ["Chapter Two", "Chapter Three",
+                               "Chapter Five"],
+              "catalog_id": "t1", "staged": False}],
+            self.CHAPTERS,
+            catalog={"t1": {"name": "Betrayal",
+                            "description": "A trusted ally betrays "
+                                           "the group."}})
+        ev = out["trope_evidence"]["betrayal"]
+        self.assertTrue(ev)
+        # The council discussion was judged adjacent: never attached.
+        self.assertTrue(all("council" not in p["quote"] for p in ev))
+        self.assertTrue(all("betrayed the watch" in p["quote"]
+                            for p in ev))
+        rec = out["trope_retrieval"]["betrayal"]
+        # Support in two distinct chapters (Two + Five) = strong.
+        self.assertEqual(rec["support"], "strong")
+        self.assertEqual(rec["outcome"], "supported-strong")
+        self.assertEqual(rec["chapters_with_support"], 2)
+        self.assertEqual(rec["adjacent"], 1)
+        self.assertEqual(rec["judge"]["supports"], 2)
+
+    def test_abstention_is_an_explicit_recorded_result(self):
+        # Trope amendment B: "searched the claimed chapters, found
+        # nothing" is recorded as such — claim name + chapters
+        # searched — not left indistinguishable from "never ran".
+        out = _orchestrator(
+            [{"name": "Dragons", "support_refs": ["Chapter One"],
+              "catalog_id": None, "staged": False}],
+            self.CHAPTERS)
+        rec = out["trope_retrieval"]["dragons"]
+        self.assertEqual(rec["outcome"], "abstained")
+        self.assertEqual(rec["support"], "none")
+        self.assertEqual(rec["chapters_searched"], ["Chapter One"])
+        self.assertNotIn("dragons", out["trope_evidence"])
+        self.assertEqual(out["marker"]["claims"]["dragons"],
+                         "abstained")
+
+    def test_failed_retrieval_is_fail_open_and_unstamped(self):
+        def dead_embedder(texts):
+            raise RuntimeError("endpoint down")
+        out = _orchestrator(
+            [{"name": "Betrayal", "support_refs": ["Chapter Two"],
+              "catalog_id": None, "staged": False},
+             {"name": "Dragons", "support_refs": ["Chapter One"],
+              "catalog_id": None, "staged": False}],
+            self.CHAPTERS, embedder=dead_embedder)
+        self.assertEqual(out["trope_evidence"], {})
+        for rec in out["trope_retrieval"].values():
+            self.assertEqual(rec["outcome"], "failed")
+            self.assertIsNone(rec["support"])
+        self.assertTrue(out["marker"]["failed"])
+        self.assertEqual(out["marker"]["totals"]["failed"], 2)
+
+    def test_result_keys_round_trip_through_json(self):
+        out = _orchestrator(
+            [{"name": "Betrayal",
+              "support_refs": ["Chapter Two", "Chapter Five"],
+              "catalog_id": None, "staged": True}],
+            self.CHAPTERS)
+        blob = json.dumps({"trope_evidence": out["trope_evidence"],
+                           "trope_retrieval": out["trope_retrieval"],
+                           "evidence_retrieval": out["marker"]})
+        back = json.loads(blob)
+        self.assertEqual(back["trope_evidence"],
+                         out["trope_evidence"])
+        self.assertEqual(back["trope_retrieval"],
+                         out["trope_retrieval"])
+        self.assertEqual(back["evidence_retrieval"], out["marker"])
+
+    def test_marker_reports_floor_and_totals(self):
+        out = _orchestrator(
+            [{"name": "Betrayal", "support_refs": ["Chapter Two"],
+              "catalog_id": None, "staged": False}],
+            self.CHAPTERS)
+        self.assertEqual(out["marker"]["method"], "targeted-v1")
+        self.assertIn("floor", out["marker"])
+        self.assertEqual(out["marker"]["totals"]["attempted"], 1)
+
+
+def _trope_result(**extra):
+    result = {"tropes": ["Betrayal", "Dragons"],
+              "trope_confidence": {"betrayal": 0.85, "dragons": 0.9},
+              "trope_chapters": {"betrayal": ["Chapter Two"],
+                                 "dragons": ["Chapter One"]}}
+    result.update(extra)
+    return result
+
+
+_CAT_MAP = {"betrayal": "t-bet", "dragons": "t-drg"}
+
+
+class TestRowAttach(unittest.TestCase):
+    def _rows(self, result):
+        rows, unmatched, failed = pp._build_trope_rows(
+            "w1", result, _CAT_MAP, None, "m", set())
+        self.assertEqual(failed, [])
+        return {r["trope_id"]: r for r in rows}
+
+    def test_supported_claim_ships_quotes_and_stamp(self):
+        result = _trope_result(
+            trope_evidence={"betrayal": [
+                {"quote": "He betrayed the watch.",
+                 "chapter": "Chapter Two", "chapter_index": 2,
+                 "offset": 40, "score": 0.9}]},
+            trope_retrieval={"betrayal": {
+                "support": "strong", "chapters_with_support": 2}})
+        row = self._rows(result)["t-bet"]
+        self.assertEqual(row["evidence"]["quotes"],
+                         [{"quote": "He betrayed the watch.",
+                           "chapter": "Chapter Two"}])
+        self.assertEqual(row["evidence"]["retrieval"],
+                         {"method": "targeted-v1", "support": "strong",
+                          "passages": 1, "chapters_with_support": 2})
+        # Confidence is the pipeline's own — never raised (§6).
+        self.assertEqual(row["confidence"], 0.85)
+
+    def test_abstained_row_differs_only_by_the_g1_stamp(self):
+        base = self._rows(_trope_result())["t-drg"]
+        result = _trope_result(trope_retrieval={"dragons": {
+            "support": "none", "chapters_with_support": 0}})
+        stamped = self._rows(result)["t-drg"]
+        self.assertEqual(stamped["evidence"]["retrieval"],
+                         {"method": "targeted-v1", "support": "none",
+                          "passages": 0, "chapters_with_support": 0})
+        self.assertNotIn("quotes", stamped["evidence"])
+        rest = {k: v for k, v in stamped.items() if k != "evidence"}
+        base_rest = {k: v for k, v in base.items() if k != "evidence"}
+        self.assertEqual(rest, base_rest)
+        ev = dict(stamped["evidence"])
+        del ev["retrieval"]
+        self.assertEqual(ev, base["evidence"])
+
+    def test_failed_claim_gets_no_stamp(self):
+        result = _trope_result(trope_retrieval={"dragons": {
+            "support": None, "chapters_with_support": 0}})
+        row = self._rows(result)["t-drg"]
+        self.assertNotIn("retrieval", row["evidence"])
+        self.assertNotIn("quotes", row["evidence"])
+
+    def test_flag_off_rows_are_byte_identical(self):
+        # No G keys in the result at all: the row builder must
+        # produce exactly today's rows.
+        rows = self._rows(_trope_result())
+        for row in rows.values():
+            self.assertEqual(
+                set(row["evidence"]),
+                {"source", "chapters", "chapter_count"})
 
 
 if __name__ == "__main__":
