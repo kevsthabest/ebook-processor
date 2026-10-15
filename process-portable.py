@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.9.11"
+PORTABLE_VERSION = "2.9.12"
 
 import argparse
 import difflib
@@ -3554,11 +3554,14 @@ class StagingState:
         return moved
 
     def adopt_for(self, work_id, title="", author="", isbn=None):
-        """Post-resolution adoption (OC-8) for callers that learn the
-        work_id only AFTER observing under a fallback key — the
-        pipeline resolves works after extraction, so the observe seam
-        never has the id. Creates no entry when nothing waits to be
-        adopted. Returns True when an adoption happened."""
+        """Post-resolution adoption (OC-8), the net for works whose
+        observe ran under a fallback key: the staging seam resolves
+        read-only BEFORE observing and observes under the canonical
+        key whenever the work already exists, so adoption now fires
+        only for works that resolve later (genuinely new works, or a
+        seam resolution that missed and the creating resolution
+        caught). Creates no entry when nothing waits to be adopted.
+        Returns True when an adoption happened."""
         if not work_id or not self.enabled:
             return False
         with self._lock:
@@ -4924,10 +4927,6 @@ def roster_store_paths(learn_dir=None):
     if not rdir.is_dir():
         return []
     return sorted(rdir.glob("*.json"))
-
-
-def load_roster_store(learn_dir, work_key):
-    return RosterStore(learn_dir=learn_dir, work_key=work_key)
 
 
 def find_roster_store(learn_dir, work):
@@ -8876,7 +8875,7 @@ def _response_format_candidates():
     if fmt == "none":
         return [None]  # explicit: no constraint at all
     cands = []
-    if CONFIG.get("llm_json_schema", True) and _JSON_SCHEMA_OK is not False:
+    if CONFIG.get("llm_json_schema", False) and _JSON_SCHEMA_OK is not False:
         cands.append({"type": "json_schema",
                       "json_schema": {"name": "extraction",
                                       "schema": {"type": "object"},
@@ -10595,13 +10594,6 @@ def _title_candidates(title):
     return rows or []
 
 
-def _existing(table, col, work_id):
-    rows = sb(table, params=f"?work_id=eq.{quote(str(work_id), safe='')}&select={col}")
-    if rows is None:
-        return None
-    return {str(r.get(col, "")).lower() for r in rows}
-
-
 class TropeLookupError(RuntimeError):
     """The trope catalog lookup itself failed (sb() returned None —
     a DB error), as opposed to the trope genuinely not being in the
@@ -11777,6 +11769,45 @@ def _checkpoint_dir(book_key):
     return SCRIPT_DIR / "preview" / ".checkpoints" / book_key
 
 
+def _checkpoint_text_sample(chapters):
+    """First substantial chapter text, used for the checkpoint
+    fingerprint. Deterministic for a given book file: extraction of
+    the same file yields the same chapters, hence the same sample."""
+    for ch in chapters or []:
+        text = (ch or {}).get("text") or ""
+        if len(text) >= 200:
+            return text[:4000]
+    for ch in chapters or []:
+        text = (ch or {}).get("text") or ""
+        if text:
+            return text[:4000]
+    return ""
+
+
+def _checkpoint_fingerprint(identifiers, title, author, sample_text=""):
+    """Identity of the book a checkpoint directory belongs to.
+
+    The checkpoint key is the file STEM alone, so two different books
+    can share a directory (two files both named "book.epub"). The
+    fingerprint is what tells them apart: ISBN/ASIN when known, the
+    normalized title and author, and a hash of the first substantial
+    chapter's text. Stable across runs of the SAME book file (same
+    extraction, same sample) and discriminating across different
+    books — different editions of a work are different books here,
+    which is the safe direction: a refused resume costs a re-run, a
+    consumed foreign checkpoint costs a corrupted book.
+    """
+    import hashlib as _hl
+    ident = ""
+    if identifiers:
+        ident = identifiers.get("isbn") or identifiers.get("asin") or ""
+    parts = [str(ident), _tnorm(title or ""), _tnorm(author or "")]
+    if sample_text:
+        parts.append(_hl.sha256(
+            sample_text.encode("utf-8", "ignore")).hexdigest()[:16])
+    return _hl.sha256("\x1f".join(parts).encode()).hexdigest()[:16]
+
+
 def _checkpoint_flags_hash():
     """Hash of the CONFIG values that affect processing output.
 
@@ -11899,14 +11930,58 @@ def _ckpt_restore_roster_entry(entry):
     return _roster_entry_complete(entry)
 
 
-def _checkpoint_save_meta(book_key, total_chapters):
+def _checkpoint_save_meta(book_key, total_chapters, fingerprint=None):
     d = _checkpoint_dir(book_key)
     d.mkdir(parents=True, exist_ok=True)
     meta = {"book_key": book_key, "total_chapters": total_chapters,
             "flags_hash": _checkpoint_flags_hash(),
             "version": PORTABLE_VERSION}
+    if fingerprint:
+        meta["fingerprint"] = fingerprint
     with open(d / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
+
+
+def _checkpoint_purge_stale(book_key, total_chapters, fingerprint=None):
+    """Remove a DIFFERENT book's chapter files + roster from a
+    checkpoint directory before a fresh run (re)writes its meta.
+
+    The directory is keyed by file stem, so it may hold another book's
+    checkpoints. A later --resume must never glob those up beside this
+    book's meta. Staleness is proven by fingerprint mismatch when both
+    sides recorded one; for a pre-fingerprint meta the only available
+    signal is a differing chapter total. Meta itself is left in place
+    (the caller rewrites it immediately). Returns files removed.
+    """
+    d = _checkpoint_dir(book_key)
+    mp = d / "meta.json"
+    if not mp.is_file():
+        return 0
+    try:
+        meta = json.load(open(mp, encoding="utf-8"))
+    except Exception:
+        return 0
+    stored_fp = meta.get("fingerprint")
+    if stored_fp and fingerprint:
+        stale = stored_fp != fingerprint
+    elif not stored_fp:
+        stale = meta.get("total_chapters") != total_chapters
+    else:
+        stale = False
+    if not stale:
+        return 0
+    removed = 0
+    for cp in list(d.glob("chapter_*.json")) + [d / "roster.json"]:
+        if cp.is_file():
+            try:
+                cp.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        print(f"  Checkpoints: cleared {removed} stale file(s) left by "
+              f"a different book with the same file name")
+    return removed
 
 
 def _checkpoint_save_chapter(book_key, idx, a, b):
@@ -11941,10 +12016,16 @@ def _checkpoint_load(book_key):
             for _entry in roster.values():
                 _ckpt_restore_roster_entry(_entry)
     chapters = {}
+    _total = meta.get("total_chapters")
     for cp in sorted(d.glob("chapter_*.json")):
         try:
             idx = int(cp.stem.split("_")[1])
         except (IndexError, ValueError):
+            continue
+        if isinstance(_total, int) and _total > 0 and idx > _total:
+            # Chapter indices are 1-based, so idx == total is the
+            # book's own last chapter; anything beyond it was left by
+            # a longer book sharing the stem — not this book's.
             continue
         data = json.load(open(cp, encoding="utf-8"))
         a = _ckpt_json_restore(data.get("a"))
@@ -11960,18 +12041,35 @@ def _checkpoint_clear(book_key):
         _sh.rmtree(d)
 
 
-def _checkpoint_resume_check(book_key, total_chapters):
+def _checkpoint_resume_check(book_key, total_chapters, fingerprint=None):
     """Validate checkpoints for a --resume run.
 
     Returns (chapters_dict, roster) or (None, None) if resume is not possible.
     Warns on flags-hash or chapter-count mismatch; prompts to confirm when
     interactive, otherwise refuses to resume.
+
+    A fingerprint mismatch is NOT a prompt case: the checkpoints belong
+    to a different book that happens to share the file stem, and no
+    confirmation may turn another book's chapter outputs into this
+    book's. Refuse outright (resume_force included — that flag bypasses
+    the flags prompt for checkpoints seeded from this book's own
+    preview, which carry no fingerprint and never reach this check).
     """
     loaded = _checkpoint_load(book_key)
     if not loaded:
         print(f"  --resume: no checkpoints found for '{book_key}', starting fresh")
         return None, None
     meta, roster, chapters = loaded
+    stored_fp = meta.get("fingerprint")
+    if fingerprint and stored_fp and fingerprint != stored_fp:
+        print(f"  --resume REFUSED: checkpoints for '{book_key}' belong "
+              f"to a different book (same file name, different content) "
+              f"— starting fresh, clearing them")
+        _checkpoint_clear(book_key)
+        return None, None
+    if meta.get("version") and meta["version"] != PORTABLE_VERSION:
+        print(f"  --resume: checkpoints written by portable "
+              f"v{meta['version']} (now v{PORTABLE_VERSION})")
     problems = []
     if meta.get("flags_hash") != _checkpoint_flags_hash():
         problems.append("processing flags differ from the checkpointed run")
@@ -12105,18 +12203,25 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     call = backends.get(CONFIG["llm"], llm_ollama)
     batch_size = effective_batch_size()
 
-    # P8: crash resume. Checkpoint key is stable per book file.
+    # P8: crash resume. Checkpoint key is the file stem, which two
+    # different books can share — the fingerprint is what tells the
+    # books apart (see _checkpoint_fingerprint).
     _ckpt_key = _checkpoint_book_key(fpath)
+    _ckpt_fp = _checkpoint_fingerprint(
+        identifiers, title, author, _checkpoint_text_sample(chapters))
     _resumed_chapters = {}  # idx -> (a, b) loaded from checkpoints
     _resumed_roster = None
     if CONFIG.get("resume"):
-        _rc, _rr = _checkpoint_resume_check(_ckpt_key, n)
+        _rc, _rr = _checkpoint_resume_check(_ckpt_key, n, _ckpt_fp)
         if _rc is not None:
             _resumed_chapters = _rc
             _resumed_roster = _rr
     else:
-        # Fresh run: write meta.json so a later --resume can validate flags.
-        _checkpoint_save_meta(_ckpt_key, n)
+        # Fresh run: clear any other book's leftovers from the shared
+        # directory, then write meta.json so a later --resume can
+        # validate flags, count, and identity.
+        _checkpoint_purge_stale(_ckpt_key, n, _ckpt_fp)
+        _checkpoint_save_meta(_ckpt_key, n, _ckpt_fp)
 
     def _ckpt_complete(idx):
         """True if chapter idx has both Call A and Call B checkpointed."""

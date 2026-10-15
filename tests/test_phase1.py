@@ -164,6 +164,28 @@ class TestEmptyResponseDiagnostics(unittest.TestCase):
 class TestPhase1bFixes(unittest.TestCase):
     """Tests for the Phase 1b fix list."""
 
+    def test_json_schema_not_offered_when_config_key_missing(self):
+        # DEFAULT_CONFIG sets llm_json_schema=False ("json_object is the
+        # proven mode"); the read-site fallback must agree, so a config
+        # missing the key must NOT offer json_schema first.
+        pp._JSON_SCHEMA_OK = None
+        had = "llm_json_schema" in pp.CONFIG
+        old = pp.CONFIG.pop("llm_json_schema", None)
+        old_fmt = pp.CONFIG.get("llm_response_format")
+        pp.CONFIG["llm_response_format"] = "json_object"
+        try:
+            cands = pp._response_format_candidates()
+        finally:
+            if had:
+                pp.CONFIG["llm_json_schema"] = old
+            if old_fmt is None:
+                pp.CONFIG.pop("llm_response_format", None)
+            else:
+                pp.CONFIG["llm_response_format"] = old_fmt
+        types = [(c or {}).get("type") for c in cands]
+        self.assertNotIn("json_schema", types)
+        self.assertEqual(types[0], "json_object")
+
     def test_simple_prompt_single_braces_no_placeholders(self):
         p = pp.PROMPT_IDENTITY_SIMPLE
         self.assertNotIn("{{", p)
