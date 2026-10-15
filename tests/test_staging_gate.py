@@ -731,6 +731,24 @@ class _StagingBackend:
             "relationships": [], "pov_character": "Mira Solace"})
 
 
+class _NoTropeBackend:
+    """Same book shape as _StagingBackend, but the extraction sights
+    no trope candidates at all — the absence shape for expiry tests."""
+
+    def __call__(self, prompt, chunk, i, n):
+        if prompt == pp.PROMPT_V2_CONTENT:
+            return json.dumps({
+                "summary": "A chapter summary.", "spice_level": 0,
+                "triggers": {}, "trigger_evidence": {},
+                "trope_candidates": [], "quotes": []})
+        return json.dumps({
+            "characters": [{
+                "name": "Mira Solace", "role": "protagonist",
+                "description": "A swordswoman of the valley.",
+                "evidence": "Mira Solace drew her sword."}],
+            "relationships": [], "pov_character": "Mira Solace"})
+
+
 class _E2EBase:
     """Shared e2e machinery (not a TestCase itself, so subclasses
     don't re-run each other's tests)."""
@@ -885,6 +903,119 @@ class TestStagingE2E(_E2EBase, unittest.TestCase):
         self.assertIn("Found Family", r2["tropes"])
         w = st.data["works"]["work-xyz"]
         self.assertEqual(len(w["adoptions"]), 1)
+        _assert_accounting_closes(self, st, "work-xyz")
+
+
+class TestStagingResolvedWorkWiring(_E2EBase, unittest.TestCase):
+    """The live wiring shape: an ingested book's work_id resolves on
+    EVERY run. Regression suite for the seam keying defect — the
+    observe seam keyed by fallback unconditionally, and OC-8
+    adoption deleted the fallback entry after every run, so each
+    run observed a virgin fallback entry at ordinal 1 and the
+    persistence check (2+ sightings at decision time) could never
+    fire on a resolved work: promotion and absence-expiry were
+    structurally unreachable live while every store-level test
+    passed (their runs stayed unresolved, or resolved only after
+    the last observe). The seam now resolves read-only first and
+    observes under the canonical key when the work resolves;
+    fallback + adoption remains the path for genuinely new works."""
+
+    def test_resolved_work_promotes_on_second_run(self):
+        st = self._tmp_state()
+        cfg = {"staging_gate": True}
+        resolved = lambda *a, **k: ("work-xyz", "test")  # noqa: E731
+        r1, _ = self._run("stagepromote", cfg, st, resolve=resolved)
+        self.assertNotIn("Found Family", r1["tropes"])
+        # Observed straight onto the canonical entry: the fallback
+        # entry was never created, so there is nothing to adopt.
+        self.assertIn("work-xyz", st.data["works"])
+        self.assertNotIn("isbn:9780306406157", st.data["works"])
+        entry = st.data["works"]["work-xyz"]["claims"][
+            "trope:name:found family"]
+        self.assertEqual(entry["sightings"], [1])
+        self.assertEqual(entry["state"], "staged")
+        r2, _ = self._run("stagepromote", cfg, st, resolve=resolved)
+        self.assertIn("Found Family", r2["tropes"])
+        self.assertEqual(r2["trope_persistence"],
+                         {"found family": {"sightings": 2,
+                                           "via": "persistence"}})
+        self.assertEqual(r2["staging"]["promoted"][0]["via"],
+                         "persistence")
+        _assert_accounting_closes(self, st, "work-xyz")
+
+    def test_resolved_work_absent_claim_expires(self):
+        st = self._tmp_state()
+        cfg = {"staging_gate": True}
+        resolved = lambda *a, **k: ("work-xyz", "test")  # noqa: E731
+        self._run("stageexpire", cfg, st, resolve=resolved)
+        # Three further resolved runs that never sight the claim:
+        # the absence window (3 completed runs) must expire it from
+        # the canonical entry, not leave it trapped forever.
+        r4 = None
+        for _ in range(3):
+            r4, _ = self._run("stageexpire", cfg, st,
+                              resolve=resolved,
+                              backend=_NoTropeBackend())
+        w = st.data["works"]["work-xyz"]
+        self.assertNotIn("trope:name:found family", w["claims"])
+        self.assertEqual(len(w["expired_recent"]), 1)
+        self.assertEqual(r4["staging"]["expired_this_run"], 1)
+        _assert_accounting_closes(self, st, "work-xyz")
+
+    def test_accumulated_store_promotes_on_next_canonical_observe(self):
+        # The accumulated shape the old wiring left in real stores,
+        # built exactly the way it arose: two runs that each
+        # observed under the fallback key and adopted into the
+        # canonical entry, leaving sightings [1, 2] in state
+        # "staged" — accumulated, never promoted, because the
+        # promotion check never ran on the canonical entry.
+        st = self._tmp_state()
+        fb = "isbn:9780306406157"
+        for _ in range(2):
+            st.observe_work(
+                work_key=fb, work_id=None,
+                title="Staging Test Book", author="Test Author",
+                isbn="9780306406157",
+                tropes=[{"name": "Found Family", "n_ch": 2,
+                         "catalog_id": None}],
+                auto_min=3, independent=True, today=D1)
+            st.adopt_for("work-xyz", "Staging Test Book",
+                         "Test Author", "9780306406157")
+        entry = st.data["works"]["work-xyz"]["claims"][
+            "trope:name:found family"]
+        self.assertEqual(entry["sightings"], [1, 2])
+        self.assertEqual(entry["state"], "staged")
+        # The next resolved run observes canonically: the claim
+        # promotes via persistence and the shipped row carries the
+        # OC-7 persistence stamp.
+        resolved = lambda *a, **k: ("work-xyz", "test")  # noqa: E731
+        r, _ = self._run("stageaccum", {"staging_gate": True}, st,
+                         resolve=resolved)
+        self.assertIn("Found Family", r["tropes"])
+        self.assertEqual(r["trope_persistence"],
+                         {"found family": {"sightings": 3,
+                                           "via": "persistence"}})
+        entry = st.data["works"]["work-xyz"]["claims"][
+            "trope:name:found family"]
+        self.assertEqual(entry["state"], "promoted")
+        _assert_accounting_closes(self, st, "work-xyz")
+
+    def test_new_work_stages_under_fallback_then_adopts(self):
+        # Genuinely new work: the first run resolves nothing, so
+        # the claim stages under the fallback key exactly as before;
+        # when a later run resolves, adoption preserves the path to
+        # promotion.
+        st = self._tmp_state()
+        cfg = {"staging_gate": True}
+        r1, _ = self._run("stagenew", cfg, st)
+        self.assertNotIn("Found Family", r1["tropes"])
+        claims = st.data["works"]["isbn:9780306406157"]["claims"]
+        self.assertEqual(list(claims), ["trope:name:found family"])
+        resolved = lambda *a, **k: ("work-xyz", "test")  # noqa: E731
+        r2, _ = self._run("stagenew", cfg, st, resolve=resolved)
+        self.assertIn("Found Family", r2["tropes"])
+        self.assertIn("work-xyz", st.data["works"])
+        self.assertNotIn("isbn:9780306406157", st.data["works"])
         _assert_accounting_closes(self, st, "work-xyz")
 
 
