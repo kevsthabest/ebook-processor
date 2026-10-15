@@ -319,5 +319,57 @@ class TestTombstoneRedirect(unittest.TestCase):
             self.assertEqual(out["links"]["violet"]["entity"], a)
 
 
+class TestSuspectFormAuthorityLiveShape(unittest.TestCase):
+    """Fix-queue batch 2, item 1 (B-F1) at the seam's shape: views
+    built by a real RosterStore, matched by the real matcher. A
+    form whose only attestation is a suspect observation (a
+    suspended link dragged it into this entity) must not tier-1
+    link a fresh entry — while suspended, the pair may only be
+    PROPOSED as a split suspect. Once a human resolves the
+    suspect, the form links again."""
+
+    def _store(self, td):
+        st = pp.RosterStore(learn_dir=td, work_key="wk-live")
+        a = st.mint_entity()
+        st.append_observation(a, {
+            "run": 1, "form": "Xaden Riorson",
+            "form_key": "xaden riorson", "chapters": [1],
+            "appearances": 40, "role_hint": None, "aliases": [],
+            "alias_keys": [], "desc_hash": ""})
+        st.append_observation(a, {
+            "run": 2, "form": "V. Sorrengail",
+            "form_key": pp.norm_name("V. Sorrengail"),
+            "chapters": [1],
+            "appearances": 12, "role_hint": None, "aliases": [],
+            "alias_keys": [], "desc_hash": ""})
+        st.flag_suspect_observations(
+            a, run=2, form_key=pp.norm_name("V. Sorrengail"))
+        return st, a
+
+    def test_suspect_only_form_does_not_link_but_is_proposed(self):
+        with tempfile.TemporaryDirectory() as td:
+            st, a = self._store(td)
+            key = pp.norm_name("V. Sorrengail")
+            out = pp.roster_match_entries(
+                [_entry(key, "V. Sorrengail", chapters=(1,))],
+                st.entity_views())
+            self.assertNotIn(key, out["links"])
+            self.assertTrue(any(
+                s["a"] == key and s["b"] == a
+                for s in out["suspects"]))
+
+    def test_resolved_suspect_form_links_at_tier_1(self):
+        with tempfile.TemporaryDirectory() as td:
+            st, a = self._store(td)
+            key = pp.norm_name("V. Sorrengail")
+            st.resolve_suspect(a, key)
+            out = pp.roster_match_entries(
+                [_entry(key, "V. Sorrengail", chapters=(1,))],
+                st.entity_views())
+            link = out["links"][key]
+            self.assertEqual(link["entity"], a)
+            self.assertEqual(link["tier"], "exact-form")
+
+
 if __name__ == "__main__":
     unittest.main()

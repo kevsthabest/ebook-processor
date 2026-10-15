@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.9.12"
+PORTABLE_VERSION = "2.9.13"
 
 import argparse
 import difflib
@@ -4233,7 +4233,7 @@ class RosterStore:
                 "minted_total": 0, "entities": {}, "retired": {},
                 "no_pairs": [], "adoptions": [],
                 "suspects": [], "canonical_changes": [],
-                "collisions": []}
+                "collisions": [], "anchor_retirements": []}
 
     # -- setup / persistence (StagingState's F8 pattern) --------------
     def _ensure_dir(self):
@@ -4688,13 +4688,22 @@ class RosterStore:
                               "merge")
             surv["observations"].extend(fold["observations"])
             surv["links"].extend(fold["links"])
-            if surv.get("anchor") is None and fold.get("anchor"):
-                surv["anchor"] = fold["anchor"]
+            fold_anchor = fold.get("anchor")
+            both_anchored = bool(surv.get("anchor") and fold_anchor)
+            if surv.get("anchor") is None and fold_anchor:
+                surv["anchor"] = fold_anchor
                 surv["canonical"] = fold["canonical"]
                 surv["canonical_source"] = fold["canonical_source"]
-            self.data["retired"][folded_id] = {
-                "merged_into": survivor_id, "run": run,
-                "reason": reason}
+            tombstone = {"merged_into": survivor_id, "run": run,
+                         "reason": reason}
+            if both_anchored:
+                # Both sides curated: the survivor keeps its OWN
+                # anchor, and the folded side's is preserved on
+                # the tombstone — never silently dropped — so a
+                # later split, unlink or report can see the
+                # conflict and a human can rule on it.
+                tombstone["anchor"] = fold_anchor
+            self.data["retired"][folded_id] = tombstone
             del self.data["entities"][folded_id]
             return True
 
@@ -4727,6 +4736,37 @@ class RosterStore:
                 sent["canonical_source"] = "rule"
                 ent["split_into"].append(succ)
                 out[fk] = succ
+            if out and ent.get("anchor"):
+                # The anchor follows its sightings: when the
+                # anchor's own name form moved, the anchor moves
+                # to that successor — left behind, it would sit
+                # on an entity tier 0 cannot see (views are
+                # active-only) while anchored_entities kept
+                # listing it. When the split empties the original
+                # and the anchor's form was never among the
+                # observations (a fetch-minted anchor), the anchor
+                # follows the largest share of the sightings
+                # rather than stranding on the tombstone.
+                anchor = ent["anchor"]
+                target = out.get(norm_name(anchor.get("name") or ""))
+                if target is None and not ent["observations"]:
+                    target = max(
+                        out.values(),
+                        key=lambda s: sum(
+                            o.get("appearances") or 0
+                            for o in self.data["entities"][s]
+                            ["observations"]))
+                if target is not None:
+                    sent = self.data["entities"][target]
+                    sent["anchor"] = anchor
+                    if ent.get("canonical_source") == "anchor":
+                        sent["canonical"] = anchor["name"]
+                        sent["canonical_source"] = "anchor"
+                        if ent["observations"]:
+                            ent["canonical"] = \
+                                ent["observations"][-1].get("form")
+                            ent["canonical_source"] = "rule"
+                    ent["anchor"] = None
             if out and not ent["observations"]:
                 ent["status"] = "split"
             return out
@@ -4738,7 +4778,9 @@ class RosterStore:
         (a preserved DB row, or a manual --alias). The anchor's key
         set is closed and exact (A3): the anchor name's form_key
         plus the form keys of the aliases recorded for it — no token
-        decomposition. Re-seeding refreshes seen_run. Returns the
+        decomposition. Re-seeding an existing anchor reconciles
+        kind/source/aliases from the fresh row (the curation may
+        have changed since the first fetch). Returns the
         entity ID. lock_canonical=False for anchors whose name is a
         normalized key rather than a display form (manual --alias):
         the anchor still pins identity at tier 0, but the display
@@ -4747,11 +4789,29 @@ class RosterStore:
         keyset = {form_key} | {norm_name(a) for a in aliases if a}
         with self._lock:
             for eid, ent in self.data["entities"].items():
+                if ent.get("status") != "active":
+                    # A split tombstone's anchor is stranded
+                    # legacy state: matching it here would shadow
+                    # re-attachment to the active successor that
+                    # carries the sightings (it retires via
+                    # retire_unclaimed_anchors instead).
+                    continue
                 anchor = ent.get("anchor")
                 if anchor:
                     aset = {norm_name(anchor["name"])} | {
                         norm_name(a) for a in anchor.get("aliases") or []}
                     if aset & keyset:
+                        # Reconcile with the freshly fetched row:
+                        # kind, source and aliases are the row's
+                        # CURRENT curation, not the first fetch's —
+                        # a row that flipped confirmed -> rejected
+                        # must start suppressing, and one whose
+                        # aliases grew must claim the new forms.
+                        # (The name is the identity key the match
+                        # was made on and stays.)
+                        anchor["kind"] = kind
+                        anchor["source"] = source
+                        anchor["aliases"] = sorted(aliases)
                         anchor["seen_run"] = run
                         return eid
             for eid, ent in self.data["entities"].items():
@@ -4779,35 +4839,69 @@ class RosterStore:
             return eid
 
     def anchored_entities(self):
+        """{entity_id: anchor} over ACTIVE entities only. A
+        non-active (split) entity's anchor is stranded legacy
+        state — tier 0 cannot claim it (views are active-only),
+        so it must not hold the A8 disengagement set hostage."""
         return {eid: ent["anchor"]
                 for eid, ent in self.data["entities"].items()
-                if ent.get("anchor")}
+                if ent.get("anchor")
+                and ent.get("status") == "active"}
+
+    def retire_unclaimed_anchors(self, claimed_ids, run):
+        """Retire every anchor this run's anchor re-read did NOT
+        claim (claimed_ids: the entity IDs seed_anchor returned
+        for the fetched rows). The re-read is the authority: a
+        preserved DB row that was deleted, or a manual alias that
+        was removed, means the curation is gone — the anchor
+        clears (a deleted rejected row must STOP suppressing) and
+        the retirement is tombstoned in `anchor_retirements` for
+        the report. Returns [(entity_id, anchor)] retired. Only
+        ever called after a SUCCESSFUL re-read: a failed fetch
+        disengages the seam under A8 before this can run, so a
+        transient DB error can never retire anything."""
+        out = []
+        with self._lock:
+            for eid, ent in self.data["entities"].items():
+                anchor = ent.get("anchor")
+                if anchor and eid not in claimed_ids:
+                    self.data["anchor_retirements"].append(
+                        {"entity": eid, "run": run, "anchor": anchor})
+                    ent["anchor"] = None
+                    out.append((eid, anchor))
+            return out
 
     # -- views (matcher input) ----------------------------------------------
     def entity_views(self):
         """Per-entity matching views over ACTIVE entities. Primary
-        forms come from every non-detached observation; tier-2 alias
-        evidence (`alias_keys`) counts only attestations NOT carried
-        solely by suspect observations (A1), while `alias_keys_all`
-        keeps the full set for reporting. desc_hash is the latest
-        trusted (non-suspect) observation's."""
+        forms (`primary_forms`) count only forms attested by at
+        least one NON-suspect observation (B-F1): a form carried
+        solely by a suspended link's observations must not claim
+        tier 1 / tier 3 for the entity — the same A1 exclusion the
+        canonical vote and tier-2 alias evidence already apply.
+        `primary_forms_all` keeps every non-detached form for the
+        reporting / split-suspect surface, mirroring
+        `alias_keys_all`. desc_hash is the latest trusted
+        (non-suspect) observation's."""
         views = []
         with self._lock:
             for eid, ent in self.data["entities"].items():
                 if ent.get("status") != "active":
                     continue
-                primary, alias_trusted, alias_all = set(), set(), set()
+                primary, primary_all = set(), set()
+                alias_trusted, alias_all = set(), set()
                 chapters = set()
                 appearances = 0
                 desc_hash = ""
                 for o in ent["observations"]:
                     if o.get("detached"):
                         continue
-                    primary.add(o["form_key"])
+                    primary_all.add(o["form_key"])
                     alias_all.update(o.get("alias_keys") or [])
                     chapters.update(o.get("chapters") or [])
                     appearances += o.get("appearances") or 0
                     if not o.get("suspect"):
+                        primary.add(o["form_key"])
                         alias_trusted.update(o.get("alias_keys") or [])
                         if o.get("desc_hash"):
                             desc_hash = o["desc_hash"]
@@ -4817,6 +4911,7 @@ class RosterStore:
                     "canonical_key": norm_name(ent["canonical"] or ""),
                     "anchor": ent.get("anchor"),
                     "primary_forms": primary,
+                    "primary_forms_all": primary_all,
                     "alias_keys": alias_trusted,
                     "alias_keys_all": alias_all,
                     "chapters": chapters,
@@ -4887,8 +4982,31 @@ class RosterStore:
             for p in src.data["no_pairs"]:
                 self.record_no(p["a"], p["b"], source=p.get("source", ""))
             self.data["minted_total"] += src.data["minted_total"]
+            _self_runs = self.data["runs_completed"]
             self.data["runs_completed"] = max(
-                self.data["runs_completed"], src.data["runs_completed"])
+                _self_runs, src.data["runs_completed"])
+            # Carry the repeat-guard fingerprint (the rename path
+            # in adopt_roster_store moves the whole record,
+            # fingerprint included; dropping it here left the
+            # combined store unable to recognise a re-completion
+            # of the source extraction, which then double-counted
+            # its sightings). Which fingerprint: the one belonging
+            # to whichever store completed MORE runs — its ordinal
+            # is the runs_completed recorded above, so the
+            # fingerprint, the ordinal and the observations
+            # recorded under that ordinal stay one extraction's.
+            # Ties go to the source: adoption happens because a
+            # run resolved the work mid-flight, and the source
+            # store's last extraction is the one that may complete
+            # again against this store. claim_run compares
+            # fingerprints by equality — there is no ordinal
+            # comparison to relax; the invariant is fingerprint
+            # <-> runs_completed <-> assignments under that ordinal.
+            _src_fp = src.data.get("last_run_fingerprint")
+            if _src_fp is not None and (
+                    self.data.get("last_run_fingerprint") is None
+                    or src.data["runs_completed"] >= _self_runs):
+                self.data["last_run_fingerprint"] = _src_fp
             if src.work_key:
                 self.data["adoptions"].append(
                     {"from_key": src.work_key,
@@ -5083,8 +5201,9 @@ def cmd_roster_report(learn_dir=None):
                     for o in ent["observations"] if o.get("suspect")]
         if suspects:
             print("    !! SUSPECT OBSERVATIONS (under suspended "
-                  "links; excluded from canonical weighting and "
-                  "alias evidence until resolved):")
+                  "links; excluded from canonical weighting, "
+                  "alias evidence and primary-form authority "
+                  "until resolved):")
             for eid, o in suspects:
                 print(f"       {eid} form '{o['form']}' (run "
                       f"{o.get('run')}) — resolve with --roster-link"
@@ -5154,6 +5273,12 @@ def cmd_roster_report(learn_dir=None):
         for rid, rec in sorted(d["retired"].items()):
             print(f"    {rid} [merged -> {rec.get('merged_into')}] "
                   f"run {rec.get('run')}: {rec.get('reason')}")
+            if rec.get("anchor"):
+                _ra = rec["anchor"]
+                print(f"       folded anchor preserved on the "
+                      f"tombstone: {_ra.get('kind')} "
+                      f"'{_ra.get('name')}' ({_ra.get('source')}) "
+                      f"— the survivor kept its own anchor")
         if d.get("suspects"):
             print("    Split suspects (proposals only — never "
                   "auto-linked):")
@@ -5176,6 +5301,14 @@ def cmd_roster_report(learn_dir=None):
             for a in d["adoptions"]:
                 print(f"       from {a.get('from_key')}: "
                       f"{a.get('entities_moved')} entit(ies) moved")
+        if d.get("anchor_retirements"):
+            print("    Anchor retirements (the curated row was "
+                  "gone at re-read; the anchor stopped applying):")
+            for t in d["anchor_retirements"]:
+                _ta = t.get("anchor") or {}
+                print(f"       run {t.get('run')}: {t.get('entity')} "
+                      f"anchor {_ta.get('kind')} "
+                      f"'{_ta.get('name')}' ({_ta.get('source')})")
 
 
 def _roster_cmd_store(work, learn_dir=None):
@@ -5317,11 +5450,24 @@ def _matcher_no_veto(no_pairs, entry_forms, view_forms):
     return None
 
 
+def _view_primary_forms_all(view):
+    """Every primary form the view's entity was observed under,
+    including forms attested only by suspect observations. This is
+    the claims / proposal surface (veto checks, contested ground,
+    split suspects): a suspended link's form still marks the
+    ground, it just cannot LINK (tiers 1/3 read `primary_forms`,
+    which entity_views now restricts to trusted attestations —
+    B-F1). Hand-built views without the key fall back to
+    `primary_forms`."""
+    return set(view.get("primary_forms_all")
+               or view.get("primary_forms") or ())
+
+
 def _view_form_keys(view):
     """Every form key an entity view claims: observed primaries, all
     observed alias keys, its canonical key, and its anchor's closed
     key set."""
-    forms = set(view.get("primary_forms") or ())
+    forms = _view_primary_forms_all(view)
     forms |= set(view.get("alias_keys_all") or ())
     if view.get("canonical_key"):
         forms.add(view["canonical_key"])
@@ -5429,7 +5575,7 @@ def roster_match_entries(entries, views, no_pairs=()):
         for v in views:
             if v["id"] == candidate["id"]:
                 continue
-            if e["form_key"] in (set(v.get("primary_forms") or ())
+            if e["form_key"] in (_view_primary_forms_all(v)
                                  | set(v.get("alias_keys_all") or ())):
                 out.append(v)
         return out
@@ -5572,7 +5718,7 @@ def roster_match_entries(entries, views, no_pairs=()):
                 continue
             why = None
             if first and any(f.split()[0] == first
-                             for f in (v.get("primary_forms") or ())):
+                             for f in _view_primary_forms_all(v)):
                 if set(e.get("chapters") or ()) \
                         & set(v.get("chapters") or ()):
                     why = ("shared first token + overlapping "
@@ -5685,10 +5831,22 @@ def roster_assign_entities(roster, store, *, anchors=None,
         anchors = []
     fingerprint = roster_fingerprint(roster)
     ordinal, repeat = store.claim_run(fingerprint)
+    claimed = set()
     for a in anchors:
-        store.seed_anchor(a["name"], a["kind"], a.get("source", "db"),
-                          ordinal, a.get("aliases") or (),
-                          lock_canonical=a.get("lock_canonical", True))
+        claimed.add(store.seed_anchor(
+            a["name"], a["kind"], a.get("source", "db"),
+            ordinal, a.get("aliases") or (),
+            lock_canonical=a.get("lock_canonical", True)))
+    # The re-read succeeded (a failure returned under A8 above):
+    # any stored anchor it did not claim backs a curated row that
+    # is gone — retire it, tombstoned, so revocations take effect.
+    for eid, anchor in store.retire_unclaimed_anchors(claimed,
+                                                      ordinal):
+        print(f"  Roster: anchor '{anchor.get('name')}' "
+              f"({anchor.get('kind')}, {anchor.get('source')}) on "
+              f"{eid} was not in this run's anchor re-read — the "
+              f"curated row is gone; anchor retired (see "
+              f"--roster-report).")
     marker = {"linked": 0, "folded": 0, "minted": 0, "suspects": [],
               "suspended": [], "suppressed": [],
               "canonical_changes": [], "canonical_names": {},

@@ -268,6 +268,102 @@ class TestSplit(_StoreCase):
         self.assertEqual(st.accounting()["unaccounted"], 0)
 
 
+class TestSplitAnchor(_StoreCase):
+    """Fix-queue batch 2, item 4: an anchor follows its sightings
+    across a split. record_split used to leave the anchor on the
+    emptied original — invisible to entity_views (tier 0 starved)
+    yet still listed by anchored_entities, so A8 kept
+    disengaging on a phantom, and seed_anchor's existing-anchor
+    branch shadowed re-attachment to the twin."""
+
+    def test_anchor_follows_its_name_form_to_the_successor(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet Sorrengail",
+                                      appearances=30))
+        st.append_observation(a, _obs(1, "Violet", appearances=10))
+        self.assertEqual(
+            st.seed_anchor("Violet Sorrengail", "confirmed", "db",
+                           run=1), a)
+        out = st.record_split(a, ["violet sorrengail"], run=2)
+        twin = out["violet sorrengail"]
+        self.assertEqual(st.get_entity(twin)["anchor"]["name"],
+                         "Violet Sorrengail")
+        self.assertEqual(st.get_entity(twin)["canonical"],
+                         "Violet Sorrengail")
+        self.assertEqual(st.get_entity(twin)["canonical_source"],
+                         "anchor")
+        self.assertIsNone(st.get_entity(a)["anchor"])
+        self.assertEqual(set(st.anchored_entities()), {twin})
+        # Tier 0 can claim the twin: its view carries the anchor.
+        views = {v["id"]: v for v in st.entity_views()}
+        self.assertIsNotNone(views[twin]["anchor"])
+        # The original keeps the remainder under a rule canonical.
+        self.assertEqual(st.get_entity(a)["status"], "active")
+        self.assertEqual(st.get_entity(a)["canonical"], "Violet")
+        self.assertEqual(st.accounting()["unaccounted"], 0)
+
+    def test_anchor_moves_when_split_empties_the_original(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet Sorrengail"))
+        st.append_observation(a, _obs(1, "Violet"))
+        st.seed_anchor("Violet Sorrengail", "confirmed", "db", run=1)
+        out = st.record_split(a, ["violet", "violet sorrengail"],
+                              run=2)
+        self.assertEqual(st.get_entity(a)["status"], "split")
+        self.assertIsNone(st.get_entity(a)["anchor"])
+        twin = out["violet sorrengail"]
+        self.assertEqual(st.get_entity(twin)["anchor"]["name"],
+                         "Violet Sorrengail")
+        self.assertEqual(set(st.anchored_entities()), {twin})
+
+    def test_anchor_fallback_when_its_form_was_never_observed(self):
+        # A branch-3 seed (anchor minted its entity) whose form
+        # never appears among the observations: when a split
+        # empties the original, the anchor follows the largest
+        # share of the sightings rather than stranding.
+        st = self._store()
+        a = st.seed_anchor("Violet Sorrengail", "confirmed", "db", 1)
+        st.append_observation(a, _obs(1, "Dad", appearances=9))
+        st.append_observation(a, _obs(1, "Brennan Sorrengail",
+                                      appearances=30))
+        out = st.record_split(a, ["dad", "brennan sorrengail"],
+                              run=2)
+        self.assertEqual(st.get_entity(a)["status"], "split")
+        self.assertIsNone(st.get_entity(a)["anchor"])
+        self.assertEqual(
+            st.get_entity(out["brennan sorrengail"])["anchor"]["name"],
+            "Violet Sorrengail")
+
+    def test_anchored_entities_never_lists_split_entities(self):
+        # Legacy stores can hold an anchor stranded on a split
+        # entity (the pre-fix record_split shape); the A8
+        # disengagement set must not contain the phantom.
+        st = self._store()
+        a = st.seed_anchor("Violet Sorrengail", "confirmed", "db", 1)
+        st.data["entities"][a]["status"] = "split"
+        self.assertEqual(st.anchored_entities(), {})
+
+    def test_seed_anchor_reattaches_to_the_active_twin(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet Sorrengail"))
+        st.seed_anchor("Violet Sorrengail", "confirmed", "db", run=1)
+        # Legacy stranding: the sightings moved to a successor
+        # but the anchor stayed behind on the emptied original.
+        twin = st.mint_entity()
+        st.get_entity(twin)["observations"] = \
+            st.get_entity(a)["observations"]
+        st.get_entity(a)["observations"] = []
+        st.get_entity(a)["status"] = "split"
+        got = st.seed_anchor("Violet Sorrengail", "confirmed", "db",
+                             run=2)
+        self.assertEqual(got, twin)
+        self.assertEqual(st.get_entity(twin)["anchor"]["name"],
+                         "Violet Sorrengail")
+
+
 class TestHumanNoInvariant(_StoreCase):
     def _two_entities(self, st):
         a = st.mint_entity()
@@ -338,6 +434,81 @@ class TestAdoption(_StoreCase):
         self.assertTrue(dst.has_no("violet", "someone else"))
         self.assertEqual(len(dst.data["adoptions"]), 1)
 
+    def test_adoption_carries_source_fingerprint(self):
+        # Fix-queue batch 2, item 3: the rename path moves the
+        # whole record (fingerprint included); the merge path must
+        # not drop last_run_fingerprint, or re-completing the
+        # source extraction against the adopted store fails the
+        # repeat guard and double-counts its sightings.
+        src = self._store("title:book|author")
+        self.assertEqual(src.claim_run("fp-src"), (1, False))
+        x = src.mint_entity()
+        src.append_observation(x, _obs(1, "Violet"))
+        dst = self._store("work-id-123")
+        dst.adopt_store(src)
+        self.assertEqual(dst.data["last_run_fingerprint"], "fp-src")
+        self.assertEqual(dst.claim_run("fp-src"), (1, True))
+
+    def test_adoption_keeps_fingerprint_of_store_with_more_runs(self):
+        # The combined store's runs_completed is the max of the
+        # two; the fingerprint must name the SAME store's last
+        # completion, or the repeat path's run_assignments(ordinal)
+        # would look under the wrong extraction's ordinal.
+        dst = self._store("work-id-9")
+        dst.claim_run("fp-dst-1")
+        dst.claim_run("fp-dst-2")
+        src = self._store("title:book|author")
+        src.claim_run("fp-src")
+        dst.adopt_store(src)
+        self.assertEqual(dst.data["last_run_fingerprint"], "fp-dst-2")
+        self.assertEqual(dst.runs_completed, 2)
+        self.assertEqual(dst.claim_run("fp-dst-2"), (2, True))
+
+    def test_adoption_tie_prefers_source_fingerprint(self):
+        # Equal run counts: the source's last extraction is the
+        # one that may complete again against the combined store
+        # (adoption happens because a run resolved the work
+        # mid-flight), so its fingerprint wins the tie.
+        dst = self._store("work-id-9")
+        dst.claim_run("fp-dst")
+        src = self._store("title:book|author")
+        src.claim_run("fp-src")
+        dst.adopt_store(src)
+        self.assertEqual(dst.data["last_run_fingerprint"], "fp-src")
+        self.assertEqual(dst.claim_run("fp-src"), (1, True))
+
+    def test_adoption_then_recompletion_does_not_double_count(self):
+        # Combined adoption x fingerprint: the source extraction
+        # completes again against the adopted store and is
+        # recognised as a repeat — the seam's refresh path then
+        # replaces its observation in place under the REMINTED id.
+        src = self._store("title:book|author")
+        self.assertEqual(src.claim_run("fp-src"), (1, False))
+        x = src.mint_entity()
+        src.append_observation(x, _obs(1, "Violet", appearances=5))
+        dst = self._store("work-id-123")
+        z = dst.mint_entity()  # dst's own ent_0001: sequences offset
+        dst.append_observation(z, _obs(1, "Xaden Riorson"))
+        dst.adopt_store(src)
+        ordinal, repeat = dst.claim_run("fp-src")
+        self.assertEqual((ordinal, repeat), (1, True))
+        assignments = dst.run_assignments(1)
+        new_id = assignments["violet"]
+        self.assertNotEqual(new_id, x)  # reminted under dst
+        total = sum(len(e["observations"])
+                    for e in dst.data["entities"].values())
+        self.assertEqual(total, 2)
+        dst.replace_observation(new_id, _obs(1, "Violet",
+                                             appearances=9))
+        total = sum(len(e["observations"])
+                    for e in dst.data["entities"].values())
+        self.assertEqual(total, 2)  # refreshed in place, not appended
+        obs = dst.get_entity(new_id)["observations"]
+        self.assertEqual(len(obs), 1)
+        self.assertEqual(obs[0]["appearances"], 9)
+        self.assertEqual(dst.claim_run("fp-other"), (2, False))
+        self.assertEqual(dst.accounting()["unaccounted"], 0)
+
     def test_adoption_refused_when_a_vetoed_union_is_embodied(self):
         src = self._store("title:book|author")
         x = src.mint_entity()
@@ -378,6 +549,133 @@ class TestViews(_StoreCase):
         self.assertNotIn("dad", view["primary_forms"])
         # And the detach recorded NOs against the entity's other forms.
         self.assertTrue(st.has_no("dad", "violet sorrengail"))
+
+
+class TestSuspectPrimaryForms(_StoreCase):
+    """Fix-queue batch 2, item 1 (B-F1): primary-form authority
+    follows the A1 exclusion — the same one the canonical vote
+    (compute_canonical_name) and tier-2 alias evidence already
+    apply. A form attested ONLY by suspect observations must not
+    claim tier 1 / tier 3 for its entity: that is a suspended link
+    silently resolving itself. The form stays visible in
+    primary_forms_all, the reporting / split-suspect surface."""
+
+    def _store_with_suspect_long_form(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet"))
+        st.append_observation(a, _obs(2, "Violet Sorrengail"))
+        st.flag_suspect_observations(a, run=2,
+                                     form_key="violet sorrengail")
+        return st, a
+
+    def test_suspect_only_form_carries_no_primary_authority(self):
+        st, a = self._store_with_suspect_long_form()
+        (view,) = st.entity_views()
+        self.assertIn("violet", view["primary_forms"])
+        self.assertNotIn("violet sorrengail", view["primary_forms"])
+        self.assertIn("violet sorrengail", view["primary_forms_all"])
+
+    def test_form_with_a_trusted_attestation_stays_primary(self):
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet Sorrengail"))
+        st.append_observation(a, _obs(2, "Violet Sorrengail"))
+        st.flag_suspect_observations(a, run=2,
+                                     form_key="violet sorrengail")
+        (view,) = st.entity_views()
+        self.assertIn("violet sorrengail", view["primary_forms"])
+
+    def test_resolved_suspect_form_votes_again(self):
+        st, a = self._store_with_suspect_long_form()
+        st.resolve_suspect(a, "violet sorrengail")
+        (view,) = st.entity_views()
+        self.assertIn("violet sorrengail", view["primary_forms"])
+
+
+class TestAnchorLifecycle(_StoreCase):
+    """Fix-queue batch 2, item 2: the anchor lifecycle. An anchor
+    is a fetched curation fact, and the fetch changes: rows flip
+    kind, gain aliases, and get deleted. Re-seeding must reconcile
+    the stored anchor with the fresh row; a row the re-read no
+    longer claims must retire its anchor (tombstoned), or a
+    revocation can never take effect; and a merge of two anchored
+    entities must not silently drop the folded side's anchor."""
+
+    def test_reseed_reconciles_kind_source_and_aliases(self):
+        st = self._store()
+        eid = st.seed_anchor("Violet Sorrengail", "confirmed", "db",
+                             run=1, aliases=["Violet"])
+        again = st.seed_anchor("Violet Sorrengail", "rejected", "db",
+                               run=2, aliases=["Violet", "Violence"])
+        self.assertEqual(again, eid)
+        anchor = st.get_entity(eid)["anchor"]
+        # The row flipped confirmed -> rejected between runs: the
+        # stored anchor must follow, or suppression (which reads
+        # kind off the anchor) can never start.
+        self.assertEqual(anchor["kind"], "rejected")
+        self.assertEqual(anchor["aliases"], ["Violence", "Violet"])
+        self.assertEqual(anchor["seen_run"], 2)
+        marker = {"suppressed": [], "suppressed_entities": []}
+        pp._note_roster_suppression(st, marker, eid, "anchor",
+                                    "Violet Sorrengail")
+        self.assertEqual(len(marker["suppressed"]), 1)
+
+    def test_unclaimed_anchor_is_retired_with_a_tombstone(self):
+        st = self._store()
+        gone = st.seed_anchor("Violet Sorrengail", "rejected", "db",
+                              run=1)
+        keep = st.seed_anchor("Xaden Riorson", "confirmed", "db",
+                              run=1)
+        # Run 2's re-read succeeds and no longer carries Violet's
+        # row (deleted): only Xaden's anchor is claimed.
+        claimed = {st.seed_anchor("Xaden Riorson", "confirmed", "db",
+                                  run=2)}
+        retired = st.retire_unclaimed_anchors(claimed, run=2)
+        self.assertEqual([e for e, _a in retired], [gone])
+        self.assertIsNone(st.get_entity(gone)["anchor"])
+        self.assertEqual(set(st.anchored_entities()), {keep})
+        (tomb,) = st.data["anchor_retirements"]
+        self.assertEqual(tomb["entity"], gone)
+        self.assertEqual(tomb["run"], 2)
+        self.assertEqual(tomb["anchor"]["kind"], "rejected")
+        # A deleted rejected row stops suppressing.
+        marker = {"suppressed": [], "suppressed_entities": []}
+        pp._note_roster_suppression(st, marker, gone, "anchor",
+                                    "Violet Sorrengail")
+        self.assertEqual(marker["suppressed"], [])
+        # Retirement is durable across a save/load round trip.
+        st.save()
+        st2 = self._store()
+        self.assertIsNone(st2.get_entity(gone)["anchor"])
+        self.assertEqual(len(st2.data["anchor_retirements"]), 1)
+
+    def test_merge_of_two_anchored_entities_preserves_folded_anchor(self):
+        st = self._store()
+        a = st.seed_anchor("Violet Sorrengail", "confirmed", "db", 1)
+        b = st.seed_anchor("Xaden Riorson", "rejected", "db", 1)
+        st.record_merge(a, b, run=2, reason="within-run merge")
+        # The survivor keeps its OWN anchor; the folded side's is
+        # preserved on the tombstone, not silently dropped.
+        self.assertEqual(st.get_entity(a)["anchor"]["name"],
+                         "Violet Sorrengail")
+        tomb = st.data["retired"][b]
+        self.assertEqual(tomb["anchor"]["name"], "Xaden Riorson")
+        self.assertEqual(tomb["anchor"]["kind"], "rejected")
+
+    def test_merge_transfers_single_anchor_to_survivor(self):
+        # Pre-existing behaviour, pinned: only the folded side
+        # anchored -> the survivor inherits anchor + canonical,
+        # and no anchor lands on the tombstone.
+        st = self._store()
+        a = st.mint_entity()
+        st.append_observation(a, _obs(1, "Violet"))
+        b = st.seed_anchor("Violet Sorrengail", "confirmed", "db", 1)
+        st.record_merge(a, b, run=1, reason="within-run merge")
+        surv = st.get_entity(a)
+        self.assertEqual(surv["anchor"]["name"], "Violet Sorrengail")
+        self.assertEqual(surv["canonical"], "Violet Sorrengail")
+        self.assertNotIn("anchor", st.data["retired"][b])
 
 
 class TestAccountingRandomized(_StoreCase):
