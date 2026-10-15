@@ -4939,8 +4939,31 @@ class RosterStore:
             for p in src.data["no_pairs"]:
                 self.record_no(p["a"], p["b"], source=p.get("source", ""))
             self.data["minted_total"] += src.data["minted_total"]
+            _self_runs = self.data["runs_completed"]
             self.data["runs_completed"] = max(
-                self.data["runs_completed"], src.data["runs_completed"])
+                _self_runs, src.data["runs_completed"])
+            # Carry the repeat-guard fingerprint (the rename path
+            # in adopt_roster_store moves the whole record,
+            # fingerprint included; dropping it here left the
+            # combined store unable to recognise a re-completion
+            # of the source extraction, which then double-counted
+            # its sightings). Which fingerprint: the one belonging
+            # to whichever store completed MORE runs — its ordinal
+            # is the runs_completed recorded above, so the
+            # fingerprint, the ordinal and the observations
+            # recorded under that ordinal stay one extraction's.
+            # Ties go to the source: adoption happens because a
+            # run resolved the work mid-flight, and the source
+            # store's last extraction is the one that may complete
+            # again against this store. claim_run compares
+            # fingerprints by equality — there is no ordinal
+            # comparison to relax; the invariant is fingerprint
+            # <-> runs_completed <-> assignments under that ordinal.
+            _src_fp = src.data.get("last_run_fingerprint")
+            if _src_fp is not None and (
+                    self.data.get("last_run_fingerprint") is None
+                    or src.data["runs_completed"] >= _self_runs):
+                self.data["last_run_fingerprint"] = _src_fp
             if src.work_key:
                 self.data["adoptions"].append(
                     {"from_key": src.work_key,

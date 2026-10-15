@@ -338,6 +338,81 @@ class TestAdoption(_StoreCase):
         self.assertTrue(dst.has_no("violet", "someone else"))
         self.assertEqual(len(dst.data["adoptions"]), 1)
 
+    def test_adoption_carries_source_fingerprint(self):
+        # Fix-queue batch 2, item 3: the rename path moves the
+        # whole record (fingerprint included); the merge path must
+        # not drop last_run_fingerprint, or re-completing the
+        # source extraction against the adopted store fails the
+        # repeat guard and double-counts its sightings.
+        src = self._store("title:book|author")
+        self.assertEqual(src.claim_run("fp-src"), (1, False))
+        x = src.mint_entity()
+        src.append_observation(x, _obs(1, "Violet"))
+        dst = self._store("work-id-123")
+        dst.adopt_store(src)
+        self.assertEqual(dst.data["last_run_fingerprint"], "fp-src")
+        self.assertEqual(dst.claim_run("fp-src"), (1, True))
+
+    def test_adoption_keeps_fingerprint_of_store_with_more_runs(self):
+        # The combined store's runs_completed is the max of the
+        # two; the fingerprint must name the SAME store's last
+        # completion, or the repeat path's run_assignments(ordinal)
+        # would look under the wrong extraction's ordinal.
+        dst = self._store("work-id-9")
+        dst.claim_run("fp-dst-1")
+        dst.claim_run("fp-dst-2")
+        src = self._store("title:book|author")
+        src.claim_run("fp-src")
+        dst.adopt_store(src)
+        self.assertEqual(dst.data["last_run_fingerprint"], "fp-dst-2")
+        self.assertEqual(dst.runs_completed, 2)
+        self.assertEqual(dst.claim_run("fp-dst-2"), (2, True))
+
+    def test_adoption_tie_prefers_source_fingerprint(self):
+        # Equal run counts: the source's last extraction is the
+        # one that may complete again against the combined store
+        # (adoption happens because a run resolved the work
+        # mid-flight), so its fingerprint wins the tie.
+        dst = self._store("work-id-9")
+        dst.claim_run("fp-dst")
+        src = self._store("title:book|author")
+        src.claim_run("fp-src")
+        dst.adopt_store(src)
+        self.assertEqual(dst.data["last_run_fingerprint"], "fp-src")
+        self.assertEqual(dst.claim_run("fp-src"), (1, True))
+
+    def test_adoption_then_recompletion_does_not_double_count(self):
+        # Combined adoption x fingerprint: the source extraction
+        # completes again against the adopted store and is
+        # recognised as a repeat — the seam's refresh path then
+        # replaces its observation in place under the REMINTED id.
+        src = self._store("title:book|author")
+        self.assertEqual(src.claim_run("fp-src"), (1, False))
+        x = src.mint_entity()
+        src.append_observation(x, _obs(1, "Violet", appearances=5))
+        dst = self._store("work-id-123")
+        z = dst.mint_entity()  # dst's own ent_0001: sequences offset
+        dst.append_observation(z, _obs(1, "Xaden Riorson"))
+        dst.adopt_store(src)
+        ordinal, repeat = dst.claim_run("fp-src")
+        self.assertEqual((ordinal, repeat), (1, True))
+        assignments = dst.run_assignments(1)
+        new_id = assignments["violet"]
+        self.assertNotEqual(new_id, x)  # reminted under dst
+        total = sum(len(e["observations"])
+                    for e in dst.data["entities"].values())
+        self.assertEqual(total, 2)
+        dst.replace_observation(new_id, _obs(1, "Violet",
+                                             appearances=9))
+        total = sum(len(e["observations"])
+                    for e in dst.data["entities"].values())
+        self.assertEqual(total, 2)  # refreshed in place, not appended
+        obs = dst.get_entity(new_id)["observations"]
+        self.assertEqual(len(obs), 1)
+        self.assertEqual(obs[0]["appearances"], 9)
+        self.assertEqual(dst.claim_run("fp-other"), (2, False))
+        self.assertEqual(dst.accounting()["unaccounted"], 0)
+
     def test_adoption_refused_when_a_vetoed_union_is_embodied(self):
         src = self._store("title:book|author")
         x = src.mint_entity()
