@@ -966,9 +966,13 @@ class TestStagingResolvedWorkWiring(_E2EBase, unittest.TestCase):
         # The accumulated shape the old wiring left in real stores,
         # built exactly the way it arose: two runs that each
         # observed under the fallback key and adopted into the
-        # canonical entry, leaving sightings [1, 2] in state
-        # "staged" — accumulated, never promoted, because the
-        # promotion check never ran on the canonical entry.
+        # canonical entry, leaving sightings [1, 2] on the canonical
+        # entry. Pin updated for fix-queue batch 3 item 4: adoption
+        # now re-evaluates the folded entry, so the second adoption
+        # itself promotes it (previously it sat "staged" until a
+        # canonical observe — and for a work whose seam resolution
+        # misses every run, that observe never comes; see
+        # TestStagingAdoptionReevaluation).
         st = self._tmp_state()
         fb = "isbn:9780306406157"
         for _ in range(2):
@@ -984,7 +988,9 @@ class TestStagingResolvedWorkWiring(_E2EBase, unittest.TestCase):
         entry = st.data["works"]["work-xyz"]["claims"][
             "trope:name:found family"]
         self.assertEqual(entry["sightings"], [1, 2])
-        self.assertEqual(entry["state"], "staged")
+        self.assertEqual(entry["state"], "promoted")
+        self.assertEqual(entry["promoted_via"], "persistence")
+        self.assertEqual(entry["promoted_run"], 2)
         # The next resolved run observes canonically: the claim
         # promotes via persistence and the shipped row carries the
         # OC-7 persistence stamp.
@@ -1017,6 +1023,82 @@ class TestStagingResolvedWorkWiring(_E2EBase, unittest.TestCase):
         self.assertIn("work-xyz", st.data["works"])
         self.assertNotIn("isbn:9780306406157", st.data["works"])
         _assert_accounting_closes(self, st, "work-xyz")
+
+
+class TestStagingAdoptionReevaluation(_StoreCase):
+    """Fix-queue batch 3, item 4 — the seam-miss subclass (Advisor
+    finding 6): a work whose seam resolution MISSES every run (ISBN-
+    less + norm-form divergence) is observed only under its fallback
+    key, while OC-8 adoption folds each run's entry into the canonical
+    entry afterwards. Promotion and absence-expiry evaluate only at
+    observe time — the canonical entry's checks never run — so a claim
+    that accumulated sightings [1, 2] on the canonical entry stayed
+    "staged" forever (and absent claims never expired). These tests
+    run the exact composition the pipeline performs per run
+    (fallback observe + adopt_for) and require the folded state to be
+    re-evaluated at adoption time."""
+
+    FB_TITLE = "Seam Miss Book"
+
+    def _run_missed(self, state, tropes):
+        """One subclass-shaped run: seam observe under the fallback
+        key with no work_id, then OC-8 adoption of the resolved id."""
+        fb_key = pp.staging_work_key(None, None, self.FB_TITLE,
+                                     "Some Author")
+        out = state.observe_work(
+            work_key=fb_key, work_id=None, title=self.FB_TITLE,
+            author="Some Author", isbn=None, tropes=tropes,
+            auto_min=3, independent=True, today=D1)
+        state.adopt_for("work-seam", self.FB_TITLE, "Some Author",
+                        None)
+        return out
+
+    def test_seam_miss_every_run_promotes_at_adoption(self):
+        st = self._state()
+        obs = [{"name": "Found Family", "n_ch": 2, "catalog_id": None}]
+        for _ in range(2):
+            out = self._run_missed(st, obs)
+            # Each run's own observe sees a virgin fallback entry
+            # (adoption deleted the previous one), so the claim
+            # holds on every observe.
+            self.assertEqual(out["trope_actions"][0]["action"], "hold")
+        entry = st.data["works"]["work-seam"]["claims"][
+            "trope:name:found family"]
+        self.assertEqual(entry["sightings"], [1, 2])
+        # The re-evaluation at adoption must have promoted it: the
+        # promotion check ran on the folded state.
+        self.assertEqual(entry["state"], "promoted")
+        self.assertEqual(entry["promoted_via"], "persistence")
+        self.assertEqual(entry["promoted_run"], 2)
+        _assert_accounting_closes(self, st, "work-seam")
+
+    def test_seam_miss_single_sighting_stays_staged(self):
+        # Guard against over-firing: one sighting must not promote,
+        # even through the adoption re-evaluation.
+        st = self._state()
+        self._run_missed(
+            st, [{"name": "Found Family", "n_ch": 2, "catalog_id": None}])
+        entry = st.data["works"]["work-seam"]["claims"][
+            "trope:name:found family"]
+        self.assertEqual(entry["sightings"], [1])
+        self.assertEqual(entry["state"], "staged")
+
+    def test_seam_miss_absent_claim_expires_at_adoption(self):
+        # The expiry half of the same hole: after the absence window
+        # (3 completed runs) elapses inside adoption folds, the claim
+        # must expire — today it would accumulate forever.
+        st = self._state()
+        self._run_missed(
+            st, [{"name": "Found Family", "n_ch": 2, "catalog_id": None}])
+        for _ in range(3):
+            self._run_missed(st, [])
+        w = st.data["works"]["work-seam"]
+        self.assertNotIn("trope:name:found family", w["claims"])
+        self.assertEqual(len(w["expired_recent"]), 1)
+        rec = w["expired_recent"][0]
+        self.assertEqual(rec["key"], "trope:name:found family")
+        self.assertEqual(rec["expired_run"], 4)
+        _assert_accounting_closes(self, st, "work-seam")
 
 
 if __name__ == "__main__":

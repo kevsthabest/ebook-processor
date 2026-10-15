@@ -3553,6 +3553,44 @@ class StagingState:
         dst["runs_completed"] = shift + src["runs_completed"]
         return moved
 
+    def _reevaluate_adopted(self, work):
+        """Re-evaluate promotion and absence-expiry on the surviving
+        entry after an adoption fold (call under the lock).
+
+        Promotion/expiry otherwise evaluate only at observe time, on
+        the entry the run observes under. A work whose seam
+        resolution misses EVERY run is only ever observed under its
+        fallback key, so its canonical entry accumulated sightings no
+        check ever saw: claims at 2+ sightings stayed "staged"
+        forever and absent claims never expired. The folded state is
+        complete (sightings already shifted into the survivor's
+        ordinal space by _merge_work_into), so both checks can run
+        here on exactly the values observe would have used. The
+        persistence rule is the one applied — sightings are the only
+        evidence an adoption carries (no current observation, so no
+        support/evidence promotion can be judged here). Promotion is
+        sticky and accounting-preserving: staged -> promoted, or
+        staged -> expired_recent, staged_ever untouched."""
+        ordinal = work["runs_completed"]
+        for key, entry in list(work["claims"].items()):
+            if entry["state"] != "staged":
+                continue
+            if len(entry["sightings"]) >= 2:
+                entry["state"] = "promoted"
+                entry["promoted_run"] = max(entry["sightings"])
+                entry["promoted_via"] = "persistence"
+            elif entry["sightings"] and \
+                    ordinal - max(entry["sightings"]) \
+                    >= _STAGING_EXPIRE_ABSENCES:
+                work["expired_recent"].append(
+                    {"key": key, "display": entry["display"],
+                     "class": entry["class"], "expired_run": ordinal,
+                     "sightings": len(entry["sightings"])})
+                del work["claims"][key]
+        while len(work["expired_recent"]) > _STAGING_EXPIRED_CAP:
+            work["expired_recent"].pop(0)
+            work["expired_dropped"] += 1
+
     def adopt_for(self, work_id, title="", author="", isbn=None):
         """Post-resolution adoption (OC-8), the net for works whose
         observe ran under a fallback key: the staging seam resolves
@@ -3561,7 +3599,12 @@ class StagingState:
         only for works that resolve later (genuinely new works, or a
         seam resolution that missed and the creating resolution
         caught). Creates no entry when nothing waits to be adopted.
-        Returns True when an adoption happened."""
+        After a fold, the surviving entry's staged claims are
+        re-evaluated for promotion/expiry (see _reevaluate_adopted):
+        a work that misses at the seam every run never observes its
+        canonical entry, so adoption is the only place its folded
+        sightings can ever be judged. Returns True when an adoption
+        happened."""
         if not work_id or not self.enabled:
             return False
         with self._lock:
@@ -3577,8 +3620,17 @@ class StagingState:
             dst = self.work_entry(dst_key, work_id, title, author)
             before = len(dst["adoptions"])
             self._adopt_fallbacks(dst, work_id, title, author, isbn)
-            if len(dst["adoptions"]) == before:
+            # A fold happened iff a candidate entry was consumed —
+            # NOT iff an adoption record was appended: a fallback
+            # entry holding no claims moves nothing and records
+            # nothing, yet its runs still merged into the survivor's
+            # runs_completed, which is exactly what the expiry
+            # re-evaluation must see.
+            folded = not any(c in self.data["works"] for c in candidates
+                             if c != dst_key)
+            if len(dst["adoptions"]) == before and not folded:
                 return False
+            self._reevaluate_adopted(dst)
             self.save()
             return True
 
