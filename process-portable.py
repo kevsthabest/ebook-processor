@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.9.13"
+PORTABLE_VERSION = "2.9.14"
 
 import argparse
 import difflib
@@ -3553,6 +3553,44 @@ class StagingState:
         dst["runs_completed"] = shift + src["runs_completed"]
         return moved
 
+    def _reevaluate_adopted(self, work):
+        """Re-evaluate promotion and absence-expiry on the surviving
+        entry after an adoption fold (call under the lock).
+
+        Promotion/expiry otherwise evaluate only at observe time, on
+        the entry the run observes under. A work whose seam
+        resolution misses EVERY run is only ever observed under its
+        fallback key, so its canonical entry accumulated sightings no
+        check ever saw: claims at 2+ sightings stayed "staged"
+        forever and absent claims never expired. The folded state is
+        complete (sightings already shifted into the survivor's
+        ordinal space by _merge_work_into), so both checks can run
+        here on exactly the values observe would have used. The
+        persistence rule is the one applied — sightings are the only
+        evidence an adoption carries (no current observation, so no
+        support/evidence promotion can be judged here). Promotion is
+        sticky and accounting-preserving: staged -> promoted, or
+        staged -> expired_recent, staged_ever untouched."""
+        ordinal = work["runs_completed"]
+        for key, entry in list(work["claims"].items()):
+            if entry["state"] != "staged":
+                continue
+            if len(entry["sightings"]) >= 2:
+                entry["state"] = "promoted"
+                entry["promoted_run"] = max(entry["sightings"])
+                entry["promoted_via"] = "persistence"
+            elif entry["sightings"] and \
+                    ordinal - max(entry["sightings"]) \
+                    >= _STAGING_EXPIRE_ABSENCES:
+                work["expired_recent"].append(
+                    {"key": key, "display": entry["display"],
+                     "class": entry["class"], "expired_run": ordinal,
+                     "sightings": len(entry["sightings"])})
+                del work["claims"][key]
+        while len(work["expired_recent"]) > _STAGING_EXPIRED_CAP:
+            work["expired_recent"].pop(0)
+            work["expired_dropped"] += 1
+
     def adopt_for(self, work_id, title="", author="", isbn=None):
         """Post-resolution adoption (OC-8), the net for works whose
         observe ran under a fallback key: the staging seam resolves
@@ -3561,7 +3599,12 @@ class StagingState:
         only for works that resolve later (genuinely new works, or a
         seam resolution that missed and the creating resolution
         caught). Creates no entry when nothing waits to be adopted.
-        Returns True when an adoption happened."""
+        After a fold, the surviving entry's staged claims are
+        re-evaluated for promotion/expiry (see _reevaluate_adopted):
+        a work that misses at the seam every run never observes its
+        canonical entry, so adoption is the only place its folded
+        sightings can ever be judged. Returns True when an adoption
+        happened."""
         if not work_id or not self.enabled:
             return False
         with self._lock:
@@ -3577,8 +3620,17 @@ class StagingState:
             dst = self.work_entry(dst_key, work_id, title, author)
             before = len(dst["adoptions"])
             self._adopt_fallbacks(dst, work_id, title, author, isbn)
-            if len(dst["adoptions"]) == before:
+            # A fold happened iff a candidate entry was consumed —
+            # NOT iff an adoption record was appended: a fallback
+            # entry holding no claims moves nothing and records
+            # nothing, yet its runs still merged into the survivor's
+            # runs_completed, which is exactly what the expiry
+            # re-evaluation must see.
+            folded = not any(c in self.data["works"] for c in candidates
+                             if c != dst_key)
+            if len(dst["adoptions"]) == before and not folded:
                 return False
+            self._reevaluate_adopted(dst)
             self.save()
             return True
 
@@ -3725,6 +3777,22 @@ class StagingState:
             entry["name_forms"].append(name)
         return recorded
 
+    @staticmethod
+    def _persistence_stamp(entry, via):
+        """The OC-7 stamp a promoted claim's shipped row carries:
+        how many independent sightings earned the ship, the
+        mechanism, and — since fix-queue batch 3 item 3 — WHICH runs
+        sighted it (`sighting_runs`: the entry's sighting ordinals).
+        The count alone evaporated at the reviewer's desk: a queue
+        row showed only the claim's own evidence, with the
+        persistence signal nowhere in it. Per-run CHAPTER support
+        cannot ride along — the entry retains no per-run chapter
+        lists (only best_chapters, a max across sightings); the
+        row's evidence.chapters carries the shipping run's support,
+        and sighting_runs names the runs to compare it against."""
+        return {"sightings": len(entry["sightings"]), "via": via,
+                "sighting_runs": list(entry["sightings"])}
+
     def _promote(self, work, entry, ordinal, via, form_changed, out,
                  display):
         entry["state"] = "promoted"
@@ -3774,8 +3842,8 @@ class StagingState:
             if n_ch < auto_min:
                 # Gate-band ship explained by earned standing alone:
                 # the stamp is how a reviewer sees that (OC-7).
-                stamp = {"sightings": len(entry["sightings"]),
-                         "via": entry["promoted_via"]}
+                stamp = self._persistence_stamp(
+                    entry, entry["promoted_via"])
             return {"action": "ship", "key": key, "stamp": stamp,
                     "form_changed": False}
         # Staged entry: promotion rules (independent sightings only;
@@ -3794,8 +3862,7 @@ class StagingState:
             item = self._promote(work, entry, ordinal, "persistence",
                                  form_changed, out, name)
             item["key"] = key
-            stamp = {"sightings": len(entry["sightings"]),
-                     "via": "persistence"}
+            stamp = self._persistence_stamp(entry, "persistence")
             return {"action": "ship", "key": key, "stamp": stamp,
                     "form_changed": form_changed}
         out["staged"].append(
@@ -3838,8 +3905,8 @@ class StagingState:
         if entry["state"] == "promoted":
             stamp = None
             if not has_ev:
-                stamp = {"sightings": len(entry["sightings"]),
-                         "via": entry["promoted_via"]}
+                stamp = self._persistence_stamp(
+                    entry, entry["promoted_via"])
             return {"action": "ship", "key": key, "stamp": stamp,
                     "form_changed": False}
         if independent and has_ev:
@@ -3852,8 +3919,7 @@ class StagingState:
             item = self._promote(work, entry, ordinal, "persistence",
                                  False, out, warning)
             item["key"] = key
-            stamp = {"sightings": len(entry["sightings"]),
-                     "via": "persistence"}
+            stamp = self._persistence_stamp(entry, "persistence")
             return {"action": "ship", "key": key, "stamp": stamp,
                     "form_changed": False}
         out["staged"].append(
@@ -6595,6 +6661,35 @@ def _roster_update(roster, characters, chapter_idx):
                                   if pk.split(" ")[0] == _tok_full]
                         if len(set(_cands)) == 1:
                             found = _cands[0]
+            if found is not None:
+                # Learned-hit cannot-link check: the tiered path below
+                # runs only when the learned lookup missed, so a
+                # learned YES used to short-circuit the Tier 1 hard NO
+                # entirely — a pair this chapter lists as two separate
+                # characters could still merge on a prior book's
+                # say-so. Check the hit against this book's
+                # cannot-links first, using the tier function's own
+                # verdict (Tier 2 still beats Tier 1: a strip /
+                # spelling / nickname pair is Call A inconsistency,
+                # not two people). A refused hit falls through to the
+                # tiered path exactly like a learned miss.
+                _refused = None
+                for _pk in roster[found].get("primary_keys", {found}):
+                    if _pk != nkey and _pk in _chapter_keys and \
+                            _merge_tier(nkey, _pk,
+                                        chapter_keys=_chapter_keys,
+                                        roster_keys=set(primaries)) \
+                            == "no":
+                        _refused = _pk
+                        break
+                if _refused is not None:
+                    UI.viz_event(
+                        getattr(_DIAG, "viz_book_key", None),
+                        '✗ Filtered: "%s" (learned merge refused: '
+                        'Tier 1 cannot-link — co-listed with "%s" '
+                        'this chapter)'
+                        % (name[:40], roster[found]["name"][:40]))
+                    found = None
             if found is None:
                 # Tiered deterministic merge (replaces the old _names_overlap
                 # substring heuristic): Tier 1 hard NO for same-chapter
@@ -9476,21 +9571,39 @@ def _dot(a, b):
 EMBED_TEXT_FORMAT = "name-desc-v1"
 
 
+def _trope_text_hash(text):
+    """Content hash of one catalog entry's embedded text. The vector
+    cache is keyed by row id, but an id alone cannot prove the cached
+    vector was embedded from the CURRENT text: editing a trope's
+    name/description under the same id must turn the entry into a
+    miss. The stored hash is that proof."""
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def trope_catalog_vectors():
     """Load trope catalog with embeddings. Fetches from Supabase `tropes`,
     embeds name+description via the dedupe embedding endpoint, caches to
     CONFIG['trope_map_cache']. Returns [(id, name, vector)].
 
     The cache file is namespaced by (embed_model, EMBED_TEXT_FORMAT) —
-    {"model": ..., "format": ..., "vectors": {id: vector}}. A cache
-    written under any other model or text format, including the legacy
-    bare {id: vector} shape, is invalidated wholesale and re-embedded:
+    {"model": ..., "format": ..., "vectors": {id: vector},
+    "hashes": {id: sha256 of the embedded text}}. A cache written
+    under any other model or text format, including the legacy bare
+    {id: vector} shape, is invalidated wholesale and re-embedded:
     cosine comparisons across different vector spaces are meaningless.
+    Within a valid namespace, an entry is a hit only when its stored
+    hash matches the current catalog row's text — a same-id content
+    edit re-embeds, a hashless entry (pre-hash cache) migrates by
+    re-embedding once, and ids absent from the catalog are pruned.
+    The write is atomic (temp file + os.replace, the codebase's
+    _save_json idiom): a crash mid-write leaves the old cache intact.
     """
     import os
     cache_path = CONFIG.get("trope_map_cache", "trope-vectors.json")
     model = CONFIG.get("embed_model", "")
     cached = {}
+    hashes = {}
     if os.path.exists(cache_path):
         try:
             raw_cache = json.load(open(cache_path, encoding="utf-8"))
@@ -9501,6 +9614,8 @@ def trope_catalog_vectors():
                 and raw_cache.get("format") == EMBED_TEXT_FORMAT
                 and isinstance(raw_cache.get("vectors"), dict)):
             cached = raw_cache["vectors"]
+            if isinstance(raw_cache.get("hashes"), dict):
+                hashes = raw_cache["hashes"]
         else:
             print("  trope vector cache invalidated (model/format "
                   "changed); re-embedding catalog")
@@ -9513,22 +9628,44 @@ def trope_catalog_vectors():
         else:
             print("  WARNING: could not load tropes from Supabase")
         return []
-    # Embed any catalog entries missing from cache.
-    missing = [r for r in rows if r["id"] not in cached]
+
+    def _text(r):
+        return f"{r['name']}: {r.get('description') or ''}"
+
+    live_ids = {r["id"] for r in rows}
+    valid = {}
+    stale = 0
+    for r in rows:
+        if r["id"] in cached \
+                and hashes.get(r["id"]) == _trope_text_hash(_text(r)):
+            valid[r["id"]] = cached[r["id"]]
+        elif r["id"] in cached:
+            stale += 1
+    pruned = [i for i in cached if i not in live_ids]
+    missing = [r for r in rows if r["id"] not in valid]
+    if stale:
+        print(f"  trope vector cache: {stale} catalog entr"
+              f"{'y' if stale == 1 else 'ies'} changed text under "
+              f"the same id; re-embedding")
     if missing:
-        texts = [f"{r['name']}: {r.get('description') or ''}" for r in missing]
-        vecs = embed_vectors(CONFIG["embed_url"], model, texts)
+        vecs = embed_vectors(CONFIG["embed_url"], model,
+                             [_text(r) for r in missing])
         for r, v in zip(missing, vecs):
-            cached[r["id"]] = v
+            valid[r["id"]] = v
+    if missing or pruned:
+        out_hashes = {r["id"]: _trope_text_hash(_text(r))
+                      for r in rows if r["id"] in valid}
         try:
-            json.dump({"model": model, "format": EMBED_TEXT_FORMAT,
-                       "vectors": cached},
-                      open(cache_path, "w", encoding="utf-8"))
+            tmp_path = cache_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump({"model": model, "format": EMBED_TEXT_FORMAT,
+                           "vectors": valid, "hashes": out_hashes}, f)
+            os.replace(tmp_path, cache_path)
         except Exception as e:
             print(f"  warning: could not write vector cache: {e}")
     # Return normalized vectors so callers can use _dot() for fast comparison.
-    return [(r["id"], r["name"], _normalize(cached[r["id"]]))
-            for r in rows if r["id"] in cached]
+    return [(r["id"], r["name"], _normalize(valid[r["id"]]))
+            for r in rows if r["id"] in valid]
 
 
 # Names that are known noise (hallucinations, family generics). "jason" is a

@@ -153,18 +153,106 @@ class TestTropeCatalogCacheNamespace(_ConfigGuard):
         self.assertEqual([list(r[2]) for r in out],
                          [self.FRESH, self.FRESH])
 
+    def _hash(self, row):
+        return pp._trope_text_hash(
+            f"{row['name']}: {row.get('description') or ''}")
+
+    def _valid_cache(self, vectors=None, rows=None):
+        rows = self.ROWS if rows is None else rows
+        vectors = {r["id"]: self.STALE for r in rows} \
+            if vectors is None else vectors
+        return {"model": "model-a",
+                "format": pp.EMBED_TEXT_FORMAT,
+                "vectors": vectors,
+                "hashes": {r["id"]: self._hash(r) for r in rows}}
+
     def test_matching_namespace_cache_is_reused(self):
-        self._write_cache({
-            "model": "model-a",
-            "format": pp.EMBED_TEXT_FORMAT,
-            "vectors": {"t1": self.STALE, "t2": self.STALE},
-        })
+        # Pin updated for fix-queue batch 3 item 2: reuse now also
+        # requires each entry's content hash to match the catalog
+        # row's current text — a namespaced cache WITHOUT hashes
+        # migrates by re-embedding (see the stale-text test below).
+        self._write_cache(self._valid_cache())
         out, printed = _capture(pp.trope_catalog_vectors)
         self.assertNotIn("invalidated", printed)
         self.assertEqual(self.embed_calls, [])  # no re-embedding at all
         # The cached (stale-looking but namespaced-valid) vectors return.
         self.assertEqual([list(r[2]) for r in out],
                          [self.STALE, self.STALE])
+
+    def test_catalog_text_edit_reembeds_only_the_edited_id(self):
+        # Same row id, edited description: the id key alone used to
+        # serve the stale vector forever. The content hash turns the
+        # edited entry into a miss; the untouched entry stays a hit.
+        self._write_cache(self._valid_cache())
+        edited = [dict(self.ROWS[0]),
+                  {"id": "t2", "name": "Found Family",
+                   "description": "a chosen kin group, revised"}]
+        pp.sb.return_value = [dict(r) for r in edited]
+        out, printed = _capture(pp.trope_catalog_vectors)
+        self.assertEqual(self.embed_calls,
+                         [["Found Family: a chosen kin group, "
+                           "revised"]])
+        by_id = {r[0]: list(r[2]) for r in out}
+        self.assertEqual(by_id["t1"], self.STALE)  # untouched: cached
+        self.assertEqual(by_id["t2"], self.FRESH)  # edited: re-embedded
+        saved = self._read_cache()
+        self.assertEqual(saved["hashes"]["t2"], self._hash(edited[1]))
+        self.assertEqual(saved["hashes"]["t1"],
+                         self._hash(self.ROWS[0]))
+        self.assertEqual(saved["vectors"]["t2"], self.FRESH)
+
+    def test_hashless_namespaced_cache_migrates_by_reembedding(self):
+        # A cache written before content hashing (namespace matches,
+        # no "hashes" at all) cannot prove any entry matches the
+        # current text: every entry is a miss, re-embedded once, and
+        # the rewritten cache carries hashes.
+        self._write_cache({
+            "model": "model-a",
+            "format": pp.EMBED_TEXT_FORMAT,
+            "vectors": {"t1": self.STALE, "t2": self.STALE},
+        })
+        out, printed = _capture(pp.trope_catalog_vectors)
+        self.assertEqual(len(self.embed_calls), 1)
+        self.assertEqual(len(self.embed_calls[0]), 2)
+        self.assertEqual([list(r[2]) for r in out],
+                         [self.FRESH, self.FRESH])
+        saved = self._read_cache()
+        self.assertEqual(saved["hashes"],
+                         {r["id"]: self._hash(r) for r in self.ROWS})
+
+    def test_deleted_catalog_id_is_pruned_from_cache(self):
+        cache = self._valid_cache()
+        cache["vectors"]["tGONE"] = self.STALE
+        cache["hashes"]["tGONE"] = "0" * 64
+        self._write_cache(cache)
+        out, printed = _capture(pp.trope_catalog_vectors)
+        # Both live entries are valid hits — nothing re-embeds — but
+        # the dead id must not linger in the file.
+        self.assertEqual(self.embed_calls, [])
+        self.assertEqual([r[0] for r in out], ["t1", "t2"])
+        saved = self._read_cache()
+        self.assertNotIn("tGONE", saved["vectors"])
+        self.assertNotIn("tGONE", saved["hashes"])
+        self.assertEqual(saved["vectors"],
+                         {"t1": self.STALE, "t2": self.STALE})
+
+    def test_cache_write_is_atomic_temp_then_replace(self):
+        import os
+        real_replace = os.replace
+        calls = []
+
+        def spy_replace(src, dst):
+            calls.append((src, dst))
+            return real_replace(src, dst)
+
+        with mock.patch("os.replace", side_effect=spy_replace):
+            out, printed = _capture(pp.trope_catalog_vectors)
+        self.assertEqual([list(r[2]) for r in out],
+                         [self.FRESH, self.FRESH])
+        self.assertEqual(calls, [(self.cache_path + ".tmp",
+                                  self.cache_path)])
+        self.assertFalse(Path(self.cache_path + ".tmp").exists())
+        self.assertTrue(Path(self.cache_path).exists())
 
     def test_missing_cache_embeds_and_writes_namespaced(self):
         out, printed = _capture(pp.trope_catalog_vectors)
@@ -176,6 +264,8 @@ class TestTropeCatalogCacheNamespace(_ConfigGuard):
         self.assertEqual(saved["format"], pp.EMBED_TEXT_FORMAT)
         self.assertEqual(saved["vectors"],
                          {"t1": self.FRESH, "t2": self.FRESH})
+        self.assertEqual(saved["hashes"],
+                         {r["id"]: self._hash(r) for r in self.ROWS})
         # Second call reuses what the first wrote — no further embeds.
         out2, _ = _capture(pp.trope_catalog_vectors)
         self.assertEqual(len(self.embed_calls), 1)
