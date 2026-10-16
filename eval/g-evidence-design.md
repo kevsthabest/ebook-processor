@@ -645,6 +645,12 @@ measurement.
    — any set difference fails the gate outright. The only
    permitted row differences are G's own evidence additions: the
    `quotes` entries and the `retrieval` stamp (§5).
+   *Gate record 2026-10-15: this signal is **PENDING-SPINE** —
+   the replay instrument does not exist yet (checkpoint resume
+   refuses/clears across code changes); the spine build's slice 3
+   provides the replay harness, and G4 is scored when it lands.
+   It is not stubbed with two fresh extractions: a stubbed G4 is
+   a false pin, worse than a deferred one.*
 4. **Budget + runtime.** Decision-model claims attributable to G
    = 0 (log-asserted); FW wall-clock overhead ≤ 10% of the
    flag-off run.

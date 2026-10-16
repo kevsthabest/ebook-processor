@@ -950,5 +950,71 @@ class TestReporting(unittest.TestCase):
         self.assertNotIn("Trope evidence", self._summary(None))
 
 
+# --- slice 6: gate artefacts -------------------------------------------------
+
+import importlib.util as _ilu
+from pathlib import Path as _Path
+
+_ROOT = _Path(__file__).resolve().parent.parent
+_gspec = _ilu.spec_from_file_location("g_gate", _ROOT / "eval"
+                                      / "g-gate.py")
+_gg = _ilu.module_from_spec(_gspec)
+_gspec.loader.exec_module(_gg)
+
+
+class TestGateArtefacts(unittest.TestCase):
+    def setUp(self):
+        self.fx = _gg.load_fixture()
+
+    def test_fixture_well_formed(self):
+        cases = self.fx["cases"]
+        self.assertGreaterEqual(len(cases), 24)
+        classes = {c["expected"] for c in cases}
+        self.assertEqual(classes,
+                         {"supports", "adjacent", "contradicts"})
+        tags = {c["tag"] for c in cases}
+        # The design names these case families explicitly.
+        self.assertTrue({"negation", "discussion", "backstory"}
+                        <= tags)
+        chapters = {(b, c["label"]): c["text"]
+                    for b, book in self.fx["books"].items()
+                    for c in book["chapters"]}
+        for case in cases:
+            # Every labelled passage is a literal span of its
+            # chapter — the fixture can never drift into quoting
+            # text that is not in its book.
+            self.assertIn(case["passage"],
+                          chapters[(case["book"], case["chapter"])])
+            self.assertIn(case["claim"], self.fx["claims"])
+
+    def test_cross_book_bleed_zero_under_adversarial_judge(self):
+        res = _gg.run_bleed(pp, self.fx, FakeEmbedder())
+        self.assertEqual(res["runs"], 9)
+        # The exercise is not vacuous: the supports-everything
+        # judge DID attach passages — every one a literal span of
+        # the target book it was retrieved from.
+        self.assertGreater(res["attached"], 0)
+        self.assertEqual(res["bleed"], 0)
+        self.assertEqual(res["detail"], [])
+
+    def test_trope_half_draws_zero_decision_budget(self):
+        def explode(n=1):
+            raise AssertionError("_dm_budget_claim called on G path")
+        orig = pp._dm_budget_claim
+        pp._dm_budget_claim = explode
+        try:
+            parts = {"claims": [{"name": "Betrayal",
+                                 "support_refs": ["Chapter Two"],
+                                 "catalog_id": None, "staged": False}],
+                     "catalog": {}, "summaries": {}}
+            out = pp.evidence_retrieve_result(
+                parts, [SCENE_CH], call=FakeJudgeCall(),
+                embedder=FakeEmbedder())
+        finally:
+            pp._dm_budget_claim = orig
+        self.assertEqual(
+            out["marker"]["totals"]["supported_single"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
