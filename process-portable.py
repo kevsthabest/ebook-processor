@@ -4855,6 +4855,200 @@ def staging_report_data(state, today=None):
             "corrupt_at_load": state.corrupt_at_load}
 
 
+# ---------------------------------------------------------------------------
+# Spine §3.5: per-work verdict read-back + suppression (OC-3)
+#
+# The generalization of the global rejection read: for THIS work,
+# the curated (confirmed/rejected) verdicts on its trope and
+# trigger claims (characters excluded, OC-3), read at emission.
+# Posture (cmd_verify_preview's): a FAILED read is not an empty
+# set — sb() returns None on any error, and None means "unknown":
+# fall back to the local cache of any age and SAY SO with the
+# cache's age, or suppress nothing and say that. Read-back never
+# writes to Supabase.
+# ---------------------------------------------------------------------------
+
+def _now_iso():
+    from datetime import datetime
+    return datetime.now().isoformat(timespec="seconds")
+
+
+class VerdictSet:
+    """One work's curated verdicts, keyed in staging currency:
+    tropes by catalog id (`trope:id:<uuid>`), triggers by the
+    normalized warning (`trigger:<warning>`)."""
+
+    def __init__(self, work_id):
+        self.work_id = work_id
+        self.tropes = {}    # trope_id -> status
+        self.triggers = {}  # normalized warning -> status
+        self.from_cache = False
+        self.fetched_at = None
+
+    def rejected_keys(self):
+        keys = {staging_claim_key("trope", catalog_id=t)
+                for t, s in self.tropes.items() if s == "rejected"}
+        keys |= {staging_claim_key("trigger", warning=w)
+                 for w, s in self.triggers.items() if s == "rejected"}
+        return keys
+
+    def confirmed_keys(self):
+        keys = {staging_claim_key("trope", catalog_id=t)
+                for t, s in self.tropes.items() if s == "confirmed"}
+        keys |= {staging_claim_key("trigger", warning=w)
+                 for w, s in self.triggers.items() if s == "confirmed"}
+        return keys
+
+    def __len__(self):
+        return len(self.tropes) + len(self.triggers)
+
+
+def fetch_work_verdicts(work_id):
+    """GET the work's curated trope + trigger verdicts. Returns a
+    VerdictSet, or None on ANY failure (never an empty set)."""
+    trope_rows = sb(
+        "book_trope_claims",
+        params=f"?work_id=eq.{work_id}"
+               "&status=in.(confirmed,rejected)"
+               "&select=trope_id,status")
+    if trope_rows is None:
+        return None
+    trig_rows = sb(
+        "book_trigger_claims",
+        params=f"?work_id=eq.{work_id}"
+               "&status=in.(confirmed,rejected)"
+               "&select=warning,status")
+    if trig_rows is None:
+        return None
+    vs = VerdictSet(work_id)
+    for r in trope_rows:
+        if r.get("trope_id") and r.get("status"):
+            vs.tropes[str(r["trope_id"])] = r["status"]
+    for r in trig_rows:
+        if r.get("warning") and r.get("status"):
+            vs.triggers[str(r["warning"]).lower().strip()] = r["status"]
+    vs.fetched_at = _now_iso()
+    return vs
+
+
+def _log_verdict_fetch(db, ok, claims, note):
+    if db is None:
+        return
+    try:
+        with db.write_txn() as conn:
+            conn.execute(
+                "INSERT INTO verdict_fetches VALUES (NULL,?,?,?,?,?)",
+                (_now_iso(), 1 if ok else 0, 1, claims, note))
+    except Exception:
+        pass
+
+
+def work_verdicts(work_id, learn_dir):
+    """The run's verdict source: fresh fetch (cached on success),
+    else the cache of any age (with the age stated), else nothing.
+    Returns (VerdictSet|None, note|None). Every attempt is logged
+    in verdict_fetches when the substrate is active; the cache
+    lives in verdicts_cache (substrate only — pre-migration there
+    is no cache and a failed read simply suppresses nothing)."""
+    db = _state_db_for(learn_dir)
+    vs = fetch_work_verdicts(work_id)
+    if vs is not None:
+        if db is not None:
+            try:
+                with db.write_txn() as conn:
+                    conn.execute(
+                        "DELETE FROM verdicts_cache WHERE work_id=?",
+                        (work_id,))
+                    for tid, status in vs.tropes.items():
+                        conn.execute(
+                            "INSERT INTO verdicts_cache VALUES "
+                            "(?,?,?,?,?)",
+                            (work_id, "trope",
+                             staging_claim_key("trope",
+                                               catalog_id=tid),
+                             status, vs.fetched_at))
+                    for w, status in vs.triggers.items():
+                        conn.execute(
+                            "INSERT INTO verdicts_cache VALUES "
+                            "(?,?,?,?,?)",
+                            (work_id, "trigger",
+                             staging_claim_key("trigger", warning=w),
+                             status, vs.fetched_at))
+            except Exception:
+                pass
+        _log_verdict_fetch(db, True, len(vs), "ok")
+        note = (f"{len(vs)} curated verdicts read for this work "
+                f"({len(vs.rejected_keys())} rejected)")
+        return vs, note
+    _log_verdict_fetch(db, False, 0, "fetch failed")
+    if db is not None:
+        rows = db.query(
+            "SELECT class, claim_key, verdict, fetched_at FROM "
+            "verdicts_cache WHERE work_id=?", (work_id,))
+        if rows:
+            vs = VerdictSet(work_id)
+            vs.from_cache = True
+            vs.fetched_at = max(r[3] for r in rows)
+            for cls, key, verdict, _fa in rows:
+                if cls == "trope":
+                    vs.tropes[key[len("trope:id:"):]] = verdict
+                else:
+                    vs.triggers[key[len("trigger:"):]] = verdict
+            return vs, (f"verdict read-back failed; using cached "
+                        f"verdicts from {vs.fetched_at}")
+    return None, ("verdict read-back failed and no cached verdicts "
+                  "exist; nothing suppressed")
+
+
+def apply_verdict_suppression(tropes, trope_conf, triggers,
+                              rejected_keys, catalog_map):
+    """Net A (design §3.5.2): the emission filter. Drops every
+    claim whose staging-currency key a human rejected, from the
+    ship lists AND their confidence map. Returns (tropes, conf,
+    triggers, suppressed_keys, suppressed_names)."""
+    supp_keys = set()
+    supp_names = []
+
+    def trope_key(name):
+        return staging_claim_key(
+            "trope", name=name,
+            catalog_id=(catalog_map or {}).get(_tnorm(name)))
+
+    kept_tropes = []
+    for t in tropes:
+        if trope_key(t) in rejected_keys:
+            supp_keys.add(trope_key(t))
+            supp_names.append(t)
+        else:
+            kept_tropes.append(t)
+    in_t = {_tnorm(t) for t in kept_tropes}
+    conf = {k: v for k, v in (trope_conf or {}).items() if k in in_t}
+    kept_triggers = []
+    for t in triggers:
+        w = t.get("warning") if isinstance(t, dict) else str(t)
+        key = staging_claim_key("trigger", warning=w)
+        if key in rejected_keys:
+            supp_keys.add(key)
+            supp_names.append(str(w))
+        else:
+            kept_triggers.append(t)
+    return kept_tropes, conf, kept_triggers, supp_keys, supp_names
+
+
+def record_rejection_events(learn_dir, run_ref, work_key, keys):
+    """The suppression counter (§3.5.3): one row per suppressed
+    claim per run, counted on the union of both nets."""
+    db = _state_db_for(learn_dir)
+    if db is None or not keys:
+        return
+    with db.write_txn() as conn:
+        for key in sorted(keys):
+            cls = key.split(":", 1)[0]
+            conn.execute(
+                "INSERT INTO rejection_events VALUES (NULL,?,?,?,?,?)",
+                (run_ref, work_key, cls, key, _now_iso()))
+
+
 def staging_observe_result(parts, state, *, independent):
     """Option F seam helper (design section 5): observe one completed
     run's stageable claims and compute the ship set. Called ONCE per
@@ -4938,6 +5132,53 @@ def staging_observe_result(parts, state, *, independent):
             if act.get("stamp"):
                 w = t.get("warning") if isinstance(t, dict) else str(t)
                 trigger_persistence[str(w).lower()] = act["stamp"]
+    # Spine §3.5.2, net B (amendment A3): a claim staged in run N
+    # and human-rejected before run N+1 must not ship in N+1 via
+    # promotion. The observe above already decided this run's ship
+    # set, promotion included; the verdict set drops rejected
+    # claims from it HERE, inside the seam, so no caller can
+    # re-ship them. The sighting itself stays recorded — the store
+    # is an observation log; suppression governs emission only.
+    suppressed_keys = set()
+    suppressed_names = []
+    _vrej = parts.get("verdict_rejected") or set()
+    if _vrej:
+        _key_of = {}
+        for obs, act in zip(obs_tropes, out["trope_actions"]):
+            if act.get("key"):
+                _key_of[_tnorm(obs["name"])] = act["key"]
+        _kept = []
+        for t in ship_tropes:
+            _k = _key_of.get(_tnorm(t))
+            if _k in _vrej:
+                suppressed_keys.add(_k)
+                suppressed_names.append(t)
+            else:
+                _kept.append(t)
+        ship_tropes = _kept
+        _in = {_tnorm(t) for t in ship_tropes}
+        conf = {k: v for k, v in conf.items() if k in _in}
+        trope_persistence = {k: v for k, v in
+                             trope_persistence.items() if k in _in}
+        _tkey_of = {}
+        for t_in, act in zip(triggers_in, out["trigger_actions"]):
+            if act.get("key"):
+                _w = t_in.get("warning") if isinstance(t_in, dict) \
+                    else str(t_in)
+                _tkey_of[str(_w)] = act["key"]
+        _kept_tr = []
+        for t in ship_triggers:
+            _w = t.get("warning") if isinstance(t, dict) else str(t)
+            _k = _tkey_of.get(str(_w))
+            if _k in _vrej:
+                suppressed_keys.add(_k)
+                suppressed_names.append(str(_w))
+            else:
+                _kept_tr.append(t)
+        ship_triggers = _kept_tr
+        trigger_persistence = {
+            k: v for k, v in trigger_persistence.items()
+            if staging_claim_key("trigger", warning=k) not in _vrej}
     marker = {"staged": out["staged"], "promoted": out["promoted"],
               "trapped_total": out["trapped_total"],
               "expired_this_run": out["expired_this_run"],
@@ -4947,7 +5188,9 @@ def staging_observe_result(parts, state, *, independent):
     return {"ship_tropes": ship_tropes, "trope_conf": conf,
             "ship_triggers": ship_triggers, "marker": marker,
             "trope_persistence": trope_persistence,
-            "trigger_persistence": trigger_persistence}
+            "trigger_persistence": trigger_persistence,
+            "suppressed_keys": suppressed_keys,
+            "suppressed_names": suppressed_names}
 
 
 def _staging_report_text(state, today=None, data=None):
@@ -14123,6 +14366,53 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     red["tropes"] = tropes
     red["trope_confidence"] = trope_conf
 
+    # Spine §3.5: per-work verdict read-back + suppression net A.
+    # Runs only when Supabase is configured (the fields below exist
+    # on the result only when a fetch was attempted, so runs without
+    # read-back are byte-identical to before). Confirmed verdicts
+    # do nothing here — no force-ship, no boost (authority creep
+    # is forbidden by the design); rejected verdicts suppress.
+    _verdict_attempted = False
+    _verdict_note = None
+    _rejected_keys = set()
+    _supp_keys = set()
+    _supp_names = []
+    if not dry_run and not aborted \
+            and CONFIG.get("supabase_url") \
+            and CONFIG.get("supabase_key"):
+        _verdict_attempted = True
+        _vwid = None
+        try:
+            _vwid, _vhow = resolve_work(
+                title or fpath.stem, author, identifiers, False,
+                create=False)
+        except Exception:
+            _vwid = None
+        if _vwid:
+            _vs, _verdict_note = work_verdicts(str(_vwid),
+                                               _learn().dir)
+            if _vs is not None:
+                _rejected_keys = _vs.rejected_keys()
+            if _rejected_keys:
+                _cat_map = red.get("trope_catalog_map") or {}
+                (tropes, trope_conf, red["triggers"], _supp_keys,
+                 _supp_names) = apply_verdict_suppression(
+                    tropes, trope_conf, red["triggers"],
+                    _rejected_keys, _cat_map)
+                red["tropes"] = tropes
+                red["trope_confidence"] = trope_conf
+
+                def _cand_key(c):
+                    return staging_claim_key(
+                        "trope", name=c,
+                        catalog_id=_cat_map.get(_tnorm(c)))
+                _sb_auto = [c for c in _sb_auto
+                            if _cand_key(c) not in _rejected_keys]
+                _sb_gated = [c for c in _sb_gated
+                             if _cand_key(c) not in _rejected_keys]
+        if _verdict_note:
+            print(f"  Verdicts: {_verdict_note}")
+
     # Option F staging seam (design section 5): ONE split point,
     # after the trope gate + rejection learning and the trigger
     # finalization in v2_reduce, before result assembly. Flag off
@@ -14171,6 +14461,9 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                 "trope_ship": tropes, "trope_conf": trope_conf,
                 "catalog_map": red.get("trope_catalog_map") or {},
                 "triggers": red["triggers"],
+                # Spine §3.5 net B: the seam drops promoted
+                # re-ships of human-rejected claims itself.
+                "verdict_rejected": _rejected_keys,
             }, _st, independent=not _resumed_chapters)
             tropes = _sg["ship_tropes"]
             trope_conf = _sg["trope_conf"]
@@ -14184,6 +14477,24 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                   f"back, {len(_staging_marker['promoted'])} promoted, "
                   f"{_staging_marker['trapped_total']} trapped for "
                   f"this work")
+            # Net B's suppressed set joins the counter union.
+            _supp_keys |= set(_sg.get("suppressed_keys") or set())
+            for _nm in (_sg.get("suppressed_names") or []):
+                if _nm not in _supp_names:
+                    _supp_names.append(_nm)
+
+    # Spine §3.5.3: the suppression counter — one rejection_events
+    # row per suppressed claim per run, counted on the UNION of
+    # both nets (before dedup the same claim could be caught twice;
+    # it is still one suppressed claim).
+    if _supp_keys:
+        record_rejection_events(
+            _learn().dir, f"v2:{fpath.stem}",
+            staging_work_key(None, identifiers.get("isbn"),
+                             title or fpath.stem, author),
+            _supp_keys)
+        print(f"  Suppressed {len(_supp_keys)} human-rejected "
+              f"claims for this work")
 
     reading_mins = word_count // 250
     result = {
@@ -14297,6 +14608,11 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     # Spine §3.4: snapshot capture rides a fresh preview run (the
     # payloads are complete here, before the preview epilogue clears
     # the checkpoint dir), and a replay stamps its provenance marker.
+    # Spine §3.5: the verdict fields exist ONLY when a fetch was
+    # attempted, so unconfigured runs stay byte-identical.
+    if _verdict_attempted:
+        result["verdicts_note"] = _verdict_note
+        result["suppressed_rejected"] = sorted(set(_supp_names))
     if _CAPTURE_CTX is not None and not aborted:
         _cap_id = capture_snapshot(
             _CAPTURE_CTX["snapshot_id"], book_key=_ckpt_key,
@@ -14900,6 +15216,13 @@ def save_preview(fpath, result):
         md.append(f"**Staging:** this preview recorded {_ns} "
                   f"sighting{'s' if _ns != 1 else ''} in the local "
                   f"staging store")
+    _supp_md = result.get("suppressed_rejected")
+    if _supp_md:
+        md.append(f"**Suppressed (human-rejected):** "
+                  f"{len(_supp_md)} claim(s) withheld: "
+                  f"{', '.join(_supp_md)}")
+    if result.get("verdicts_note"):
+        md.append(f"**Verdicts:** {result['verdicts_note']}")
     md.append("")
     md.append(f"## Tropes ({len(result['tropes'])})")
     for t in result["tropes"]:
