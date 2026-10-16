@@ -3820,7 +3820,8 @@ def _corpus_phase1_write(db, parsed, fingerprint, source_hash):
             "text_root_hash": root}
 
 
-def _corpus_finalize_run(db, run_id, outcome, detail):
+def _corpus_finalize_run(db, run_id, outcome, detail,
+                         embed_model=None):
     """Close out an ingest_runs row, MERGING the outcome detail into
     the bookkeeping detail (reason, source, supersession record) —
     the run's forensic record keeps both halves (§3.4)."""
@@ -3836,10 +3837,11 @@ def _corpus_finalize_run(db, run_id, outcome, detail):
                 merged = {}
         merged.update(detail)
         conn.execute(
-            "UPDATE ingest_runs SET finished=?, outcome=?, detail=? "
-            "WHERE id=?",
+            "UPDATE ingest_runs SET finished=?, outcome=?, detail=?, "
+            "embed_model=COALESCE(?, embed_model) WHERE id=?",
             (_corpus_now(), outcome,
-             json.dumps(merged, ensure_ascii=False), run_id))
+             json.dumps(merged, ensure_ascii=False), embed_model,
+             run_id))
 
 
 def corpus_ingest_book(db, fpath, reason="", force=False,
@@ -3928,8 +3930,21 @@ def corpus_ingest_book(db, fpath, reason="", force=False,
         return result
     result.update(stats)
     if embedder is not None:
-        outcome = corpus_embed_work(db, fingerprint, embedder,
-                                    run_id=run_id)
+        embed_fn, embed_model = embedder
+        outcome = corpus_embed_work(db, fingerprint, embed_fn,
+                                    embed_model, run_id=run_id)
+        detail = {"source_name": parsed["source_name"],
+                  "phases": [1, 2], "reason": reason or None,
+                  "chapters": stats["chapters"],
+                  "passages": stats["passages"]}
+        if outcome == "suspect":
+            detail["canary"] = (
+                "drift — generation marked suspect; its vectors "
+                "read as misses until re-embedded clean (§2.4)")
+        _corpus_finalize_run(
+            db, run_id,
+            "complete" if outcome == "complete" else "partial",
+            detail, embed_model=embed_model)
         result["outcome"] = outcome
     else:
         _corpus_finalize_run(db, run_id, "partial", {
@@ -3985,9 +4000,15 @@ def cmd_ingest(paths, learn_dir=None, reason="", force=False):
             files.append(p)
         else:
             print(f"  --ingest: no such file or directory: {p}")
+    emb = _corpus_config_embedder()
+    if emb is None:
+        print("  (no embedder configured — text-only ingest; "
+              "vectors stay pending. Set embed_url/embed_model in "
+              "config.json, then run --corpus-reembed.)")
     results = []
     for f in files:
-        r = corpus_ingest_book(db, f, reason=reason, force=force)
+        r = corpus_ingest_book(db, f, reason=reason, force=force,
+                               embedder=emb)
         fp8 = (r["fingerprint"] or "????????")[:8]
         line = (f"  {r['source_name']}: {r['outcome']} [{fp8}] "
                 f"{r['chapters']} chapters, {r['passages']} passages")
@@ -4014,6 +4035,389 @@ def cmd_corpus_remove(fingerprint, learn_dir=None):
     counts = corpus_remove_work(db, fingerprint)
     parts = ", ".join(f"{t} {n}" for t, n in counts.items() if n)
     print(f"  Removed corpus work {fingerprint}: {parts}.")
+
+
+# ---------------------------------------------------------------------------
+# Corpus vectors (corpus-design §2): BLOB-canonical storage,
+# content-keyed reads, in-process search, and the A1 drift canary.
+# Storage and search are separate decisions (§2's preamble): the
+# BLOBs are readable by anything, forever, with no loadable binary;
+# search is an in-process scan — numpy when importable, a
+# pure-Python fallback otherwise, top-k parity pinned (§2.5).
+# ---------------------------------------------------------------------------
+
+_CORPUS_EMBED_BATCH = 64
+# Drift tolerance for the canary (§2.4): a sentinel's re-embedded
+# vector must cosine-match its reference within this band, and the
+# pairwise structure must hold within it too.
+_CORPUS_CANARY_BAND = 0.05
+_CORPUS_CANARY_TEXTS = [
+    "The harbour bell rang once over the grey water.",
+    "She folded the letter twice and hid it in the drawer.",
+    "Quantum tunnelling lets particles cross barriers they cannot "
+    "climb.",
+    "Preheat the oven, then whisk the eggs with sugar and lemon "
+    "zest.",
+    "The committee postponed the vote until after the harvest "
+    "festival.",
+    "A red fox slipped through the hedge at the bottom of the "
+    "garden.",
+]
+# (db path, model, format) generations whose canary this process has
+# already verified — the check runs at generation birth, on every
+# ingest/reembed entry, and on --corpus-status (§2.4), not per read.
+_CANARY_CHECKED_THIS_PROCESS = set()
+
+
+def _corpus_pack_vector(vec):
+    import struct
+    return struct.pack(f"<{len(vec)}f", *vec)
+
+
+def _corpus_unpack_vector(blob, dim):
+    import struct
+    return list(struct.unpack(f"<{dim}f", blob))
+
+
+def _corpus_cosine(a, b):
+    import math
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+# -- generations + the drift canary (§2.4) ----------------------------
+
+def _corpus_generation_key(model, fmt):
+    return f"generation:{model}|{fmt}"
+
+
+def _corpus_generation(db, model, fmt=_CORPUS_VECTOR_FORMAT):
+    raw = db.meta_get(_corpus_generation_key(model, fmt))
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _corpus_store_generation(db, gen):
+    db.meta_set(_corpus_generation_key(gen["model"], gen["format"]),
+                json.dumps(gen, ensure_ascii=False))
+    db.meta_set("generation_current",
+                json.dumps({"model": gen["model"],
+                            "format": gen["format"]},
+                           ensure_ascii=False))
+
+
+def _corpus_generation_birth(db, embed_fn, model,
+                             fmt=_CORPUS_VECTOR_FORMAT):
+    """A generation is born with its sentinel set (§2.4): pinned
+    probe texts embedded NOW, their reference vectors and pairwise
+    cosines recorded in meta. Later drift — the same model string
+    served by different weights — is measured against this birth
+    record, the only reference that exists."""
+    vecs = embed_fn(list(_CORPUS_CANARY_TEXTS))
+    if len(vecs) != len(_CORPUS_CANARY_TEXTS):
+        raise CorpusIngestError(
+            "canary: embedder returned a wrong vector count")
+    dim = len(vecs[0])
+    cosines = [[round(_corpus_cosine(a, b), 6) for b in vecs]
+               for a in vecs]
+    gen = {"model": model, "format": fmt, "dim": dim,
+           "canary": "ok", "born": _corpus_now(),
+           "checked": _corpus_now(),
+           "sentinels": {"vectors": vecs, "cosines": cosines}}
+    _corpus_store_generation(db, gen)
+    _CANARY_CHECKED_THIS_PROCESS.add((str(db.path), model, fmt))
+    return gen
+
+
+def _corpus_canary_check(db, embed_fn, model,
+                         fmt=_CORPUS_VECTOR_FORMAT):
+    """Re-embed the sentinels and compare against the birth record
+    (§2.4). Returns True (within band), False (DRIFT — the
+    generation is marked suspect in meta and its rows read as
+    misses until re-embedded clean), or None (the check itself
+    could not run — an unreachable endpoint is an outage, not
+    drift, and leaves the recorded state standing)."""
+    gen = _corpus_generation(db, model, fmt)
+    if gen is None:
+        return True
+    try:
+        fresh = embed_fn(list(_CORPUS_CANARY_TEXTS))
+    except Exception:
+        return None
+    if len(fresh) != len(_CORPUS_CANARY_TEXTS):
+        return None
+    ref = gen["sentinels"]["vectors"]
+    drift = False
+    for rv, nv in zip(ref, fresh):
+        if _corpus_cosine(rv, nv) < 1.0 - _CORPUS_CANARY_BAND:
+            drift = True
+            break
+    if not drift:
+        ref_cos = gen["sentinels"]["cosines"]
+        for i, a in enumerate(fresh):
+            for j, b in enumerate(fresh):
+                if abs(_corpus_cosine(a, b) - ref_cos[i][j]) \
+                        > _CORPUS_CANARY_BAND:
+                    drift = True
+                    break
+            if drift:
+                break
+    gen["canary"] = "suspect" if drift else "ok"
+    gen["checked"] = _corpus_now()
+    _corpus_store_generation(db, gen)
+    _CANARY_CHECKED_THIS_PROCESS.add((str(db.path), model, fmt))
+    return not drift
+
+
+def _corpus_generation_suspect(db, model, fmt=_CORPUS_VECTOR_FORMAT):
+    gen = _corpus_generation(db, model, fmt)
+    return bool(gen and gen.get("canary") == "suspect")
+
+
+# -- phase 2: embedding (§3.3) -----------------------------------------
+
+def corpus_embed_work(db, fingerprint, embed_fn, model,
+                      fmt=_CORPUS_VECTOR_FORMAT, run_id=None):
+    """Embed every passage of a work that lacks a current-stamp
+    vector (§3.3 phase 2). The text embedded is RE-SLICED FROM THE
+    STORED CHAPTER at write time (A2) — never carried from the
+    parse — so no vector is ever computed over text the corpus
+    does not hold. Batches commit as they land: a mid-phase failure
+    leaves vectors_partial with the landed rows committed, and
+    resume is gap-filling by content key. Returns 'complete' |
+    'partial' | 'suspect' (canary drift: nothing is embedded into
+    a suspect generation)."""
+    own_run = run_id is None
+    if own_run:
+        with db.write_txn() as conn:
+            cur = conn.execute(
+                "INSERT INTO ingest_runs (fingerprint, started, "
+                "finished, parser_version, embed_model, outcome, "
+                "detail) VALUES (?, ?, NULL, ?, ?, NULL, ?)",
+                (fingerprint, _corpus_now(), CORPUS_PARSER_VERSION,
+                 model, json.dumps({"kind": "reembed"})))
+            run_id = cur.lastrowid
+    outcome = "partial"
+    try:
+        gen = _corpus_generation(db, model, fmt)
+        if gen is None:
+            try:
+                gen = _corpus_generation_birth(db, embed_fn, model,
+                                               fmt)
+            except Exception:
+                return "partial"
+        elif gen.get("canary") == "suspect" or (
+                (str(db.path), model, fmt)
+                not in _CANARY_CHECKED_THIS_PROCESS):
+            ok = _corpus_canary_check(db, embed_fn, model, fmt)
+            if ok is False:
+                return "suspect"
+        chapters = {r[0]: r[1] for r in db.query(
+            "SELECT chapter_index, text FROM corpus_chapters "
+            "WHERE fingerprint=?", (fingerprint,))}
+        missing = db.query(
+            "SELECT p.passage_id, p.chapter_index, p.start_offset, "
+            "p.end_offset FROM corpus_passages p LEFT JOIN "
+            "passage_vectors pv ON pv.passage_id = p.passage_id "
+            "AND pv.model=? AND pv.format=? WHERE p.fingerprint=? "
+            "AND pv.passage_id IS NULL ORDER BY p.chapter_index, "
+            "p.start_offset", (model, fmt, fingerprint))
+        for i in range(0, len(missing), _CORPUS_EMBED_BATCH):
+            batch = missing[i:i + _CORPUS_EMBED_BATCH]
+            texts = [chapters[ci][s:e] for _pid, ci, s, e in batch]
+            try:
+                vecs = embed_fn(texts)
+            except Exception:
+                break  # landed batches stay committed (§3.3)
+            if len(vecs) != len(texts) or not vecs:
+                break
+            dim = len(vecs[0])
+            if any(len(v) != dim for v in vecs):
+                break
+            with db.write_txn("vectors") as conn:
+                for (pid, _ci, _s, _e), vec in zip(batch, vecs):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO passage_vectors "
+                        "(passage_id, fingerprint, model, format, "
+                        "dim, vector) VALUES (?, ?, ?, ?, ?, ?)",
+                        (pid, fingerprint, model, fmt, dim,
+                         _corpus_pack_vector(vec)))
+        n_pass = db.query(
+            "SELECT COUNT(*) FROM corpus_passages WHERE fingerprint=?",
+            (fingerprint,))[0][0]
+        n_vec = db.query(
+            "SELECT COUNT(*) FROM passage_vectors WHERE fingerprint=? "
+            "AND model=? AND format=?",
+            (fingerprint, model, fmt))[0][0]
+        if n_pass and n_vec >= n_pass:
+            new_status, outcome = "complete", "complete"
+        elif n_vec:
+            new_status, outcome = "vectors_partial", "partial"
+        else:
+            new_status, outcome = None, "partial"
+        with db.write_txn("vectors") as conn:
+            if new_status is not None:
+                conn.execute(
+                    "UPDATE corpus_works SET status=?, updated_at=? "
+                    "WHERE fingerprint=?",
+                    (new_status, _corpus_now(), fingerprint))
+            _corpus_refresh_envelope_in_txn(db, conn, fingerprint)
+        return outcome
+    finally:
+        if own_run:
+            with db.write_txn() as conn:
+                conn.execute(
+                    "UPDATE ingest_runs SET finished=?, outcome=? "
+                    "WHERE id=?",
+                    (_corpus_now(),
+                     "complete" if outcome == "complete" else "partial",
+                     run_id))
+
+
+# -- reads + search (§2.2, §4.4's content key) --------------------------
+
+def corpus_passage_vectors(db, fingerprint, model,
+                           fmt=_CORPUS_VECTOR_FORMAT):
+    """{passage_id: [floats]} for the work's rows stamped with the
+    given (model, format). Stamp discipline is on the read path,
+    per row (§2.4): foreign-stamp rows are absent, and a suspect
+    generation's rows are ALL misses until re-embedded clean."""
+    if _corpus_generation_suspect(db, model, fmt):
+        return {}
+    rows = db.query(
+        "SELECT passage_id, dim, vector FROM passage_vectors "
+        "WHERE fingerprint=? AND model=? AND format=?",
+        (fingerprint, model, fmt))
+    return {pid: _corpus_unpack_vector(blob, dim)
+            for pid, dim, blob in rows}
+
+
+def corpus_vector_by_text_hash(db, fingerprint, text_hash, model,
+                               fmt=_CORPUS_VECTOR_FORMAT):
+    """The §4.4 content key as a lookup: a vector is served only
+    when the passage's text hash, the model, and the format all
+    match the present corpus state — any mismatch is a miss."""
+    if _corpus_generation_suspect(db, model, fmt):
+        return None
+    rows = db.query(
+        "SELECT pv.dim, pv.vector FROM passage_vectors pv JOIN "
+        "corpus_passages p ON p.passage_id = pv.passage_id WHERE "
+        "p.fingerprint=? AND p.text_hash=? AND pv.model=? AND "
+        "pv.format=? LIMIT 1", (fingerprint, text_hash, model, fmt))
+    if not rows:
+        return None
+    return _corpus_unpack_vector(rows[0][1], rows[0][0])
+
+
+_NUMPY_STATE = {"mod": None, "tried": False}
+
+
+def _numpy():
+    if not _NUMPY_STATE["tried"]:
+        _NUMPY_STATE["tried"] = True
+        try:
+            import numpy as _np
+            _NUMPY_STATE["mod"] = _np
+        except Exception:
+            _NUMPY_STATE["mod"] = None
+    return _NUMPY_STATE["mod"]
+
+
+def _corpus_default_engine():
+    return "numpy" if _numpy() is not None else "pure"
+
+
+def corpus_search_passages(db, fingerprint, query_vector, model,
+                           fmt=_CORPUS_VECTOR_FORMAT, top_k=10,
+                           engine=None):
+    """Top-k cosine neighbours among the work's current-stamp
+    passage vectors (§2.2: per-book scope is the v1 working set).
+    engine='numpy' | 'pure' — the parity between them is pinned
+    (§2.5), and the pure path is what a numpy-less Python runs."""
+    vecs = corpus_passage_vectors(db, fingerprint, model, fmt)
+    if not vecs or top_k <= 0:
+        return []
+    ids = sorted(vecs)
+    if engine is None:
+        engine = _corpus_default_engine()
+    scores = None
+    if engine == "numpy":
+        np = _numpy()
+        if np is not None:
+            import math
+            mat = np.array([vecs[i] for i in ids], dtype=np.float64)
+            q = np.array(query_vector, dtype=np.float64)
+            qn = float(np.linalg.norm(q))
+            norms = np.linalg.norm(mat, axis=1)
+            dots = mat @ q
+            scores = [
+                (float(dots[k] / (norms[k] * qn))
+                 if norms[k] > 0 and qn > 0 else 0.0)
+                for k in range(len(ids))]
+    if scores is None:
+        scores = [_corpus_cosine(query_vector, vecs[i]) for i in ids]
+    order = sorted(range(len(ids)), key=lambda k: (-scores[k], ids[k]))
+    return [(ids[k], float(scores[k])) for k in order[:top_k]]
+
+
+def _corpus_config_embedder():
+    """(embed_fn, model) from CONFIG, or None when no embedder is
+    configured (embed_url/embed_model are config-only, no default
+    model — the §0 discipline embed_vectors already lives by)."""
+    url = CONFIG.get("embed_url") or ""
+    model = CONFIG.get("embed_model") or ""
+    if not url or not model:
+        return None
+
+    def embed(texts, _url=url, _model=model):
+        return embed_vectors(_url, _model, texts)
+
+    return (embed, model)
+
+
+def cmd_corpus_reembed(learn_dir=None, work=None):
+    """--corpus-reembed [--work <fingerprint>]: fill the current
+    vector generation for works whose passages lack current-stamp
+    vectors (§2.4/§3.4 — the cheap re-ingest: minutes of embedding,
+    zero re-parsing)."""
+    d = (Path(learn_dir) if learn_dir
+         else Path(os.path.expanduser("~")) / ".ebook-processor"
+         / "learned")
+    emb = _corpus_config_embedder()
+    if emb is None:
+        print("  --corpus-reembed needs embed_url and embed_model "
+              "in config.json; no embedder is configured.")
+        return []
+    db = _corpus_db_for(d, mode="importer")
+    if db is None:
+        print(f"  No corpus in {d} — nothing to re-embed.")
+        return []
+    if work:
+        fps = [r[0] for r in db.query(
+            "SELECT fingerprint FROM corpus_works WHERE fingerprint"
+            "=?", (work,))]
+        if not fps:
+            print(f"  No corpus work with fingerprint {work}.")
+            return []
+    else:
+        fps = [r[0] for r in db.query(
+            "SELECT fingerprint FROM corpus_works WHERE status NOT "
+            "IN ('failed', 'ingesting') ORDER BY title, fingerprint")]
+    embed_fn, model = emb
+    results = []
+    for fp in fps:
+        outcome = corpus_embed_work(db, fp, embed_fn, model)
+        print(f"  [{fp[:8]}] re-embed: {outcome} (model {model})")
+        results.append({"fingerprint": fp, "outcome": outcome})
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -9984,6 +10388,27 @@ def _corpus_status_text(learn_dir):
 
 def cmd_corpus_status(learn_dir=None, as_json=False):
     """Print the §7.4 corpus status report and exit."""
+    # §2.4: --corpus-status is a canary check point. When an
+    # embedder is configured and a current generation exists,
+    # re-embed the sentinels first so a SUSPECT line is earned by
+    # THIS check, not stale history. Best-effort: the check detects
+    # drift; it never gates a report.
+    emb = _corpus_config_embedder()
+    if emb is not None:
+        d = (Path(learn_dir) if learn_dir
+             else Path(os.path.expanduser("~")) / ".ebook-processor"
+             / "learned")
+        db = _corpus_db_for(d, mode="report")
+        if db is not None:
+            cur_raw = db.meta_get("generation_current")
+            if cur_raw:
+                try:
+                    cur = json.loads(cur_raw)
+                    _corpus_canary_check(db, emb[0], cur["model"],
+                                         cur.get("format")
+                                         or _CORPUS_VECTOR_FORMAT)
+                except Exception:
+                    pass
     if as_json:
         print(json.dumps(_corpus_status_data(learn_dir),
                          ensure_ascii=False, indent=1))
@@ -18427,6 +18852,13 @@ def _build_parser():
                          "one transaction, counts printed; A10) "
                          "from the corpus store and exit; never "
                          "touches state.db")
+    g_learn.add_argument("--corpus-reembed", action="store_true",
+                    help="fill the current vector generation for "
+                         "works missing current-stamp passage "
+                         "vectors (cheap re-ingest, §2.4) and exit")
+    g_learn.add_argument("--work", default="",
+                    help="with --corpus-reembed: only this "
+                         "fingerprint")
     g_learn.add_argument("--calibration-report", action="store_true",
                     help="print the threshold calibration report "
                          "(per-trigger kept/dropped score "
@@ -18600,6 +19032,11 @@ def main():
         load_config()
         cmd_corpus_remove(args.corpus_remove,
                           learn_dir=args.learn_dir or None)
+        return
+    if args.corpus_reembed:
+        load_config()
+        cmd_corpus_reembed(learn_dir=args.learn_dir or None,
+                           work=args.work or None)
         return
     if args.calibration_report:
         load_config()
