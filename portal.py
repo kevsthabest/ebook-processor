@@ -342,10 +342,12 @@ def _corpus_reads(conn, db_path):
     ).fetchone() is not None
     works = []
     by_status = {}
-    for fp, title, author, series, sidx, status, pv, nch in conn.execute(
+    for fp, title, author, series, sidx, status, pv, nch, \
+            payload_raw in conn.execute(
             "SELECT fingerprint, title, author, series, "
-            "series_index, status, parser_version, chapter_count "
-            "FROM corpus_works ORDER BY title, fingerprint"):
+            "series_index, status, parser_version, chapter_count, "
+            "payload FROM corpus_works "
+            "ORDER BY title, fingerprint"):
         n_pass = conn.execute(
             "SELECT COUNT(*) FROM corpus_passages WHERE fingerprint=?",
             (fp,)).fetchone()[0]
@@ -374,11 +376,23 @@ def _corpus_reads(conn, db_path):
                 except (TypeError, ValueError):
                     idx = sidx
                 series_label = f"{series} #{idx}"
+        # The ingest-recorded source file name rides the
+        # payload; it is the join key to the run-events
+        # artifacts (§2.1's "last run's matrix"), whose books
+        # are file names and nothing else.
+        source_name = None
+        try:
+            payload = json.loads(payload_raw or "{}") or {}
+            if isinstance(payload, dict):
+                source_name = payload.get("source_name")
+        except (TypeError, ValueError):
+            source_name = None
         works.append({
             "fingerprint": fp, "title": title, "author": author,
             "series_label": series_label, "status": status,
             "parser_version": pv, "chapters": nch,
             "passages": n_pass, "vector_coverage": coverage,
+            "source_name": source_name,
             "envelope_computed_at": env[0] if env else None,
             "last_activity": _last_activity(conn, fp)})
         by_status[status] = by_status.get(status, 0) + 1
@@ -565,6 +579,15 @@ def home_data(learn_dir, script_dir, backup_dir=None):
         w["stale_parser"] = bool(
             parser_current is not None
             and w["parser_version"] != parser_current)
+    # "Last run's matrix" (§2.1, S4): which retained artifact,
+    # if any, last scored each work's book. The scan memoises
+    # on the artifacts' signatures, so the 30 s Home refresh
+    # pays a directory listing, not a re-read.
+    matrix_map = latest_matrices(
+        learn_dir, {w.get("source_name") for w in works})
+    for w in works:
+        entry = matrix_map.get(w.get("source_name") or "")
+        w["matrix_run"] = entry["run_id"] if entry else None
     quotes_by_status = corpus["quotes_by_status"] if corpus else {}
     cards = {
         "works_total": len(works),
@@ -1435,6 +1458,14 @@ class EventsTailer:
             self._consumed = len(self._events)
             return list(out)
 
+    def events(self):
+        """Every parsed event so far, in stream order — the
+        Matrices panel's raw material (S4). A copy: the panel
+        reduces the stream, it does not share the tailer's
+        list."""
+        with self._lock:
+            return list(self._events)
+
 
 def _event_feed_text(ev):
     """One feed line for an artifact event (§5.3). Decision
@@ -1467,6 +1498,248 @@ def _event_feed_text(ev):
         return (f"run end: {ev.get('books')} book(s), failures "
                 f"{ev.get('failures')}")
     return None
+
+
+# ---------------------------------------------------------------------------
+# The Matrices panel (spec §2.3, slice S4): the resolver's work,
+# reduced from the S0 run-events artifact
+# ---------------------------------------------------------------------------
+
+# Below this cosine a cell paints shade only — no printed
+# number (§2.3). It is a display rule, not a resolver threshold:
+# the reduction keeps every true score, the panel declines to
+# print the ones that would read as precision they are not.
+_MATRIX_SHADE_FLOOR = 0.50
+
+
+def _matrix_bars(ctx):
+    """The bars the panel prints. The merge bar and the mapping
+    bar are the resolver's own configured thresholds — the
+    values a run launched now would use — falling back to the
+    processor's defaults when config names neither. The shade
+    floor is the spec's display rule above."""
+    raw = _raw_config(ctx)
+
+    def _bar(key, default):
+        try:
+            value = float(raw.get(key))
+        except (TypeError, ValueError):
+            return default
+        return value if 0.0 <= value <= 1.0 else default
+
+    return {"merge_bar": _bar("dedupe_threshold", 0.85),
+            "map_bar": _bar("trope_map_threshold", 0.78),
+            "shade_floor": _MATRIX_SHADE_FLOOR}
+
+
+def reduce_matrix(events):
+    """Reduce one run's event stream to the panel's grid state.
+
+    Pure function of the stream: the live panel (a job's
+    tailer) and the post-run reopening (the retained artifact
+    read back) feed it the same events and get the identical
+    grid — that identity is the reopening's whole claim.
+
+    The freeze rule lives here, not in the renderer: a pair's
+    first verdict settles its cell, and no later event — a
+    re-score, even a conflicting verdict — changes a settled
+    cell. The renderer can therefore repaint freely; what it
+    is handed for a settled pair never moves.
+
+    A resolver event with no book field belongs to the book
+    bracket it arrived inside (the sink attributes by thread;
+    the bracket is the stream's own record of that)."""
+    books = {}
+    order = []
+    current = None
+    decision = None
+    finished = False
+    interrupted = False
+
+    def section(book):
+        if book not in books:
+            books[book] = {"book": book, "names": [], "cells": {},
+                           "verdicts": [], "impulses": [],
+                           "decision_calls": None}
+            order.append(book)
+        return books[book]
+
+    for ev in events:
+        kind = ev.get("event")
+        if kind == "book_start":
+            current = ev.get("book")
+            if current is not None:
+                section(current)
+        elif kind == "book_end":
+            book = ev.get("book") or current
+            if book is not None:
+                section(book)["decision_calls"] = \
+                    ev.get("decision_calls")
+        elif kind == "decision":
+            decision = {"used": ev.get("used"),
+                        "cap": ev.get("cap")}
+        elif kind == "run_end":
+            finished = True
+            interrupted = bool(ev.get("interrupted"))
+        elif kind in ("pair", "verdict", "impulse"):
+            book = ev.get("book") or current
+            if book is None:
+                continue
+            sec = section(book)
+            if kind == "impulse":
+                sec["impulses"].append({
+                    "label": ev.get("label"),
+                    "neighbours": ev.get("neighbours") or [],
+                    "fate": ev.get("fate"),
+                    "catalog_id": ev.get("catalog_id"),
+                    "score": ev.get("score"),
+                    "seq": ev.get("seq")})
+                continue
+            a, b = ev.get("a"), ev.get("b")
+            if a is None or b is None:
+                continue
+            for name in (a, b):
+                if name not in sec["names"]:
+                    sec["names"].append(name)
+            key = (a, b) if a <= b else (b, a)
+            cell = sec["cells"].get(key)
+            if kind == "pair":
+                if cell is not None \
+                        and cell["state"] == "settled":
+                    continue  # frozen — see the docstring
+                if cell is None:
+                    cell = {"a": key[0], "b": key[1],
+                            "score": None, "state": "scored",
+                            "verdict": None, "via": None,
+                            "reason": None, "seq": ev.get("seq")}
+                    sec["cells"][key] = cell
+                cell["score"] = ev.get("score")
+                cell["seq"] = ev.get("seq")
+            else:  # verdict
+                if cell is not None \
+                        and cell["state"] == "settled":
+                    continue  # the first verdict is final
+                if cell is None:
+                    cell = {"a": key[0], "b": key[1],
+                            "score": None, "state": "scored",
+                            "verdict": None, "via": None,
+                            "reason": None, "seq": ev.get("seq")}
+                    sec["cells"][key] = cell
+                if ev.get("score") is not None:
+                    cell["score"] = ev.get("score")
+                cell.update(
+                    {"state": "settled",
+                     "verdict": ev.get("verdict"),
+                     "via": ev.get("via"),
+                     "reason": ev.get("reason"),
+                     "seq": ev.get("seq")})
+                sec["verdicts"].append({
+                    "a": cell["a"], "b": cell["b"],
+                    "verdict": cell["verdict"],
+                    "via": cell["via"], "score": cell["score"],
+                    "reason": cell["reason"],
+                    "seq": ev.get("seq")})
+    out = []
+    for book in order:
+        sec = books[book]
+        idx = {name: i for i, name in enumerate(sec["names"])}
+        cells = sorted(
+            sec["cells"].values(),
+            key=lambda c: (idx[c["a"]], idx[c["b"]]))
+        out.append({
+            "book": book, "names": sec["names"], "cells": cells,
+            "verdicts": sec["verdicts"],
+            "impulses": sec["impulses"],
+            "candidates": len(cells),
+            "resolved": sum(1 for c in cells
+                            if c["state"] == "settled"),
+            "decision_calls": sec["decision_calls"]})
+    return {"books": out, "decision": decision,
+            "finished": finished, "interrupted": interrupted}
+
+
+_ARTIFACT_MEMO = {}
+
+
+def _artifact_events(path):
+    """(events, aggregates) for one retained artifact, read
+    through a throwaway tailer so a torn final line is tolerated
+    exactly as the live path tolerates it. Memoised on the
+    file's (size, mtime): a finished artifact is immutable, so
+    the reopening page's polls are stat-only once read; a still
+    growing one re-reads when its signature moves."""
+    path = Path(path)
+    try:
+        st = path.stat()
+        sig = (st.st_size, st.st_mtime_ns)
+    except OSError:
+        sig = None
+    if sig is not None:
+        hit = _ARTIFACT_MEMO.get(str(path))
+        if hit is not None and hit[0] == sig:
+            return hit[1], hit[2]
+    tailer = EventsTailer()
+    tailer.attach(path)
+    agg = tailer.poll()
+    events = tailer.events()
+    if sig is not None:
+        _ARTIFACT_MEMO[str(path)] = (sig, events, agg)
+    return events, agg
+
+
+_MATRIX_SCAN_CACHE = {}
+
+
+def latest_matrices(learn_dir, wanted):
+    """For each wanted book (file) name, the newest retained
+    artifact that actually scored it: {book: {run_id, path}}.
+
+    "Actually scored" matters: an artifact that merely opened
+    the book (book_start, no pair or verdict) holds no matrix
+    to reopen. Artifacts are append-only and immutable once
+    their run ends, so the scan memoises on the directory's
+    (name, size, mtime) signature — Home polls this, and the
+    steady state costs one listing, not a re-read of every
+    run the operator has ever kept."""
+    wanted = {b for b in wanted if b}
+    if not wanted:
+        return {}
+    folder = Path(learn_dir) / "run-events"
+    try:
+        files = sorted(folder.glob("run-*.jsonl"))
+    except OSError:
+        files = []
+    sig = []
+    for path in files:
+        try:
+            st = path.stat()
+            sig.append((path.name, st.st_size, st.st_mtime_ns))
+        except OSError:
+            continue
+    sig = tuple(sig)
+    key = (str(learn_dir), tuple(sorted(wanted)))
+    hit = _MATRIX_SCAN_CACHE.get(key)
+    if hit is not None and hit[0] == sig:
+        return dict(hit[1])
+
+    def _newest_first(path):
+        try:
+            return (path.stat().st_mtime_ns, path.name)
+        except OSError:
+            return (0, path.name)
+
+    found = {}
+    for path in sorted(files, key=_newest_first, reverse=True):
+        if len(found) == len(wanted):
+            break
+        events, _agg = _artifact_events(path)
+        scored = {ev.get("book") for ev in events
+                  if ev.get("event") in ("pair", "verdict")
+                  and ev.get("book")}
+        for book in scored & (wanted - set(found)):
+            found[book] = {"run_id": path.stem, "path": str(path)}
+    _MATRIX_SCAN_CACHE[key] = (sig, dict(found))
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -1777,6 +2050,22 @@ class Job:
             if running is not None and running is not self:
                 snap["queued_behind"] = running.label
         return snap
+
+    def matrix(self):
+        """The Matrices panel's payload for this job (S4): the
+        tailer's aggregates — the same object the snapshot
+        carries, so the panel and the decision ticker read one
+        computation and cannot disagree — plus the grid
+        reduction over the tailer's retained stream. The
+        tailer stays the panel's only consumer of the artifact;
+        the reduction is a second view of its events, never a
+        second reader of the file."""
+        agg = self._refresh_events()
+        return {"aggregates": agg,
+                "matrix": reduce_matrix(self.tailer.events()),
+                "run_id": (self.tailer.path.stem
+                           if self.tailer.path is not None
+                           else None)}
 
     def brief(self):
         """The running-now strip's view of this job (§5.1)."""
@@ -2191,6 +2480,19 @@ def _render_home(home):
                     f"<button type='button' class='rowact' "
                     f"data-reembed='{_esc(w['fingerprint'])}'>"
                     f"Re-embed</button>")
+            # S4's row entry point: offered exactly when a
+            # retained artifact scored this work's book. The
+            # link is navigation to a read-only page; wireRows
+            # stops its click bubbling into the row's forensics
+            # handler.
+            matrix_link = ""
+            if w.get("matrix_run"):
+                matrix_link = (
+                    f"<a class='rowact' data-mxlink "
+                    f"href='/matrix/{_esc(w['fingerprint'])}'>"
+                    f"Last run's matrix</a>")
+            actions = " ".join(
+                part for part in (reembed, matrix_link) if part)
             out.append(
                 f"<tr data-fp='{_esc(w['fingerprint'])}'>"
                 f"<td>{_esc(w['title'])}</td>"
@@ -2201,7 +2503,7 @@ def _render_home(home):
                 f"<td>{_esc(w['chapters'])}</td>"
                 f"<td>{_esc(w['passages'])}</td>"
                 f"<td>{cov}</td><td>{activity_cell}</td>"
-                f"<td>{reembed}</td></tr>")
+                f"<td>{actions}</td></tr>")
         out.append("</tbody></table>")
         out.append("<p class='note'>Select a book row for its "
                    "forensics report (--explain).</p>")
@@ -2340,6 +2642,39 @@ code.argv { font-size: 12px; word-break: break-all; }
 fieldset { border: 1px solid #ddd5c7; border-radius: 8px;
   background: #fff; margin: 12px 0; }
 legend { font-size: 13px; font-weight: 600; }
+a.rowact { background: #e8e2d5; color: #1d1a16; padding: 3px 9px;
+  font-size: 12px; border-radius: 6px; text-decoration: none;
+  display: inline-block; }
+a.rowact:hover { background: #ddd3bf; }
+.mxbook { margin: 14px 0 22px; }
+.mxwrap { overflow-x: auto; }
+table.mx { width: auto; max-width: 100%; }
+table.mx th, table.mx td { padding: 3px 5px; font-size: 11.5px;
+  text-align: center; }
+table.mx th.ch { max-width: 92px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+table.mx th.rh { text-align: left; max-width: 130px; overflow:
+  hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mxcell { min-width: 36px; height: 26px; }
+.mxcell.diag { background: #efe9dc; }
+.mxcell.bar { box-shadow: inset 0 0 0 2px #b8860b; }
+.mxcell.settled-merged { box-shadow: inset 0 0 0 2px #2e6b34;
+  font-weight: 650; }
+.mxcell.settled-split { opacity: .55; }
+.mxcell.settled-blocked { box-shadow: inset 0 0 0 2px #a33327;
+  color: #a33327; font-weight: 650; }
+.mxcols { display: grid; grid-template-columns: minmax(0, 1fr)
+  300px; gap: 16px; align-items: start; }
+@media (max-width: 900px) { .mxcols { grid-template-columns: 1fr; } }
+.mxprog { font-size: 13px; margin: 0 0 6px; }
+ul.verdicts { list-style: none; padding: 0; margin: 0;
+  font-size: 12.5px; }
+ul.verdicts li { padding: 3px 0; border-bottom: 1px solid
+  #eee7da; }
+ul.verdicts li.v-merged { color: #2e6b34; }
+ul.verdicts li.v-blocked { color: #a33327; }
+.mxnote { color: #6b6459; font-size: 12.5px; max-width: 640px; }
+table.tp td.bar { box-shadow: inset 0 0 0 2px #b8860b; }
 """
 
 _PAGE_JS = """
@@ -2396,6 +2731,12 @@ function wireRows() {
       }
       pre.scrollIntoView({block: 'nearest'});
     });
+  });
+  // "Last run's matrix" links navigate; without this, the
+  // click would also bubble into the row's forensics handler
+  // on its way out.
+  document.querySelectorAll('a[data-mxlink]').forEach(a => {
+    a.addEventListener('click', (ev) => { ev.stopPropagation(); });
   });
   document.querySelectorAll('[data-reembed]').forEach(btn => {
     btn.addEventListener('click', async (ev) => {
@@ -2915,10 +3256,14 @@ def _render_run(job):
         "Resume</button></p>"
         "<div id='run-backup'></div>"
         "<div id='run-artifacts'></div>"
+        + _MATRIX_PANEL_HTML +
         "<h3>Results</h3><ul class='feed' id='run-feed'></ul>"
         "<details><summary>Run log (raw output)</summary>"
         "<pre class='log' id='run-log'></pre></details>")
-    script = f"<script>const JOB_ID = {job.id};</script>" + _RUN_JS
+    script = (f"<script>const JOB_ID = {job.id}; "
+              f"const MX_URL = '/api/jobs/' + JOB_ID + '/matrix'; "
+              f"const MX_LOCK_META = false;</script>"
+              + _RUN_JS + _MATRIX_JS)
     return main_html, script
 
 
@@ -3009,6 +3354,326 @@ document.getElementById('run-resume').addEventListener('click',
 """
 
 
+# The panel's server-rendered skeleton — identical on the run
+# page and on the reopening page (§2.3: it lives on the run
+# page, plus its post-run reopening; nowhere else). Everything
+# inside it is display: the skeleton holds no control of any
+# kind, and the script below builds none either. The grid
+# itself is client-rendered from the reduction payload because
+# it grows cell by cell while a run is live.
+_MATRIX_PANEL_HTML = (
+    "<section id='mx-panel' hidden>"
+    "<h3>Matrices — merge resolution</h3>"
+    "<p class='note' id='mx-meta'></p>"
+    "<div id='mx-books'></div>"
+    "</section>")
+
+
+_MATRIX_JS = """
+<script>
+// The Matrices panel (S4, spec §2.3). A window, not a lever:
+// this script only GETs its payload and paints display nodes —
+// it builds no button, link, input, or any other control, and
+// nothing in the panel can change an outcome. Two rendering
+// rules carry the spec:
+//   * freeze-on-settle — a settled cell is painted once and
+//     never touched again (mxSettled is consulted before
+//     every paint; the reduction already guarantees a settled
+//     cell's data never moves, this keeps its DOM node just
+//     as still);
+//   * shade-only under the floor — a score below the payload's
+//     shade_floor paints colour and no number (mxCellText).
+const mxBooks = {};   // book name -> rendered section state
+const mxSettled = {}; // book + pair key -> true once painted
+function mxKey(a, b) {
+  return a <= b ? a + '\\u0000' + b : b + '\\u0000' + a; }
+function mxShade(score) {
+  if (score == null) return '';
+  const alpha = 0.08 + 0.55 *
+    Math.max(0, Math.min(1, score));
+  return 'background:rgba(51,82,63,' + alpha.toFixed(2) + ')'; }
+function mxCellText(cell, bars) {
+  if (cell.score != null)
+    return cell.score >= bars.shade_floor
+      ? cell.score.toFixed(2) : '';
+  if (cell.state === 'settled')
+    return cell.verdict === 'merged' ? '✓'
+      : (cell.verdict === 'blocked' ? '⊘' : '');
+  return '';
+}
+function mxCellTitle(cell) {
+  let t = cell.a + ' × ' + cell.b;
+  if (cell.score != null) t += ' · ' + cell.score.toFixed(3);
+  if (cell.state === 'settled') {
+    t += ' → ' + cell.verdict + ' via ' + cell.via;
+    if (cell.reason) t += ' — ' + cell.reason;
+  }
+  return t;
+}
+function mxSection(book) {
+  const root = document.createElement('div');
+  root.className = 'mxbook';
+  const h = document.createElement('h4');
+  h.textContent = book + ' — character candidates';
+  root.appendChild(h);
+  const cols = document.createElement('div');
+  cols.className = 'mxcols';
+  const left = document.createElement('div');
+  const twrap = document.createElement('div');
+  twrap.className = 'mxwrap';
+  const table = document.createElement('table');
+  table.className = 'mx';
+  const thead = document.createElement('thead');
+  const hrow = document.createElement('tr');
+  hrow.appendChild(document.createElement('th'));
+  thead.appendChild(hrow);
+  table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  table.appendChild(tbody);
+  twrap.appendChild(table);
+  left.appendChild(twrap);
+  const legend = document.createElement('p');
+  legend.className = 'mxnote';
+  legend.textContent = 'Scores are candidacy, not decisions: ' +
+    'a pair can clear the bar and still split when the ' +
+    'evidence binds the two as family rather than identity.';
+  left.appendChild(legend);
+  cols.appendChild(left);
+  const rail = document.createElement('div');
+  const prog = document.createElement('p');
+  prog.className = 'mxprog';
+  rail.appendChild(prog);
+  const ul = document.createElement('ul');
+  ul.className = 'verdicts';
+  rail.appendChild(ul);
+  cols.appendChild(rail);
+  root.appendChild(cols);
+  const ih = document.createElement('h4');
+  ih.textContent = 'Trope impulses — nearest catalogue ' +
+    'neighbours';
+  ih.hidden = true;
+  root.appendChild(ih);
+  const tp = document.createElement('table');
+  tp.className = 'tp';
+  tp.hidden = true;
+  const itp = document.createElement('thead');
+  const itr = document.createElement('tr');
+  ['Label', 'Nearest', '2nd', '3rd', 'Fate'].forEach(t => {
+    const th = document.createElement('th');
+    th.textContent = t;
+    itr.appendChild(th);
+  });
+  itp.appendChild(itr);
+  tp.appendChild(itp);
+  const itb = document.createElement('tbody');
+  tp.appendChild(itb);
+  root.appendChild(tp);
+  document.getElementById('mx-books').appendChild(root);
+  const sec = {hrow, tbody, prog, ul, ih, tp, itb, names: [],
+               rows: {}, cellEls: {}, railCount: 0, impCount: 0};
+  mxBooks[book] = sec;
+  return sec;
+}
+function mxPairCell(sec, key) {
+  const td = document.createElement('td');
+  td.className = 'mxcell';
+  (sec.cellEls[key] = sec.cellEls[key] || []).push(td);
+  return td;
+}
+function mxGrowAxes(sec, names) {
+  // Names only ever append — the reduction lists them in
+  // first-appearance order — so growth adds a header, a row,
+  // and one cell per existing row. Existing nodes, settled
+  // ones included, are never rebuilt or moved.
+  for (let i = sec.names.length; i < names.length; i++) {
+    const name = names[i];
+    const th = document.createElement('th');
+    th.className = 'ch';
+    th.textContent = name;
+    th.title = name;
+    sec.hrow.appendChild(th);
+    sec.names.forEach(prev => {
+      sec.rows[prev].appendChild(
+        mxPairCell(sec, mxKey(prev, name)));
+    });
+    const tr = document.createElement('tr');
+    const rh = document.createElement('th');
+    rh.className = 'rh';
+    rh.textContent = name;
+    rh.title = name;
+    tr.appendChild(rh);
+    sec.names.forEach(prev => {
+      tr.appendChild(mxPairCell(sec, mxKey(prev, name)));
+    });
+    const diag = document.createElement('td');
+    diag.className = 'mxcell diag';
+    // The diagonal is a real address, not decoration: a
+    // Signal-1 merge joins two roster entries carrying the
+    // SAME name, and its cell is (name, name).
+    (sec.cellEls[mxKey(name, name)] =
+      sec.cellEls[mxKey(name, name)] || []).push(diag);
+    tr.appendChild(diag);
+    sec.tbody.appendChild(tr);
+    sec.rows[name] = tr;
+    sec.names.push(name);
+  }
+}
+function mxPaintCells(sec, bookState, bars) {
+  bookState.cells.forEach(cell => {
+    const key = mxKey(cell.a, cell.b);
+    const skey = bookState.book + '\\u0000' + key;
+    if (mxSettled[skey]) return;  // frozen: never repainted
+    (sec.cellEls[key] || []).forEach(td => {
+      td.className = 'mxcell' +
+        (cell.score != null && cell.score >= bars.merge_bar
+          ? ' bar' : '') +
+        (cell.state === 'settled'
+          ? ' settled-' + cell.verdict : '');
+      td.style.cssText = mxShade(cell.score);
+      td.textContent = mxCellText(cell, bars);
+      td.title = mxCellTitle(cell);
+    });
+    if (cell.state === 'settled') mxSettled[skey] = true;
+  });
+}
+function mxAppendRail(sec, bookState) {
+  const vs = bookState.verdicts;
+  for (let i = sec.railCount; i < vs.length; i++) {
+    const v = vs[i];
+    const li = document.createElement('li');
+    li.className = 'v-' + v.verdict;
+    let t = v.a + ' × ' + v.b + ' → ' + v.verdict +
+      ' via ' + v.via;
+    if (v.score != null) t += ' (' + v.score.toFixed(2) + ')';
+    if (v.reason) t += ' — ' + v.reason;
+    li.textContent = t;
+    sec.ul.appendChild(li);
+  }
+  sec.railCount = vs.length;
+  sec.prog.textContent = bookState.resolved + ' / ' +
+    bookState.candidates + ' candidate pairs resolved' +
+    (bookState.decision_calls != null
+      ? ' · ' + bookState.decision_calls + ' decision calls'
+      : '');
+}
+function mxAppendImpulses(sec, bookState, bars) {
+  const imps = bookState.impulses;
+  sec.ih.hidden = sec.tp.hidden = imps.length === 0;
+  for (let i = sec.impCount; i < imps.length; i++) {
+    const im = imps[i];
+    const tr = document.createElement('tr');
+    const label = document.createElement('td');
+    label.textContent = im.label;
+    tr.appendChild(label);
+    for (let k = 0; k < 3; k++) {
+      const td = document.createElement('td');
+      const nb = im.neighbours[k];
+      if (nb) {
+        td.textContent = nb.name + ' (' +
+          nb.score.toFixed(2) + ')';
+        td.style.cssText = mxShade(nb.score);
+        if (nb.score >= bars.map_bar) td.className = 'bar';
+      }
+      tr.appendChild(td);
+    }
+    const fate = document.createElement('td');
+    if (im.fate === 'mapped') {
+      const cat = im.neighbours.find(n => n.id === im.catalog_id);
+      fate.textContent = 'mapped → ' +
+        (cat ? cat.name : im.catalog_id);
+    } else {
+      fate.textContent = 'routed to proposals';
+    }
+    tr.appendChild(fate);
+    sec.itb.appendChild(tr);
+  }
+  sec.impCount = imps.length;
+}
+function mxApplyBook(bookState, bars) {
+  const sec = mxBooks[bookState.book] ||
+    mxSection(bookState.book);
+  mxGrowAxes(sec, bookState.names);
+  mxPaintCells(sec, bookState, bars);
+  mxAppendRail(sec, bookState);
+  mxAppendImpulses(sec, bookState, bars);
+}
+let mxMetaDone = false;
+let mxWrap = null;
+function applyMatrix(data) {
+  const panel = document.getElementById('mx-panel');
+  // The page shell re-renders <main> from the server on its
+  // own refresh; when it does, the skeleton is a fresh element
+  // and every node this script painted is detached with the
+  // old one. Detect the swap by the container's identity and
+  // rebuild into the live skeleton — the same recovery a page
+  // reload performs. Without it the panel would keep painting
+  // into a detached tree and show nothing.
+  const wrap = document.getElementById('mx-books');
+  if (mxWrap !== null && wrap !== mxWrap) {
+    for (const k in mxBooks) delete mxBooks[k];
+    for (const k in mxSettled) delete mxSettled[k];
+    mxMetaDone = false;
+  }
+  mxWrap = wrap;
+  const books = (data.matrix && data.matrix.books) || [];
+  const hasContent = books.some(b =>
+    b.cells.length || b.impulses.length);
+  if (hasContent || data.matrix.finished) panel.hidden = false;
+  if (!mxMetaDone && !MX_LOCK_META) {
+    mxMetaDone = true;
+    document.getElementById('mx-meta').textContent =
+      'Cosine over name + context vectors · merge bar ' +
+      data.bars.merge_bar + ' · mapping bar ' +
+      data.bars.map_bar + ' · cells under ' +
+      data.bars.shade_floor + ' are shade only — the bar ' +
+      'nominates; guards and verdicts decide.' +
+      (data.run_id ? ' · run events ' + data.run_id : '');
+  }
+  books.forEach(b => mxApplyBook(b, data.bars));
+  if (!hasContent && data.matrix.finished && !MX_LOCK_META) {
+    document.getElementById('mx-meta').textContent =
+      'This run scored no candidate pairs.';
+  }
+}
+async function pollMatrix() {
+  try {
+    const res = await fetch(MX_URL, {cache: 'no-store'});
+    if (res.ok) applyMatrix(await res.json());
+  } catch (e) {}
+}
+setInterval(pollMatrix, 1500);
+pollMatrix();
+</script>
+"""
+
+
+def _render_matrix_page(info, run_id):
+    """The reopening page (§2.1): one work's last run's
+    matrix, read from the retained artifact. Same panel, same
+    script as the run page — the grid is reduced from the
+    artifact itself, so what reopens is the identical grid,
+    not a re-rendering of a summary."""
+    fingerprint, title, source_name = info
+    if run_id:
+        note = (f"Run events {_esc(run_id)}, read from the "
+                f"retained run-events artifact. The panel is a "
+                f"window on the resolver's finished work — "
+                f"nothing here can change an outcome.")
+    else:
+        note = ("No retained run-events artifact records a "
+                "resolver pass for this book yet.")
+    main_html = (
+        f"<h2>{_esc(title or source_name)} — last run's "
+        f"matrix</h2>"
+        f"<p class='note'>{note}</p>"
+        + _MATRIX_PANEL_HTML)
+    script = (f"<script>const MX_URL = '/api/matrix?work="
+              f"{_esc(fingerprint)}'; "
+              f"const MX_LOCK_META = true;</script>"
+              + _MATRIX_JS)
+    return main_html, script
+
+
 # ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
@@ -3077,6 +3742,71 @@ class PortalContext:
             text = (result.stderr or "").strip() \
                 or "(--explain produced no output)"
         return text
+
+    def work_info(self, query):
+        """(fingerprint, title, source_name) for a work, or
+        None. The fingerprint is resolve_work's
+        database-resolved value — never the raw request string.
+        The source name is the corpus record's own payload
+        field: the name the work's book file carried at ingest,
+        which is the only name a run-events artifact knows the
+        book by."""
+        fingerprint = resolve_work(self.learn_dir, query)
+        if fingerprint is None:
+            return None
+        corpus_path = self.learn_dir / "corpus.db"
+        if not corpus_path.exists():
+            return None
+        conn = _ro_connect(corpus_path)
+        try:
+            row = conn.execute(
+                "SELECT title, payload FROM corpus_works "
+                "WHERE fingerprint=?", (fingerprint,)).fetchone()
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        source_name = None
+        try:
+            payload = json.loads(row[1] or "{}") or {}
+            if isinstance(payload, dict):
+                source_name = payload.get("source_name")
+        except (TypeError, ValueError):
+            source_name = None
+        return fingerprint, row[0], source_name
+
+    def work_matrix(self, query):
+        """The reopening payload for one work (§2.1's "last
+        run's matrix"): the newest retained artifact that
+        scored the work's book, reduced by the same function
+        the live panel uses — the identical grid by
+        construction, not a re-rendering. Returns
+        (payload, None) or (None, reason)."""
+        info = self.work_info(query)
+        if info is None:
+            return None, f"no such work: {query}"
+        fingerprint, title, source_name = info
+        if not source_name:
+            return None, ("this work's corpus record names no "
+                          "source file, so no run can be "
+                          "matched to it")
+        entry = latest_matrices(
+            self.learn_dir, {source_name}).get(source_name)
+        if entry is None:
+            return None, ("no retained run-events artifact "
+                          "records a resolver pass for this book")
+        events, agg = _artifact_events(Path(entry["path"]))
+        state = reduce_matrix(events)
+        state = dict(state, books=[
+            b for b in state["books"]
+            if b["book"] == source_name])
+        return {"work": {"fingerprint": fingerprint,
+                         "title": title, "book": source_name},
+                "run_id": entry["run_id"], "aggregates": agg,
+                "matrix": state,
+                "bars": _matrix_bars(self)}, None
 
     @property
     def labels_dir(self):
@@ -3536,6 +4266,30 @@ def make_server(host, port, ctx):
                     self._json(200, {
                         "work": fingerprint,
                         "text": ctx.explain(fingerprint)})
+                elif parsed.path == "/api/matrix":
+                    query = parse_qs(parsed.query).get(
+                        "work", [""])[0]
+                    payload, err = ctx.work_matrix(query)
+                    if payload is None:
+                        self._json(404, {"error": err})
+                        return
+                    self._json(200, payload)
+                elif parsed.path.startswith("/matrix/"):
+                    info = ctx.work_info(
+                        parsed.path[len("/matrix/"):])
+                    if info is None:
+                        self._json(404, {
+                            "error": "no such work"})
+                        return
+                    payload, _err = ctx.work_matrix(info[0])
+                    main_html, script = _render_matrix_page(
+                        info,
+                        payload["run_id"] if payload else None)
+                    self._send(200, _page(
+                        f"{info[1] or info[2]} — last run's "
+                        f"matrix", main_html, ctx,
+                        extra_script=script),
+                        "text/html; charset=utf-8")
                 elif parsed.path == "/api/jobs":
                     self._json(200, {"jobs": [
                         job.brief() for job in
@@ -3548,6 +4302,10 @@ def make_server(host, port, ctx):
                         return
                     if len(parts) == 4 and parts[3] == "stream":
                         self._stream_job(job)
+                    elif len(parts) == 4 and parts[3] == "matrix":
+                        payload = job.matrix()
+                        payload["bars"] = _matrix_bars(ctx)
+                        self._json(200, payload)
                     elif len(parts) == 3:
                         self._json(200, job.snapshot())
                     else:
