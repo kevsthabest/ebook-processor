@@ -4016,6 +4016,22 @@ def cmd_ingest(paths, learn_dir=None, reason="", force=False):
             line += f" — {r['detail']}"
         print(line)
         results.append(r)
+    # §10.4(a): the deterministic opening line for each book whose
+    # text landed. Quote records are stage-family writes (§5.2) —
+    # the importer handle cannot make them — so generation runs
+    # here, after the loop, through a processor-mode handle.
+    fps = [r["fingerprint"] for r in results
+           if r.get("fingerprint")
+           and r["outcome"] in ("partial", "complete")]
+    if fps:
+        _close_corpus_dbs()
+        pdb = CorpusDB.open(d, mode="processor")
+        if pdb is not None:
+            for fp in fps:
+                try:
+                    corpus_generate_opening_line(pdb, fp)
+                except Exception:
+                    pass
     return results
 
 
@@ -4442,9 +4458,14 @@ _EVIDENCE_QUERY_SHAPE_VERSION = "1"
 
 # Stage -> envelope section (§6.4): the sections a stage write
 # refreshes in its own transaction.
-_STAGE_SECTION = {"retrieve": "retrieval",
-                  "quote-verify": "quotes",
-                  "quote-select": "quotes"}
+_STAGE_SECTION = {"retrieve": "retrieval"}
+# The quotes stages are deliberately NOT in _STAGE_SECTION: the
+# envelope's quotes section is a materialization of the quotes
+# TABLE (the §10.3 record), refreshed by the record's writer in
+# the same transaction as the record write
+# (_corpus_refresh_quotes_section_in_txn) — a tally over stage
+# outputs would go stale the moment selection flips a row's
+# status without re-deriving anything.
 
 
 def _corpus_stage_input_hash(material):
@@ -4670,8 +4691,13 @@ def corpus_retract_stage_output(db, fingerprint, stage, output_key,
             except (TypeError, ValueError):
                 remaining[key] = {}
         _corpus_refresh_stage_section_in_txn(
-            db, conn, fingerprint, stage, remaining, None, None,
-            retracted={"at": now, "reason": reason})
+            db, conn, fingerprint, stage, remaining,
+            None, None, retracted={"at": now, "reason": reason})
+        if stage in ("quote-verify", "quote-select"):
+            # The quotes section is table-derived; stamp the
+            # retraction trace onto it here (§6.4 leg 3).
+            _corpus_refresh_quotes_section_in_txn(
+                db, conn, fingerprint, retracted=reason)
     return True
 
 
@@ -4926,6 +4952,388 @@ def _retrieve_claim_input_hash(ctx, claim, floor):
         "query_shape": _EVIDENCE_QUERY_SHAPE_VERSION,
     }
     return _corpus_stage_input_hash(material)
+
+
+# ---------------------------------------------------------------------------
+# Quote verification (§10.1) + the quote-verify stage (§4.2 wave 1)
+#
+# VERIFY is a pure corpus function: fingerprint-scoped, matching on
+# token SEQUENCE — tolerant of whitespace, punctuation and case
+# drift, strict on words. A substituted, inserted or omitted word,
+# or a "…" elision, fails closed; the legacy evidence matcher's
+# fuzzy fallback (_verify_against_norm) is deliberately NOT used
+# here — a quote that ships must be the book's own words. The
+# shipped text is always the corpus span bytes; the candidate is
+# preserved in provenance beside its snapped flag and drift class.
+# A chapter assertion is an assertion (A3): an asserted candidate
+# is searched in that chapter only; a match elsewhere records
+# drift class "chapter" and FAILS. Unasserted candidates search
+# the whole book and the found chapter becomes the assertion.
+# ---------------------------------------------------------------------------
+
+QUOTE_VERIFY_STAGE_VERSION = "1"
+QUOTE_SELECT_STAGE_VERSION = "1"
+
+_QUOTE_TOKEN_RE = re.compile(r"[^\W_]+")
+_QUOTE_SPAN_OPEN = "\"'“‘"
+_QUOTE_SPAN_CLOSE = ".!?\"'”’"
+
+
+def _quote_tokens(text):
+    """Word tokens of a text under the _norm_quote discipline
+    (quote/dash unification + casefold), each with its (start,
+    end) offsets in the ORIGINAL text. Punctuation and whitespace
+    are separators: they are where drift is tolerated. Words are
+    the tokens themselves: they are where it is not."""
+    norm_chars, origins = [], []
+    for i, ch in enumerate(text or ""):
+        for c in ch.translate(_QUOTE_NORM_TABLE).casefold():
+            norm_chars.append(c)
+            origins.append(i)
+    norm = "".join(norm_chars)
+    return [(m.group(0), origins[m.start()], origins[m.end() - 1] + 1)
+            for m in _QUOTE_TOKEN_RE.finditer(norm)]
+
+
+def _quote_find_all(chapter_tokens, cand_tokens):
+    """Every (start, end) span in one chapter whose token sequence
+    equals the candidate's, in order."""
+    if not cand_tokens:
+        return []
+    seq = [t for t, _s, _e in cand_tokens]
+    starts = {}
+    for i, (tok, _s, _e) in enumerate(chapter_tokens):
+        starts.setdefault(tok, []).append(i)
+    hits = []
+    n = len(seq)
+    for i in starts.get(seq[0], []):
+        window = chapter_tokens[i:i + n]
+        if [t for t, _s, _e in window] == seq:
+            hits.append((window[0][1], window[-1][2]))
+    return hits
+
+
+def _quote_drift(candidate, span):
+    """The drift class between a candidate and the corpus span it
+    matched: None when byte-identical, else the coarsest single
+    class that explains the difference — whitespace, case, or
+    punctuation (token equality is already proven, so any
+    remaining difference is one of those three by construction)."""
+    if candidate == span:
+        return None
+
+    def ws(s):
+        return re.sub(r"\s+", " ", s.translate(_QUOTE_NORM_TABLE)).strip()
+
+    def wsc(s):
+        return re.sub(r"\s+", " ",
+                      s.translate(_QUOTE_NORM_TABLE).casefold()).strip()
+
+    if ws(candidate) == ws(span):
+        return "whitespace"
+    if wsc(candidate) == wsc(span):
+        return "case"
+    return "punctuation"
+
+
+def _verify_quote_impl(db, fingerprint, candidate_text, kind,
+                       asserted_chapter, support_chapters):
+    """The search behind verify_quote: returns (record, diag) —
+    a verified-span record, or (None, diag) where diag names the
+    failure ({"reason": "no_match"} | {"reason": "chapter",
+    "found_chapter_index": n} | {"reason": "no_corpus_text"} |
+    {"reason": "empty_candidate"})."""
+    chapters = corpus_chapters_for(db, fingerprint)
+    if not chapters:
+        return None, {"reason": "no_corpus_text"}
+    cand = _quote_tokens(candidate_text)
+    if not cand:
+        return None, {"reason": "empty_candidate"}
+    by_index = {c["index"]: c for c in chapters}
+    scope = ([asserted_chapter] if asserted_chapter is not None
+             else sorted(by_index))
+    hits_by_ch = {}
+    for ci in scope:
+        ch = by_index.get(ci)
+        if ch is None:
+            continue
+        hits = _quote_find_all(_quote_tokens(ch["text"]), cand)
+        if hits:
+            hits_by_ch[ci] = hits
+    if not hits_by_ch:
+        if asserted_chapter is not None:
+            # A3's diagnostic: the words exist, but not where they
+            # were asserted to be — drift class "chapter", a FAIL,
+            # never a silent relocation.
+            for ci in sorted(by_index):
+                if ci == asserted_chapter:
+                    continue
+                if _quote_find_all(_quote_tokens(by_index[ci]["text"]),
+                                   cand):
+                    return None, {"reason": "chapter",
+                                  "found_chapter_index": ci}
+        return None, {"reason": "no_match"}
+    chapter_index = min(hits_by_ch)
+    occurrences = sum(len(v) for v in hits_by_ch.values())
+    text = by_index[chapter_index]["text"]
+    start, end = hits_by_ch[chapter_index][0]
+    # The shipped span is corpus bytes; let it carry its sentence
+    # punctuation (a trailing period, a leading quote mark) so a
+    # verified quote reads as the book printed it.
+    s, e = start, end
+    while s > 0 and text[s - 1] in _QUOTE_SPAN_OPEN:
+        s -= 1
+    while e < len(text) and text[e] in _QUOTE_SPAN_CLOSE:
+        e += 1
+    span_text = text[s:e]
+    drift = _quote_drift(candidate_text, span_text)
+    record = {"chapter_index": chapter_index, "start": s, "end": e,
+              "text": span_text, "snapped": drift is not None,
+              "drift": drift, "occurrences": occurrences,
+              "sentence_bounded": (s, e) in set(_sentence_spans(text))}
+    if support_chapters is not None \
+            and chapter_index not in support_chapters:
+        record["outside_support_chapters"] = True
+    return record, {}
+
+
+def verify_quote(db, fingerprint, candidate_text, kind="evidence",
+                 asserted_chapter=None, support_chapters=None):
+    """§10.1 VERIFY: does this exact wording occur in this book?
+
+    Returns {chapter_index, start, end, text (the corpus span),
+    snapped, drift, occurrences, sentence_bounded} or None.
+    kind is the candidate's declared kind ("evidence",
+    "signature", "opening", …); asserted_chapter (a chapter
+    INDEX) scopes the search to that chapter — a match elsewhere
+    fails; support_chapters, when given, adds the
+    outside_support_chapters diagnostic when the span lands
+    outside the set. FTS narrowing is a future accelerator only:
+    the token-sequence scan is the authority, and results must
+    not depend on whether the index exists (§1.5 degraded opens
+    verify identically)."""
+    record, _diag = _verify_quote_impl(
+        db, fingerprint, candidate_text, kind, asserted_chapter,
+        support_chapters)
+    return record
+
+
+def _corpus_refresh_quotes_section_in_txn(db, conn, fingerprint,
+                                          retracted=None):
+    """The envelope's quotes section is a materialization of the
+    quotes table (§6.4): refreshed in the same transaction as any
+    quotes-row write, from the rows themselves. Present iff at
+    least one quote is recorded; a work whose quotes were all
+    retracted reads unknown WITH the retraction trace — never a
+    silent "none"."""
+    rows = conn.execute(
+        "SELECT status, COUNT(*) FROM quotes WHERE fingerprint=? "
+        "GROUP BY status", (fingerprint,)).fetchall()
+    by_status = {s: n for s, n in rows}
+    total = sum(by_status.values())
+    env = _corpus_envelope_load(conn, fingerprint)
+    sections = env.setdefault("sections", {})
+    section = {"state": "present" if total else "unknown",
+               "stage": "quotes", "model": None,
+               "stage_version": QUOTE_VERIFY_STAGE_VERSION,
+               "updated_at": _corpus_now(), "scope": "work"}
+    if total:
+        section["value"] = {"quotes": total, "by_status": by_status,
+                            "selected": by_status.get("selected", 0)}
+    if retracted is not None:
+        section["retracted_at"] = _corpus_now()
+        section["reason"] = retracted
+    sections["quotes"] = section
+    _corpus_envelope_store(conn, fingerprint, env)
+
+
+def _quote_candidate_key(kind, asserted, text_hash):
+    return _corpus_sha256(
+        f"{kind}\x1f{asserted}\x1f{text_hash}")[:32]
+
+
+def _quote_row_id(fingerprint, kind, chapter_index, start, end, text):
+    return _corpus_sha256("\x1f".join(
+        [fingerprint, kind, str(chapter_index), str(start), str(end),
+         text]))[:32]
+
+
+def corpus_verify_quotes(db, fingerprint, candidates):
+    """The quote-verify stage (§4.2 wave 1): settle one verdict per
+    candidate — a quotes-table record (§10.3) plus a stage output
+    carrying the verify provenance — under the §4 contract, so a
+    re-run over the same book text and the same candidates
+    re-reads verdicts instead of re-scanning.
+
+    Each candidate: {"text", "kind" (default "evidence"),
+    "chapter_index" or "chapter_label" (the A3 assertion),
+    "source"}. The stage's input hash enumerates the candidate
+    text, its kind and assertion, and the text hashes of every
+    chapter in its search scope."""
+    chapters = corpus_chapters_for(db, fingerprint)
+    by_index = {c["index"]: c for c in chapters}
+    label_to_index = {}
+    for c in chapters:
+        label_to_index.setdefault(c.get("label"), c["index"])
+        label_to_index.setdefault(
+            " ".join(str(c.get("label") or "").casefold().split()),
+            c["index"])
+
+    def resolve_asserted(cand):
+        if cand.get("chapter_index") is not None:
+            idx = cand["chapter_index"]
+            return (idx, None) if idx in by_index else (None, "chapter")
+        label = cand.get("chapter_label")
+        if label is None:
+            return None, None
+        if label in label_to_index:
+            return label_to_index[label], None
+        folded = " ".join(str(label).casefold().split())
+        if folded in label_to_index:
+            return label_to_index[folded], None
+        return None, "chapter_unresolved"
+
+    stored = corpus_stage_outputs(db, fingerprint, "quote-verify")
+    produced, rows = {}, []
+    summary = {"verified": 0, "rejected": 0, "reused": 0}
+    for cand in candidates or []:
+        text_c = cand.get("text") or ""
+        kind = cand.get("kind") or "evidence"
+        asserted, resolve_err = resolve_asserted(cand)
+        text_hash = _corpus_text_hash(text_c)
+        key = _quote_candidate_key(kind, asserted, text_hash)
+        scope = ([asserted] if asserted is not None
+                 else sorted(by_index))
+        material = {
+            "stage": "quote-verify",
+            "stage_version": QUOTE_VERIFY_STAGE_VERSION,
+            "candidate_hash": text_hash, "kind": kind,
+            "asserted_chapter": asserted,
+            "scope": [{"index": ci,
+                       "text_hash": _corpus_text_hash(
+                           by_index[ci]["text"])}
+                      for ci in scope if ci in by_index],
+        }
+        ih = _corpus_stage_input_hash(material)
+        prior = stored.get(key)
+        if prior is not None and prior["input_hash"] == ih:
+            produced[key] = {"input_hash": ih,
+                             "payload": prior["payload"]}
+            summary["reused"] += 1
+            summary[prior["payload"]["status"]] += 1
+            continue
+        if resolve_err is not None:
+            record, diag = None, {"reason": resolve_err,
+                                  "asserted_label":
+                                      cand.get("chapter_label")}
+        else:
+            record, diag = _verify_quote_impl(
+                db, fingerprint, text_c, kind, asserted,
+                cand.get("support_chapters"))
+        if record is not None:
+            status = "verified"
+            verify_block = {
+                "candidate_text": text_c,
+                "chapter_index": record["chapter_index"],
+                "start": record["start"], "end": record["end"],
+                "snapped": record["snapped"],
+                "drift": record["drift"],
+                "occurrences": record["occurrences"],
+                "sentence_bounded": record["sentence_bounded"]}
+            if record.get("outside_support_chapters"):
+                verify_block["outside_support_chapters"] = True
+            payload = {"candidate_text": text_c, "kind": kind,
+                       "source": cand.get("source"),
+                       "status": status, "verify": verify_block}
+            rows.append((
+                _quote_row_id(fingerprint, kind,
+                              record["chapter_index"], record["start"],
+                              record["end"], record["text"]),
+                fingerprint, record["chapter_index"], record["start"],
+                record["end"], record["text"], kind, status,
+                json.dumps(payload, ensure_ascii=False)))
+        else:
+            status = "rejected"
+            payload = {"candidate_text": text_c, "kind": kind,
+                       "source": cand.get("source"),
+                       "status": status,
+                       "verify": {"candidate_text": text_c, **diag}}
+            rows.append((
+                _quote_row_id(fingerprint, kind, asserted, -1, -1,
+                              text_c),
+                fingerprint, asserted, None, None, text_c, kind,
+                status, json.dumps(payload, ensure_ascii=False)))
+        summary[status] += 1
+        produced[key] = {"input_hash": ih, "payload": payload}
+    if rows:
+        with db.write_txn("stages") as conn:
+            for row in rows:
+                conn.execute(
+                    "INSERT OR REPLACE INTO quotes (quote_id, "
+                    "fingerprint, chapter_index, start_offset, "
+                    "end_offset, text, kind, status, payload) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)", row)
+            _corpus_refresh_quotes_section_in_txn(db, conn, fingerprint)
+    if produced or stored:
+        corpus_stage_settle(
+            db, fingerprint, "quote-verify",
+            stage_version=QUOTE_VERIFY_STAGE_VERSION, model=None,
+            outputs=produced,
+            run_payload={"candidates": len(candidates or [])})
+    summary["outputs"] = produced
+    return summary
+
+
+def corpus_generate_opening_line(db, fingerprint):
+    """§10.4(a): the deterministic opening line — the first
+    sentence of the first non-frontmatter chapter — verified and
+    recorded at ingest. Deterministic by construction: the
+    candidate IS a corpus span, so verification is a formality
+    that keeps one code path for every recorded quote. Returns
+    the quote row's summary dict, or None when the work has no
+    non-frontmatter text."""
+    chapters = corpus_chapters_for(db, fingerprint)
+    target = None
+    for c in chapters:
+        if not c.get("is_frontmatter"):
+            target = c
+            break
+    if target is None:
+        return None
+    spans = _sentence_spans(target["text"])
+    if not spans:
+        return None
+    s, e = spans[0]
+    sentence = target["text"][s:e]
+    corpus_verify_quotes(db, fingerprint, [{
+        "text": sentence, "kind": "opening",
+        "chapter_index": target["index"],
+        "source": "deterministic"}])
+    rows = db.query(
+        "SELECT quote_id, text FROM quotes WHERE fingerprint=? "
+        "AND kind='opening' AND status IN ('verified','selected')",
+        (fingerprint,))
+    if not rows:
+        return None
+    return {"quote_id": rows[0][0], "text": rows[0][1],
+            "chapter_index": target["index"]}
+
+
+def corpus_verify_run_quotes(db, fingerprint, run_quotes):
+    """Call site (b) (§10.1): a run's model-proposed quotes,
+    verified against the corpus when the work is ingested. Run
+    quotes carry their chapter LABEL (the reduce's assertion);
+    the corpus resolves it. Speaker and spoiler posture stay
+    run-side metadata; the corpus records the verify verdict."""
+    candidates = []
+    for q in run_quotes or []:
+        if isinstance(q, dict) and q.get("text"):
+            candidates.append({"text": q["text"], "kind": "evidence",
+                               "chapter_label": q.get("chapter"),
+                               "source": "run"})
+    if not candidates:
+        return None
+    return corpus_verify_quotes(db, fingerprint, candidates)
 
 
 # ---------------------------------------------------------------------------
@@ -18219,6 +18627,29 @@ def process_file_v2(fpath, dry_run=False, preview=False):
               f"{_gt['adjacent_only']} adjacent-only, "
               f"{_gt['failed']} failed")
 
+    # Corpus quote verification (corpus-design §10.1 call site b,
+    # --corpus-quotes, default OFF): this run's model-proposed
+    # quotes verified against the corpus when the work is
+    # ingested. The corpus records verdicts; the run's own quote
+    # list is untouched (publication is slice 7's payload, not the
+    # run's face). Corpus trouble degrades to silence — a corpus
+    # write never fails a run (§5.2).
+    if CONFIG.get("corpus_quotes") and not dry_run and not aborted:
+        try:
+            _qdb = _corpus_db_for(_learn().dir, mode="processor")
+            if _qdb is not None and corpus_work_state(
+                    _qdb, _ckpt_fp) in ("text_complete",
+                                        "vectors_partial",
+                                        "complete"):
+                _qv = corpus_verify_run_quotes(
+                    _qdb, _ckpt_fp, red.get("quotes"))
+                if _qv:
+                    print(f"  Corpus quotes: {_qv['verified']} "
+                          f"verified, {_qv['rejected']} rejected "
+                          f"against the corpus text")
+        except Exception:
+            pass
+
     reading_mins = word_count // 250
     result = {
         "file": fpath.name, "title": title or fpath.stem, "author": author,
@@ -19405,6 +19836,15 @@ def _build_parser():
                          "evidence with a retrieval stamp (default "
                          "off; see eval/g-evidence-design.md)")
 
+    g_merge.add_argument("--corpus-quotes", action="store_true",
+                    help="corpus store: verify this run's quotes "
+                         "against the corpus text and run quote "
+                         "selection for ingested works — verification "
+                         "(§10.1), the decision-model poll (§10.2) "
+                         "and the publication record (§10.3) "
+                         "(default off; see eval/corpus-design.md "
+                         "§10)")
+
     g_merge.add_argument("--use-corpus", action="store_true",
                     help="corpus store: source a run's acquisition "
                          "(chapters, word count, chapter-detection "
@@ -19879,6 +20319,9 @@ def main():
 
     if getattr(args, "use_corpus", False):
         CONFIG["use_corpus"] = True
+
+    if getattr(args, "corpus_quotes", False):
+        CONFIG["corpus_quotes"] = True
 
     if getattr(args, "emit_uncertainty", False):
         CONFIG["emit_uncertainty"] = True
