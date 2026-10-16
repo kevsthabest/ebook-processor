@@ -966,7 +966,13 @@ a stage's replacement never reaches outside its own
 (the corpus-write doctrine the program already proved on
 Supabase rows) turned inward, with content addressing
 doing the targeting that wholesale replacement does by
-scope.
+scope. One presentation-scoped reading, recorded from the
+build's final review: for candidate-driven stages such as
+quote-verify, whole-set replacement applies within a
+presentation — verdicts from disjoint presentations
+accumulate rather than replace one another, and staleness
+is refused at read boundaries by hash recompute, not by
+cross-presentation deletion.
 
 ### 4.2 First adopters, and what stays out
 

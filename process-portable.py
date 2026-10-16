@@ -5312,9 +5312,32 @@ def corpus_verify_quotes(db, fingerprint, candidates):
     return summary
 
 
+def _chapter_body_start(chapter):
+    """Offset where a chapter's prose begins: past its own
+    heading when the stored text opens with the chapter's
+    stored label — as a whole first line, or as an exact
+    prefix (Advisor Ruling-2: the heading is metadata the
+    corpus already stores as the label, and §10.6 ships it
+    separately as chapter_label; it is not part of the first
+    sentence). Zero when the text carries no such heading,
+    so heading-less chapters are unchanged."""
+    text = chapter.get("text") or ""
+    label = (chapter.get("label") or "").strip()
+    if not label:
+        return 0
+    nl = text.find("\n")
+    first_line = text if nl == -1 else text[:nl]
+    if first_line.strip() == label:
+        return len(text) if nl == -1 else nl + 1
+    if text.startswith(label):
+        return len(label)
+    return 0
+
+
 def corpus_generate_opening_line(db, fingerprint):
     """§10.4(a): the deterministic opening line — the first
-    sentence of the first non-frontmatter chapter — verified and
+    sentence of the first non-frontmatter chapter, taken from
+    after the chapter's own heading (Ruling-2) — verified and
     recorded at ingest. Deterministic by construction: the
     candidate IS a corpus span, so verification is a formality
     that keeps one code path for every recorded quote. Returns
@@ -5328,11 +5351,15 @@ def corpus_generate_opening_line(db, fingerprint):
             break
     if target is None:
         return None
-    spans = _sentence_spans(target["text"])
+    body = _chapter_body_start(target)
+    spans = _sentence_spans(target["text"][body:])
     if not spans:
         return None
     s, e = spans[0]
-    sentence = target["text"][s:e]
+    # The shipped text slices exactly from the stored chapter
+    # text — the heading exclusion is the span's start offset,
+    # never string surgery on the sentence itself.
+    sentence = target["text"][body + s:body + e]
     corpus_verify_quotes(db, fingerprint, [{
         "text": sentence, "kind": "opening",
         "chapter_index": target["index"],

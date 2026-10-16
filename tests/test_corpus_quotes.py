@@ -36,6 +36,12 @@ _FILLER = ("The road wound on through pine and stone while the "
            "company argued about maps, meals and old debts. ")
 _DAWN = ("He betrayed the watch and the guard fell silent "
          "before dawn.")
+# The G fixture's first prose sentence (§10.4(a), Advisor
+# Ruling-2): the opening line EXCLUDES the chapter heading —
+# "Chapter 1" is the chapter's stored label, shipped separately
+# as chapter_label (§10.6), never part of the opening span.
+_OPENING = ("The fleet rode out the storm beyond the harbour "
+            "wall and the sea ran high.")
 
 
 class _QuoteBase(unittest.TestCase):
@@ -214,9 +220,7 @@ class TestVerifyStage(_QuoteBase):
     def test_opening_line_generated_and_idempotent(self):
         res = pp.corpus_generate_opening_line(self.db, self.fp_a)
         self.assertIsNotNone(res)
-        first = pp._sentence_spans(self.chapters_a[1]["text"])[0]
-        expected = self.chapters_a[1]["text"][first[0]:first[1]]
-        self.assertEqual(res["text"], expected)
+        self.assertEqual(res["text"], _OPENING)
         rows = self.db.query(
             "SELECT status, kind FROM quotes WHERE fingerprint=? "
             "AND kind='opening'", (self.fp_a,))
@@ -226,6 +230,31 @@ class TestVerifyStage(_QuoteBase):
         self.assertEqual(self.db.query(
             "SELECT COUNT(*) FROM quotes WHERE fingerprint=?",
             (self.fp_a,))[0][0], 1)
+
+    def test_opening_line_excludes_chapter_heading(self):
+        # Advisor Ruling-2 pin: the fixture's chapter 1 text
+        # begins with its stored label as a heading line
+        # ("Chapter 1\nThe fleet rode out…"). The opening line
+        # is the first PROSE sentence, taken from after the
+        # heading — the heading is an exclusion of the span's
+        # start offset, and the shipped text must still slice
+        # exactly from the stored chapter text (A2 discipline).
+        chapter = self.chapters_a[1]
+        self.assertEqual(chapter["label"], "Chapter 1")
+        self.assertTrue(
+            chapter["text"].startswith("Chapter 1\n"))
+        res = pp.corpus_generate_opening_line(self.db, self.fp_a)
+        self.assertIsNotNone(res)
+        self.assertEqual(res["text"], _OPENING)
+        self.assertNotIn("Chapter 1", res["text"])
+        row = self.db.query(
+            "SELECT start_offset, end_offset FROM quotes "
+            "WHERE fingerprint=? AND kind='opening'",
+            (self.fp_a,))[0]
+        self.assertEqual(
+            chapter["text"][row[0]:row[1]], res["text"])
+        self.assertGreater(
+            row[0], chapter["text"].index("\n"))
 
     def test_cmd_ingest_generates_opening_line(self):
         learn2 = self.dir / "learned2"
@@ -317,9 +346,7 @@ class TestSelectAndPayload(_QuoteBase):
         self.assertEqual(kinds, {"signature", "opening"})
         opening = [q for q in payload["quotes"]["quotes"]
                    if q["kind"] == "opening"][0]
-        first = pp._sentence_spans(self.chapters_a[1]["text"])[0]
-        self.assertEqual(opening["text"],
-                         self.chapters_a[1]["text"][first[0]:first[1]])
+        self.assertEqual(opening["text"], _OPENING)
 
     def test_poll_is_metadata_only(self):
         ask = _fake_ask({"before dawn": {"quotability": 0.95}})
