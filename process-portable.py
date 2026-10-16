@@ -4790,6 +4790,80 @@ class _CorpusWindowCache(dict):
 
 # -- retrieve adoption (§4.2, wave 1) ---------------------------------
 
+def corpus_acquire_for_run(learn_dir, fpath):
+    """Corpus-sourced acquisition (§11 slice 5): when the corpus
+    holds this exact file's text — the presented file's bytes hash
+    to a stored source_hash — and the generation is current,
+    return the acquisition block's full output surface (§3.1's
+    mirror) read from the corpus: chapters, title, author,
+    identifiers, and the word_count and chapter-detection fallback
+    flag recorded by the INGEST run's own parse. None otherwise,
+    and the caller parses the file exactly as today.
+    Corpus-sourcing never re-derives the surface: what ingest
+    recorded is what the run gets, which is what makes §13's
+    signal 2a (corpus-sourced ≡ file-sourced) a property of the
+    store rather than of two parsers agreeing."""
+    try:
+        db = _corpus_db_for(learn_dir, mode="processor")
+        if db is None:
+            return None
+        source_hash = _corpus_sha256(Path(fpath).read_bytes())
+        rows = db.query(
+            "SELECT fingerprint FROM corpus_works "
+            "WHERE source_hash=?", (source_hash,))
+        if not rows:
+            return None
+        fingerprint = rows[0][0]
+        if corpus_work_state(db, fingerprint) not in (
+                "text_complete", "vectors_partial", "complete"):
+            return None
+        chapters = corpus_chapters_for(db, fingerprint)
+        if not chapters:
+            return None
+        rec = corpus_work_record(db, fingerprint) or {}
+        payload = rec.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                payload = {}
+        payload = payload or {}
+        identifiers = rec.get("identifiers")
+        if isinstance(identifiers, str):
+            try:
+                identifiers = json.loads(identifiers)
+            except ValueError:
+                identifiers = {}
+        return {"chapters": chapters,
+                "title": rec.get("title"),
+                "author": rec.get("author"),
+                "identifiers": identifiers or {},
+                "word_count": payload.get("word_count"),
+                "chapter_detection_fallback": bool(
+                    payload.get("chapter_detection_fallback")),
+                "source_name": payload.get("source_name"),
+                "fingerprint": fingerprint}
+    except Exception:
+        return None
+
+
+def _corpus_retrieve_ctx_build(db, fingerprint, writable):
+    """The context dict over an already-chosen handle, or None
+    when the generation cannot serve (no embed model configured,
+    suspect generation). Shared by the run path and the pinned
+    replay path (§4.3)."""
+    model = CONFIG.get("embed_model") or ""
+    if not model:
+        return None
+    if _corpus_generation_suspect(db, model, _CORPUS_VECTOR_FORMAT):
+        return None
+    return {"db": db, "fingerprint": fingerprint,
+            "writable": bool(writable), "embed_model": model,
+            "embed_format": _CORPUS_VECTOR_FORMAT,
+            "judge_model": CONFIG.get("model") or "",
+            "judge_backend": CONFIG.get("llm") or ""}
+
+
 def corpus_retrieve_context(learn_dir, fingerprint, *, writable=True):
     """The retrieve stage's adoption context for a run, or None when
     the corpus cannot serve this work: no corpus in the learn dir,
@@ -4800,22 +4874,22 @@ def corpus_retrieve_context(learn_dir, fingerprint, *, writable=True):
     proceeds per-run, exactly as before the corpus). writable=False
     under replay (§4.3: reads only, no settling, no gap-fill
     write-back). Corpus trouble degrades to None — slower, never
-    wrong (§5.3) — never to a failed run."""
+    wrong (§5.3) — never to a failed run.
+
+    Under replay the context comes from the snapshot-validated,
+    READ-ONLY pinned handle run_replay injected (§4.3) — never
+    from the learn dir, which inside a replay is the sandbox."""
     try:
+        if _REPLAY_CTX is not None:
+            pinned = _REPLAY_CTX.get("corpus")
+            if pinned and pinned.get("fingerprint") == fingerprint:
+                return _corpus_retrieve_ctx_build(
+                    pinned["db"], fingerprint, False)
+            return None
         db = _corpus_db_for(learn_dir, mode="processor")
         if db is None or not corpus_retrieval_ready(db, fingerprint):
             return None
-        model = CONFIG.get("embed_model") or ""
-        if not model:
-            return None
-        if _corpus_generation_suspect(db, model,
-                                      _CORPUS_VECTOR_FORMAT):
-            return None
-        return {"db": db, "fingerprint": fingerprint,
-                "writable": bool(writable), "embed_model": model,
-                "embed_format": _CORPUS_VECTOR_FORMAT,
-                "judge_model": CONFIG.get("model") or "",
-                "judge_backend": CONFIG.get("llm") or ""}
+        return _corpus_retrieve_ctx_build(db, fingerprint, writable)
     except Exception:
         return None
 
@@ -10471,6 +10545,15 @@ _LEARNED = None
 # current (fresh, preview) run.
 _REPLAY_CTX = None
 _CAPTURE_CTX = None
+
+# Corpus snapshot block staging (corpus-design §4.3): a capture
+# run stashes ITS OWN parse's chapter hashes here, keyed by the
+# run's fingerprint, immediately before capture_snapshot runs;
+# capture consumes (pops) the entry into the manifest's corpus
+# block. The hashes are never read back from corpus rows — the
+# block attests what the capture run itself parsed, and replay
+# validates the live corpus against it.
+_PENDING_CAPTURE_HASHES = {}
 
 
 def _learn():
@@ -17203,6 +17286,19 @@ def capture_snapshot(snapshot_id, *, book_key, fingerprint, title,
         "created": _staging_today(), "reason": reason,
         "extraction": extraction,
     }
+    # §4.3 corpus block: written at every capture from the capture
+    # run's own parse (stashed by process_file_v2 under this
+    # fingerprint). Absent only when the capturing run stashed
+    # nothing — a pre-design capture, or a direct call — never
+    # back-filled from corpus rows.
+    _stash = _PENDING_CAPTURE_HASHES.pop(fingerprint, None)
+    if _stash is not None:
+        manifest["corpus"] = {
+            "fingerprint": fingerprint,
+            "parser_version": CORPUS_PARSER_VERSION,
+            "text_root_hash": _stash["text_root_hash"],
+            "chapter_hashes": list(_stash["chapter_hashes"]),
+        }
     with open(dest / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1, ensure_ascii=False)
     db = _state_db_for(learn_dir)
@@ -17253,6 +17349,54 @@ def _presented_fingerprint(fpath):
         identifiers, title, author, _checkpoint_text_sample(chapters))
 
 
+def _release_replay_corpus(handle):
+    """Close a replay's pinned corpus handle and drop it from the
+    registry (the registry must never hand a replay's read-only
+    handle to a later run path). Safe to call twice."""
+    if handle is None:
+        return
+    with _CORPUS_DBS_LOCK:
+        key = str(handle.path.parent.resolve())
+        if _CORPUS_DBS.get(key) is handle:
+            _CORPUS_DBS.pop(key, None)
+    handle.close()
+
+
+def _replay_corpus_validate(learn_dir, block):
+    """§4.3: validate a snapshot's corpus block against the LIVE
+    corpus, per chapter, by hash. Returns the pinned context
+    {"db": <read-only handle>, "fingerprint": fp} on a match. On
+    any mismatch — no corpus, work absent, a single chapter's
+    text drifted — the corpus path is REFUSED for this replay and
+    the fallback is printed; the replay itself proceeds
+    file-sourced, exactly as a pre-design snapshot replays."""
+    fp = block.get("fingerprint")
+    db = None
+    try:
+        db = CorpusDB.open(learn_dir, mode="report", readonly=True)
+        if db is None:
+            print("  --replay: the snapshot carries a corpus block "
+                  "but no corpus is present — corpus path refused "
+                  "for this replay; running file-sourced")
+            return None
+        chapters = corpus_chapters_for(db, fp) or []
+        hashes = [_corpus_text_hash(c["text"]) for c in chapters]
+        if not chapters \
+                or hashes != list(block.get("chapter_hashes") or []) \
+                or _corpus_root_hash(hashes) \
+                != block.get("text_root_hash"):
+            print("  --replay: the live corpus does not match the "
+                  "snapshot's corpus block (chapter hashes differ) "
+                  "— corpus path refused for this replay; running "
+                  "file-sourced")
+            _release_replay_corpus(db)
+            return None
+        return {"db": db, "fingerprint": fp}
+    except Exception:
+        _release_replay_corpus(db)
+        return None
+
+
 def run_replay(snapshot_id, book_path, learn_dir, process_fn=None):
     """Replay one snapshot against the presented book file.
 
@@ -17284,6 +17428,14 @@ def run_replay(snapshot_id, book_path, learn_dir, process_fn=None):
               "only its own book")
         report["refusal"] = "fingerprint mismatch"
         return 1, report
+    # §4.3: when the snapshot carries a corpus block, validate it
+    # against the live corpus by hash; a match pins read-only
+    # corpus access for the replay, a mismatch refuses the corpus
+    # path (printed) and the replay runs file-sourced.
+    replay_corpus = None
+    if manifest.get("corpus"):
+        replay_corpus = _replay_corpus_validate(
+            learn_dir, manifest["corpus"])
     import shutil as _sh
     import tempfile as _tf
     sandbox = Path(_tf.mkdtemp(prefix="ebook-replay-"))
@@ -17322,7 +17474,8 @@ def run_replay(snapshot_id, book_path, learn_dir, process_fn=None):
         _STAGING_STATE = None
         _REPLAY_CTX = {"snapshot_id": snapshot_id,
                        "payload_dir": str(snap_dir),
-                       "manifest": manifest}
+                       "manifest": manifest,
+                       "corpus": replay_corpus}
         try:
             ok = process_fn(Path(book_path), dry_run=False,
                             preview=True)
@@ -17346,6 +17499,8 @@ def run_replay(snapshot_id, book_path, learn_dir, process_fn=None):
                 sb_db.close()
         return (0 if ok else 1), report
     finally:
+        if replay_corpus is not None:
+            _release_replay_corpus(replay_corpus["db"])
         _sh.rmtree(sandbox, ignore_errors=True)
         report["sandbox_deleted"] = not sandbox.exists()
 
@@ -17361,7 +17516,27 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     _DEBUG_TAG = fpath.stem if (preview or dry_run) and CONFIG.get("debug") else None
     suffix = fpath.suffix.lower()
 
-    if suffix == ".epub":
+    # Corpus-sourced acquisition (corpus-design §11 slice 5,
+    # --use-corpus, default OFF): the corpus already holds this
+    # file's text and the ingest run's own acquisition record, so
+    # the run reads its chapters from the store instead of
+    # re-parsing the file — same chapters, same word count, same
+    # fallback flag (§13 signal 2a). Never under replay: a replay
+    # re-parses the presented file against its snapshot, by design.
+    _acq = None
+    if CONFIG.get("use_corpus") and _REPLAY_CTX is None:
+        _acq = corpus_acquire_for_run(_learn().dir, fpath)
+    if _acq is not None:
+        chapters = _acq["chapters"]
+        title, author = _acq["title"], _acq["author"]
+        identifiers = _acq["identifiers"]
+        word_count = _acq["word_count"]
+        _chap_fallback = bool(_acq["chapter_detection_fallback"])
+        _DIAG.chapter_detection_fallback = _chap_fallback
+        print(f"  Corpus-sourced: acquisition read from the corpus "
+              f"(fingerprint {_acq['fingerprint'][:12]}…), "
+              f"no file parse")
+    elif suffix == ".epub":
         _DIAG.chapter_detection_fallback = False  # reset per book
         units, title, author, identifiers = extract_epub_units(fpath)
         chapters = split_chapters(units)
@@ -18192,6 +18367,13 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         except Exception as _uq_e:
             print(f"  Uncertainty queue emission failed ({_uq_e})")
     if _CAPTURE_CTX is not None and not aborted:
+        # §4.3: the snapshot's corpus block attests THIS run's own
+        # parse — its chapter hashes, computed here from the run's
+        # chapters, never read back from corpus rows.
+        _cap_hashes = [_corpus_text_hash(c["text"]) for c in chapters]
+        _PENDING_CAPTURE_HASHES[_ckpt_fp] = {
+            "chapter_hashes": _cap_hashes,
+            "text_root_hash": _corpus_root_hash(_cap_hashes)}
         _cap_id = capture_snapshot(
             _CAPTURE_CTX["snapshot_id"], book_key=_ckpt_key,
             fingerprint=_ckpt_fp, title=result.get("title"),
@@ -19223,6 +19405,14 @@ def _build_parser():
                          "evidence with a retrieval stamp (default "
                          "off; see eval/g-evidence-design.md)")
 
+    g_merge.add_argument("--use-corpus", action="store_true",
+                    help="corpus store: source a run's acquisition "
+                         "(chapters, word count, chapter-detection "
+                         "diagnostics) from the corpus when this "
+                         "file's text is already ingested, instead "
+                         "of re-parsing the file (default off; see "
+                         "eval/corpus-design.md §4.3/§11 slice 5)")
+
     g_merge.add_argument("--emit-uncertainty", action="store_true",
                     help="measurement spine: emit this run's "
                          "uncertain items (tier-vs-judge "
@@ -19686,6 +19876,9 @@ def main():
 
     if args.evidence_retrieval:
         CONFIG["evidence_retrieval"] = True
+
+    if getattr(args, "use_corpus", False):
+        CONFIG["use_corpus"] = True
 
     if getattr(args, "emit_uncertainty", False):
         CONFIG["emit_uncertainty"] = True
