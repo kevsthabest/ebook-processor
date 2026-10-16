@@ -1,0 +1,2490 @@
+{
+ "_about": {
+  "what": "English given-name diminutives (canonical name -> diminutives). Used ONLY to propose character-merge candidates for the validation ladder; a diminutive link never merges on its own.",
+  "source": "Subset of the carltonnorthern/nicknames dataset (nickname-and-diminutive-names-lookup), names.csv has_nickname triplets.",
+  "source_url": "https://github.com/carltonnorthern/nickname-and-diminutive-names-lookup",
+  "license": "Apache-2.0",
+  "subset_rule": "Canonical names with >= 3 recorded nicknames in the source, plus every full name targeted by the pipeline's built-in nickname map.",
+  "retrieved": "2026-10-16",
+  "upstream_rows": 2827
+ },
+ "pairs": {
+  "aaron": [
+   "erin",
+   "ron",
+   "ronnie"
+  ],
+  "abbigail": [
+   "abbe",
+   "abbey",
+   "abbi",
+   "abbie",
+   "abby",
+   "gail",
+   "nabby"
+  ],
+  "abbigale": [
+   "abbe",
+   "abbey",
+   "abbi",
+   "abbie",
+   "abby",
+   "gail",
+   "nabby"
+  ],
+  "abel": [
+   "ab",
+   "abe",
+   "eb",
+   "ebbie"
+  ],
+  "abigail": [
+   "abbe",
+   "abbey",
+   "abbi",
+   "abbie",
+   "abby",
+   "gail",
+   "nabby"
+  ],
+  "abigale": [
+   "abbe",
+   "abbey",
+   "abbi",
+   "abbie",
+   "abby",
+   "gail",
+   "nabby"
+  ],
+  "absalom": [
+   "ab",
+   "abbie",
+   "app"
+  ],
+  "adaline": [
+   "ada",
+   "addy",
+   "adie",
+   "delia",
+   "dell",
+   "lena"
+  ],
+  "adelaide": [
+   "addy",
+   "adele",
+   "adie",
+   "dell",
+   "della",
+   "heidi"
+  ],
+  "adelbert": [
+   "albert",
+   "bert",
+   "del",
+   "delbert"
+  ],
+  "adeline": [
+   "ada",
+   "addy",
+   "delia",
+   "dell",
+   "lena"
+  ],
+  "adelphia": [
+   "addy",
+   "adele",
+   "dell",
+   "delphia",
+   "philly"
+  ],
+  "adena": [
+   "adina",
+   "deena",
+   "dena",
+   "dina"
+  ],
+  "adolphus": [
+   "ado",
+   "adolph",
+   "dolph"
+  ],
+  "adrienne": [
+   "addie",
+   "enne",
+   "rienne"
+  ],
+  "agnes": [
+   "aggy",
+   "inez",
+   "nessa"
+  ],
+  "alberta": [
+   "allie",
+   "bert",
+   "bertie"
+  ],
+  "aldrich": [
+   "rich",
+   "riche",
+   "richie"
+  ],
+  "alexander": [
+   "al",
+   "alec",
+   "alex",
+   "sandy"
+  ],
+  "alexandra": [
+   "alex",
+   "alla",
+   "sandra",
+   "sandy"
+  ],
+  "alexandria": [
+   "alex",
+   "alexander",
+   "alla",
+   "drina",
+   "sandra"
+  ],
+  "alfred": [
+   "al",
+   "fred",
+   "freddy"
+  ],
+  "alfreda": [
+   "alfy",
+   "freda",
+   "freddy",
+   "frieda"
+  ],
+  "alice": [
+   "allie",
+   "elsie",
+   "lisa"
+  ],
+  "alicia": [
+   "allie",
+   "elsie",
+   "lisa"
+  ],
+  "allan": [
+   "al",
+   "alan",
+   "allen"
+  ],
+  "allen": [
+   "al",
+   "alan",
+   "allan"
+  ],
+  "allisandra": [
+   "ali",
+   "allie",
+   "ally"
+  ],
+  "allison": [
+   "ali",
+   "allie",
+   "ally"
+  ],
+  "allyson": [
+   "ali",
+   "allie",
+   "ally"
+  ],
+  "allyssa": [
+   "ali",
+   "allie",
+   "ally"
+  ],
+  "almena": [
+   "ali",
+   "allie",
+   "ally",
+   "mena"
+  ],
+  "alonzo": [
+   "al",
+   "lon",
+   "lonzo"
+  ],
+  "alyssa": [
+   "al",
+   "ally",
+   "lissia"
+  ],
+  "amelia": [
+   "amy",
+   "emily",
+   "mel",
+   "millie"
+  ],
+  "andrea": [
+   "andi",
+   "andrew",
+   "andy",
+   "drea",
+   "rea"
+  ],
+  "andrew": [
+   "andy",
+   "drew",
+   "randy"
+  ],
+  "andriane": [
+   "ada",
+   "adri",
+   "rienne"
+  ],
+  "angelica": [
+   "angel",
+   "angelika",
+   "angelique",
+   "angie"
+  ],
+  "angelina": [
+   "angel",
+   "angie",
+   "lina"
+  ],
+  "anna": [
+   "ann",
+   "anne",
+   "annie",
+   "nan"
+  ],
+  "anne": [
+   "ann",
+   "annie",
+   "nan"
+  ],
+  "anselm": [
+   "ance",
+   "anse",
+   "ansel",
+   "selma"
+  ],
+  "anthony": [
+   "ant",
+   "tony"
+  ],
+  "antoinette": [
+   "ann",
+   "netta",
+   "tony"
+  ],
+  "antonia": [
+   "ann",
+   "netta",
+   "tony"
+  ],
+  "arabella": [
+   "ara",
+   "arry",
+   "bella",
+   "belle"
+  ],
+  "arabelle": [
+   "ara",
+   "arry",
+   "bella",
+   "belle"
+  ],
+  "araminta": [
+   "armida",
+   "middie",
+   "minty",
+   "ruminta"
+  ],
+  "aron": [
+   "erin",
+   "ron",
+   "ronnie"
+  ],
+  "asenath": [
+   "assene",
+   "natty",
+   "sene"
+  ],
+  "ashley": [
+   "ash",
+   "ashly",
+   "leah",
+   "lee"
+  ],
+  "augusta": [
+   "aggy",
+   "gatsy",
+   "gussie",
+   "tina"
+  ],
+  "augustina": [
+   "aggy",
+   "gatsy",
+   "gussie",
+   "tina"
+  ],
+  "augustine": [
+   "august",
+   "austin",
+   "gus"
+  ],
+  "augustus": [
+   "august",
+   "austin",
+   "gus"
+  ],
+  "aurelia": [
+   "aurilla",
+   "ora",
+   "orilla",
+   "ree",
+   "rilly"
+  ],
+  "babs": [
+   "bab",
+   "barbara",
+   "barby"
+  ],
+  "barbara": [
+   "bab",
+   "babs",
+   "barbie",
+   "barby",
+   "bobbie"
+  ],
+  "bartholomew": [
+   "bart",
+   "bartel",
+   "bat",
+   "mees",
+   "meus"
+  ],
+  "beatrice": [
+   "bea",
+   "trisha",
+   "trix",
+   "trixie"
+  ],
+  "bella": [
+   "arabella",
+   "belle",
+   "isabella"
+  ],
+  "ben": [
+   "benji",
+   "bennie",
+   "benny"
+  ],
+  "benjamin": [
+   "ben",
+   "benjy",
+   "bennie",
+   "benny",
+   "jamie"
+  ],
+  "bennett": [
+   "ben",
+   "bennie",
+   "benny"
+  ],
+  "bernard": [
+   "barney",
+   "berney",
+   "bernie",
+   "berny"
+  ],
+  "bert": [
+   "bertie",
+   "bob",
+   "bobby"
+  ],
+  "bertha": [
+   "bert",
+   "bertie",
+   "birdie"
+  ],
+  "beth": [
+   "betsy",
+   "betty",
+   "elizabeth"
+  ],
+  "bill": [
+   "billy",
+   "fred",
+   "robert",
+   "william",
+   "willie"
+  ],
+  "billy": [
+   "fred",
+   "robert",
+   "william"
+  ],
+  "bridget": [
+   "biddie",
+   "biddy",
+   "bridgie",
+   "bridie"
+  ],
+  "broderick": [
+   "brady",
+   "brody",
+   "rick",
+   "ricky",
+   "rod"
+  ],
+  "bryanna": [
+   "ana",
+   "anna",
+   "bri",
+   "briana",
+   "brianna"
+  ],
+  "calvin": [
+   "cal",
+   "vin",
+   "vinny"
+  ],
+  "cameron": [
+   "cam",
+   "ron",
+   "ronny"
+  ],
+  "carmon": [
+   "cammie",
+   "carm",
+   "charm"
+  ],
+  "carol": [
+   "carolann",
+   "carole",
+   "caroline",
+   "carri",
+   "carrie",
+   "cassie",
+   "kara",
+   "kari",
+   "lynn"
+  ],
+  "caroline": [
+   "carol",
+   "carole",
+   "carrie",
+   "cassie",
+   "lynn"
+  ],
+  "carolyn": [
+   "carrie",
+   "cassie",
+   "lynn"
+  ],
+  "cassandra": [
+   "cassie",
+   "sandra",
+   "sandy"
+  ],
+  "catherine": [
+   "casey",
+   "cassie",
+   "cathy",
+   "kathy",
+   "katy",
+   "kay",
+   "kit",
+   "kittie",
+   "lena",
+   "trina"
+  ],
+  "cathleen": [
+   "casey",
+   "cassie",
+   "cathy",
+   "kathy",
+   "katy",
+   "kay",
+   "kit",
+   "kittie",
+   "lena",
+   "trina"
+  ],
+  "cathy": [
+   "catherine",
+   "cathleen",
+   "kathy"
+  ],
+  "cedric": [
+   "ced",
+   "rick",
+   "ricky"
+  ],
+  "celinda": [
+   "linda",
+   "lindy",
+   "lynn"
+  ],
+  "charles": [
+   "carl",
+   "charlie",
+   "chick",
+   "chuck"
+  ],
+  "charlotte": [
+   "char",
+   "lotta",
+   "lottie",
+   "sherry"
+  ],
+  "chick": [
+   "caroline",
+   "charlotte",
+   "chuck"
+  ],
+  "christiana": [
+   "ann",
+   "chris",
+   "christy",
+   "crissy",
+   "kris",
+   "kristy",
+   "tina"
+  ],
+  "christina": [
+   "chris",
+   "chrissy",
+   "christy",
+   "crissy",
+   "kris",
+   "kristy",
+   "tina"
+  ],
+  "christine": [
+   "chris",
+   "chrissy",
+   "christy",
+   "crissy",
+   "kris",
+   "kristy",
+   "tina"
+  ],
+  "christopher": [
+   "chris",
+   "kit"
+  ],
+  "cinderella": [
+   "arilla",
+   "cindy",
+   "rella",
+   "rilla"
+  ],
+  "claire": [
+   "clair",
+   "clara",
+   "clare"
+  ],
+  "corey": [
+   "coco",
+   "cordy",
+   "ree"
+  ],
+  "cornelia": [
+   "cornie",
+   "corny",
+   "nelia",
+   "nelle",
+   "nelly"
+  ],
+  "cornelius": [
+   "con",
+   "conny",
+   "corny",
+   "neil",
+   "niel"
+  ],
+  "cory": [
+   "coco",
+   "cordy",
+   "ree"
+  ],
+  "crystal": [
+   "chris",
+   "crys",
+   "stal",
+   "tal"
+  ],
+  "cyrenius": [
+   "cene",
+   "cy",
+   "renius",
+   "serene",
+   "swene"
+  ],
+  "daniel": [
+   "dan",
+   "dann",
+   "danny"
+  ],
+  "david": [
+   "dave",
+   "davey",
+   "day"
+  ],
+  "debbie": [
+   "deb",
+   "debby",
+   "deborah",
+   "debra"
+  ],
+  "debora": [
+   "deb",
+   "debbie",
+   "debby"
+  ],
+  "deborah": [
+   "deb",
+   "debbie",
+   "debby"
+  ],
+  "delia": [
+   "cordelia",
+   "delius",
+   "fidelia"
+  ],
+  "delilah": [
+   "dell",
+   "della",
+   "lil",
+   "lila"
+  ],
+  "deliverance": [
+   "della",
+   "delly",
+   "dilly"
+  ],
+  "della": [
+   "adela",
+   "adelaide",
+   "delilah",
+   "dell"
+  ],
+  "delores": [
+   "dee",
+   "dell",
+   "della",
+   "lola",
+   "lolly"
+  ],
+  "delphine": [
+   "del",
+   "delf",
+   "delphi"
+  ],
+  "demaris": [
+   "dea",
+   "maris",
+   "mary"
+  ],
+  "demerias": [
+   "dea",
+   "maris",
+   "mary"
+  ],
+  "derek": [
+   "derrek",
+   "rick",
+   "ricky"
+  ],
+  "derrick": [
+   "eric",
+   "rick",
+   "ricky"
+  ],
+  "diana": [
+   "di",
+   "dicey",
+   "didi"
+  ],
+  "diane": [
+   "di",
+   "dian",
+   "dianne",
+   "dicey",
+   "didi"
+  ],
+  "dominick": [
+   "dom",
+   "nick",
+   "nicky"
+  ],
+  "donald": [
+   "don",
+   "donnie",
+   "donny",
+   "dony"
+  ],
+  "donovan": [
+   "don",
+   "donnie",
+   "donny",
+   "dony"
+  ],
+  "dorothy": [
+   "dolly",
+   "dora",
+   "dortha",
+   "dot",
+   "dottie",
+   "dotty"
+  ],
+  "ebenezer": [
+   "eb",
+   "ebbie",
+   "eben"
+  ],
+  "edgar": [
+   "ed",
+   "eddie",
+   "eddy"
+  ],
+  "edmond": [
+   "ed",
+   "eddie",
+   "eddy"
+  ],
+  "edmund": [
+   "ed",
+   "eddie",
+   "eddy",
+   "ned",
+   "ted"
+  ],
+  "eduardo": [
+   "ed",
+   "eddie",
+   "eddy"
+  ],
+  "edward": [
+   "ed",
+   "eddie",
+   "eddy",
+   "ned",
+   "ted",
+   "teddy"
+  ],
+  "edwin": [
+   "ed",
+   "eddie",
+   "eddy",
+   "ned",
+   "win"
+  ],
+  "eleanor": [
+   "elaine",
+   "ellen",
+   "ellie",
+   "lanna",
+   "lenora",
+   "nelly",
+   "nora"
+  ],
+  "eliana": [
+   "ella",
+   "elle",
+   "ellie"
+  ],
+  "elias": [
+   "eli",
+   "lee",
+   "lias"
+  ],
+  "elizabeth": [
+   "bess",
+   "bessie",
+   "beth",
+   "betsy",
+   "betty",
+   "eliza",
+   "lib",
+   "libby",
+   "lisa",
+   "liz",
+   "liza",
+   "lizzie",
+   "lizzy"
+  ],
+  "ellen": [
+   "helen",
+   "nell",
+   "nellie"
+  ],
+  "ellender": [
+   "ellen",
+   "helen",
+   "nellie"
+  ],
+  "elmira": [
+   "ellie",
+   "elly",
+   "mira"
+  ],
+  "emeline": [
+   "em",
+   "emily",
+   "emma",
+   "emmy",
+   "milly"
+  ],
+  "emilia": [
+   "em",
+   "emmy",
+   "millie"
+  ],
+  "emily": [
+   "em",
+   "emma",
+   "emmy",
+   "mel",
+   "millie"
+  ],
+  "epaphroditius": [
+   "dite",
+   "ditus",
+   "dyce",
+   "dyche",
+   "eppa"
+  ],
+  "erick": [
+   "eric",
+   "rick",
+   "ricky"
+  ],
+  "erik": [
+   "eric",
+   "rick",
+   "ricky"
+  ],
+  "ernestine": [
+   "erna",
+   "ernest",
+   "teeny",
+   "tina"
+  ],
+  "evaline": [
+   "eva",
+   "eve",
+   "lena"
+  ],
+  "evangeline": [
+   "ev",
+   "evan",
+   "vangie"
+  ],
+  "evelyn": [
+   "ev",
+   "eve",
+   "evelina"
+  ],
+  "fallon": [
+   "fal",
+   "falcon",
+   "fall",
+   "fallie",
+   "fally",
+   "falon",
+   "lon",
+   "lonnie"
+  ],
+  "felicia": [
+   "fel",
+   "feli",
+   "felix"
+  ],
+  "ferdinand": [
+   "ferdie",
+   "fred",
+   "freddie",
+   "freddy"
+  ],
+  "ferdinando": [
+   "ferdie",
+   "fred",
+   "nando"
+  ],
+  "florence": [
+   "flo",
+   "flora",
+   "flossy"
+  ],
+  "frances": [
+   "cissy",
+   "fanny",
+   "fran",
+   "francie",
+   "frankie",
+   "frannie",
+   "franniey",
+   "franny",
+   "sis"
+  ],
+  "francine": [
+   "fran",
+   "francie",
+   "frannie",
+   "franniey",
+   "franny"
+  ],
+  "francis": [
+   "fran",
+   "frank",
+   "frankie"
+  ],
+  "frederica": [
+   "erica",
+   "erika",
+   "freddy",
+   "frederick",
+   "rickey"
+  ],
+  "frederick": [
+   "derick",
+   "erick",
+   "fred",
+   "freddie",
+   "freddy",
+   "fritz",
+   "rick",
+   "ricky"
+  ],
+  "fredericka": [
+   "ericka",
+   "freda",
+   "freddy",
+   "frieda",
+   "ricka",
+   "rickey"
+  ],
+  "frieda": [
+   "fred",
+   "freddie",
+   "freddy"
+  ],
+  "garrett": [
+   "barrett",
+   "gare",
+   "garratt",
+   "garret",
+   "garry",
+   "gary",
+   "jerry",
+   "rhett"
+  ],
+  "genevieve": [
+   "eve",
+   "jean",
+   "jenny"
+  ],
+  "geraldine": [
+   "dina",
+   "gerri",
+   "gerrie",
+   "gerry",
+   "jerry"
+  ],
+  "gertrude": [
+   "gert",
+   "gertie",
+   "trudy"
+  ],
+  "gilbert": [
+   "bert",
+   "gil",
+   "wilber"
+  ],
+  "gregory": [
+   "gory",
+   "greg"
+  ],
+  "hannah": [
+   "anna",
+   "nan",
+   "nanny"
+  ],
+  "harold": [
+   "hal",
+   "hap",
+   "haps",
+   "harry"
+  ],
+  "harrison": [
+   "hap",
+   "haps",
+   "harry"
+  ],
+  "harry": [
+   "hap",
+   "haps",
+   "harold",
+   "henry"
+  ],
+  "helen": [
+   "ella",
+   "ellen",
+   "ellie",
+   "lena"
+  ],
+  "helena": [
+   "aileen",
+   "eileen",
+   "elaine",
+   "eleanor",
+   "ellen",
+   "lena",
+   "nell",
+   "nellie"
+  ],
+  "helene": [
+   "ella",
+   "ellen",
+   "ellie",
+   "lena"
+  ],
+  "heloise": [
+   "eloise",
+   "elouise",
+   "lois"
+  ],
+  "henrietta": [
+   "etta",
+   "etty",
+   "hank",
+   "henny",
+   "nettie",
+   "retta"
+  ],
+  "henry": [
+   "hal",
+   "hank",
+   "hap",
+   "haps",
+   "harry"
+  ],
+  "hester": [
+   "esther",
+   "hessy",
+   "hetty"
+  ],
+  "hezekiah": [
+   "hez",
+   "hy",
+   "kiah"
+  ],
+  "honora": [
+   "honey",
+   "nora",
+   "norah",
+   "norry"
+  ],
+  "hubert": [
+   "bert",
+   "hub",
+   "hugh"
+  ],
+  "ignatius": [
+   "iggy",
+   "nace",
+   "nate",
+   "natius"
+  ],
+  "ignatzio": [
+   "iggy",
+   "nace",
+   "naz"
+  ],
+  "isabel": [
+   "bell",
+   "bella",
+   "belle",
+   "ib",
+   "issy",
+   "nib",
+   "nibby",
+   "tibbie"
+  ],
+  "isabella": [
+   "bella",
+   "belle",
+   "ib",
+   "issy",
+   "nib",
+   "nibby",
+   "tibbie"
+  ],
+  "isabelle": [
+   "bella",
+   "belle",
+   "ib",
+   "issy",
+   "nib",
+   "nibby",
+   "tibbie"
+  ],
+  "jacob": [
+   "jaap",
+   "jake",
+   "jay"
+  ],
+  "jacqueline": [
+   "jack",
+   "jackie",
+   "jacqui"
+  ],
+  "jahoda": [
+   "hoda",
+   "hodie",
+   "hody"
+  ],
+  "jalen": [
+   "al",
+   "alen",
+   "haylen",
+   "jaelin",
+   "jaelyn",
+   "jailyn",
+   "jay",
+   "jaye",
+   "jaylin",
+   "jaylyn",
+   "len",
+   "lennie",
+   "lenny"
+  ],
+  "james": [
+   "jamie",
+   "jem",
+   "jim",
+   "jimmie",
+   "jimmy"
+  ],
+  "jane": [
+   "janie",
+   "jean",
+   "jennie",
+   "jessie"
+  ],
+  "jasmine": [
+   "jas",
+   "jazz",
+   "jazzy"
+  ],
+  "jeanette": [
+   "janet",
+   "jean",
+   "jessie",
+   "nettie"
+  ],
+  "jedediah": [
+   "diah",
+   "dyer",
+   "jed"
+  ],
+  "jedidiah": [
+   "diah",
+   "dyer",
+   "jed"
+  ],
+  "jeffrey": [
+   "geoff",
+   "jeff"
+  ],
+  "jennet": [
+   "jenn",
+   "jenny",
+   "jessie"
+  ],
+  "jennifer": [
+   "jen",
+   "jenn",
+   "jenni",
+   "jennie",
+   "jenny"
+  ],
+  "jerry": [
+   "geraldine",
+   "geri",
+   "gerry",
+   "jereme"
+  ],
+  "jessica": [
+   "jess",
+   "jessie"
+  ],
+  "jessie": [
+   "jane",
+   "janet",
+   "jess"
+  ],
+  "joanna": [
+   "hannah",
+   "jo",
+   "joan",
+   "jodi",
+   "jody"
+  ],
+  "johannah": [
+   "hannah",
+   "jo",
+   "joan",
+   "jody",
+   "nonie"
+  ],
+  "johannes": [
+   "john",
+   "johnny",
+   "jonathan"
+  ],
+  "john": [
+   "ian",
+   "jack",
+   "jock",
+   "johnny",
+   "jon",
+   "jonnie",
+   "jonny"
+  ],
+  "johnathan": [
+   "john",
+   "johnathon",
+   "johny",
+   "jon",
+   "jonathan",
+   "jonathon",
+   "jonnie",
+   "jonny",
+   "nathan"
+  ],
+  "johnathon": [
+   "john",
+   "johnathan",
+   "johny",
+   "jon",
+   "jonathan",
+   "jonathon",
+   "jonnie",
+   "jonny"
+  ],
+  "jon": [
+   "john",
+   "johnny",
+   "jonnie",
+   "jonny"
+  ],
+  "jonathan": [
+   "john",
+   "johnathan",
+   "johnathon",
+   "johny",
+   "jon",
+   "jonathon",
+   "jonnie",
+   "jonny",
+   "nathan"
+  ],
+  "jonathon": [
+   "john",
+   "johnathan",
+   "johnathon",
+   "johny",
+   "jon",
+   "jonathan",
+   "jonnie",
+   "jonny"
+  ],
+  "joseph": [
+   "jody",
+   "joe",
+   "joey",
+   "jos"
+  ],
+  "josephine": [
+   "fina",
+   "jo",
+   "jody",
+   "joey",
+   "josey",
+   "josie"
+  ],
+  "joshua": [
+   "joe",
+   "jos",
+   "josh"
+  ],
+  "josophine": [
+   "jo",
+   "joey",
+   "josey"
+  ],
+  "judith": [
+   "juda",
+   "jude",
+   "judi",
+   "judie",
+   "judy"
+  ],
+  "julia": [
+   "jill",
+   "jules",
+   "julie"
+  ],
+  "julie": [
+   "jule",
+   "jules",
+   "julia"
+  ],
+  "junior": [
+   "jr",
+   "june",
+   "junie"
+  ],
+  "justin": [
+   "justina",
+   "juston",
+   "justus"
+  ],
+  "katelin": [
+   "kate",
+   "kay",
+   "kaye"
+  ],
+  "katelyn": [
+   "kate",
+   "kay",
+   "kaye"
+  ],
+  "katherine": [
+   "cassie",
+   "cathy",
+   "kate",
+   "kathy",
+   "katie",
+   "katy",
+   "kay",
+   "kaye",
+   "kit",
+   "kittie",
+   "lena",
+   "trina"
+  ],
+  "kathleen": [
+   "cassie",
+   "cathy",
+   "kathy",
+   "katy",
+   "kay",
+   "kit",
+   "kittie",
+   "lena",
+   "trina"
+  ],
+  "kathryn": [
+   "kate",
+   "kathy",
+   "katie"
+  ],
+  "katy": [
+   "kate",
+   "kathy",
+   "katie"
+  ],
+  "kelley": [
+   "kelli",
+   "kellie",
+   "kelly"
+  ],
+  "kendra": [
+   "kay",
+   "kenj",
+   "kenji",
+   "kenny"
+  ],
+  "kenneth": [
+   "ken",
+   "kendrick",
+   "kenny"
+  ],
+  "kent": [
+   "ken",
+   "kendrick",
+   "kenny"
+  ],
+  "kimberley": [
+   "kim",
+   "kimberli",
+   "kimberly"
+  ],
+  "kimberly": [
+   "kim",
+   "kimberley",
+   "kimberli"
+  ],
+  "kristina": [
+   "christina",
+   "kris",
+   "krissy",
+   "tina"
+  ],
+  "kristine": [
+   "chris",
+   "christy",
+   "crissy",
+   "kris",
+   "kristy",
+   "tina"
+  ],
+  "laurence": [
+   "larry",
+   "lon",
+   "lonny",
+   "lorne",
+   "lorry"
+  ],
+  "lavina": [
+   "ina",
+   "vina",
+   "viney"
+  ],
+  "lavinia": [
+   "ina",
+   "vina",
+   "viney"
+  ],
+  "lavonia": [
+   "vina",
+   "viney",
+   "vonnie",
+   "wyncha"
+  ],
+  "lawrence": [
+   "larry",
+   "lawrie",
+   "lon",
+   "lonny",
+   "lorne",
+   "lorry"
+  ],
+  "leonard": [
+   "len",
+   "lenny",
+   "leo",
+   "leon",
+   "lineau"
+  ],
+  "leonora": [
+   "nell",
+   "nellie",
+   "nora"
+  ],
+  "leonore": [
+   "elenor",
+   "honor",
+   "nora"
+  ],
+  "letitia": [
+   "lettice",
+   "lettie",
+   "tish",
+   "titia"
+  ],
+  "liliana": [
+   "lil",
+   "lilly",
+   "lily"
+  ],
+  "lillah": [
+   "lil",
+   "lilly",
+   "lily",
+   "lolly"
+  ],
+  "lillian": [
+   "lil",
+   "lilly",
+   "lolly"
+  ],
+  "lindsay": [
+   "lindsey",
+   "lindsie",
+   "lindsy"
+  ],
+  "lorelei": [
+   "laurie",
+   "lori",
+   "lorrie"
+  ],
+  "loretta": [
+   "etta",
+   "lorie",
+   "lorrie",
+   "retta"
+  ],
+  "louis": [
+   "lewis",
+   "lou",
+   "louie",
+   "louise"
+  ],
+  "louisa": [
+   "eliza",
+   "lois",
+   "lou"
+  ],
+  "louise": [
+   "eliza",
+   "lois",
+   "lou"
+  ],
+  "louvinia": [
+   "vina",
+   "viney",
+   "vonnie",
+   "wyncha"
+  ],
+  "lucille": [
+   "cille",
+   "lou",
+   "lu",
+   "lucy"
+  ],
+  "lucinda": [
+   "cindy",
+   "lou",
+   "lu",
+   "lucy"
+  ],
+  "luella": [
+   "ella",
+   "lu",
+   "lula"
+  ],
+  "mackenzie": [
+   "kenzy",
+   "mac",
+   "mack"
+  ],
+  "maddy": [
+   "madeline",
+   "madelyn",
+   "madge"
+  ],
+  "madeline": [
+   "lena",
+   "maddi",
+   "maddie",
+   "maddy",
+   "madge",
+   "madie",
+   "magda",
+   "maggie",
+   "maud"
+  ],
+  "magdelina": [
+   "lena",
+   "madge",
+   "magda",
+   "maggie"
+  ],
+  "malcolm": [
+   "mac",
+   "mal",
+   "malc"
+  ],
+  "manerva": [
+   "eve",
+   "minerva",
+   "nerva",
+   "nervie"
+  ],
+  "margaret": [
+   "daisy",
+   "gretta",
+   "madge",
+   "maggie",
+   "maggy",
+   "marge",
+   "margery",
+   "margie",
+   "margy",
+   "meg",
+   "midge",
+   "peg",
+   "peggy",
+   "polly",
+   "rita"
+  ],
+  "margaretta": [
+   "daisy",
+   "gretta",
+   "madge",
+   "maggie",
+   "marge",
+   "margery",
+   "margie",
+   "meg",
+   "midge",
+   "peg",
+   "peggy",
+   "rita"
+  ],
+  "margarita": [
+   "daisy",
+   "greta",
+   "madge",
+   "maggie",
+   "maisie",
+   "marge",
+   "margo",
+   "meg",
+   "megan",
+   "metta",
+   "midge",
+   "peggie",
+   "rita"
+  ],
+  "marge": [
+   "margaret",
+   "margaretta",
+   "margery"
+  ],
+  "marietta": [
+   "mae",
+   "mamie",
+   "maria",
+   "mariah",
+   "marie",
+   "marion",
+   "mary",
+   "maureen",
+   "may",
+   "mercy",
+   "minnie",
+   "mitzi",
+   "mollie",
+   "molly",
+   "polly"
+  ],
+  "marsha": [
+   "marcia",
+   "marcie",
+   "mary"
+  ],
+  "martha": [
+   "marty",
+   "mat",
+   "mattie",
+   "patsy",
+   "patty"
+  ],
+  "mary": [
+   "mae",
+   "mamie",
+   "marie",
+   "mitzi",
+   "molly",
+   "polly"
+  ],
+  "mathew": [
+   "mat",
+   "matt",
+   "maty"
+  ],
+  "matilda": [
+   "matty",
+   "maud",
+   "tilla",
+   "tilly"
+  ],
+  "matthew": [
+   "matt",
+   "mattie",
+   "matty",
+   "thias",
+   "thys"
+  ],
+  "matthews": [
+   "matt",
+   "mattie",
+   "matty"
+  ],
+  "matthias": [
+   "matt",
+   "thias",
+   "thys"
+  ],
+  "mckenna": [
+   "ken",
+   "kenna",
+   "meaka"
+  ],
+  "mehitabel": [
+   "hetty",
+   "hitty",
+   "mabel",
+   "mitty"
+  ],
+  "melinda": [
+   "linda",
+   "lindy",
+   "lynn",
+   "mel",
+   "mindy"
+  ],
+  "melissa": [
+   "lisa",
+   "lissa",
+   "mel",
+   "milly",
+   "missy"
+  ],
+  "mercedes": [
+   "merci",
+   "mercy",
+   "sadie"
+  ],
+  "michael": [
+   "micah",
+   "mick",
+   "mickey",
+   "micky",
+   "mike",
+   "mikey"
+  ],
+  "micheal": [
+   "mike",
+   "mikey",
+   "miky"
+  ],
+  "michele": [
+   "chelle",
+   "mickey",
+   "shelley",
+   "shellie",
+   "shelly"
+  ],
+  "michelle": [
+   "chelle",
+   "mickey",
+   "shelley",
+   "shellie",
+   "shelly",
+   "shely"
+  ],
+  "miguel": [
+   "michael",
+   "miggy",
+   "miguael",
+   "miguaell",
+   "miguail",
+   "miguaill",
+   "miguayl",
+   "miguayll",
+   "miguell",
+   "mike"
+  ],
+  "mike": [
+   "michael",
+   "mick",
+   "micky"
+  ],
+  "miranda": [
+   "mandy",
+   "mira",
+   "randi",
+   "randy"
+  ],
+  "miriam": [
+   "mimi",
+   "mitzi",
+   "mitzie"
+  ],
+  "mitzi": [
+   "mary",
+   "mittie",
+   "mitty"
+  ],
+  "moses": [
+   "amos",
+   "mose",
+   "moss"
+  ],
+  "myrtle": [
+   "mert",
+   "myrt",
+   "myrti"
+  ],
+  "nancy": [
+   "ann",
+   "nan",
+   "nanny"
+  ],
+  "napoleon": [
+   "leon",
+   "nap",
+   "nappy"
+  ],
+  "natalie": [
+   "natty",
+   "nettie"
+  ],
+  "nathaniel": [
+   "nat",
+   "nate",
+   "nathan",
+   "natty",
+   "than"
+  ],
+  "nicholas": [
+   "claas",
+   "claes",
+   "nic",
+   "nick",
+   "nickie",
+   "nicky",
+   "nico"
+  ],
+  "nichole": [
+   "cole",
+   "nicki",
+   "nicky",
+   "nikki"
+  ],
+  "nicholette": [
+   "cole",
+   "nichole",
+   "nickey",
+   "nicki",
+   "nicky",
+   "nicole",
+   "nikki"
+  ],
+  "nicodemus": [
+   "nic",
+   "nick",
+   "nickie",
+   "nicky",
+   "nico"
+  ],
+  "nicolas": [
+   "nic",
+   "nick",
+   "nickie",
+   "nicky",
+   "nico"
+  ],
+  "nicole": [
+   "cole",
+   "nicki",
+   "nicky",
+   "nikki",
+   "nole"
+  ],
+  "nikolas": [
+   "claes",
+   "nic",
+   "nick",
+   "nickie",
+   "nicky",
+   "nico"
+  ],
+  "obadiah": [
+   "diah",
+   "dyer",
+   "obed",
+   "obie"
+  ],
+  "obedience": [
+   "beda",
+   "beedy",
+   "biddie",
+   "obed"
+  ],
+  "olive": [
+   "livia",
+   "nollie",
+   "ollie"
+  ],
+  "olivia": [
+   "livia",
+   "nollie",
+   "ollie"
+  ],
+  "onicyphorous": [
+   "cy",
+   "cyphorus",
+   "one",
+   "osaforum",
+   "osaforus",
+   "syphorous"
+  ],
+  "oswald": [
+   "ossy",
+   "ozzy",
+   "waldo"
+  ],
+  "parmelia": [
+   "amelia",
+   "melia",
+   "milly"
+  ],
+  "parthenia": [
+   "parsuny",
+   "pasoonie",
+   "phenie",
+   "teeny"
+  ],
+  "patricia": [
+   "pat",
+   "patsy",
+   "patti",
+   "patty",
+   "tricia",
+   "trish",
+   "trisha"
+  ],
+  "patrick": [
+   "paddy",
+   "pat",
+   "pate",
+   "patsy",
+   "peter"
+  ],
+  "permelia": [
+   "mellie",
+   "melly",
+   "milly"
+  ],
+  "peter": [
+   "pate",
+   "pete"
+  ],
+  "philinda": [
+   "linda",
+   "lindy",
+   "lynn"
+  ],
+  "philip": [
+   "phil",
+   "pip"
+  ],
+  "philipina": [
+   "penie",
+   "phoebe",
+   "pip"
+  ],
+  "prescott": [
+   "pres",
+   "scott",
+   "scotty"
+  ],
+  "priscilla": [
+   "cilla",
+   "cissy",
+   "prissy"
+  ],
+  "rebecca": [
+   "becca",
+   "beck",
+   "becky",
+   "reba"
+  ],
+  "reginald": [
+   "naldo",
+   "reg",
+   "reggie",
+   "renny"
+  ],
+  "richard": [
+   "dick",
+   "dickie",
+   "dickon",
+   "dicky",
+   "rich",
+   "richie",
+   "rick",
+   "ricky"
+  ],
+  "robert": [
+   "bill",
+   "billy",
+   "bob",
+   "bobby",
+   "dob",
+   "dobbin",
+   "hob",
+   "hobkin",
+   "rob",
+   "robby",
+   "rupert"
+  ],
+  "roberta": [
+   "bert",
+   "bertie",
+   "birdie",
+   "birtie",
+   "bobbie",
+   "robbie",
+   "roby"
+  ],
+  "roderick": [
+   "erick",
+   "rickie",
+   "rod",
+   "roddy"
+  ],
+  "rodger": [
+   "bobby",
+   "hodge",
+   "rod",
+   "roge",
+   "roger"
+  ],
+  "roger": [
+   "bobby",
+   "hodge",
+   "rod",
+   "rodger",
+   "roge"
+  ],
+  "roland": [
+   "lanny",
+   "orlando",
+   "rollo",
+   "rolly"
+  ],
+  "ronald": [
+   "naldo",
+   "ron",
+   "ronnie",
+   "ronny"
+  ],
+  "rosabel": [
+   "belle",
+   "rosa",
+   "rose",
+   "roz"
+  ],
+  "rosabella": [
+   "bella",
+   "belle",
+   "rosa",
+   "rose",
+   "roz"
+  ],
+  "rosalinda": [
+   "linda",
+   "rosa",
+   "rose",
+   "roz"
+  ],
+  "rosalyn": [
+   "linda",
+   "rosa",
+   "rose",
+   "roz"
+  ],
+  "roseann": [
+   "ann",
+   "rose",
+   "rosie",
+   "roz"
+  ],
+  "roseanna": [
+   "ann",
+   "rose",
+   "rosie",
+   "roz"
+  ],
+  "rosemary": [
+   "marie",
+   "mary",
+   "rose",
+   "rosemarie",
+   "rosey"
+  ],
+  "roxanna": [
+   "ann",
+   "rose",
+   "roxie"
+  ],
+  "roxanne": [
+   "ann",
+   "rose",
+   "roxie"
+  ],
+  "rudolph": [
+   "dolph",
+   "olph",
+   "rolf",
+   "rudy"
+  ],
+  "rudolphus": [
+   "dolph",
+   "olph",
+   "rolf",
+   "rudy"
+  ],
+  "samantha": [
+   "mantha",
+   "sam",
+   "sammy"
+  ],
+  "samuel": [
+   "sam",
+   "sammy"
+  ],
+  "samyra": [
+   "myra",
+   "sam",
+   "sammy"
+  ],
+  "sarah": [
+   "sadie",
+   "sally",
+   "sara"
+  ],
+  "savannah": [
+   "anna",
+   "savanna",
+   "vannie"
+  ],
+  "scott": [
+   "sceeter",
+   "scottie",
+   "scotty",
+   "squat"
+  ],
+  "shelton": [
+   "shel",
+   "shelly",
+   "tony"
+  ],
+  "sheridan": [
+   "dan",
+   "danny",
+   "sher"
+  ],
+  "sheryl": [
+   "cheri",
+   "cherie",
+   "sher",
+   "sheri",
+   "sherri",
+   "sherry",
+   "sherryl"
+  ],
+  "shirley": [
+   "lee",
+   "sherry",
+   "shirl"
+  ],
+  "sibbilla": [
+   "sibbell",
+   "sibbie",
+   "sybill"
+  ],
+  "silvester": [
+   "si",
+   "sly",
+   "syl",
+   "vest",
+   "vester"
+  ],
+  "solomon": [
+   "sal",
+   "salmon",
+   "saul",
+   "sol",
+   "solly",
+   "zolly"
+  ],
+  "sophronia": [
+   "frona",
+   "fronia",
+   "sophia"
+  ],
+  "stacey": [
+   "staci",
+   "stacie",
+   "stacy"
+  ],
+  "stacie": [
+   "stacey",
+   "staci",
+   "stacy"
+  ],
+  "stephanie": [
+   "annie",
+   "steffi",
+   "steffie",
+   "steph",
+   "stephani",
+   "stephany",
+   "stephie",
+   "stephine",
+   "stevie"
+  ],
+  "steven": [
+   "steph",
+   "steve",
+   "stevie"
+  ],
+  "susan": [
+   "hannah",
+   "sue",
+   "sukey",
+   "susie",
+   "suzie"
+  ],
+  "susannah": [
+   "hannah",
+   "sue",
+   "sukey",
+   "susie"
+  ],
+  "suzanne": [
+   "sue",
+   "suki",
+   "susie"
+  ],
+  "sylvester": [
+   "si",
+   "sly",
+   "sy",
+   "syl",
+   "vessie",
+   "vester",
+   "vet"
+  ],
+  "tamara": [
+   "tami",
+   "tammie",
+   "tammy"
+  ],
+  "teresa": [
+   "terry",
+   "tess",
+   "tessa",
+   "tessie"
+  ],
+  "terri": [
+   "teri",
+   "terrie",
+   "terry"
+  ],
+  "theodore": [
+   "ted",
+   "teddy",
+   "theo"
+  ],
+  "theodosia": [
+   "dosia",
+   "theo",
+   "theodosius"
+  ],
+  "theresa": [
+   "terry",
+   "tess",
+   "tessa",
+   "tessie",
+   "thirza",
+   "thursa",
+   "traci",
+   "tracie",
+   "tracy"
+  ],
+  "thom": [
+   "thomas",
+   "tom",
+   "tommy"
+  ],
+  "thomas": [
+   "thom",
+   "tom",
+   "tommy"
+  ],
+  "timothy": [
+   "tim",
+   "timmy"
+  ],
+  "tracey": [
+   "traci",
+   "tracie",
+   "tracy"
+  ],
+  "valentina": [
+   "felty",
+   "val",
+   "vallie"
+  ],
+  "vanessa": [
+   "essa",
+   "nessa",
+   "vanna"
+  ],
+  "veronica": [
+   "franky",
+   "frony",
+   "ron",
+   "ronie",
+   "ronna",
+   "ronnie",
+   "ronny",
+   "vonnie"
+  ],
+  "vic": [
+   "vicki",
+   "vickie",
+   "vicky",
+   "victor"
+  ],
+  "vicki": [
+   "vickie",
+   "vicky",
+   "victoria"
+  ],
+  "victoria": [
+   "tori",
+   "torie",
+   "torri",
+   "torrie",
+   "tory",
+   "vic",
+   "vicki",
+   "vickie",
+   "vicky"
+  ],
+  "vincent": [
+   "vic",
+   "vin",
+   "vince",
+   "vinnie",
+   "vinny"
+  ],
+  "vincenzo": [
+   "vic",
+   "vin",
+   "vince",
+   "vinnie",
+   "vinny"
+  ],
+  "vinson": [
+   "vin",
+   "vince",
+   "vinnie",
+   "vinny"
+  ],
+  "virginia": [
+   "ginger",
+   "ginny",
+   "jane",
+   "jennie",
+   "virgy"
+  ],
+  "westley": [
+   "farmboy",
+   "wes",
+   "west"
+  ],
+  "wilbur": [
+   "will",
+   "willie",
+   "willy"
+  ],
+  "wilfred": [
+   "fred",
+   "wil",
+   "will",
+   "willie"
+  ],
+  "wilhelmina": [
+   "mina",
+   "minnie",
+   "willie",
+   "wilma"
+  ],
+  "will": [
+   "bill",
+   "fred",
+   "wilbur",
+   "willie"
+  ],
+  "william": [
+   "bela",
+   "bell",
+   "bill",
+   "billy",
+   "wil",
+   "will",
+   "willie",
+   "willy"
+  ],
+  "wilson": [
+   "will",
+   "willie",
+   "willy"
+  ],
+  "winfield": [
+   "field",
+   "win",
+   "winny"
+  ],
+  "winifred": [
+   "freddie",
+   "winnet",
+   "winnie"
+  ],
+  "winnifred": [
+   "fred",
+   "freddie",
+   "freddy",
+   "winnie",
+   "winny"
+  ],
+  "woodrow": [
+   "drew",
+   "wood",
+   "woody"
+  ],
+  "zachariah": [
+   "zac",
+   "zach",
+   "zachy",
+   "zack",
+   "zak",
+   "zakk",
+   "zeke"
+  ],
+  "zachary": [
+   "zac",
+   "zach",
+   "zachy",
+   "zack",
+   "zak",
+   "zakk",
+   "zeke"
+  ],
+  "zachery": [
+   "zac",
+   "zach",
+   "zachy",
+   "zack",
+   "zak",
+   "zakk",
+   "zeke"
+  ],
+  "zedediah": [
+   "diah",
+   "dyer",
+   "zed"
+  ]
+ }
+}

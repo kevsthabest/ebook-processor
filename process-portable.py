@@ -9558,6 +9558,16 @@ def _merge_pair_signal(ka, kb):
     ja, jb = " ".join(sorted(sa)), " ".join(sorted(sb))
     if ja and jb and (ja in jb or jb in ja):
         return 1
+    # Diminutive signal: first tokens linked by the diminutive table
+    # (no string metric bridges Bill/William or Peggy/Margaret).
+    # Guard against surname-only speculation: one side must be a
+    # bare first name, or the pair must share a non-first token.
+    # This only PROPOSES the pair to Tier 3 — pairs a veto (Tier 1
+    # cannot-link, surname trap) already rejected never get here.
+    ta, tb = _strip_merge_noise(ka), _strip_merge_noise(kb)
+    if ta and tb and _diminutive_pair(ta[0], tb[0]):
+        if len(ta) == 1 or len(tb) == 1 or set(ta[1:]) & set(tb[1:]):
+            return 1
     return 0
 
 
@@ -12766,6 +12776,54 @@ def _nick_pair(fa, fb):
     """True if fa/fb are a known nickname pair (either direction)."""
     return fa != fb and (_COMMON_NICKNAMES.get(fa) == fb or
                          _COMMON_NICKNAMES.get(fb) == fa)
+
+
+_DIMINUTIVES_CACHE = None
+
+
+def _diminutive_map():
+    """Symmetric diminutive link map {name: {linked names}}.
+
+    Sources: diminutives.json beside this script (a vendored subset
+    of the carltonnorthern/nicknames dataset, Apache-2.0 — see the
+    file's _about block) UNION the built-in _COMMON_NICKNAMES pairs.
+    Candidate generation ONLY: a link proposes a pair to the Tier 3
+    ladder; it never merges, never scores a deterministic tier, and
+    never bypasses a veto. A missing or unreadable data file degrades
+    to the built-in pairs — the raw .py keeps working when shared
+    without its data file.
+    """
+    global _DIMINUTIVES_CACHE
+    if _DIMINUTIVES_CACHE is not None:
+        return _DIMINUTIVES_CACHE
+    links = {}
+
+    def _link(a, b):
+        a, b = (a or "").strip().lower(), (b or "").strip().lower()
+        if a and b and a != b:
+            links.setdefault(a, set()).add(b)
+            links.setdefault(b, set()).add(a)
+
+    try:
+        _data = json.loads(
+            (SCRIPT_DIR / "diminutives.json").read_text(encoding="utf-8"))
+        for _full, _dims in (_data.get("pairs") or {}).items():
+            for _d in _dims or []:
+                _link(_full, _d)
+    except Exception:
+        pass
+    for _nick, _full in _COMMON_NICKNAMES.items():
+        _link(_nick, _full)
+    _DIMINUTIVES_CACHE = links
+    return links
+
+
+def _diminutive_pair(fa, fb):
+    """True if fa/fb are diminutive-linked (vendored table or the
+    built-in nickname map, either direction)."""
+    if not fa or not fb or fa == fb:
+        return False
+    return fb in _diminutive_map().get(fa, ())
 
 
 def _merge_tier(a_key, b_key, chapter_keys=None, a_chapters=None,
