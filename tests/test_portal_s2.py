@@ -516,6 +516,38 @@ class TestCovers(unittest.TestCase):
         book.write_bytes(b"not a zip")
         self.assertIsNone(portal.epub_cover(book, self.cache))
 
+    def test_svg_cover_is_not_served_as_active_svg(self):
+        # The served type comes from a raster allowlist, never
+        # verbatim from book metadata: active SVG on the portal
+        # origin could script against the portal API.
+        book = self.root / "svg.epub"
+        opf = (
+            '<?xml version="1.0"?>\n'
+            '<package xmlns="http://www.idpf.org/2007/opf" '
+            'version="3.0"><metadata '
+            'xmlns:dc="http://purl.org/dc/elements/1.1/">'
+            '<dc:title>Fixture</dc:title></metadata><manifest>'
+            '<item id="c1" href="c1.xhtml" '
+            'media-type="application/xhtml+xml"/>'
+            '<item id="cov" href="cover.svg" '
+            'media-type="image/svg+xml" '
+            'properties="cover-image"/></manifest>'
+            '<spine><itemref idref="c1"/></spine></package>')
+        with zipfile.ZipFile(book, "w") as z:
+            z.writestr("META-INF/container.xml",
+                       '<?xml version="1.0"?>\n'
+                       '<container xmlns="urn:oasis:names:tc:'
+                       'opendocument:xmlns:container" '
+                       'version="1.0"><rootfiles>'
+                       '<rootfile full-path="OEBPS/content.opf" '
+                       'media-type="application/oebps-package+xml"/>'
+                       '</rootfiles></container>')
+            z.writestr("OEBPS/content.opf", opf)
+            z.writestr("OEBPS/c1.xhtml",
+                       "<html><body>text</body></html>")
+            z.writestr("OEBPS/cover.svg", b"<svg/>")
+        self.assertIsNone(portal.epub_cover(book, self.cache))
+
 
 class TestProfilesMirror(unittest.TestCase):
     def test_builtins_come_from_the_processor_source(self):
@@ -702,6 +734,48 @@ class TestLaunchHTTP(_ServerCase):
         self.assertEqual(status, 200)
         return json.loads(body)
 
+    def _raw_post(self, path, body, headers):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=body.encode("utf-8"), headers=headers,
+            method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status, resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8")
+
+    def test_foreign_origin_post_is_403_and_launches_nothing(self):
+        # A web page on another origin must not be able to fire
+        # a launch: the Host check validates the destination,
+        # which a cross-site request satisfies by construction.
+        status, _b = self._raw_post(
+            "/api/launch",
+            '{"action": "write", "confirm": true}',
+            {"Content-Type": "application/json",
+             "Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+        status, body, _h = self._req("GET", "/api/jobs")
+        self.assertEqual(json.loads(body)["jobs"], [])
+
+    def test_text_plain_post_is_400_and_launches_nothing(self):
+        # The simple-request vector: no preflight is triggered
+        # by text/plain, so the JSON-only rule is what stops it.
+        status, _b = self._raw_post(
+            "/api/launch",
+            '{"action": "write", "confirm": true}',
+            {"Content-Type": "text/plain"})
+        self.assertEqual(status, 400)
+        status, body, _h = self._req("GET", "/api/jobs")
+        self.assertEqual(json.loads(body)["jobs"], [])
+
+    def test_same_origin_post_still_launches(self):
+        status, _b = self._raw_post(
+            "/api/backup", "{}",
+            {"Content-Type": "application/json",
+             "Origin": f"http://127.0.0.1:{self.port}"})
+        self.assertEqual(status, 200)
+
     def test_write_run_without_confirm_is_400(self):
         status, body, _h = self._req(
             "POST", "/api/launch", {"action": "write"})
@@ -797,6 +871,12 @@ class TestStopResumeHTTP(_ServerCase):
         self.assertEqual(len(resume_calls), 1)
         self.assertIn("--preview", resume_calls[0])
         self.assertIn("--emit-run-events", resume_calls[0])
+        # The same job cannot be resumed twice: its claim is
+        # spent (a second launch could republish a write run
+        # with no fresh confirm).
+        status, _b, _h = self._req(
+            "POST", f"/api/jobs/{hang_id}/resume", {})
+        self.assertEqual(status, 400)
 
     def test_resume_refused_without_checkpoints(self):
         job_id = self._launch({"action": "preview",

@@ -59,7 +59,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 DEFAULT_PORT = 8765
 LOOPBACK = "127.0.0.1"
@@ -1258,6 +1258,7 @@ class Job:
         self._stop_at = None
         self._terminated = False
         self._killed = False
+        self._resume_claimed = False
         self._preview_before = set()
         self._lock = threading.Lock()
 
@@ -1377,7 +1378,7 @@ class Job:
         try:
             candidates = [p for p in folder.glob("run-*.jsonl")
                           if p.stat().st_mtime
-                          >= (self.started or 0) - 1.0]
+                          >= (self.started or 0)]
         except OSError:
             return
         if candidates:
@@ -1404,6 +1405,22 @@ class Job:
             return False
         return checkpoints_exist(self.ctx.script_dir,
                                  self.spec.file_path)
+
+    def claim_resume(self):
+        """Claim this job's single resume, atomically. The
+        check and the claim are one lock-held step: two
+        concurrent resume requests for the same job must not
+        both launch (for a write job the second would
+        republish with no fresh confirm). A job whose resume
+        was claimed is resumed through the NEW job it created,
+        which carries its own claim."""
+        with self._lock:
+            if self._resume_claimed:
+                return False
+            if not self._can_resume():
+                return False
+            self._resume_claimed = True
+            return True
 
     def snapshot(self):
         agg = self._refresh_events()
@@ -1612,7 +1629,14 @@ def _extract_cover(path):
             if z.getinfo(entry).file_size > _COVER_MAX_BYTES:
                 return None
             data = z.read(entry)
-            if media_type.startswith("image/"):
+            # The served type comes from a raster allowlist,
+            # never verbatim from book metadata: a book that
+            # declares its cover image/svg+xml would otherwise
+            # get active SVG served from the portal's own
+            # origin, where its script could reach the portal
+            # API. Anything unlisted falls back to the
+            # extension's type, or to no cover at all.
+            if media_type in _COVER_EXTS:
                 ctype = media_type
             else:
                 ctype = _COVER_TYPES.get(Path(entry).suffix.lower())
@@ -2021,6 +2045,19 @@ setInterval(async () => {
 // report); a row's Re-embed button launches action A3 and
 // navigates to the new run page.
 function wireRows() {
+  // Cover tiles: a book with no cover gets the placeholder
+  // block. The swap is wired here, with the stem carried in a
+  // data attribute and assigned via textContent — an inline
+  // onerror string would break (and worse) on stems with
+  // quotes in them.
+  document.querySelectorAll('img.tileimg').forEach(img => {
+    img.addEventListener('error', () => {
+      const d = document.createElement('div');
+      d.className = 'nocover';
+      d.textContent = img.dataset.stem || '';
+      img.replaceWith(d);
+    });
+  });
   document.querySelectorAll('tr[data-fp]').forEach(row => {
     row.addEventListener('click', async () => {
       const pre = document.getElementById('explain');
@@ -2126,9 +2163,9 @@ def _render_ingest(ctx):
         stem = Path(name).stem
         out.append(
             f"<div class='tile'>"
-            f"<img src='/cover?name={_esc(name)}' alt='' "
-            f"onerror='this.outerHTML=\"<div class=&quot;nocover"
-            f"&quot;>{_esc(stem)}</div>\"'>"
+            f"<img class='tileimg' "
+            f"src='/cover?name={quote(name, safe='')}' alt='' "
+            f"data-stem='{_esc(stem)}'>"
             f"<div class='tname'>{_esc(name)}</div>"
             f"<div class='muted'>{_fmt_bytes(entry['size'])}</div>"
             f"<label><input type='checkbox' name='file' "
@@ -2528,8 +2565,50 @@ def make_server(host, port, ctx):
                 return
             self._json(200, {"job_id": job.id, "state": job.state})
 
+        def _origin_ok(self):
+            """POSTs are state-changing, and the Host check
+            alone cannot vet them: it validates the DESTINATION
+            host, which a cross-site request to 127.0.0.1
+            satisfies by construction. A browser page on another
+            origin must not be able to fire launches (a "simple
+            request" needs no preflight, and the write-run
+            confirm is just a body field to an attacker). So:
+            an Origin header, when present, must name this
+            portal itself — loopback host, the bound port. The
+            portal's own pages are same-origin, so they always
+            pass; non-browser clients send no Origin at all."""
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return True
+            parsed = urlparse(origin)
+            if (parsed.hostname or "") not in (
+                    "127.0.0.1", "localhost", "::1"):
+                return False
+            try:
+                if parsed.port is None:
+                    return True
+                return parsed.port == self.server.server_address[1]
+            except ValueError:
+                return False
+
         def do_POST(self):
             if not self._host_ok():
+                return
+            if not self._origin_ok():
+                self._json(403, {"error": "cross-origin POST "
+                                          "refused"})
+                return
+            # Companion control: the API is JSON-only. A
+            # cross-site form post cannot set this content type
+            # without a preflight the portal never grants, so
+            # requiring it closes the simple-request vector
+            # even where an Origin header is absent. The
+            # portal's own scripts always send it.
+            ctype = (self.headers.get("Content-Type") or "")
+            ctype = ctype.split(";")[0].strip().lower()
+            if ctype != "application/json":
+                self._json(400, {"error": "POSTs must be "
+                                          "application/json"})
                 return
             parsed = urlparse(self.path)
             try:
@@ -2550,10 +2629,12 @@ def make_server(host, port, ctx):
                         job.stop()
                         self._json(200, {"state": job.state})
                     elif parts[3] == "resume":
-                        if not job.snapshot()["can_resume"]:
+                        if not job.claim_resume():
                             self._json(400, {
-                                "error": "nothing to resume — no "
-                                         "checkpoints for this run"})
+                                "error": "cannot resume this run "
+                                         "— no checkpoints for it, "
+                                         "or it was already "
+                                         "resumed"})
                             return
                         new_job = ctx.resume(job)
                         self._json(200, {"job_id": new_job.id,
