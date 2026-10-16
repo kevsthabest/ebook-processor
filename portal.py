@@ -340,7 +340,15 @@ def _corpus_reads(conn, db_path):
         if series:
             series_label = series
             if sidx is not None:
-                idx = int(sidx) if float(sidx).is_integer() else sidx
+                # series_index is a REAL column, but a hand-edited
+                # or foreign-written store can hold text there;
+                # one malformed value must not take Home down
+                # (the slice's degrade-never-error contract).
+                try:
+                    num = float(sidx)
+                    idx = int(num) if num.is_integer() else sidx
+                except (TypeError, ValueError):
+                    idx = sidx
                 series_label = f"{series} #{idx}"
         works.append({
             "fingerprint": fp, "title": title, "author": author,
@@ -430,10 +438,17 @@ def _recent_runs(corpus_conn, works_by_fp, preview_dir):
                 "work": works_by_fp.get(fp, (fp or "")[:8]),
                 "outcome": status or "", "detail": ""})
     if preview_dir is not None and Path(preview_dir).is_dir():
-        for path in Path(preview_dir).glob("*.json"):
-            if path.name.endswith("-trope-map.json") \
-                    or path.name.startswith("."):
-                continue
+        # Parse only the newest artifacts: the composite shows
+        # 12 runs, so re-reading every preview file on every
+        # poll would grow without bound as artifacts accumulate.
+        # mtime is the sort the composite itself uses, so the
+        # newest 25 files always contain any preview that could
+        # make the cut.
+        artifacts = [p for p in Path(preview_dir).glob("*.json")
+                     if not p.name.endswith("-trope-map.json")
+                     and not p.name.startswith(".")]
+        artifacts.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in artifacts[:25]:
             when = datetime.fromtimestamp(
                 path.stat().st_mtime, tz=timezone.utc).strftime(
                     "%Y-%m-%dT%H:%M:%S")
@@ -883,6 +898,10 @@ _PAGE_JS = """
 // renderer, so a polled page can never drift from a fresh load.
 setInterval(async () => {
   if (document.visibilityState !== 'visible') return;
+  // An open forensics report is mid-read; swapping <main> would
+  // destroy it. The poll simply skips until it is closed.
+  const pre = document.getElementById('explain');
+  if (pre && !pre.hidden) return;
   try {
     const res = await fetch(location.pathname, {cache: 'no-store'});
     if (!res.ok) return;
@@ -980,12 +999,50 @@ class PortalContext:
         return text
 
 
+def _host_allowed(host_header, port):
+    """Whether a request's Host header names this portal.
+
+    Binding loopback stops other machines reaching the server,
+    but not a malicious web page in the operator's own browser:
+    without a Host check, DNS rebinding could make the page's
+    origin resolve to 127.0.0.1 and read the console (or fire
+    explain runs) cross-origin. Only the portal's own names —
+    with the port it actually bound — are served.
+    """
+    if not host_header:
+        return False
+    allowed = {LOOPBACK, "localhost", "[::1]", "::1"}
+    name = host_header.strip()
+    if name.startswith("["):
+        bare, _, rest = name[1:].partition("]")
+        host_part = f"[{bare}]"
+        port_part = rest.lstrip(":")
+    elif name.count(":") == 1:
+        host_part, _, port_part = name.partition(":")
+    else:
+        # No colon: a bare host. More than one: a bare IPv6
+        # literal (the bracketed form is handled above).
+        host_part, port_part = name, ""
+    if host_part not in allowed:
+        return False
+    if not port_part:
+        return True
+    return port_part.isdigit() and int(port_part) == port
+
+
 def make_server(host, port, ctx):
     """Build (but do not start) the portal server. The bind host
     passes validate_bind_host here as well as in main(), so the
     loopback guarantee holds for any caller, not just the CLI
     entry point."""
     host = validate_bind_host(host)
+    if host == "::1":
+        # validate_bind_host accepts the spelling (it IS
+        # loopback), but the stdlib server here is IPv4; failing
+        # with a clear refusal beats a raw gaierror at bind time.
+        raise PortalError(
+            "this server binds IPv4 loopback (127.0.0.1); "
+            "::1 is refused rather than half-supported")
     bind_host = LOOPBACK if host == "localhost" else host
 
     class Handler(BaseHTTPRequestHandler):
@@ -1003,6 +1060,12 @@ def make_server(host, port, ctx):
             self.wfile.write(raw)
 
         def do_GET(self):
+            bound_port = self.server.server_address[1]
+            if not _host_allowed(self.headers.get("Host"), bound_port):
+                self._send(403, json.dumps(
+                    {"error": "host not allowed"}),
+                    "application/json")
+                return
             parsed = urlparse(self.path)
             try:
                 if parsed.path == "/":
@@ -1032,8 +1095,14 @@ def make_server(host, port, ctx):
                     self._send(404, json.dumps({"error": "not found"}),
                                "application/json")
             except Exception as e:  # a broken surface must say so,
-                self._send(500, json.dumps(  # not hang the operator
-                    {"error": f"{type(e).__name__}: {e}"}),
+                # not hang the operator. The browser gets the
+                # exception type only — full detail (which can
+                # embed paths and argv) goes to the operator's
+                # terminal, the side of the glass that owns it.
+                print(f"portal: request failed: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+                self._send(500, json.dumps(
+                    {"error": f"internal error ({type(e).__name__})"}),
                     "application/json")
 
     server = ThreadingHTTPServer((bind_host, port), Handler)

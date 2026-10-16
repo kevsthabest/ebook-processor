@@ -193,6 +193,21 @@ class TestBindValidation(unittest.TestCase):
                 portal.validate_bind_host(host)
 
 
+class TestHostAllowed(unittest.TestCase):
+    def test_own_names_with_the_bound_port(self):
+        self.assertTrue(portal._host_allowed("127.0.0.1:8765", 8765))
+        self.assertTrue(portal._host_allowed("localhost:8765", 8765))
+        self.assertTrue(portal._host_allowed("[::1]:8765", 8765))
+        self.assertTrue(portal._host_allowed("127.0.0.1", 8765))
+
+    def test_foreign_or_wrong_port_refused(self):
+        self.assertFalse(portal._host_allowed("evil.example.com", 8765))
+        self.assertFalse(portal._host_allowed("127.0.0.1:9999", 8765))
+        self.assertFalse(portal._host_allowed("192.168.1.5:8765", 8765))
+        self.assertFalse(portal._host_allowed("", 8765))
+        self.assertFalse(portal._host_allowed(None, 8765))
+
+
 class TestPickPort(unittest.TestCase):
     def test_first_free_port_wins(self):
         tried = []
@@ -376,6 +391,21 @@ class TestHomeData(unittest.TestCase):
         self.assertIsNone(portal.resolve_work(self.learn, "deadbeef"))
         self.assertIsNone(portal.resolve_work(self.learn, "ab"))
 
+    def test_malformed_series_index_degrades_not_500s(self):
+        # A hand-edited or foreign-written store can hold text in
+        # the REAL series_index column; Home must render the row,
+        # not die on the float conversion (Advisor W2).
+        conn = sqlite3.connect(self.learn / "corpus.db")
+        conn.execute(
+            "UPDATE corpus_works SET series_index='not-a-number' "
+            "WHERE fingerprint=?", (_FP3,))
+        conn.commit()
+        conn.close()
+        home = self._home()
+        rows = {w["fingerprint"]: w for w in home["works"]}
+        self.assertEqual(rows[_FP3]["series_label"],
+                         "Daemon #not-a-number")
+
 
 class TestHTTPServer(unittest.TestCase):
     def setUp(self):
@@ -398,10 +428,10 @@ class TestHTTPServer(unittest.TestCase):
         self._thread.join(timeout=5)
         self._td.cleanup()
 
-    def _get(self, path):
+    def _get(self, path, timeout=10):
         with urllib.request.urlopen(
                 f"http://127.0.0.1:{self.port}{path}",
-                timeout=10) as resp:
+                timeout=timeout) as resp:
             return resp.status, resp.read().decode("utf-8")
 
     def test_home_page_and_api_agree_and_write_nothing(self):
@@ -429,6 +459,45 @@ class TestHTTPServer(unittest.TestCase):
                          corpus_hash)
         self.assertEqual(_ro_dump_hash(self.learn / "state.db"),
                          state_hash)
+
+    def test_forged_host_header_is_refused(self):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                          timeout=10)
+        conn.putrequest("GET", "/", skip_host=True)
+        conn.putheader("Host", "evil.example.com")
+        conn.endheaders()
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 403)
+
+    def test_ipv6_bind_is_a_clear_refusal_not_a_gaierror(self):
+        ctx = portal.PortalContext(learn_dir=self.learn,
+                                   script_dir=self.script,
+                                   backup_dir=None)
+        with self.assertRaises(portal.PortalError):
+            portal.make_server("::1", 0, ctx)
+
+    def test_successful_explain_and_its_hash_caveat(self):
+        # Advisor W3: the CLI's report-mode corpus open performs
+        # its own meta bookkeeping on a store the substrate has
+        # never opened, so a FIRST --explain against such a store
+        # can move corpus.db's dump hash. That is the CLI's open
+        # behaviour — identical when run by hand in a terminal —
+        # not a portal write. What S1 pins: a successful explain
+        # answers, and once that bookkeeping has settled, portal
+        # traffic (explains included) moves nothing.
+        status, body = self._get(f"/api/explain?work={_FP1[:8]}",
+                                 timeout=60)
+        self.assertEqual(status, 200)
+        self.assertIn("Daemon", json.loads(body)["text"])
+        settled = _ro_dump_hash(self.learn / "corpus.db")
+        self._get(f"/api/explain?work={_FP1[:8]}", timeout=60)
+        self._get("/")
+        self._get("/api/home")
+        self.assertEqual(_ro_dump_hash(self.learn / "corpus.db"),
+                         settled)
 
 
 if __name__ == "__main__":
