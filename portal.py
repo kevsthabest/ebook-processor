@@ -1659,6 +1659,13 @@ def reduce_matrix(events):
 
 
 _ARTIFACT_MEMO = {}
+# The memo exists so re-polls of a retained artifact cost a stat,
+# not a re-read — but a long-lived portal would otherwise grow it
+# by one entry per artifact ever opened. Entries are pure
+# functions of immutable files, so a full clear on overflow is
+# safe (the worst case is one re-read per artifact still being
+# viewed) and simpler than eviction bookkeeping.
+_ARTIFACT_MEMO_CAP = 512
 
 
 def _artifact_events(path):
@@ -1683,6 +1690,9 @@ def _artifact_events(path):
     agg = tailer.poll()
     events = tailer.events()
     if sig is not None:
+        if str(path) not in _ARTIFACT_MEMO \
+                and len(_ARTIFACT_MEMO) >= _ARTIFACT_MEMO_CAP:
+            _ARTIFACT_MEMO.clear()
         _ARTIFACT_MEMO[str(path)] = (sig, events, agg)
     return events, agg
 

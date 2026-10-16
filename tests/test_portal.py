@@ -503,5 +503,42 @@ class TestHTTPServer(unittest.TestCase):
                          settled)
 
 
+class TestArtifactMemoBound(unittest.TestCase):
+    """The artifact memo must stay bounded however many retained
+    runs a long-lived portal is asked to reopen — and must keep
+    serving hits while it does."""
+
+    def setUp(self):
+        portal._ARTIFACT_MEMO.clear()
+        self._td = tempfile.TemporaryDirectory()
+        self.dir = Path(self._td.name)
+
+    def tearDown(self):
+        portal._ARTIFACT_MEMO.clear()
+        self._td.cleanup()
+
+    def _artifact(self, name):
+        p = self.dir / name
+        p.write_text('{"kind": "run_start", "run_id": "r"}\n',
+                     encoding="utf-8")
+        return p
+
+    def test_memo_stays_bounded_after_many_inserts(self):
+        cap = portal._ARTIFACT_MEMO_CAP
+        for i in range(cap + 100):
+            portal._artifact_events(self._artifact(f"run-{i}.jsonl"))
+            self.assertLessEqual(len(portal._ARTIFACT_MEMO), cap)
+
+    def test_memo_still_serves_hits(self):
+        p = self._artifact("run-1.jsonl")
+        ev1, agg1 = portal._artifact_events(p)
+        sentinel = (("sentinel",), {"sentinel": True})
+        portal._ARTIFACT_MEMO[str(p)] = (
+            portal._ARTIFACT_MEMO[str(p)][0],) + sentinel
+        ev2, agg2 = portal._artifact_events(p)
+        self.assertEqual(ev2, sentinel[0])
+        self.assertEqual(agg2, sentinel[1])
+
+
 if __name__ == "__main__":
     unittest.main()
