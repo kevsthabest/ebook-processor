@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.11.1"
+PORTABLE_VERSION = "2.12.0"
 
 
 import argparse
@@ -2732,15 +2732,22 @@ _SUBSTRATE_TABLES = [
 ]
 
 
-class StateDB:
-    """The substrate handle for one learn dir's state.db.
+class _SubstrateHandle:
+    """Generic substrate machinery shared by the learn-dir stores
+    (corpus design §1.1): connection management, schema creation,
+    corruption preservation, backup, checkpoint, dump_hash, write
+    transactions. Each handle supplies only its policy via class
+    attributes (filename, DDL list, table list, schema version)
+    and hooks — _register_instance (per-handle registry),
+    _corrupt_fallback (what corruption MEANS for this store —
+    the enumerated divergence point between handles), _pre_write
+    (StateDB's rolling backup; the corpus has none, §1.1 (a)),
+    and _after_open (the corpus's capability probes, §1.5)."""
 
-    One connection per process per learn dir (registry below),
-    check_same_thread=False, writes serialized by an RLock and
-    executed as single transactions — the same discipline as the
-    JSON stores' load-modify-save, with strictly less lost-update
-    surface. Reads come from the same connection.
-    """
+    _DB_NAME = None
+    _DDL = ()
+    _TABLES = ()
+    _SCHEMA_VERSION = 1
 
     def __init__(self, path, conn):
         self.path = Path(path)
@@ -2750,8 +2757,8 @@ class StateDB:
         self._backup_done = False
 
     # -- construction ---------------------------------------------------
-    @staticmethod
-    def _connect(path):
+    @classmethod
+    def _connect(cls, path):
         conn = sqlite3.connect(str(path), check_same_thread=False,
                                timeout=30)
         conn.execute("PRAGMA journal_mode=WAL")
@@ -2761,39 +2768,39 @@ class StateDB:
     @classmethod
     def _create_schema(cls, conn):
         with conn:
-            for ddl in _SUBSTRATE_DDL:
+            for ddl in cls._DDL:
                 conn.execute(ddl)
             conn.execute(f"PRAGMA user_version="
-                         f"{SUBSTRATE_SCHEMA_VERSION}")
+                         f"{cls._SCHEMA_VERSION}")
 
     @classmethod
-    def create(cls, learn_dir):
-        """Create state.db in learn_dir if absent (schema applied),
-        else open the existing one. Used by migration and tests; the
-        running stores never call this (they open only)."""
+    def create(cls, learn_dir, **init_kwargs):
+        """Create the DB in learn_dir if absent (schema applied),
+        else open the existing one."""
         d = Path(learn_dir)
         d.mkdir(parents=True, exist_ok=True)
-        p = d / _STATE_DB_NAME
+        p = d / cls._DB_NAME
         if p.exists():
-            return cls.open(learn_dir)
+            return cls.open(learn_dir, **init_kwargs)
         conn = cls._connect(p)
         cls._create_schema(conn)
-        db = cls(p, conn)
-        _register_state_db(db)
+        db = cls(p, conn, **init_kwargs)
+        db._after_open()
+        cls._register_instance(db)
         return db
 
     @classmethod
-    def open(cls, learn_dir):
-        """Open the learn dir's state.db, or None when there is none.
-        A corrupt DB gets the F8 discipline: loud warning, original
-        bytes (incl. WAL sidecars) preserved as .corrupt, and a fresh
-        empty DB in its place — stores start empty and NOTHING is
-        auto-restored (a restore could resurrect retracted state
-        without a sound; recovery is a human act, §3.8)."""
+    def open(cls, learn_dir, **init_kwargs):
+        """Open the learn dir's DB, or None when there is none.
+        A corrupt DB gets the F8 discipline through the handle's
+        _corrupt_fallback: loud warning, original bytes (incl. WAL
+        sidecars) preserved as .corrupt, NO automatic restore —
+        what happens next is the handle's own consequence (§1.1)."""
         d = Path(learn_dir)
-        p = d / _STATE_DB_NAME
+        p = d / cls._DB_NAME
         if not p.exists():
             return None
+        conn = None
         try:
             conn = cls._connect(p)
             row = conn.execute("PRAGMA quick_check").fetchone()
@@ -2801,37 +2808,48 @@ class StateDB:
                 raise sqlite3.DatabaseError(
                     f"quick_check: {row[0] if row else 'no result'}")
             ver = conn.execute("PRAGMA user_version").fetchone()[0]
-            if ver != SUBSTRATE_SCHEMA_VERSION:
+            if ver != cls._SCHEMA_VERSION:
                 # Unknown future/past schema: re-applying DDL is
                 # additive-safe (IF NOT EXISTS) and user_version is
                 # re-stamped; store payloads are versioned by the
                 # stores themselves.
                 cls._create_schema(conn)
-            db = cls(p, conn)
+            db = cls(p, conn, **init_kwargs)
+            conn = None
         except Exception as e:
-            print(f"  !! WARNING: state substrate {p} could not be "
-                  f"opened ({e}); starting the state stores EMPTY. "
-                  f"The original file will be preserved as a .corrupt "
-                  f"backup. State was NOT carried over — staging "
-                  f"sightings reset (promotions delayed), learning "
-                  f"resets, roster continuity resets for affected "
-                  f"works; no output is created by the loss.")
-            try:
-                conn.close()
-            except Exception:
-                pass
-            cls._preserve_corrupt(p)
-            conn = cls._connect(p)
-            cls._create_schema(conn)
-            db = cls(p, conn)
-            db.corrupt_at_open = True
-        _register_state_db(db)
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            db = cls._corrupt_fallback(p, e)
+            if db is None:
+                return None
+        db._after_open()
+        cls._register_instance(db)
         return db
+
+    # -- per-handle policy hooks ----------------------------------------
+    @classmethod
+    def _register_instance(cls, db):
+        pass
+
+    @classmethod
+    def _corrupt_fallback(cls, path, err):
+        raise NotImplementedError
+
+    def _after_open(self):
+        pass
+
+    def _pre_write(self):
+        pass
 
     @staticmethod
     def _preserve_corrupt(path):
-        """Rename a corrupt state.db (and its WAL sidecars, which are
-        part of the state) to .corrupt siblings. Never clobbers an
+        """Rename a corrupt DB (and its WAL sidecars, which are
+        part of the state) to .corrupt siblings — a rename, never
+        a copy (A11: atomic on the same filesystem, cannot
+        half-happen on a nearly-full disk). Never clobbers an
         existing backup."""
         path = Path(path)
         try:
@@ -2844,7 +2862,7 @@ class StateDB:
                 src = Path(str(path) + suffix)
                 if src.exists():
                     os.replace(src, Path(str(dest) + suffix))
-            print(f"  !! Preserved corrupt state substrate as {dest}")
+            print(f"  !! Preserved corrupt substrate as {dest}")
         except Exception as e:
             print(f"  !! WARNING: could not preserve corrupt substrate "
                   f"{path} ({e})")
@@ -2863,11 +2881,97 @@ class StateDB:
             return cur.fetchall()
 
     def write_txn(self):
-        """Context manager: one write transaction. Before the first
-        write of this process, the rolling backup is refreshed if
-        the DB changed since it was taken (A2: via the backup API,
-        never a raw file copy)."""
-        return _StateDBWriteTxn(self)
+        """Context manager: one write transaction (the handle's
+        _pre_write hook runs first, under the lock)."""
+        return _SubstrateWriteTxn(self)
+
+    def backup_to(self, dest_path):
+        """Copy the whole DB to dest via SQLite's backup API (A2:
+        consistent under WAL, includes the WAL tail)."""
+        dest = Path(dest_path)
+        with self._lock:
+            out = sqlite3.connect(str(dest))
+            try:
+                self._conn.backup(out)
+            finally:
+                out.close()
+
+    def checkpoint(self):
+        """Fold the WAL back into the main file (a maintenance op:
+        logical content unchanged). Replay seeding opens the live DB
+        immutable (A2), which cannot recover a WAL — checkpointing
+        through this handle first makes the seeded copy complete."""
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+
+    def dump_hash(self):
+        """Canonical hash of the DB's LOGICAL content (A2): every
+        table's rows in a fixed order, serialized deterministically.
+        Immune to WAL checkpointing and file-layout noise — two DBs
+        with the same content hash identically."""
+        with self._lock:
+            return _dump_hash_conn(self._conn, self._TABLES)
+
+    def size_info(self):
+        try:
+            total = self.path.stat().st_size
+        except OSError:
+            total = 0
+        for suffix in ("-wal", "-shm"):
+            try:
+                total += Path(str(self.path) + suffix).stat().st_size
+            except OSError:
+                pass
+        return {"bytes": total, "path": str(self.path)}
+
+
+class StateDB(_SubstrateHandle):
+    """The substrate handle for one learn dir's state.db.
+
+    One connection per process per learn dir (registry below),
+    check_same_thread=False, writes serialized by an RLock and
+    executed as single transactions — the same discipline as the
+    JSON stores' load-modify-save, with strictly less lost-update
+    surface. Reads come from the same connection.
+
+    Policy (corpus design §1.1): rolling backup on first write;
+    corruption starts the state stores EMPTY under the F8 warning
+    (state content exists nowhere else, and a restore could
+    resurrect retracted state without a sound — recovery is a
+    human act, §3.8); creation is migration/tests only — the
+    running stores open only.
+    """
+
+    _DB_NAME = _STATE_DB_NAME
+    _DDL = _SUBSTRATE_DDL
+    _TABLES = _SUBSTRATE_TABLES
+    _SCHEMA_VERSION = SUBSTRATE_SCHEMA_VERSION
+
+    @classmethod
+    def _register_instance(cls, db):
+        _register_state_db(db)
+
+    @classmethod
+    def _corrupt_fallback(cls, path, err):
+        print(f"  !! WARNING: state substrate {path} could not be "
+              f"opened ({err}); starting the state stores EMPTY. "
+              f"The original file will be preserved as a .corrupt "
+              f"backup. State was NOT carried over — staging "
+              f"sightings reset (promotions delayed), learning "
+              f"resets, roster continuity resets for affected "
+              f"works; no output is created by the loss.")
+        cls._preserve_corrupt(path)
+        conn = cls._connect(path)
+        cls._create_schema(conn)
+        db = cls(path, conn)
+        db.corrupt_at_open = True
+        return db
+
+    def _pre_write(self):
+        self._maybe_backup()
 
     def _maybe_backup(self):
         if self._backup_done:
@@ -2899,56 +3003,14 @@ class StateDB:
             print(f"  !! WARNING: state substrate backup failed ({e}); "
                   f"continuing without a fresh backup")
 
-    def backup_to(self, dest_path):
-        """Copy the whole DB to dest via SQLite's backup API (A2:
-        consistent under WAL, includes the WAL tail)."""
-        dest = Path(dest_path)
-        with self._lock:
-            out = sqlite3.connect(str(dest))
-            try:
-                self._conn.backup(out)
-            finally:
-                out.close()
 
-    def checkpoint(self):
-        """Fold the WAL back into the main file (a maintenance op:
-        logical content unchanged). Replay seeding opens the live DB
-        immutable (A2), which cannot recover a WAL — checkpointing
-        through this handle first makes the seeded copy complete."""
-        with self._lock:
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception:
-                pass
-
-    def dump_hash(self):
-        """Canonical hash of the DB's LOGICAL content (A2): every
-        table's rows in a fixed order, serialized deterministically.
-        Immune to WAL checkpointing and file-layout noise — two DBs
-        with the same content hash identically."""
-        with self._lock:
-            return _dump_hash_conn(self._conn)
-
-    def size_info(self):
-        try:
-            total = self.path.stat().st_size
-        except OSError:
-            total = 0
-        for suffix in ("-wal", "-shm"):
-            try:
-                total += Path(str(self.path) + suffix).stat().st_size
-            except OSError:
-                pass
-        return {"bytes": total, "path": str(self.path)}
-
-
-class _StateDBWriteTxn:
+class _SubstrateWriteTxn:
     def __init__(self, db):
         self._db = db
 
     def __enter__(self):
         self._db._lock.acquire()
-        self._db._maybe_backup()
+        self._db._pre_write()
         self._db._conn.execute("BEGIN IMMEDIATE")
         return self._db._conn
 
@@ -2963,12 +3025,15 @@ class _StateDBWriteTxn:
         return False
 
 
-def _dump_hash_conn(conn):
+_StateDBWriteTxn = _SubstrateWriteTxn
+
+
+def _dump_hash_conn(conn, tables=None):
     import hashlib as _hl
     h = _hl.sha256()
     existing = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    for t in _SUBSTRATE_TABLES:
+    for t in (tables if tables is not None else _SUBSTRATE_TABLES):
         if t not in existing:
             h.update(f"{t}:absent;".encode())
             continue
@@ -3018,6 +3083,348 @@ def _close_state_dbs():
 
 def _substrate_active(learn_dir):
     return _state_db_for(learn_dir) is not None
+
+
+
+
+# ---------------------------------------------------------------------------
+# Corpus store (eval/corpus-design.md): corpus.db beside state.db,
+# sharing the substrate machinery through _SubstrateHandle (§1.1).
+# The corpus is retained source + recorded stage output; it decides
+# nothing about any claim (design header doctrine). Divergences from
+# StateDB, complete per §1.1: (a) NO rolling backup on corpus writes
+# (the substrate is precious, the corpus is rebuildable, §5.3);
+# (b) corruption consequence — a corrupt corpus opens as ABSENT and
+# processing falls back to file parsing, where state starts empty;
+# (c) creation posture — corpus.db is create-on-ingest (or explicit
+# create in tests/maintenance), never created by a mere open.
+# ---------------------------------------------------------------------------
+
+CORPUS_SCHEMA_VERSION = 1
+CORPUS_V = "1"
+_CORPUS_DB_NAME = "corpus.db"
+CORPUS_PARSER_VERSION = "1"
+# The window builder's contract (§1.4): passage ids are content-
+# derived over this format string; a window-shape change versions it.
+_CORPUS_WINDOW_FORMAT = "win600-sent-v1"
+# The vector encoding's format string (§1.4): float32 little-endian.
+_CORPUS_VECTOR_FORMAT = "raw-f32-v1"
+# A9: the corpus handle names its busy_timeout at open (§5.2).
+_CORPUS_BUSY_TIMEOUT_MS = 30000
+
+_CORPUS_DDL = [
+    "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)",
+    """CREATE TABLE IF NOT EXISTS corpus_works (
+         fingerprint TEXT PRIMARY KEY, book_key TEXT, work_id TEXT,
+         title TEXT, author TEXT, identifiers TEXT, series TEXT,
+         series_index REAL, parser_version TEXT, chapter_count INTEGER,
+         text_root_hash TEXT, source_hash TEXT, status TEXT,
+         ingested_at TEXT, updated_at TEXT, payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS corpus_chapters (
+         fingerprint TEXT, chapter_index INTEGER, label TEXT,
+         text TEXT, text_hash TEXT, char_count INTEGER,
+         word_count INTEGER, is_frontmatter INTEGER,
+         PRIMARY KEY (fingerprint, chapter_index))""",
+    """CREATE TABLE IF NOT EXISTS corpus_passages (
+         passage_id TEXT PRIMARY KEY, fingerprint TEXT,
+         chapter_index INTEGER, start_offset INTEGER,
+         end_offset INTEGER, text_hash TEXT)""",
+    """CREATE INDEX IF NOT EXISTS corpus_passages_work_chapter
+         ON corpus_passages (fingerprint, chapter_index)""",
+    """CREATE TABLE IF NOT EXISTS passage_vectors (
+         passage_id TEXT PRIMARY KEY, fingerprint TEXT, model TEXT,
+         format TEXT, dim INTEGER, vector BLOB)""",
+    """CREATE TABLE IF NOT EXISTS ingest_runs (
+         id INTEGER PRIMARY KEY, fingerprint TEXT, started TEXT,
+         finished TEXT, parser_version TEXT, embed_model TEXT,
+         outcome TEXT, detail TEXT)""",
+    """CREATE TABLE IF NOT EXISTS stage_runs (
+         run_id TEXT PRIMARY KEY, fingerprint TEXT, stage TEXT,
+         stage_version TEXT, model TEXT, input_hash TEXT,
+         started TEXT, finished TEXT, status TEXT, payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS stage_outputs (
+         fingerprint TEXT, stage TEXT, output_key TEXT,
+         input_hash TEXT, run_id TEXT, payload TEXT,
+         PRIMARY KEY (fingerprint, stage, output_key))""",
+    """CREATE TABLE IF NOT EXISTS quotes (
+         quote_id TEXT PRIMARY KEY, fingerprint TEXT,
+         chapter_index INTEGER, start_offset INTEGER,
+         end_offset INTEGER, text TEXT, kind TEXT, status TEXT,
+         payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS work_envelope (
+         fingerprint TEXT PRIMARY KEY, corpus_v TEXT,
+         envelope TEXT, computed_at TEXT)""",
+]
+
+# FTS5 external-content index over corpus_chapters (§1.3, option A),
+# maintained by triggers (A7) inside the same transaction as the text
+# write — there is no application-level "remember to sync the index"
+# step to forget, and rowids (unstable across generation replacement)
+# stay honest through the rewrite. Applied only when the FTS5 probe
+# passes (§1.5); a probe-less Python opens the corpus degraded.
+_CORPUS_FTS_DDL = [
+    """CREATE VIRTUAL TABLE IF NOT EXISTS corpus_fts USING fts5(
+         text, content=corpus_chapters, content_rowid=rowid,
+         tokenize='unicode61')""",
+    """CREATE TRIGGER IF NOT EXISTS corpus_chapters_ai
+         AFTER INSERT ON corpus_chapters BEGIN
+           INSERT INTO corpus_fts(rowid, text)
+             VALUES (new.rowid, new.text);
+         END""",
+    """CREATE TRIGGER IF NOT EXISTS corpus_chapters_ad
+         AFTER DELETE ON corpus_chapters BEGIN
+           INSERT INTO corpus_fts(corpus_fts, rowid, text)
+             VALUES ('delete', old.rowid, old.text);
+         END""",
+    """CREATE TRIGGER IF NOT EXISTS corpus_chapters_au
+         AFTER UPDATE ON corpus_chapters BEGIN
+           INSERT INTO corpus_fts(corpus_fts, rowid, text)
+             VALUES ('delete', old.rowid, old.text);
+           INSERT INTO corpus_fts(rowid, text)
+             VALUES (new.rowid, new.text);
+         END""",
+]
+
+# Tables whose logical content the corpus dump hash covers. The FTS
+# index is derived (a function of corpus_chapters) and is excluded —
+# the hash attests canonical content, not its indexes.
+_CORPUS_TABLES = [
+    "meta", "corpus_works", "corpus_chapters", "corpus_passages",
+    "passage_vectors", "ingest_runs", "stage_runs", "stage_outputs",
+    "quotes", "work_envelope",
+]
+
+# §5.2's writer table, enforced by handle construction (mode), not
+# convention: meta is written by CorpusDB open itself (probes,
+# generation stamps); every other family names its writer modes.
+_CORPUS_FAMILY_MODES = {
+    "text": {"importer"},
+    "vectors": {"importer", "processor"},
+    "stages": {"processor"},
+    "envelope": {"importer", "processor"},
+}
+CORPUS_MODES = ("importer", "processor", "report")
+
+
+class CorpusWriteRefused(RuntimeError):
+    """A corpus write attempted through a handle whose mode does not
+    own that table family (§5.2 writer discipline)."""
+
+
+def _corpus_probe_fts5(conn):
+    """§1.5 probe: can this Python's SQLite build FTS5 tables?
+    Probed at open, never presumed."""
+    try:
+        conn.execute(
+            "CREATE VIRTUAL TABLE temp.__corpus_probe_fts USING fts5(x)")
+        conn.execute("DROP TABLE temp.__corpus_probe_fts")
+        return True
+    except Exception:
+        return False
+
+
+def _corpus_probe_extensions(conn):
+    """§1.5 probe: is extension loading callable on this connection
+    (the §2.3 sqlite-vec path's precondition)?"""
+    try:
+        return callable(getattr(conn, "enable_load_extension", None))
+    except Exception:
+        return False
+
+
+_FTS_NOTICE_PRINTED = False
+
+
+class CorpusDB(_SubstrateHandle):
+    """The corpus handle for one learn dir's corpus.db (§1.1).
+
+    Constructed IN a mode (§5.2): a handle is built as importer,
+    processor, or report, and its write_txn(family) refuses families
+    the mode does not own — from the first day, because slices land
+    their writers against guards that already exist (§11 slice 1).
+    """
+
+    _DB_NAME = _CORPUS_DB_NAME
+    _DDL = _CORPUS_DDL
+    _TABLES = _CORPUS_TABLES
+    _SCHEMA_VERSION = CORPUS_SCHEMA_VERSION
+
+    def __init__(self, path, conn, mode="processor", readonly=False):
+        super().__init__(path, conn)
+        if mode not in CORPUS_MODES:
+            raise ValueError(f"unknown corpus mode: {mode!r}")
+        self.mode = mode
+        self._readonly = bool(readonly)
+        self.fts_available = False
+        self.extensions_available = False
+
+    @classmethod
+    def _connect(cls, path):
+        conn = super()._connect(path)
+        conn.execute(f"PRAGMA busy_timeout={_CORPUS_BUSY_TIMEOUT_MS}")
+        return conn
+
+    @classmethod
+    def _create_schema(cls, conn):
+        super()._create_schema(conn)
+        if _corpus_probe_fts5(conn):
+            with conn:
+                for ddl in _CORPUS_FTS_DDL:
+                    conn.execute(ddl)
+
+    @classmethod
+    def _register_instance(cls, db):
+        _register_corpus_db(db)
+
+    @classmethod
+    def _corrupt_fallback(cls, path, err):
+        # §1.1 divergence (b): corpus content is re-derivable, so a
+        # corrupt corpus opens as ABSENT — processing falls back to
+        # file parsing — instead of starting over an empty DB in
+        # place (which would also violate create-on-ingest, (c)).
+        print(f"  !! WARNING: corpus {path} could not be opened "
+              f"({err}); the corpus is UNAVAILABLE for this process "
+              f"and processing falls back to file parsing. The "
+              f"original file will be preserved as a .corrupt backup "
+              f"(rename-in-place, never a copy). No book data is "
+              f"lost: the corpus is retained work, re-derivable by "
+              f"--ingest from the books themselves.")
+        cls._preserve_corrupt(path)
+        return None
+
+    def _after_open(self):
+        # §1.5 probes, recorded in meta (writable handles only).
+        probe_fts = _corpus_probe_fts5(self._conn)
+        self.extensions_available = _corpus_probe_extensions(self._conn)
+        have_fts = bool(self.query(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='corpus_fts'"))
+        if probe_fts and not have_fts and not self._readonly:
+            # Self-heal across machines: the DB was created on a
+            # Python whose SQLite lacked FTS5; this one has it, so
+            # the derived index joins now (it rebuilds from the
+            # canonical text via the triggers' backfill below).
+            with self._lock:
+                with self._conn:
+                    for ddl in _CORPUS_FTS_DDL:
+                        self._conn.execute(ddl)
+                    self._conn.execute(
+                        "INSERT INTO corpus_fts(corpus_fts) "
+                        "VALUES ('rebuild')")
+            have_fts = True
+        self.fts_available = bool(probe_fts and have_fts)
+        if self._readonly:
+            return
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO meta (k, v) VALUES "
+                    "('corpus_v', ?), ('created_by', ?)",
+                    (CORPUS_V, PORTABLE_VERSION))
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO meta (k, v) VALUES "
+                    "('probe_fts5', ?), ('probe_extensions', ?)",
+                    ("1" if probe_fts else "0",
+                     "1" if self.extensions_available else "0"))
+
+    def meta_get(self, key, default=None):
+        rows = self.query("SELECT v FROM meta WHERE k=?", (key,))
+        return rows[0][0] if rows else default
+
+    def meta_set(self, key, value):
+        """Open-level bookkeeping writes (generation stamps, canary
+        state): meta's writer is CorpusDB itself (§5.2)."""
+        if self._readonly:
+            raise CorpusWriteRefused("read-only corpus handle")
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)",
+                    (key, value))
+
+    def write_txn(self, family=None):
+        """One write transaction for a table FAMILY (§5.2). The mode
+        check happens at construction of the transaction — a refused
+        family raises before any lock or BEGIN."""
+        if family is not None:
+            modes = _CORPUS_FAMILY_MODES.get(family)
+            if modes is None:
+                raise CorpusWriteRefused(
+                    f"unknown corpus table family: {family!r}")
+            if self.mode not in modes:
+                raise CorpusWriteRefused(
+                    f"corpus mode {self.mode!r} may not write the "
+                    f"{family!r} family (writer modes: "
+                    f"{', '.join(sorted(modes))})")
+        if self._readonly:
+            raise CorpusWriteRefused("read-only corpus handle")
+        return _SubstrateWriteTxn(self)
+
+    # -- consumers ------------------------------------------------------
+    def fts_search_chapters(self, phrase):
+        """Chapter-granular FTS search (§1.3): returns a list of
+        (fingerprint, chapter_index) whose text matches the phrase,
+        or None when FTS is unavailable on this Python (degraded
+        open, §1.5 — the notice prints once per process)."""
+        global _FTS_NOTICE_PRINTED
+        if not self.fts_available:
+            if not _FTS_NOTICE_PRINTED:
+                _FTS_NOTICE_PRINTED = True
+                print("  FTS unavailable on this Python's SQLite — "
+                      "text search skipped (corpus text, passages, "
+                      "and vectors are unaffected)")
+            return None
+        tokens = [t for t in str(phrase).split() if t]
+        if not tokens:
+            return []
+        match = '"' + " ".join(
+            t.replace('"', ' ') for t in tokens) + '"'
+        rows = self.query(
+            "SELECT c.fingerprint, c.chapter_index FROM corpus_fts f "
+            "JOIN corpus_chapters c ON c.rowid = f.rowid "
+            "WHERE corpus_fts MATCH ? "
+            "ORDER BY c.fingerprint, c.chapter_index", (match,))
+        return [(r[0], r[1]) for r in rows]
+
+
+_CORPUS_DBS = {}
+_CORPUS_DBS_LOCK = threading.Lock()
+
+
+def _register_corpus_db(db):
+    with _CORPUS_DBS_LOCK:
+        _CORPUS_DBS[str(db.path.parent.resolve())] = db
+
+
+def _corpus_db_for(learn_dir, mode="processor"):
+    """The corpus handle for a learn dir in the given mode, or None
+    when the dir has no corpus.db (open NEVER creates one, §1.1
+    (c)). A registered handle in a different mode is closed and
+    re-opened in the requested mode — a handle's mode is its write
+    authority, never silently widened."""
+    if learn_dir is None:
+        return None
+    key = str(Path(learn_dir).resolve())
+    with _CORPUS_DBS_LOCK:
+        db = _CORPUS_DBS.get(key)
+    if db is not None:
+        if db.mode == mode:
+            return db
+        db.close()
+        with _CORPUS_DBS_LOCK:
+            _CORPUS_DBS.pop(key, None)
+    if not (Path(learn_dir) / _CORPUS_DB_NAME).exists():
+        return None
+    return CorpusDB.open(learn_dir, mode=mode)
+
+
+def _close_corpus_dbs():
+    """Close every registered corpus handle (tests, hygiene)."""
+    with _CORPUS_DBS_LOCK:
+        dbs = list(_CORPUS_DBS.values())
+        _CORPUS_DBS.clear()
+    for db in dbs:
+        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -8684,6 +9091,315 @@ def cmd_learn_status(learn_dir=None):
         if nbytes > 50 * 1024 * 1024:
             print("  Note: state.db is large (>50 MB); the staging "
                   "and roster reports show what is accumulating.")
+
+
+
+
+# ---------------------------------------------------------------------------
+# Corpus reports: --calibration-report (§6.3/§7.3 — the analytics down
+# payment: existing threshold samples, no corpus required) and
+# --corpus-status (§7.4). Both are read-model commands: they open the
+# stores, print, and change nothing.
+# ---------------------------------------------------------------------------
+
+_CALIBRATION_LIMIT_NOTICE = (
+    "DISTRIBUTIONAL ONLY: the threshold samples carry no work, run, "
+    "or outcome keys, so this report describes the score "
+    "distributions the judge produces — it cannot say what a score "
+    "was worth downstream, because nothing joins a sample to its "
+    "fate.")
+_CALIBRATION_DECISION_RULE = (
+    "Decision rule: distributional shape may inform a threshold "
+    "conversation; it may not move one. A threshold move requires "
+    "the wave-2 outcome-joined calibration (samples recorded with "
+    "work/run/outcome refs by the stage-contract adoption).")
+_CALIBRATION_LEVELS = (0.5, 0.75, 0.9, 0.95)
+
+
+def _percentile(sorted_vals, p):
+    """Linear-interpolation percentile (p in [0, 100])."""
+    if not sorted_vals:
+        return None
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    rank = (p / 100.0) * (len(sorted_vals) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    frac = rank - lo
+    return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
+
+
+def _deciles(vals):
+    s = sorted(vals)
+    return [round(_percentile(s, p), 4) for p in range(10, 100, 10)]
+
+
+def _auc(kept, dropped):
+    """P(a random kept sample out-scores a random dropped one),
+    ties counting half (Mann-Whitney). None when a bucket is empty."""
+    if not kept or not dropped:
+        return None
+    wins = 0.0
+    for k in kept:
+        for d in dropped:
+            if k > d:
+                wins += 1.0
+            elif k == d:
+                wins += 0.5
+    return wins / (len(kept) * len(dropped))
+
+
+def _kept_rate_crossings(kept, dropped):
+    """For each named level, the P(yes) value at which the observed
+    kept-rate — P(kept | score >= t) over the pooled samples —
+    first reaches the level, scanning t upward over observed
+    scores. None when the rate never reaches the level."""
+    pooled = sorted(set(kept) | set(dropped))
+    out = {}
+    for level in _CALIBRATION_LEVELS:
+        cross = None
+        for t in pooled:
+            kg = sum(1 for v in kept if v >= t)
+            dg = sum(1 for v in dropped if v >= t)
+            if kg + dg and kg / (kg + dg) >= level:
+                cross = t
+                break
+        out[f"{level:.2f}"] = cross
+    return out
+
+
+def _calibration_report(stats):
+    """Pure: threshold_stats dict -> report data (§6.3)."""
+    triggers = []
+    for trigger in sorted(stats or {}):
+        ent = stats.get(trigger) or {}
+        kept = [float(v) for v in (ent.get("kept") or [])]
+        dropped = [float(v) for v in (ent.get("dropped") or [])]
+        ks, ds = sorted(kept), sorted(dropped)
+        triggers.append({
+            "trigger": trigger,
+            "kept": {"n": len(kept),
+                     "deciles": _deciles(kept) if kept else [],
+                     "median": (round(_percentile(ks, 50), 4)
+                                if kept else None)},
+            "dropped": {"n": len(dropped),
+                        "deciles": _deciles(dropped) if dropped else [],
+                        "median": (round(_percentile(ds, 50), 4)
+                                   if dropped else None)},
+            "separation": {
+                "median_diff": (
+                    round(_percentile(ks, 50) - _percentile(ds, 50), 4)
+                    if kept and dropped else None),
+                "auc": (round(_auc(kept, dropped), 4)
+                        if kept and dropped else None)},
+            "crossings": _kept_rate_crossings(kept, dropped),
+        })
+    return {"triggers": triggers,
+            "limit": _CALIBRATION_LIMIT_NOTICE,
+            "decision_rule": _CALIBRATION_DECISION_RULE}
+
+
+def _calibration_report_text(stats):
+    data = _calibration_report(stats)
+    lines = ["Threshold calibration report",
+             f"  {data['limit']}",
+             f"  {data['decision_rule']}"]
+    if not data["triggers"]:
+        lines.append("  No threshold samples recorded yet.")
+    for t in data["triggers"]:
+        lines.append(f"  {t['trigger']}:")
+        for bucket in ("kept", "dropped"):
+            b = t[bucket]
+            dec = ", ".join(f"{v:.2f}" for v in b["deciles"])
+            lines.append(
+                f"    {bucket} (n={b['n']}): deciles [{dec}]"
+                + (f" median {b['median']:.2f}"
+                   if b["median"] is not None else ""))
+        sep = t["separation"]
+        if sep["auc"] is not None:
+            lines.append(
+                f"    separation: AUC {sep['auc']:.3f}, median diff "
+                f"{sep['median_diff']:+.3f}")
+        cross = ", ".join(
+            f"{lvl} -> {v if v is not None else 'never'}"
+            for lvl, v in t["crossings"].items())
+        lines.append(f"    kept-rate crossings: {cross}")
+    return "\n".join(lines)
+
+
+def cmd_calibration_report(learn_dir=None, as_json=False):
+    """Print the §6.3 calibration report and exit."""
+    state = LearnedState(learn_dir=learn_dir, enabled=True)
+    if as_json:
+        print(json.dumps(_calibration_report(state.threshold_stats),
+                         ensure_ascii=False, indent=1))
+    else:
+        print(_calibration_report_text(state.threshold_stats))
+
+
+def _corpus_generations(db):
+    """Vector generations recorded in meta (§2.4): a list of
+    {model, format, dim, canary} dicts, oldest first."""
+    gens = []
+    for k, v in db.query(
+            "SELECT k, v FROM meta WHERE k LIKE 'generation:%' "
+            "ORDER BY k"):
+        try:
+            gens.append(json.loads(v))
+        except (TypeError, ValueError):
+            continue
+    return gens
+
+
+def _corpus_size_breakdown(db):
+    """corpus.db bytes by component (§7.4): per-table page counts
+    via dbstat when this SQLite has it; content-byte estimates as
+    the fallback. Keys: text, fts, vectors, other, total."""
+    total = db.size_info()["bytes"]
+    try:
+        rows = db.query(
+            "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name")
+        pages = {name: size for name, size in rows}
+        text = pages.get("corpus_chapters", 0)
+        fts = pages.get("corpus_fts", 0) + sum(
+            v for k, v in pages.items() if k.startswith("corpus_fts_"))
+        vectors = pages.get("passage_vectors", 0)
+        other = max(total - text - fts - vectors, 0)
+        return {"text": text, "fts": fts, "vectors": vectors,
+                "other": other, "total": total, "via": "dbstat"}
+    except Exception:
+        text = db.query(
+            "SELECT COALESCE(SUM(LENGTH(text)), 0) "
+            "FROM corpus_chapters")[0][0]
+        vectors = db.query(
+            "SELECT COALESCE(SUM(LENGTH(vector)), 0) "
+            "FROM passage_vectors")[0][0]
+        return {"text": text, "fts": 0, "vectors": vectors,
+                "other": max(total - text - vectors, 0),
+                "total": total, "via": "content-estimate"}
+
+
+def _corpus_status_data(learn_dir):
+    """Pure read model for --corpus-status (§7.4)."""
+    d = (Path(learn_dir) if learn_dir
+         else Path(os.path.expanduser("~")) / ".ebook-processor"
+         / "learned")
+    data = {"present": False, "dir": str(d), "works": [],
+            "totals": {"works": 0, "by_status": {}, "quotes": 0,
+                       "quotes_by_status": {}},
+            "generations": [], "bytes": None,
+            "current_parser_version": CORPUS_PARSER_VERSION}
+    db = _corpus_db_for(d, mode="report")
+    if db is None:
+        return data
+    data["present"] = True
+    data["fts_available"] = db.fts_available
+    gen = None
+    cur = db.meta_get("generation_current")
+    if cur:
+        try:
+            gen = json.loads(cur)
+        except (TypeError, ValueError):
+            gen = None
+    works = []
+    for row in db.query(
+            "SELECT fingerprint, title, author, status, "
+            "parser_version, chapter_count FROM corpus_works "
+            "ORDER BY title, fingerprint"):
+        fp, title, author, status, pv, nch = row
+        n_pass = db.query(
+            "SELECT COUNT(*) FROM corpus_passages WHERE fingerprint=?",
+            (fp,))[0][0]
+        coverage = None
+        if gen and n_pass:
+            n_vec = db.query(
+                "SELECT COUNT(*) FROM passage_vectors pv JOIN "
+                "corpus_passages p ON p.passage_id = pv.passage_id "
+                "WHERE p.fingerprint=? AND pv.model=? AND pv.format=?",
+                (fp, gen.get("model"), gen.get("format")))[0][0]
+            coverage = round(n_vec / n_pass, 4)
+        env = db.query(
+            "SELECT computed_at FROM work_envelope WHERE fingerprint=?",
+            (fp,))
+        works.append({
+            "fingerprint": fp, "title": title, "author": author,
+            "status": status, "parser_version": pv,
+            "chapters": nch, "passages": n_pass,
+            "vector_coverage": coverage,
+            "envelope_computed_at": env[0][0] if env else None})
+        by = data["totals"]["by_status"]
+        by[status] = by.get(status, 0) + 1
+    data["works"] = works
+    data["totals"]["works"] = len(works)
+    for status, n in db.query(
+            "SELECT status, COUNT(*) FROM quotes GROUP BY status"):
+        data["totals"]["quotes_by_status"][status] = n
+        data["totals"]["quotes"] += n
+    data["generations"] = _corpus_generations(db)
+    data["bytes"] = _corpus_size_breakdown(db)
+    return data
+
+
+_CORPUS_STANDING_SENTENCE = (
+    "corpus.db IS retained book text, not a cache — deleting it "
+    "costs re-ingest, never correctness (§5.3).")
+
+
+def _corpus_status_text(learn_dir):
+    data = _corpus_status_data(learn_dir)
+    lines = [f"Corpus status ({data['dir']}/):"]
+    if not data["present"]:
+        lines.append("  corpus.db: absent — no books ingested yet "
+                     "(--ingest is the named act that creates it).")
+        lines.append(f"  {_CORPUS_STANDING_SENTENCE}")
+        return "\n".join(lines)
+    if not data["fts_available"]:
+        lines.append("  FTS: unavailable on this Python's SQLite "
+                     "(degraded open, §1.5) — text search skipped; "
+                     "text, passages, and vectors unaffected.")
+    for w in data["works"]:
+        cov = ("n/a" if w["vector_coverage"] is None
+               else f"{w['vector_coverage'] * 100:.0f}%")
+        stale = ("" if w["parser_version"] == CORPUS_PARSER_VERSION
+                 else " [stale parser]")
+        lines.append(
+            f"  {w['title'] or '(untitled)'} [{w['fingerprint'][:8]}] "
+            f"{w['status']} · parser {w['parser_version']} "
+            f"(current {CORPUS_PARSER_VERSION}){stale} · "
+            f"{w['chapters']} chapters · {w['passages']} passages · "
+            f"vectors {cov}")
+    t = data["totals"]
+    by = ", ".join(f"{k} {v}" for k, v in sorted(t["by_status"].items()))
+    lines.append(f"  Works: {t['works']}" + (f" ({by})" if by else ""))
+    if t["quotes"]:
+        qb = ", ".join(f"{k} {v}" for k, v in
+                       sorted(t["quotes_by_status"].items()))
+        lines.append(f"  Quotes: {t['quotes']} ({qb})")
+    for g in data["generations"]:
+        warn = ("  !! GENERATION SUSPECT — drift canary failed; its "
+                "vectors read as misses until re-embedded (§2.4)"
+                if g.get("canary") == "suspect" else "")
+        lines.append(
+            f"  Vector generation {g.get('model')} / "
+            f"{g.get('format')} (dim {g.get('dim')}): canary "
+            f"{g.get('canary', 'unknown')}{warn}")
+    b = data["bytes"]
+    if b:
+        lines.append(
+            f"  corpus.db: {b['total']} bytes (text {b['text']}, "
+            f"FTS {b['fts']}, vectors {b['vectors']}, other "
+            f"{b['other']}; via {b['via']})")
+    lines.append(f"  {_CORPUS_STANDING_SENTENCE}")
+    return "\n".join(lines)
+
+
+def cmd_corpus_status(learn_dir=None, as_json=False):
+    """Print the §7.4 corpus status report and exit."""
+    if as_json:
+        print(json.dumps(_corpus_status_data(learn_dir),
+                         ensure_ascii=False, indent=1))
+    else:
+        print(_corpus_status_text(learn_dir))
 
 
 def _effective_titles():
@@ -17046,7 +17762,8 @@ def _build_parser():
                          "to a fresh successor entity, and exit")
     ap.add_argument("--json", action="store_true",
                     help="emit JSON where a command supports it "
-                         "(currently --staging-report)")
+                         "(--staging-report, --corpus-status, "
+                         "--calibration-report)")
     g_learn.add_argument("--import-labels", metavar="PATH", default="",
                     help="import hand-labeled merge pairs (label-merges.py output) "
                          "into the nickname dictionary, then continue")
@@ -17096,6 +17813,17 @@ def _build_parser():
     g_out.add_argument("--trope-map", metavar="PREVIEW_JSON",
                     help="map a preview file's tropes to the Cozy Libram catalog "
                          "via embeddings; writes a review JSON, nothing to Supabase")
+
+    g_learn.add_argument("--corpus-status", action="store_true",
+                    help="print the corpus store status (works, "
+                         "vector coverage vs the current generation, "
+                         "quotes, sizes; corpus design §7.4) and exit "
+                         "(no books processed)")
+    g_learn.add_argument("--calibration-report", action="store_true",
+                    help="print the threshold calibration report "
+                         "(per-trigger kept/dropped score "
+                         "distributions; distributional only — "
+                         "§6.3) and exit (no books processed)")
 
     g_isbn = ap.add_argument_group("ISBN")
     g_isbn.add_argument("--allow-no-isbn", action="store_true",
@@ -17248,6 +17976,16 @@ def main():
         cmd_roster_split(args.roster_split[0], args.roster_split[1],
                          args.roster_split[2:],
                          learn_dir=args.learn_dir or None)
+        return
+
+    if args.corpus_status:
+        load_config()
+        cmd_corpus_status(args.learn_dir or None, as_json=args.json)
+        return
+    if args.calibration_report:
+        load_config()
+        cmd_calibration_report(args.learn_dir or None,
+                               as_json=args.json)
         return
 
     # Auto-update: check origin/master before doing any real work. On a
