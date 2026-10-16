@@ -1,11 +1,12 @@
 # The measurement spine — deterministic replay, review fixture, SQLite substrate, verdict read-back: design
 
-Status: DESIGN ONLY (no code). User approved the direction
-2026-10-15: *"Sequence Tier 1 first (replay standardization makes
-everything else measurable), with the SQLite substrate designed
-alongside the replay harness — one project."* This document is that
-project's design. It has not yet had its Security Advisor red-team;
-open choices (§7) are the User's to rule.
+Status: DESIGN, APPROVED FOR BUILD 2026-10-15. The User approved
+the direction ("Sequence Tier 1 first — replay standardization
+makes everything else measurable — with the SQLite substrate
+designed alongside the replay harness, one project"), then
+approved all eight open choices (§7) AS RECOMMENDED, with the
+Security Advisor's red-team amendments A1–A6 (see the Rulings
+addendum at the end of this document — it is part of the spec).
 
 Doctrine, stated once and binding on everything below: **the spine
 is measurement and state infrastructure; it decides nothing about
@@ -1208,4 +1209,86 @@ Ship/no-ship rests on these signals as written — in particular,
 signal 2 is absolute: if the substrate moves any pipeline output,
 the migration does not ship until that is understood, because a
 state layer that changes behaviour is not a state layer.
+
+---
+
+## Rulings addendum (2026-10-15) — part of the spec
+
+**User rulings.** All eight open choices (§7) approved AS
+RECOMMENDED: OC-1 `state.db` in the learn dir, WAL +
+`synchronous=FULL`; OC-2 persistence seam only; OC-3 read-back
+scope tropes + triggers; OC-4 uncertainty batches 4:1
+uncertainty:random, cap ~20/round; OC-5 decision calls stay live
+during replay; OC-6 gate books unchanged (FW / Daemon /
+Freedom™); OC-7 migration automatic on first run; OC-8
+fine-distinction fixture classes included, labelled
+`interpretation-only`, reported separately.
+
+**Advisor amendments (red-team, PROCEED-WITH-CHANGES — all
+mandatory for the build):**
+
+- **A1 (migration crash window).** §3.7's verify-then-rename
+  aborts cleanly on a *detected* failure, but a crash or power
+  loss mid-migration cannot run the abort path: it would leave a
+  partial `state.db` beside still-authoritative JSON, and the
+  trigger ("state.db absent") would then skip migration forever
+  and run on the partial DB. The migration therefore builds into
+  `state.db.migrating` and renames it into place ONLY after
+  verification passes — the codebase's temp+replace idiom applied
+  to the migration itself. A leftover `.migrating` at startup is
+  an incomplete migration: discard and retry. A1 is what makes
+  OC-7's automatic trigger safe.
+- **A2 (WAL copy safety).** Under WAL, a raw file copy of
+  `state.db` can silently miss the WAL tail or capture a torn
+  state. The §1.3 sandbox copy and §3.8's rolling `.bak` go
+  through SQLite's backup API (or a checkpoint with no open write
+  transaction); the live DB is opened immutable for seeding; and
+  `test_replay_never_writes_live_stores` pins **logical content**
+  (a canonical dump hash), not raw file bytes — under WAL, merely
+  opening the live DB can checkpoint on close and change its hash
+  with no logical write, so a byte pin would false-fail.
+- **A3 (suppression covers the promoted re-ship).** §4.5 pins
+  suppressed-claims-never-stage, but the mirror path must also be
+  pinned: a claim staged in run N, rejected by the User before
+  run N+1, must not ship in N+1 via promotion. The build names the
+  mechanism in code (emission suppression at result assembly PLUS
+  a rejection check inside the staging seam helper, both fed by
+  the same VerdictSet) and pins it: staged → rejected → no ship.
+- **A4 (G ordering).** G's §10 invariance signal (G4) is recorded
+  as PENDING-SPINE in G's gate record and scored when this
+  build's replay harness (slice 3) lands; it is never stubbed
+  with two fresh extractions.
+- **A5 (snapshot store keying).** §1.2's snapshot store is keyed
+  by the book **fingerprint** (the batch-1 `_checkpoint`
+  fingerprint), not the stem-derived `<book_key>` — the layout
+  matches the identity model, and two same-stem books never share
+  a directory tree.
+- **A6 (replay queue hygiene).** Uncertainty-queue emission
+  during a replay lands in the throwaway substrate and is
+  discarded with it (§1.3/§2.4): a replay of an old draw must not
+  enqueue live labelling items for superseded state. Stated in a
+  code comment where the queue emits.
+
+**Build interpretations (recorded by the Builder, consistent
+with the above; flagged for the Advisor gate):**
+
+- §1.3's `replay_runs` row is written into the **sandbox**
+  substrate (the only substrate a replay may write); the durable
+  record of a replay is its preview artefact's `replay` marker.
+  This is the reading that keeps §5's "replays never write live
+  state" absolute under A2's logical-content pin.
+- §4.2's suppression seam lives in `process_file_v2`, the
+  pipeline that owns the staging seam neighbourhood §4.2 names.
+  The legacy pipeline is untouched.
+- `staging_works` carries a `payload` column for the work
+  record's residual fields (adoptions, `expired_dropped`) — the
+  §3.2 pattern ("the entry's remaining record") applied to the
+  one table §3.3 drew without one; reconstruction is exact either
+  way and the round-trip test (§3.10) is the pin.
+- Migration is triggered from `main()` (first run on the new
+  code, OC-7), not from bare store constructors: unit tests and
+  embedders that construct stores against JSON fixtures keep the
+  JSON backend until a `state.db` exists in that learn dir. A
+  store uses the substrate iff `state.db` is present in its
+  learn dir.
 

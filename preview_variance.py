@@ -864,6 +864,89 @@ def entity_section(old_d, new_d):
     return lines
 
 
+def _entity_ids(d):
+    return {c.get("entity_id") for c in (d.get("characters") or [])
+            if c.get("entity_id")}
+
+
+def _pair_scores(a, b):
+    """The shared pairwise identity scores (trope / trigger /
+    entity-ID Jaccards) both replay numbers are built from."""
+    at, _ = extract_tropes(a)
+    bt, _ = extract_tropes(b)
+    ag, _, _ = extract_triggers(a)
+    bg, _, _ = extract_triggers(b)
+    return (jaccard(at, bt), jaccard(ag, bg),
+            jaccard(_entity_ids(a), _entity_ids(b)))
+
+
+def replay_variance_section(previews):
+    """Spine §3.4.4: the two numbers the replay harness exists to
+    separate, over a set of previews of ONE book.
+
+    pipeline-delta — a replay preview vs the CAPTURE preview of the
+    same snapshot (the preview carrying `snapshot_captured`): the
+    SAME extraction re-derived, so every difference is pipeline
+    code + decision-draw. draw-variance — across >=2 fresh (non-
+    replay) previews of a book that has a snapshot group in the
+    set: ordinary run-to-run draw, extraction included.
+
+    A replay whose capture baseline is not in the set prints the
+    refusal reason and is never silently scored as draw-variance.
+    Additions only: a marker-less set renders [].
+    """
+    previews = [d for d in previews if isinstance(d, dict)]
+    baselines = {}
+    replays = []
+    fresh = []
+    for d in previews:
+        if d.get("snapshot_captured"):
+            baselines[d["snapshot_captured"]] = d
+            fresh.append(d)  # a capture run IS a fresh extraction
+        elif isinstance(d.get("replay"), dict) \
+                and d["replay"].get("snapshot_id"):
+            replays.append(d)
+        else:
+            fresh.append(d)
+    if not baselines and not replays:
+        return []
+    lines = ["  Replay variance (spine):"]
+    for d in replays:
+        marker = d["replay"]
+        sid = marker["snapshot_id"]
+        base = baselines.get(sid)
+        if base is None:
+            lines.append(
+                f"    snapshot {sid}: replay present but its capture "
+                "preview is not in this set — pipeline-delta not "
+                "scored (a replay is never scored as draw-variance)")
+            continue
+        tj, gj, ej = _pair_scores(base, d)
+        lines.append(
+            f"    pipeline-delta (snapshot {sid}, capture vs "
+            f"replay): tropes J {tj:.3f}, triggers J {gj:.3f}, "
+            f"entity-ID J {ej:.3f}")
+        lines.append(
+            f"      code: {marker.get('source_code_sha')} -> "
+            f"{marker.get('replay_code_sha')}; config digest: "
+            + ("same" if marker.get("source_config_digest")
+               == marker.get("replay_config_digest") else "DIFFERED"))
+    if len(fresh) >= 2 and (baselines or replays):
+        pairs = []
+        for i in range(len(fresh)):
+            for j in range(i + 1, len(fresh)):
+                pairs.append(_pair_scores(fresh[i], fresh[j]))
+        for label, idx in (("tropes", 0), ("triggers", 1),
+                           ("entity-ID", 2)):
+            vals = [p[idx] for p in pairs]
+            lines.append(
+                f"    draw-variance ({len(fresh)} fresh previews, "
+                f"{len(pairs)} pairs): {label} J min "
+                f"{min(vals):.3f} / mean "
+                f"{sum(vals) / len(vals):.3f}")
+    return lines
+
+
 def find_labels(old_d, new_d):
     """Locate a labels fixture for this book in the eval/ directory
     next to this script. Matches on work_id first, then on the fixture's
@@ -950,6 +1033,7 @@ def compare_previews(old_d, new_d, labels_data=None, labels_source=None):
                      f"{sum(present) / len(present):.3f}")
     lines.append("")
     lines += compare_dashboard(old_d, new_d, labels_data, labels_source)
+    lines += replay_variance_section([old_d, new_d])
     return lines
 
 

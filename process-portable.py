@@ -45,7 +45,8 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.10.0"
+PORTABLE_VERSION = "2.11.0"
+
 
 import argparse
 import difflib
@@ -55,6 +56,7 @@ import os
 import posixpath
 import re
 import shutil
+import sqlite3
 import struct
 import sys
 import threading
@@ -2601,6 +2603,637 @@ class DecisionValidator:
 
 
 # ---------------------------------------------------------------------------
+# The measurement spine: SQLite state substrate (eval/spine-design.md).
+#
+# One local SQLite database (stdlib sqlite3 — no dependency, identical
+# on Windows and Linux) replaces the JSON persistence layer beneath
+# LearnedState, StagingState and the per-work RosterStore files. THE
+# STORES KEEP THEIR IN-MEMORY MODELS AND ALL DECISION LOGIC; only the
+# persistence seam changes (design §3.2, OC-2). Keys and counters are
+# promoted to columns so the spine's queries (§3.4) are SQL; nested
+# per-entry records ride as JSON payload columns, sufficient with the
+# columns to reconstruct each store's dict EXACTLY (round-trip is
+# pinned by tests). The spine decides nothing about any claim.
+#
+# A learn dir uses the substrate iff state.db is present in it.
+# Migration (spine slice 2) creates state.db from the JSON stores,
+# triggered from main() on the first run on the new code (OC-7) —
+# bare store construction never creates one, so JSON-mode behaviour
+# is byte-identical until migration.
+#
+# Failure posture (design §3.8, at least as safe as the JSON status
+# quo): every save is a transaction; quick_check on open; corruption
+# gets the F8 discipline (loud warning, original bytes preserved as
+# .corrupt incl. WAL sidecars, stores start empty, NO automatic
+# restore — recovery is a human act). Before the first write in a
+# process, the DB is copied to state.db.bak via SQLite's backup API
+# (Advisor A2 — under WAL a raw file copy can miss the WAL tail).
+# ---------------------------------------------------------------------------
+
+SUBSTRATE_SCHEMA_VERSION = 1
+_STATE_DB_NAME = "state.db"
+_STATE_DB_MIGRATING_NAME = "state.db.migrating"
+_STATE_DB_BAK_NAME = "state.db.bak"
+
+_SUBSTRATE_DDL = [
+    "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)",
+    # LearnedState (mirrors the four JSON files + series tree).
+    """CREATE TABLE IF NOT EXISTS learned_nicknames (
+         nkey TEXT PRIMARY KEY, full TEXT, count INTEGER,
+         books TEXT, human INTEGER, manual INTEGER, payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS learned_titles (
+         title TEXT PRIMARY KEY, count INTEGER, rests TEXT,
+         payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS learned_threshold_stats (
+         trigger TEXT PRIMARY KEY, kept TEXT, dropped TEXT)""",
+    """CREATE TABLE IF NOT EXISTS learned_rejected_tropes (
+         trej_key TEXT PRIMARY KEY, count INTEGER, books TEXT,
+         reasons TEXT, human INTEGER, payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS series_state (
+         series_key TEXT PRIMARY KEY, payload TEXT)""",
+    # StagingState.
+    """CREATE TABLE IF NOT EXISTS staging_works (
+         work_key TEXT PRIMARY KEY, work_id TEXT, title TEXT,
+         author TEXT, runs_completed INTEGER, staged_ever INTEGER,
+         payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS staging_claims (
+         work_key TEXT, claim_key TEXT, class TEXT, display TEXT,
+         state TEXT, promoted_run INTEGER, promoted_via TEXT,
+         best_chapters INTEGER, evidence_ever INTEGER,
+         first_seen TEXT, last_seen TEXT, sightings TEXT,
+         name_forms TEXT, payload TEXT,
+         PRIMARY KEY (work_key, claim_key))""",
+    """CREATE TABLE IF NOT EXISTS staging_expired (
+         work_key TEXT, claim_key TEXT, expired_run INTEGER,
+         sightings TEXT, payload TEXT)""",
+    # RosterStore (work_key is the partition).
+    """CREATE TABLE IF NOT EXISTS roster_works (
+         work_key TEXT PRIMARY KEY, work_id TEXT, title TEXT,
+         author TEXT, runs_completed INTEGER,
+         last_run_fingerprint TEXT, next_entity_seq INTEGER,
+         minted_total INTEGER, payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS roster_entities (
+         work_key TEXT, entity_id TEXT, status TEXT, canonical TEXT,
+         payload TEXT, PRIMARY KEY (work_key, entity_id))""",
+    """CREATE TABLE IF NOT EXISTS roster_retired (
+         work_key TEXT, entity_id TEXT, payload TEXT,
+         PRIMARY KEY (work_key, entity_id))""",
+    """CREATE TABLE IF NOT EXISTS roster_no_pairs (
+         work_key TEXT, a_key TEXT, b_key TEXT, source TEXT,
+         payload TEXT, PRIMARY KEY (work_key, a_key, b_key))""",
+    """CREATE TABLE IF NOT EXISTS roster_adoptions (
+         work_key TEXT, seq INTEGER, payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS roster_anchor_retirements (
+         work_key TEXT, entity_id TEXT, run INTEGER, payload TEXT)""",
+    # Spine tables (design §3.5).
+    """CREATE TABLE IF NOT EXISTS snapshots (
+         snapshot_id TEXT PRIMARY KEY, book_key TEXT, fingerprint TEXT,
+         title TEXT, author TEXT, chapter_count INTEGER,
+         payload_sha256 TEXT, store_path TEXT, baseline_preview TEXT,
+         created TEXT, reason TEXT, extraction TEXT)""",
+    """CREATE TABLE IF NOT EXISTS replay_runs (
+         run_id TEXT PRIMARY KEY, snapshot_id TEXT, started TEXT,
+         replay_code_sha TEXT, replay_config_digest TEXT,
+         preview_path TEXT)""",
+    """CREATE TABLE IF NOT EXISTS verdicts_cache (
+         work_id TEXT, class TEXT, claim_key TEXT, verdict TEXT,
+         fetched_at TEXT, PRIMARY KEY (work_id, class, claim_key))""",
+    """CREATE TABLE IF NOT EXISTS verdict_fetches (
+         id INTEGER PRIMARY KEY, fetched_at TEXT, ok INTEGER,
+         works INTEGER, claims INTEGER, note TEXT)""",
+    """CREATE TABLE IF NOT EXISTS fixture_scores (
+         id INTEGER PRIMARY KEY, release TEXT, fixture_version TEXT,
+         scored_at TEXT, payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS uncertainty_queue (
+         id INTEGER PRIMARY KEY, created TEXT, run_ref TEXT,
+         work_key TEXT, class TEXT, subject TEXT, packet TEXT,
+         status TEXT, label TEXT, labelled_by TEXT, labelled_at TEXT)""",
+    """CREATE TABLE IF NOT EXISTS rejection_events (
+         id INTEGER PRIMARY KEY, run_ref TEXT, work_key TEXT,
+         class TEXT, claim_key TEXT, created TEXT)""",
+    # NOTE: a correction_events table is RESERVED by the design
+    # (§3.6) for decision D1's future corrections ledger. It is
+    # deliberately NOT created here: its semantics are D1's to rule.
+]
+
+# Tables whose logical content the replay-never-writes pin covers
+# (A2): every table in the schema. Replays write only inside their
+# throwaway sandbox substrate, so a live DB's dump hash must not move
+# across a replay at all.
+_SUBSTRATE_TABLES = [
+    "meta", "learned_nicknames", "learned_titles",
+    "learned_threshold_stats", "learned_rejected_tropes",
+    "series_state", "staging_works", "staging_claims",
+    "staging_expired", "roster_works", "roster_entities",
+    "roster_retired", "roster_no_pairs", "roster_adoptions",
+    "roster_anchor_retirements", "snapshots", "replay_runs",
+    "verdicts_cache", "verdict_fetches", "fixture_scores",
+    "uncertainty_queue", "rejection_events",
+]
+
+
+class StateDB:
+    """The substrate handle for one learn dir's state.db.
+
+    One connection per process per learn dir (registry below),
+    check_same_thread=False, writes serialized by an RLock and
+    executed as single transactions — the same discipline as the
+    JSON stores' load-modify-save, with strictly less lost-update
+    surface. Reads come from the same connection.
+    """
+
+    def __init__(self, path, conn):
+        self.path = Path(path)
+        self._conn = conn
+        self._lock = threading.RLock()
+        self.corrupt_at_open = False
+        self._backup_done = False
+
+    # -- construction ---------------------------------------------------
+    @staticmethod
+    def _connect(path):
+        conn = sqlite3.connect(str(path), check_same_thread=False,
+                               timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        return conn
+
+    @classmethod
+    def _create_schema(cls, conn):
+        with conn:
+            for ddl in _SUBSTRATE_DDL:
+                conn.execute(ddl)
+            conn.execute(f"PRAGMA user_version="
+                         f"{SUBSTRATE_SCHEMA_VERSION}")
+
+    @classmethod
+    def create(cls, learn_dir):
+        """Create state.db in learn_dir if absent (schema applied),
+        else open the existing one. Used by migration and tests; the
+        running stores never call this (they open only)."""
+        d = Path(learn_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / _STATE_DB_NAME
+        if p.exists():
+            return cls.open(learn_dir)
+        conn = cls._connect(p)
+        cls._create_schema(conn)
+        db = cls(p, conn)
+        _register_state_db(db)
+        return db
+
+    @classmethod
+    def open(cls, learn_dir):
+        """Open the learn dir's state.db, or None when there is none.
+        A corrupt DB gets the F8 discipline: loud warning, original
+        bytes (incl. WAL sidecars) preserved as .corrupt, and a fresh
+        empty DB in its place — stores start empty and NOTHING is
+        auto-restored (a restore could resurrect retracted state
+        without a sound; recovery is a human act, §3.8)."""
+        d = Path(learn_dir)
+        p = d / _STATE_DB_NAME
+        if not p.exists():
+            return None
+        try:
+            conn = cls._connect(p)
+            row = conn.execute("PRAGMA quick_check").fetchone()
+            if not row or row[0] != "ok":
+                raise sqlite3.DatabaseError(
+                    f"quick_check: {row[0] if row else 'no result'}")
+            ver = conn.execute("PRAGMA user_version").fetchone()[0]
+            if ver != SUBSTRATE_SCHEMA_VERSION:
+                # Unknown future/past schema: re-applying DDL is
+                # additive-safe (IF NOT EXISTS) and user_version is
+                # re-stamped; store payloads are versioned by the
+                # stores themselves.
+                cls._create_schema(conn)
+            db = cls(p, conn)
+        except Exception as e:
+            print(f"  !! WARNING: state substrate {p} could not be "
+                  f"opened ({e}); starting the state stores EMPTY. "
+                  f"The original file will be preserved as a .corrupt "
+                  f"backup. State was NOT carried over — staging "
+                  f"sightings reset (promotions delayed), learning "
+                  f"resets, roster continuity resets for affected "
+                  f"works; no output is created by the loss.")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            cls._preserve_corrupt(p)
+            conn = cls._connect(p)
+            cls._create_schema(conn)
+            db = cls(p, conn)
+            db.corrupt_at_open = True
+        _register_state_db(db)
+        return db
+
+    @staticmethod
+    def _preserve_corrupt(path):
+        """Rename a corrupt state.db (and its WAL sidecars, which are
+        part of the state) to .corrupt siblings. Never clobbers an
+        existing backup."""
+        path = Path(path)
+        try:
+            dest = path.with_name(path.name + ".corrupt")
+            n = 1
+            while dest.exists():
+                dest = path.with_name(f"{path.name}.corrupt-{n}")
+                n += 1
+            for suffix in ("", "-wal", "-shm"):
+                src = Path(str(path) + suffix)
+                if src.exists():
+                    os.replace(src, Path(str(dest) + suffix))
+            print(f"  !! Preserved corrupt state substrate as {dest}")
+        except Exception as e:
+            print(f"  !! WARNING: could not preserve corrupt substrate "
+                  f"{path} ({e})")
+
+    def close(self):
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+    # -- access -----------------------------------------------------------
+    def query(self, sql, params=()):
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            return cur.fetchall()
+
+    def write_txn(self):
+        """Context manager: one write transaction. Before the first
+        write of this process, the rolling backup is refreshed if
+        the DB changed since it was taken (A2: via the backup API,
+        never a raw file copy)."""
+        return _StateDBWriteTxn(self)
+
+    def _maybe_backup(self):
+        if self._backup_done:
+            return
+        self._backup_done = True
+        try:
+            if not self.path.exists():
+                return
+            n_rows = 0
+            for t in ("learned_nicknames", "staging_works",
+                      "roster_works", "meta"):
+                n_rows += self.query(f"SELECT COUNT(*) FROM {t}")[0][0]
+            if n_rows == 0:
+                return  # nothing worth recovering yet
+            bak = self.path.with_name(_STATE_DB_BAK_NAME)
+            if bak.exists():
+                try:
+                    other = sqlite3.connect(str(bak))
+                    try:
+                        same = _dump_hash_conn(other) == self.dump_hash()
+                    finally:
+                        other.close()
+                except Exception:
+                    same = False
+                if same:
+                    return
+            self.backup_to(bak)
+        except Exception as e:
+            print(f"  !! WARNING: state substrate backup failed ({e}); "
+                  f"continuing without a fresh backup")
+
+    def backup_to(self, dest_path):
+        """Copy the whole DB to dest via SQLite's backup API (A2:
+        consistent under WAL, includes the WAL tail)."""
+        dest = Path(dest_path)
+        with self._lock:
+            out = sqlite3.connect(str(dest))
+            try:
+                self._conn.backup(out)
+            finally:
+                out.close()
+
+    def checkpoint(self):
+        """Fold the WAL back into the main file (a maintenance op:
+        logical content unchanged). Replay seeding opens the live DB
+        immutable (A2), which cannot recover a WAL — checkpointing
+        through this handle first makes the seeded copy complete."""
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+
+    def dump_hash(self):
+        """Canonical hash of the DB's LOGICAL content (A2): every
+        table's rows in a fixed order, serialized deterministically.
+        Immune to WAL checkpointing and file-layout noise — two DBs
+        with the same content hash identically."""
+        with self._lock:
+            return _dump_hash_conn(self._conn)
+
+    def size_info(self):
+        try:
+            total = self.path.stat().st_size
+        except OSError:
+            total = 0
+        for suffix in ("-wal", "-shm"):
+            try:
+                total += Path(str(self.path) + suffix).stat().st_size
+            except OSError:
+                pass
+        return {"bytes": total, "path": str(self.path)}
+
+
+class _StateDBWriteTxn:
+    def __init__(self, db):
+        self._db = db
+
+    def __enter__(self):
+        self._db._lock.acquire()
+        self._db._maybe_backup()
+        self._db._conn.execute("BEGIN IMMEDIATE")
+        return self._db._conn
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self._db._conn.execute("COMMIT")
+            else:
+                self._db._conn.execute("ROLLBACK")
+        finally:
+            self._db._lock.release()
+        return False
+
+
+def _dump_hash_conn(conn):
+    import hashlib as _hl
+    h = _hl.sha256()
+    existing = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    for t in _SUBSTRATE_TABLES:
+        if t not in existing:
+            h.update(f"{t}:absent;".encode())
+            continue
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({t})")]
+        rows = conn.execute(
+            f"SELECT * FROM {t} ORDER BY {', '.join(cols[:2])}").fetchall()
+        h.update(f"{t}:{len(rows)};".encode())
+        for row in rows:
+            h.update(repr(tuple(row)).encode("utf-8", "replace"))
+            h.update(b"\n")
+    return h.hexdigest()
+
+
+_STATE_DBS = {}
+_STATE_DBS_LOCK = threading.Lock()
+
+
+def _register_state_db(db):
+    with _STATE_DBS_LOCK:
+        _STATE_DBS[str(db.path.parent.resolve())] = db
+
+
+def _state_db_for(learn_dir):
+    """The substrate for a learn dir, or None when the dir has no
+    state.db (JSON mode). Positive hits are cached per process;
+    opening applies the corruption discipline in StateDB.open."""
+    if learn_dir is None:
+        return None
+    key = str(Path(learn_dir).resolve())
+    with _STATE_DBS_LOCK:
+        db = _STATE_DBS.get(key)
+    if db is not None:
+        return db
+    if not (Path(learn_dir) / _STATE_DB_NAME).exists():
+        return None
+    return StateDB.open(learn_dir)
+
+
+def _close_state_dbs():
+    """Close every registered substrate (tests, process hygiene)."""
+    with _STATE_DBS_LOCK:
+        dbs = list(_STATE_DBS.values())
+        _STATE_DBS.clear()
+    for db in dbs:
+        db.close()
+
+
+def _substrate_active(learn_dir):
+    return _state_db_for(learn_dir) is not None
+
+
+# ---------------------------------------------------------------------------
+# Migration: JSON store files -> state.db (spine §3.7 + amendment A1)
+#
+# The build goes into state.db.migrating and is renamed into place
+# ONLY after verification passes (per-store counts equal the file
+# counts, staging's staged_ever identity closes per work, roster
+# accounting closes). A leftover .migrating at startup is an
+# incomplete migration: discard it and retry. On abort the JSON
+# files remain authoritative and untouched — delay-only, exactly
+# the F8 posture. On success the imported originals are renamed
+# <name>.migrated-<date> (never deleted); the printed rollback is:
+# delete state.db, strip the .migrated-<date> suffixes, done.
+# ---------------------------------------------------------------------------
+
+def _migration_sources(d):
+    """The JSON store files a migration would import, as Paths."""
+    out = []
+    for name in ("nicknames.json", "titles.json",
+                 "threshold_stats.json", "rejected_tropes.json",
+                 "staging.json"):
+        p = d / name
+        if p.exists():
+            out.append(p)
+    series = d / "series"
+    if series.is_dir():
+        out.extend(sorted(series.rglob("*.json")))
+    rosters = d / "rosters"
+    if rosters.is_dir():
+        out.extend(sorted(rosters.glob("*.json")))
+    return out
+
+
+def migrate_state_to_substrate(learn_dir):
+    """One-shot JSON -> state.db migration (see the section header).
+    Returns a report dict: {"status": migrated|already|aborted,
+    "counts": {...}, "reason": ...}. Never raises."""
+    d = Path(learn_dir)
+    db_path = d / _STATE_DB_NAME
+    mig_path = d / _STATE_DB_MIGRATING_NAME
+    if db_path.exists():
+        return {"status": "already"}
+    for sidecar in ("", "-wal", "-shm"):
+        try:
+            Path(str(mig_path) + sidecar).unlink(missing_ok=True)
+        except OSError:
+            pass
+    sources = _migration_sources(d)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(mig_path), check_same_thread=False)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
+            tmpdb = StateDB(mig_path, conn)
+            StateDB._create_schema(conn)
+            counts = _migration_import(d, tmpdb)
+            _migration_verify(d, tmpdb, counts)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        for sidecar in ("", "-wal", "-shm"):
+            try:
+                Path(str(mig_path) + sidecar).unlink(missing_ok=True)
+            except OSError:
+                pass
+        print(f"  !! State migration ABORTED ({e}); the JSON store "
+              "files remain authoritative and untouched. The "
+              "migration retries on the next run.")
+        return {"status": "aborted", "reason": str(e)}
+    # Verified: rename into place (A1), then retire the originals.
+    os.replace(mig_path, db_path)
+    for sidecar in ("-wal", "-shm"):
+        s = Path(str(mig_path) + sidecar)
+        if s.exists():
+            os.replace(s, Path(str(db_path) + sidecar))
+    stamp = _staging_today()
+    for p in sources:
+        try:
+            os.replace(p, p.with_name(f"{p.name}.migrated-{stamp}"))
+        except OSError:
+            pass
+    _state_db_for(d)  # register the live handle
+    print(f"  State stores migrated to {db_path} "
+          f"({counts.get('learned', 0)} learned entries, "
+          f"{counts.get('staging_works', 0)} staging works, "
+          f"{counts.get('rosters', 0)} roster stores, "
+          f"{counts.get('series', 0)} series files). The originals "
+          f"were renamed *.migrated-{stamp}, never deleted. "
+          "Rollback: delete state.db and strip the suffixes.")
+    return {"status": "migrated", "counts": counts}
+
+
+def _migration_import(d, tmpdb):
+    """Import every JSON store into the .migrating DB. Corruption in
+    any store raises (the stores degrade-to-empty on their own; here
+    that degradation is detected and treated as fatal)."""
+    jd = lambda o: json.dumps(o, ensure_ascii=False)
+    counts = {}
+    learned = LearnedState(learn_dir=d, enabled=True)
+    if learned._corrupt_seen:
+        raise ValueError(
+            f"learned store file(s) unreadable: "
+            f"{sorted(learned._corrupt_seen)}")
+    learned._db_save_all(tmpdb)
+    counts["learned"] = (len(learned.nicknames) + len(learned.titles)
+                         + len(learned.threshold_stats)
+                         + len(learned.rejected_tropes))
+    series_dir = d / "series"
+    n_series = 0
+    if series_dir.is_dir():
+        with tmpdb.write_txn() as conn:
+            for p in sorted(series_dir.rglob("*.json")):
+                raw = p.read_text(encoding="utf-8")
+                json.loads(raw)  # validate; a bad file aborts
+                rel = p.relative_to(series_dir)
+                key = str(rel)[:-len(".json")].replace(os.sep, "/")
+                conn.execute(
+                    "INSERT OR REPLACE INTO series_state VALUES (?,?)",
+                    (key, raw))
+                n_series += 1
+    counts["series"] = n_series
+    staging = StagingState(learn_dir=d, enabled=True)
+    if staging.corrupt_at_load:
+        raise ValueError("staging.json is unreadable")
+    rep = staging_report_data(staging)
+    if rep["unaccounted"] != 0:
+        raise ValueError(
+            f"staging identity does not close (unaccounted="
+            f"{rep['unaccounted']})")
+    staging._db_save(tmpdb)
+    counts["staging_works"] = len(staging.data["works"])
+    counts["staging_claims"] = sum(
+        len(w["claims"]) for w in staging.data["works"].values())
+    n_rosters = 0
+    rosters_dir = d / "rosters"
+    if rosters_dir.is_dir():
+        for p in sorted(rosters_dir.glob("*.json")):
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            wk = raw.get("work_key") if isinstance(raw, dict) else None
+            if not wk:
+                raise ValueError(f"roster store {p.name} has no "
+                                 "work_key")
+            store = RosterStore(learn_dir=d, work_key=wk)
+            if store.corrupt_at_load:
+                raise ValueError(f"roster store {p.name} is "
+                                 "unreadable")
+            if store.accounting()["unaccounted"] != 0:
+                raise ValueError(
+                    f"roster store {p.name} accounting does not "
+                    "close")
+            store._db_save(tmpdb)
+            n_rosters += 1
+    counts["rosters"] = n_rosters
+    with tmpdb.write_txn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta VALUES (?,?)",
+            ("migrated_from", jd({
+                "date": _staging_today(),
+                "sources": [p.name for p in _migration_sources(d)],
+                "counts": counts})))
+    return counts
+
+
+def _migration_verify(d, tmpdb, counts):
+    """Re-read the built DB and compare against the imported counts
+    and the source stores (the rename into place happens only when
+    this passes)."""
+    q = lambda sql, args=(): tmpdb.query(sql, args)[0][0]
+    n_learned = sum(q(f"SELECT COUNT(*) FROM {t}") for t in
+                    ("learned_nicknames", "learned_titles",
+                     "learned_threshold_stats",
+                     "learned_rejected_tropes"))
+    if n_learned != counts["learned"]:
+        raise ValueError("learned counts differ after import")
+    if q("SELECT COUNT(*) FROM staging_works") \
+            != counts["staging_works"]:
+        raise ValueError("staging work counts differ after import")
+    if q("SELECT COUNT(*) FROM staging_claims") \
+            != counts["staging_claims"]:
+        raise ValueError("staging claim counts differ after import")
+    if q("SELECT COUNT(*) FROM roster_works") != counts["rosters"]:
+        raise ValueError("roster counts differ after import")
+    if q("SELECT COUNT(*) FROM series_state") != counts["series"]:
+        raise ValueError("series counts differ after import")
+    staging_back = StagingState._db_load(tmpdb)
+    staging_src = StagingState(learn_dir=d, enabled=True)
+    if staging_back != staging_src.data:
+        raise ValueError("staging read-back differs from the JSON "
+                         "store")
+    learned_back = LearnedState._db_load_all(tmpdb)
+    src = LearnedState(learn_dir=d, enabled=True)
+    if learned_back != (src.nicknames, src.titles,
+                        src.threshold_stats, src.rejected_tropes):
+        raise ValueError("learned read-back differs from the JSON "
+                         "store")
+
+
+def ensure_state_migrated(learn_dir):
+    """OC-7: migration runs automatically on the first run that
+    touches state. No state at all -> an empty substrate is created
+    (fresh installs start on the substrate)."""
+    if not learn_dir:
+        return None
+    d = Path(learn_dir)
+    if (d / _STATE_DB_NAME).exists():
+        return {"status": "already"}
+    if not _migration_sources(d):
+        StateDB.create(d)
+        return {"status": "created-empty"}
+    return migrate_state_to_substrate(d)
+
+
+# ---------------------------------------------------------------------------
 # Cross-run learning: the pipeline gets smarter with every book processed.
 #
 # LearnedState persists four kinds of knowledge under <learn_dir>/:
@@ -2760,6 +3393,14 @@ class LearnedState:
 
     def _load_all(self):
         with self._lock:
+            db = self._db()
+            if db is not None:
+                (self.nicknames, self.titles, self.threshold_stats,
+                 self.rejected_tropes) = self._db_load_all(db)
+                self._titles_cache = None
+                if db.corrupt_at_open:
+                    self._corrupt_seen.add("state.db")
+                return
             self.nicknames = self._load_json("nicknames.json", {})
             self.titles = self._load_json("titles.json", {})
             self.threshold_stats = self._load_json("threshold_stats.json", {})
@@ -2771,10 +3412,83 @@ class LearnedState:
         if not self.enabled:
             return
         with self._lock:
+            db = self._db()
+            if db is not None:
+                try:
+                    self._db_save_all(db)
+                except Exception as e:
+                    self._writable = False
+                    self._warn_once(
+                        f"  State substrate write failed ({e}); "
+                        f"learning state not persisted this run")
+                return
             self._save_json("nicknames.json", self.nicknames)
             self._save_json("titles.json", self.titles)
             self._save_json("threshold_stats.json", self.threshold_stats)
             self._save_json("rejected_tropes.json", self.rejected_tropes)
+
+    # -- substrate seam (spine §3.2: persistence only; the in-memory
+    #    model above is unchanged) ------------------------------------
+    def _db(self):
+        return _state_db_for(self.dir)
+
+    @staticmethod
+    def _db_load_all(db):
+        nicknames = {}
+        for nkey, payload in db.query(
+                "SELECT nkey, payload FROM learned_nicknames "
+                "ORDER BY rowid"):
+            nicknames[nkey] = json.loads(payload)
+        titles = {}
+        for title, payload in db.query(
+                "SELECT title, payload FROM learned_titles "
+                "ORDER BY rowid"):
+            titles[title] = json.loads(payload)
+        threshold_stats = {}
+        for trigger, kept, dropped in db.query(
+                "SELECT trigger, kept, dropped FROM "
+                "learned_threshold_stats ORDER BY rowid"):
+            threshold_stats[trigger] = {"kept": json.loads(kept),
+                                        "dropped": json.loads(dropped)}
+        rejected = {}
+        for key, payload in db.query(
+                "SELECT trej_key, payload FROM learned_rejected_tropes "
+                "ORDER BY rowid"):
+            rejected[key] = json.loads(payload)
+        return nicknames, titles, threshold_stats, rejected
+
+    def _db_save_all(self, db):
+        jd = lambda o: json.dumps(o, ensure_ascii=False)
+        with db.write_txn() as conn:
+            conn.execute("DELETE FROM learned_nicknames")
+            for k, e in self.nicknames.items():
+                conn.execute(
+                    "INSERT INTO learned_nicknames VALUES "
+                    "(?,?,?,?,?,?,?)",
+                    (k, e.get("full"), int(e.get("count", 0)),
+                     jd(e.get("books", [])),
+                     1 if e.get("human") else 0,
+                     1 if e.get("manual") else 0, jd(e)))
+            conn.execute("DELETE FROM learned_titles")
+            for k, e in self.titles.items():
+                conn.execute(
+                    "INSERT INTO learned_titles VALUES (?,?,?,?)",
+                    (k, int(e.get("count", 0)), jd(e.get("rests", [])),
+                     jd(e)))
+            conn.execute("DELETE FROM learned_threshold_stats")
+            for k, e in self.threshold_stats.items():
+                conn.execute(
+                    "INSERT INTO learned_threshold_stats VALUES "
+                    "(?,?,?)",
+                    (k, jd(e.get("kept", [])), jd(e.get("dropped", []))))
+            conn.execute("DELETE FROM learned_rejected_tropes")
+            for k, e in self.rejected_tropes.items():
+                conn.execute(
+                    "INSERT INTO learned_rejected_tropes VALUES "
+                    "(?,?,?,?,?,?)",
+                    (k, int(e.get("count", 0)), jd(e.get("books", [])),
+                     jd(e.get("reasons", [])),
+                     1 if e.get("human") else 0, jd(e)))
 
     # -- nicknames ------------------------------------------------------
     def record_alias(self, alias_name, canonical_name):
@@ -3061,12 +3775,63 @@ class LearnedState:
         safe = re.sub(r"\W+", "_", series_key)[:64].strip("_") or "unknown"
         return self.dir / "series" / (safe + ".json")
 
+    # -- series persistence seam (spine: series/*.json files become
+    #    series_state rows keyed by their path under series/, minus
+    #    the .json suffix — "author_x" flat, "daemon/roster" named) --
+    def _series_db_key(self, p):
+        rel = Path(p).relative_to(self.dir / "series").as_posix()
+        return rel[:-5] if rel.endswith(".json") else rel
+
+    def _db_series_get(self, p):
+        """Parsed series payload from the substrate: the dict, or
+        None when no row exists. A corrupt payload is LOUD and reads
+        as {} (the F8 rule: preserved by the substrate's own
+        discipline at open; a bad payload never silently merges)."""
+        db = self._db()
+        if db is None:
+            return None
+        rows = db.query(
+            "SELECT payload FROM series_state WHERE series_key=?",
+            (self._series_db_key(p),))
+        if not rows:
+            return None
+        try:
+            data = json.loads(rows[0][0])
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            print(f"  !! WARNING: series state row for {p} could not "
+                  f"be parsed ({e}); treating it as EMPTY")
+            return {}
+
+    def _db_series_put(self, p, data):
+        db = self._db()
+        with db.write_txn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO series_state VALUES (?,?)",
+                (self._series_db_key(p),
+                 json.dumps(data, ensure_ascii=False)))
+
+    def _write_series_data(self, p, data):
+        """Persist one series payload: a series_state row on the
+        substrate, else the atomic file write."""
+        if self._db() is not None:
+            self._db_series_put(p, data)
+            return
+        self._preserve_corrupt(p)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, p)
+
     def _load_series_data(self, p):
         """Load a series-roster file for a save-side merge. A corrupt
         file starts empty LOUDLY and its bytes are preserved as a
         .corrupt backup before the overwrite — the same rule as the
         learned files (a silent reset here used to erase the roster
         the merge was supposed to extend)."""
+        if self._db() is not None:
+            data = self._db_series_get(p)
+            return data if data is not None else {}
         if not p.exists():
             return {}
         try:
@@ -3082,14 +3847,9 @@ class LearnedState:
         if not self.enabled or not series_key:
             return {}
         p = self._series_path(series_key)
-        if not p.exists():
+        if self._db() is None and not p.exists():
             return {}
-        try:
-            with open(p, encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            self._note_corrupt(p, e)
-            return {}
+        data = self._load_series_data(p)
         hints = {}
         for ch in data.get("characters", []):
             canon = norm_name(ch.get("name", ""))
@@ -3125,11 +3885,7 @@ class LearnedState:
             data["books"].append({"isbn": isbn, "title": title})
         # Atomic write.
         try:
-            self._preserve_corrupt(p)
-            tmp = p.with_suffix(p.suffix + ".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, p)
+            self._write_series_data(p, data)
         except Exception as e:
             self._warn_once(f"  Could not save series roster ({e})")
             return
@@ -3158,14 +3914,9 @@ class LearnedState:
         if not self.enabled or not series_key:
             return {}
         p = self._named_series_path(series_key)
-        if not p.exists():
+        if self._db() is None and not p.exists():
             return {}
-        try:
-            with open(p, encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            self._note_corrupt(p, e)
-            return {}
+        data = self._load_series_data(p)
         hints = {}
         for ch in data.get("characters", []):
             canon = norm_name(ch.get("name", ""))
@@ -3208,11 +3959,7 @@ class LearnedState:
                                   "position": series_position})
         # Atomic write.
         try:
-            self._preserve_corrupt(p)
-            tmp = p.with_suffix(p.suffix + ".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, p)
+            self._write_series_data(p, data)
         except Exception as e:
             self._warn_once(f"  Could not save named-series roster ({e})")
             return
@@ -3434,6 +4181,14 @@ class StagingState:
                   f"{path} ({e}); it will still be overwritten")
 
     def _load(self):
+        db = _state_db_for(self.dir)
+        if db is not None:
+            try:
+                self.data = self._db_load(db)
+            except Exception as e:
+                self._note_corrupt(self.dir / _STATE_DB_NAME, e)
+                self.data = {"version": 1, "works": {}}
+            return
         p = self._path()
         if not p.exists():
             return
@@ -3448,6 +4203,59 @@ class StagingState:
             self._note_corrupt(p, e)
             self.data = {"version": 1, "works": {}}
 
+    # -- substrate seam (spine §3.2) ------------------------------------
+    @staticmethod
+    def _db_load(db):
+        works = {}
+        for work_key, payload in db.query(
+                "SELECT work_key, payload FROM staging_works "
+                "ORDER BY rowid"):
+            w = json.loads(payload)
+            w["claims"] = {}
+            w["expired_recent"] = []
+            works[work_key] = w
+        for work_key, claim_key, payload in db.query(
+                "SELECT work_key, claim_key, payload FROM "
+                "staging_claims ORDER BY rowid"):
+            works[work_key]["claims"][claim_key] = json.loads(payload)
+        for work_key, payload in db.query(
+                "SELECT work_key, payload FROM staging_expired "
+                "ORDER BY rowid"):
+            works[work_key]["expired_recent"].append(json.loads(payload))
+        return {"version": 1, "works": works}
+
+    def _db_save(self, db):
+        jd = lambda o: json.dumps(o, ensure_ascii=False)
+        with db.write_txn() as conn:
+            conn.execute("DELETE FROM staging_works")
+            conn.execute("DELETE FROM staging_claims")
+            conn.execute("DELETE FROM staging_expired")
+            for wk, w in self.data["works"].items():
+                payload = {k: v for k, v in w.items()
+                           if k not in ("claims", "expired_recent")}
+                conn.execute(
+                    "INSERT INTO staging_works VALUES (?,?,?,?,?,?,?)",
+                    (wk, w.get("work_id"), w.get("title"),
+                     w.get("author"), int(w.get("runs_completed", 0)),
+                     int(w.get("staged_ever", 0)), jd(payload)))
+                for ck, c in w["claims"].items():
+                    conn.execute(
+                        "INSERT INTO staging_claims VALUES "
+                        "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (wk, ck, c.get("class"), c.get("display"),
+                         c.get("state"), c.get("promoted_run"),
+                         c.get("promoted_via"),
+                         int(c.get("best_chapters", 0)),
+                         1 if c.get("evidence_ever") else 0,
+                         c.get("first_seen"), c.get("last_seen"),
+                         jd(c.get("sightings", [])),
+                         jd(c.get("name_forms", [])), jd(c)))
+                for e in w["expired_recent"]:
+                    conn.execute(
+                        "INSERT INTO staging_expired VALUES (?,?,?,?,?)",
+                        (wk, e.get("key"), e.get("expired_run"),
+                         jd(e.get("sightings", [])), jd(e)))
+
     def save(self):
         """Atomic write: temp file + os.replace. No-op when not
         writable. A size guard warns past 5 MB (the realistic growth
@@ -3455,6 +4263,17 @@ class StagingState:
         if not self._writable or not self.enabled:
             return False
         with self._lock:
+            db = _state_db_for(self.dir)
+            if db is not None:
+                try:
+                    self._db_save(db)
+                    return True
+                except Exception as e:
+                    self._writable = False
+                    self._warn_once(
+                        f"  Staging store write failed ({e}); "
+                        "staging is disabled for the rest of this run.")
+                    return False
             try:
                 p = self._path()
                 self._preserve_corrupt(p)
@@ -4128,6 +4947,451 @@ def staging_report_data(state, today=None):
             "corrupt_at_load": state.corrupt_at_load}
 
 
+# ---------------------------------------------------------------------------
+# Spine §3.5: per-work verdict read-back + suppression (OC-3)
+#
+# The generalization of the global rejection read: for THIS work,
+# the curated (confirmed/rejected) verdicts on its trope and
+# trigger claims (characters excluded, OC-3), read at emission.
+# Posture (cmd_verify_preview's): a FAILED read is not an empty
+# set — sb() returns None on any error, and None means "unknown":
+# fall back to the local cache of any age and SAY SO with the
+# cache's age, or suppress nothing and say that. Read-back never
+# writes to Supabase.
+# ---------------------------------------------------------------------------
+
+def _now_iso():
+    from datetime import datetime
+    return datetime.now().isoformat(timespec="seconds")
+
+
+class VerdictSet:
+    """One work's curated verdicts, keyed in staging currency:
+    tropes by catalog id (`trope:id:<uuid>`), triggers by the
+    normalized warning (`trigger:<warning>`)."""
+
+    def __init__(self, work_id):
+        self.work_id = work_id
+        self.tropes = {}    # trope_id -> status
+        self.triggers = {}  # normalized warning -> status
+        self.from_cache = False
+        self.fetched_at = None
+
+    def rejected_keys(self):
+        keys = {staging_claim_key("trope", catalog_id=t)
+                for t, s in self.tropes.items() if s == "rejected"}
+        keys |= {staging_claim_key("trigger", warning=w)
+                 for w, s in self.triggers.items() if s == "rejected"}
+        return keys
+
+    def confirmed_keys(self):
+        keys = {staging_claim_key("trope", catalog_id=t)
+                for t, s in self.tropes.items() if s == "confirmed"}
+        keys |= {staging_claim_key("trigger", warning=w)
+                 for w, s in self.triggers.items() if s == "confirmed"}
+        return keys
+
+    def __len__(self):
+        return len(self.tropes) + len(self.triggers)
+
+
+def fetch_work_verdicts(work_id):
+    """GET the work's curated trope + trigger verdicts. Returns a
+    VerdictSet, or None on ANY failure (never an empty set)."""
+    trope_rows = sb(
+        "book_trope_claims",
+        params=f"?work_id=eq.{work_id}"
+               "&status=in.(confirmed,rejected)"
+               "&select=trope_id,status")
+    if trope_rows is None:
+        return None
+    trig_rows = sb(
+        "book_trigger_claims",
+        params=f"?work_id=eq.{work_id}"
+               "&status=in.(confirmed,rejected)"
+               "&select=warning,status")
+    if trig_rows is None:
+        return None
+    vs = VerdictSet(work_id)
+    for r in trope_rows:
+        if r.get("trope_id") and r.get("status"):
+            vs.tropes[str(r["trope_id"])] = r["status"]
+    for r in trig_rows:
+        if r.get("warning") and r.get("status"):
+            vs.triggers[str(r["warning"]).lower().strip()] = r["status"]
+    vs.fetched_at = _now_iso()
+    return vs
+
+
+def _log_verdict_fetch(db, ok, claims, note):
+    if db is None:
+        return
+    try:
+        with db.write_txn() as conn:
+            conn.execute(
+                "INSERT INTO verdict_fetches VALUES (NULL,?,?,?,?,?)",
+                (_now_iso(), 1 if ok else 0, 1, claims, note))
+    except Exception:
+        pass
+
+
+def work_verdicts(work_id, learn_dir):
+    """The run's verdict source: fresh fetch (cached on success),
+    else the cache of any age (with the age stated), else nothing.
+    Returns (VerdictSet|None, note|None). Every attempt is logged
+    in verdict_fetches when the substrate is active; the cache
+    lives in verdicts_cache (substrate only — pre-migration there
+    is no cache and a failed read simply suppresses nothing)."""
+    db = _state_db_for(learn_dir)
+    vs = fetch_work_verdicts(work_id)
+    if vs is not None:
+        if db is not None:
+            try:
+                with db.write_txn() as conn:
+                    conn.execute(
+                        "DELETE FROM verdicts_cache WHERE work_id=?",
+                        (work_id,))
+                    for tid, status in vs.tropes.items():
+                        conn.execute(
+                            "INSERT INTO verdicts_cache VALUES "
+                            "(?,?,?,?,?)",
+                            (work_id, "trope",
+                             staging_claim_key("trope",
+                                               catalog_id=tid),
+                             status, vs.fetched_at))
+                    for w, status in vs.triggers.items():
+                        conn.execute(
+                            "INSERT INTO verdicts_cache VALUES "
+                            "(?,?,?,?,?)",
+                            (work_id, "trigger",
+                             staging_claim_key("trigger", warning=w),
+                             status, vs.fetched_at))
+            except Exception:
+                pass
+        _log_verdict_fetch(db, True, len(vs), "ok")
+        note = (f"{len(vs)} curated verdicts read for this work "
+                f"({len(vs.rejected_keys())} rejected)")
+        return vs, note
+    _log_verdict_fetch(db, False, 0, "fetch failed")
+    if db is not None:
+        rows = db.query(
+            "SELECT class, claim_key, verdict, fetched_at FROM "
+            "verdicts_cache WHERE work_id=?", (work_id,))
+        if rows:
+            vs = VerdictSet(work_id)
+            vs.from_cache = True
+            vs.fetched_at = max(r[3] for r in rows)
+            for cls, key, verdict, _fa in rows:
+                if cls == "trope":
+                    vs.tropes[key[len("trope:id:"):]] = verdict
+                else:
+                    vs.triggers[key[len("trigger:"):]] = verdict
+            return vs, (f"verdict read-back failed; using cached "
+                        f"verdicts from {vs.fetched_at}")
+    return None, ("verdict read-back failed and no cached verdicts "
+                  "exist; nothing suppressed")
+
+
+def apply_verdict_suppression(tropes, trope_conf, triggers,
+                              rejected_keys, catalog_map):
+    """Net A (design §3.5.2): the emission filter. Drops every
+    claim whose staging-currency key a human rejected, from the
+    ship lists AND their confidence map. Returns (tropes, conf,
+    triggers, suppressed_keys, suppressed_names)."""
+    supp_keys = set()
+    supp_names = []
+
+    def trope_key(name):
+        return staging_claim_key(
+            "trope", name=name,
+            catalog_id=(catalog_map or {}).get(_tnorm(name)))
+
+    kept_tropes = []
+    for t in tropes:
+        if trope_key(t) in rejected_keys:
+            supp_keys.add(trope_key(t))
+            supp_names.append(t)
+        else:
+            kept_tropes.append(t)
+    in_t = {_tnorm(t) for t in kept_tropes}
+    conf = {k: v for k, v in (trope_conf or {}).items() if k in in_t}
+    kept_triggers = []
+    for t in triggers:
+        w = t.get("warning") if isinstance(t, dict) else str(t)
+        key = staging_claim_key("trigger", warning=w)
+        if key in rejected_keys:
+            supp_keys.add(key)
+            supp_names.append(str(w))
+        else:
+            kept_triggers.append(t)
+    return kept_tropes, conf, kept_triggers, supp_keys, supp_names
+
+
+def record_rejection_events(learn_dir, run_ref, work_key, keys):
+    """The suppression counter (§3.5.3): one row per suppressed
+    claim per run, counted on the union of both nets."""
+    db = _state_db_for(learn_dir)
+    if db is None or not keys:
+        return
+    with db.write_txn() as conn:
+        for key in sorted(keys):
+            cls = key.split(":", 1)[0]
+            conn.execute(
+                "INSERT INTO rejection_events VALUES (NULL,?,?,?,?,?)",
+                (run_ref, work_key, cls, key, _now_iso()))
+
+
+# ---------------------------------------------------------------------------
+# Spine: the uncertainty queue (design §3.7 queue classes + OC-4
+# binding controls). The queue holds the runs' most informative
+# undecided items for labelling; packets are self-contained (the
+# pair/claim, both verdicts + scores, chapter co-listing, evidence
+# held, provenance) so a labeller never needs the run's context.
+# ---------------------------------------------------------------------------
+
+_UNCERTAINTY_CLASSES = ("tier-judge-disagreement", "near-threshold",
+                        "family-band", "split-suspect",
+                        "form-changed-promotion", "control")
+
+
+def collect_uncertainty_items(result, *, book_label, work_key,
+                              suspects=()):
+    """The run's uncertainty items (design classes 1, 2, 4 +
+    controls). Pure over the result dict."""
+    items = []
+    prov = {"book": book_label, "work_key": work_key}
+    roster = ((result.get("chapter_data") or {}).get("roster")
+              or {})
+
+    def _roster_entry(name):
+        for k, e in roster.items():
+            if _tnorm(k) == _tnorm(name) \
+                    or _tnorm(e.get("name") or "") == _tnorm(name):
+                return e
+        return {}
+
+    def _desc(entry):
+        descs = entry.get("descriptions") or []
+        if descs and isinstance(descs[0], (list, tuple)) \
+                and len(descs[0]) >= 2:
+            return descs[0][1] or ""
+        return ""
+
+    # Class 2 (merge half): pairs near the 0.85 merge bar.
+    for pm in result.get("possible_merges") or []:
+        p = pm.get("p_yes")
+        if p is None or abs(p - 0.85) > 0.10:
+            continue
+        ea, eb = _roster_entry(pm.get("name_a") or ""), \
+            _roster_entry(pm.get("name_b") or "")
+        both = sorted(set(ea.get("chapters") or [])
+                      & set(eb.get("chapters") or []))
+        items.append({
+            "class": "near-threshold",
+            "subject": f"merge: {pm.get('name_a')} ~ "
+                       f"{pm.get('name_b')}",
+            "packet": {
+                "kind": "merge_pair",
+                "name_a": pm.get("name_a"),
+                "name_b": pm.get("name_b"),
+                "p_yes": p, "reason": pm.get("reason"),
+                "chapters_both": both,
+                "desc_a": _desc(ea), "desc_b": _desc(eb),
+                "evidence_a": "", "evidence_b": "",
+                "book": book_label, "provenance": prov}})
+    # Classes 1 + 2 (family half) + controls, from the family
+    # validation outcomes recorded on the relationships.
+    for rel in result.get("relationships") or []:
+        if (rel.get("type") or "") not in _REL_FAMILY_TYPES:
+            continue
+        p = rel.get("validation_p")
+        if p is None:
+            continue
+        packet = {
+            "kind": "family_claim",
+            "from": rel.get("from"), "to": rel.get("to"),
+            "type": rel.get("type"), "judge_p": p,
+            "note": rel.get("validation_note"),
+            "evidence": rel.get("evidence_mined")
+                        or rel.get("evidence") or "",
+            "evidence_grade": rel.get("evidence_grade"),
+            "provenance": prov}
+        subject = (f"family: {rel.get('from')} — {rel.get('to')} "
+                   f"({rel.get('type')})")
+        binding = rel.get("evidence_grade") == "binding"
+        bare = not (rel.get("evidence") or "").strip() and not binding
+        if (binding and p < 0.30) or (p >= 0.70 and bare):
+            # Class 1: the deterministic evidence tier and the
+            # judge point opposite ways.
+            items.append({"class": "tier-judge-disagreement",
+                          "subject": subject, "packet": packet})
+        elif abs(p - 0.30) <= 0.10 or abs(p - 0.70) <= 0.10:
+            items.append({"class": "family-band",
+                          "subject": subject, "packet": packet})
+        elif p >= 0.80 or p <= 0.20:
+            # A decided pair: a control for the 4:1 batch mix.
+            items.append({"class": "control", "subject": subject,
+                          "packet": packet})
+    # Class 4: form-changed promotions (staging marker).
+    for prom in ((result.get("staging") or {}).get("promoted")
+                 or []):
+        if prom.get("form_changed"):
+            items.append({
+                "class": "form-changed-promotion",
+                "subject": f"claim: {prom.get('display')}",
+                "packet": {"kind": "claim", "key": prom.get("key"),
+                           "display": prom.get("display"),
+                           "via": prom.get("via"),
+                           "provenance": prov}})
+    items.extend(suspects)
+    return items
+
+
+def roster_split_suspects(learn_dir):
+    """Class 3: roster split-suspects still unresolved in a later
+    run than the one that recorded them (substrate query over the
+    roster payloads)."""
+    db = _state_db_for(learn_dir)
+    if db is None:
+        return []
+    items = []
+    for wk, runs, payload in db.query(
+            "SELECT work_key, runs_completed, payload FROM "
+            "roster_works ORDER BY rowid"):
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        for s in data.get("suspects") or []:
+            first = s.get("run")
+            if first is None or (runs or 0) - first < 1:
+                continue
+            items.append({
+                "class": "split-suspect",
+                "subject": f"split suspect: {s.get('a')} ~ "
+                           f"{s.get('b')} ({wk})",
+                "packet": {"kind": "split_suspect", "work_key": wk,
+                           "a": s.get("a"), "b": s.get("b"),
+                           "reason": s.get("reason"),
+                           "first_run": first,
+                           "runs_completed": runs}})
+    return items
+
+
+def emit_uncertainty(learn_dir, run_ref, items):
+    """Write queue rows (substrate only; JSON mode has no queue).
+    Controls are stored with status 'control', the rest 'pending'.
+    Returns rows written."""
+    db = _state_db_for(learn_dir)
+    if db is None or not items:
+        return 0
+    with db.write_txn() as conn:
+        for it in items:
+            conn.execute(
+                "INSERT INTO uncertainty_queue VALUES "
+                "(NULL,?,?,?,?,?,?,?,?,?,?)",
+                (_now_iso(), run_ref,
+                 (it["packet"].get("provenance") or {}).get(
+                     "work_key"),
+                 it["class"], it["subject"],
+                 json.dumps(it["packet"], ensure_ascii=False),
+                 "control" if it["class"] == "control" else "pending",
+                 None, None, None))
+    return len(items)
+
+
+def build_labelling_batch(learn_dir, cap=20):
+    """One labelling round (OC-4): pending uncertainty items mixed
+    4:1 with random controls (decided pairs from real runs), cap
+    ~20. Deterministic order (queue order); the mix ratio is the
+    binding control, randomness of the control draw is not."""
+    db = _state_db_for(learn_dir)
+    if db is None:
+        return []
+    rows = db.query(
+        "SELECT id, class, subject, packet FROM uncertainty_queue "
+        "WHERE status='pending' ORDER BY id")
+    controls = db.query(
+        "SELECT id, class, subject, packet FROM uncertainty_queue "
+        "WHERE status='control' ORDER BY id")
+    n_ctl = min(len(controls), cap // 5)
+    n_unc = min(len(rows), cap - n_ctl)
+    picked = [rows[i] for i in range(n_unc)] \
+        + [controls[i] for i in range(n_ctl)]
+    return [{"id": r[0], "class": r[1], "subject": r[2],
+             "packet": json.loads(r[3])} for r in picked]
+
+
+def apply_uncertainty_labels(learn_dir, labels_path,
+                             merge_pairs_path=None):
+    """Intake: apply a labels file ([{queue_id, label, labeller}])
+    to the queue; merge-pair labels also append to
+    eval/merge_pairs.json in the harness's entry shape."""
+    db = _state_db_for(learn_dir)
+    if db is None:
+        return {"labelled": 0, "merge_pairs_added": 0,
+                "missing": [], "error": "no substrate"}
+    labels = json.loads(
+        Path(labels_path).read_text(encoding="utf-8"))
+    if merge_pairs_path is None:
+        merge_pairs_path = SCRIPT_DIR / "eval" / "merge_pairs.json"
+    pairs = []
+    if Path(merge_pairs_path).exists():
+        pairs = json.loads(
+            Path(merge_pairs_path).read_text(encoding="utf-8"))
+    labelled = 0
+    added = 0
+    missing = []
+    with db.write_txn() as conn:
+        for lab in labels:
+            qid = lab.get("queue_id", lab.get("id"))
+            rows = db.query(
+                "SELECT class, packet FROM uncertainty_queue "
+                "WHERE id=?", (qid,))
+            if not rows:
+                missing.append(qid)
+                continue
+            conn.execute(
+                "UPDATE uncertainty_queue SET status='labelled', "
+                "label=?, labelled_by=?, labelled_at=? WHERE id=?",
+                (lab.get("label"), lab.get("labeller"),
+                 _now_iso(), qid))
+            labelled += 1
+            packet = json.loads(rows[0][1])
+            if packet.get("kind") == "merge_pair" \
+                    and lab.get("label") in ("same", "different"):
+                pairs.append({
+                    "name_a": packet.get("name_a"),
+                    "name_b": packet.get("name_b"),
+                    "label": lab["label"],
+                    "book": packet.get("book")
+                            or (packet.get("provenance") or {})
+                            .get("book"),
+                    "desc_a": packet.get("desc_a") or "",
+                    "desc_b": packet.get("desc_b") or "",
+                    "evidence_a": packet.get("evidence_a") or "",
+                    "evidence_b": packet.get("evidence_b") or "",
+                    "source": "uncertainty queue (spine)"})
+                added += 1
+    if added:
+        with open(merge_pairs_path, "w", encoding="utf-8") as f:
+            json.dump(pairs, f, indent=1, ensure_ascii=False)
+    return {"labelled": labelled, "merge_pairs_added": added,
+            "missing": missing}
+
+
+def cmd_apply_uncertainty_labels(learn_dir, labels_path):
+    rep = apply_uncertainty_labels(learn_dir, labels_path)
+    if rep.get("error"):
+        print(f"  --apply-uncertainty-labels: {rep['error']}")
+        return
+    print(f"  Uncertainty labels applied: {rep['labelled']} "
+          f"({rep['merge_pairs_added']} merge pair(s) appended to "
+          f"eval/merge_pairs.json"
+          + (f"; unknown queue ids: {rep['missing']}"
+             if rep["missing"] else "") + ")")
+
+
 def staging_observe_result(parts, state, *, independent):
     """Option F seam helper (design section 5): observe one completed
     run's stageable claims and compute the ship set. Called ONCE per
@@ -4211,6 +5475,53 @@ def staging_observe_result(parts, state, *, independent):
             if act.get("stamp"):
                 w = t.get("warning") if isinstance(t, dict) else str(t)
                 trigger_persistence[str(w).lower()] = act["stamp"]
+    # Spine §3.5.2, net B (amendment A3): a claim staged in run N
+    # and human-rejected before run N+1 must not ship in N+1 via
+    # promotion. The observe above already decided this run's ship
+    # set, promotion included; the verdict set drops rejected
+    # claims from it HERE, inside the seam, so no caller can
+    # re-ship them. The sighting itself stays recorded — the store
+    # is an observation log; suppression governs emission only.
+    suppressed_keys = set()
+    suppressed_names = []
+    _vrej = parts.get("verdict_rejected") or set()
+    if _vrej:
+        _key_of = {}
+        for obs, act in zip(obs_tropes, out["trope_actions"]):
+            if act.get("key"):
+                _key_of[_tnorm(obs["name"])] = act["key"]
+        _kept = []
+        for t in ship_tropes:
+            _k = _key_of.get(_tnorm(t))
+            if _k in _vrej:
+                suppressed_keys.add(_k)
+                suppressed_names.append(t)
+            else:
+                _kept.append(t)
+        ship_tropes = _kept
+        _in = {_tnorm(t) for t in ship_tropes}
+        conf = {k: v for k, v in conf.items() if k in _in}
+        trope_persistence = {k: v for k, v in
+                             trope_persistence.items() if k in _in}
+        _tkey_of = {}
+        for t_in, act in zip(triggers_in, out["trigger_actions"]):
+            if act.get("key"):
+                _w = t_in.get("warning") if isinstance(t_in, dict) \
+                    else str(t_in)
+                _tkey_of[str(_w)] = act["key"]
+        _kept_tr = []
+        for t in ship_triggers:
+            _w = t.get("warning") if isinstance(t, dict) else str(t)
+            _k = _tkey_of.get(str(_w))
+            if _k in _vrej:
+                suppressed_keys.add(_k)
+                suppressed_names.append(str(_w))
+            else:
+                _kept_tr.append(t)
+        ship_triggers = _kept_tr
+        trigger_persistence = {
+            k: v for k, v in trigger_persistence.items()
+            if staging_claim_key("trigger", warning=k) not in _vrej}
     marker = {"staged": out["staged"], "promoted": out["promoted"],
               "trapped_total": out["trapped_total"],
               "expired_this_run": out["expired_this_run"],
@@ -4220,7 +5531,9 @@ def staging_observe_result(parts, state, *, independent):
     return {"ship_tropes": ship_tropes, "trope_conf": conf,
             "ship_triggers": ship_triggers, "marker": marker,
             "trope_persistence": trope_persistence,
-            "trigger_persistence": trigger_persistence}
+            "trigger_persistence": trigger_persistence,
+            "suppressed_keys": suppressed_keys,
+            "suppressed_names": suppressed_names}
 
 
 def _staging_report_text(state, today=None, data=None):
@@ -5131,6 +6444,20 @@ class RosterStore:
                   f"{path} ({e}); it will still be overwritten")
 
     def _load(self):
+        db = _state_db_for(self.dir.parent)
+        if db is not None:
+            try:
+                data = self._db_load(db)
+            except Exception as e:
+                self._note_corrupt(self.dir.parent / _STATE_DB_NAME, e)
+                self.data = self._empty_data(self.work_key)
+                return
+            if data is not None:
+                empty = self._empty_data(self.work_key)
+                empty.update(data)
+                empty["work_key"] = self.work_key
+                self.data = empty
+            return
         p = self.path
         if not p.exists():
             return
@@ -5149,6 +6476,80 @@ class RosterStore:
             self._note_corrupt(p, e)
             self.data = self._empty_data(self.work_key)
 
+    # -- substrate seam (spine §3.3): one row-set per work ------------
+    def _db_load(self, db):
+        wk = self.work_key
+        rows = db.query("SELECT payload FROM roster_works "
+                        "WHERE work_key=?", (wk,))
+        if not rows:
+            return None
+        data = json.loads(rows[0][0])
+        jd = json.loads
+        data["entities"] = {
+            eid: jd(p) for eid, p in db.query(
+                "SELECT entity_id, payload FROM roster_entities "
+                "WHERE work_key=? ORDER BY rowid", (wk,))}
+        data["retired"] = {
+            rid: jd(p) for rid, p in db.query(
+                "SELECT entity_id, payload FROM roster_retired "
+                "WHERE work_key=? ORDER BY rowid", (wk,))}
+        data["no_pairs"] = [jd(p) for (p,) in db.query(
+            "SELECT payload FROM roster_no_pairs WHERE work_key=? "
+            "ORDER BY rowid", (wk,))]
+        data["adoptions"] = [jd(p) for (p,) in db.query(
+            "SELECT payload FROM roster_adoptions WHERE work_key=? "
+            "ORDER BY seq", (wk,))]
+        data["anchor_retirements"] = [jd(p) for (p,) in db.query(
+            "SELECT payload FROM roster_anchor_retirements "
+            "WHERE work_key=? ORDER BY rowid", (wk,))]
+        return data
+
+    def _db_save(self, db):
+        wk = self.work_key
+        d = self.data
+        jd = lambda o: json.dumps(o, ensure_ascii=False)
+        residual = {k: v for k, v in d.items()
+                    if k not in ("entities", "retired", "no_pairs",
+                                 "adoptions", "anchor_retirements")}
+        with db.write_txn() as conn:
+            for table in ("roster_works", "roster_entities",
+                          "roster_retired", "roster_no_pairs",
+                          "roster_adoptions",
+                          "roster_anchor_retirements"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE work_key=?", (wk,))
+            conn.execute(
+                "INSERT INTO roster_works VALUES (?,?,?,?,?,?,?,?,?)",
+                (wk, d.get("work_id"), d.get("title"), d.get("author"),
+                 int(d.get("runs_completed", 0)),
+                 d.get("last_run_fingerprint"),
+                 int(d.get("next_entity_seq", 1)),
+                 int(d.get("minted_total", 0)), jd(residual)))
+            for eid, e in d["entities"].items():
+                conn.execute(
+                    "INSERT INTO roster_entities VALUES (?,?,?,?,?)",
+                    (wk, eid, e.get("status"), e.get("canonical"),
+                     jd(e)))
+            for rid, r in d["retired"].items():
+                conn.execute(
+                    "INSERT INTO roster_retired VALUES (?,?,?)",
+                    (wk, rid, jd(r)))
+            for pair in d["no_pairs"]:
+                conn.execute(
+                    "INSERT INTO roster_no_pairs VALUES (?,?,?,?,?)",
+                    (wk, pair.get("a"), pair.get("b"),
+                     pair.get("source"), jd(pair)))
+            for i, ad in enumerate(d["adoptions"]):
+                conn.execute(
+                    "INSERT INTO roster_adoptions VALUES (?,?,?)",
+                    (wk, i, jd(ad)))
+            for r in d["anchor_retirements"]:
+                conn.execute(
+                    "INSERT INTO roster_anchor_retirements VALUES "
+                    "(?,?,?,?)",
+                    (wk, r.get("entity_id") or r.get("entity"),
+                     r.get("run"), jd(r)))
+
     def save(self):
         """Atomic write: temp file + os.replace. No-op when not
         writable/enabled."""
@@ -5156,6 +6557,18 @@ class RosterStore:
                 or self.work_key is None:
             return False
         with self._lock:
+            db = _state_db_for(self.dir.parent)
+            if db is not None:
+                try:
+                    self._db_save(db)
+                    return True
+                except Exception as e:
+                    self._writable = False
+                    self._warn_once(
+                        f"  Roster store write failed ({e}); roster "
+                        "persistence is disabled for the rest of this "
+                        "run.")
+                    return False
             try:
                 p = self.path
                 self._preserve_corrupt(p)
@@ -5871,11 +7284,74 @@ def roster_store_paths(learn_dir=None):
     return sorted(rdir.glob("*.json"))
 
 
+def _roster_store_locs(learn_dir):
+    """Every persisted roster store as (label, work_key_or_None,
+    path_or_None): on the substrate the label is a state.db key and
+    the store is constructed by key; in JSON mode the label is the
+    store filename and the store loads via load_path."""
+    base = Path(learn_dir) if learn_dir else _learned_dir()
+    db = _state_db_for(base)
+    if db is not None:
+        return [(f"state.db:{wk}", wk, None) for (wk,) in db.query(
+            "SELECT work_key FROM roster_works ORDER BY rowid")]
+    return [(p.name, None, p) for p in roster_store_paths(base)]
+
+
+def _roster_store_exists(store):
+    """True when the store has a persisted home: a roster_works row
+    on the substrate, else its file."""
+    db = _state_db_for(store.dir.parent)
+    if db is not None:
+        return bool(db.query(
+            "SELECT 1 FROM roster_works WHERE work_key=?",
+            (store.work_key,)))
+    return store.path.exists()
+
+
+def _roster_delete_persisted(learn_dir, work_key):
+    """Remove a store's persisted home (substrate rows, else its
+    file)."""
+    base = Path(learn_dir) if learn_dir else _learned_dir()
+    db = _state_db_for(base)
+    if db is not None:
+        with db.write_txn() as conn:
+            for table in ("roster_works", "roster_entities",
+                          "roster_retired", "roster_no_pairs",
+                          "roster_adoptions",
+                          "roster_anchor_retirements"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE work_key=?",
+                    (work_key,))
+        return
+    p = base / "rosters" / _roster_store_filename(work_key)
+    if p.exists():
+        p.unlink()
+
+
 def find_roster_store(learn_dir, work):
     """Find the store for a <work> argument (exact work_key, else
     work_id, else title — first unambiguous match). Returns
     (RosterStore, None) or (None, error_message)."""
     matches = []
+    db = _state_db_for(Path(learn_dir) if learn_dir
+                       else _learned_dir())
+    if db is not None:
+        for wk, wid, title in db.query(
+                "SELECT work_key, work_id, title FROM roster_works "
+                "ORDER BY rowid"):
+            if work in (wk, wid):
+                return RosterStore(learn_dir=learn_dir,
+                                   work_key=wk), None
+            if work and _tnorm(work) == _tnorm(title or ""):
+                matches.append(RosterStore(learn_dir=learn_dir,
+                                           work_key=wk))
+        if len(matches) == 1:
+            return matches[0], None
+        if len(matches) > 1:
+            return None, (f"work {work!r} matches {len(matches)} "
+                          "roster stores by title; use the work_id "
+                          "or work key")
+        return None, f"no roster store found for work {work!r}"
     for path in roster_store_paths(learn_dir):
         try:
             with open(path, encoding="utf-8") as f:
@@ -5920,13 +7396,13 @@ def adopt_roster_store(learn_dir, work_id, title="", author="",
         if cand == dst_key:
             continue
         src = RosterStore(learn_dir=learn_dir, work_key=cand)
-        if not src.path.exists() or src.corrupt_at_load:
+        if not _roster_store_exists(src) or src.corrupt_at_load:
             continue
         if _tnorm(src.data.get("title")) != _tnorm(title) \
                 or _tnorm(src.data.get("author")) != _tnorm(author):
             continue
         dst = RosterStore(learn_dir=learn_dir, work_key=dst_key)
-        if not dst.path.exists():
+        if not _roster_store_exists(dst):
             # Rename: same store, new key — no reminting needed.
             src.data["work_key"] = dst_key
             src.data["work_id"] = str(work_id)
@@ -5934,13 +7410,17 @@ def adopt_roster_store(learn_dir, work_id, title="", author="",
                 {"from_key": cand, "entities_moved":
                  len(src.data["entities"]) + len(src.data["retired"])})
             old_path = src.path
+            old_key = cand
             src.work_key = dst_key  # .path now resolves to the new key
             src.save()              # writes the store under the new key
-            try:
-                if old_path != src.path and old_path.exists():
-                    old_path.unlink()
-            except OSError:
-                pass
+            if _state_db_for(Path(learn_dir)) is not None:
+                _roster_delete_persisted(learn_dir, old_key)
+            else:
+                try:
+                    if old_path != src.path and old_path.exists():
+                        old_path.unlink()
+                except OSError:
+                    pass
             adopted = True
             continue
         try:
@@ -5952,7 +7432,7 @@ def adopt_roster_store(learn_dir, work_id, title="", author="",
             dst.data["work_id"] = str(work_id)
         dst.save()
         try:
-            src.path.unlink()
+            _roster_delete_persisted(learn_dir, cand)
         except OSError:
             pass
         adopted = True
@@ -5985,16 +7465,19 @@ def cmd_roster_report(learn_dir=None):
     """--roster-report: every roster store, its accounting closed,
     suspects loudest, then entities, links, suspensions,
     suppressions, collisions, splits and canonical changes."""
-    paths = roster_store_paths(_roster_cmd_learn_dir(learn_dir))
-    if not paths:
+    base = _roster_cmd_learn_dir(learn_dir)
+    locs = _roster_store_locs(base)
+    if not locs:
         print("No roster stores found. Roster stores are written by "
               "runs with --persist-roster.")
         return
-    print(f"Roster stores: {len(paths)} work(s)")
-    for path in paths:
-        store = _roster_report_store(path)
+    print(f"Roster stores: {len(locs)} work(s)")
+    for label, wk, path in locs:
+        store = (RosterStore(learn_dir=base, work_key=wk)
+                 if wk is not None else _roster_report_store(path))
         if store is None or store.corrupt_at_load:
-            print(f"\n!! CORRUPT roster store: {path}")
+            print(f"\n!! CORRUPT roster store: "
+                  f"{label if wk is not None else path}")
             print("   Unreadable — preserved on disk. Runs against "
                   "this work degrade to stateless behaviour until "
                   "the file is repaired or removed.")
@@ -6005,7 +7488,7 @@ def cmd_roster_report(learn_dir=None):
               f"{d.get('author') or ''}")
         print(f"    work_id: {d.get('work_id') or '(unresolved)'}   "
               f"runs completed: {d.get('runs_completed', 0)}   "
-              f"store: {path.name}")
+              f"store: {label}")
         if d.get("work_id"):
             try:
                 wid2, how2 = resolve_work(d.get("title") or "",
@@ -7065,6 +8548,15 @@ def _staging():
 # call sites never need None checks.
 _LEARNED = None
 
+# Spine replay/capture contexts (design §3.4). _REPLAY_CTX is set
+# only inside run_replay: while it lives, _checkpoint_dir serves the
+# snapshot's payload directory, checkpoint WRITES are suppressed
+# (the snapshot stays pristine), and every store write lands in the
+# sandbox substrate. _CAPTURE_CTX arms snapshot capture for the
+# current (fresh, preview) run.
+_REPLAY_CTX = None
+_CAPTURE_CTX = None
+
 
 def _learn():
     global _LEARNED
@@ -7079,7 +8571,32 @@ def _count_series_rosters(state):
     Counts each series bucket once: author-based flat files
     (series/*.json) and named-series rosters (series/*/roster.json).
     Pure (no I/O beyond reading); returns (0, 0) when the dir is absent.
-    """
+    On the substrate the same buckets are series_state rows, keyed
+    "author_x" (flat) and "<name>/roster" (named)."""
+    db = _state_db_for(state.dir)
+    if db is not None:
+        n_series = 0
+        n_chars = 0
+        seen = set()
+        for (key, payload) in db.query(
+                "SELECT series_key, payload FROM series_state "
+                "ORDER BY rowid"):
+            bucket = key[:-len("/roster")] if key.endswith("/roster") \
+                else key
+            if not bucket or bucket in seen:
+                continue
+            seen.add(bucket)
+            try:
+                data = json.loads(payload)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            n_series += 1
+            chars = data.get("characters", [])
+            if isinstance(chars, list):
+                n_chars += len(chars)
+        return n_series, n_chars
     series_dir = state.dir / "series"
     if not series_dir.is_dir():
         return 0, 0
@@ -7157,6 +8674,16 @@ def cmd_learn_status(learn_dir=None):
     """Print learning system status and exit (for --learn-status)."""
     state = LearnedState(learn_dir=learn_dir, enabled=True)
     print(_learn_status_text(state))
+    db = _state_db_for(state.dir)
+    if db is not None:
+        nbytes = db.size_info()["bytes"]
+        print(f"  State substrate: state.db (SQLite), {nbytes} bytes "
+              "on disk incl. WAL. state.db IS the state, not a "
+              "cache; state.db.bak beside it is the rolling backup "
+              "(refreshed on the first write of each process).")
+        if nbytes > 50 * 1024 * 1024:
+            print("  Note: state.db is large (>50 MB); the staging "
+                  "and roster reports show what is accumulating.")
 
 
 def _effective_titles():
@@ -12857,6 +14384,10 @@ def _checkpoint_book_key(fpath):
 
 
 def _checkpoint_dir(book_key):
+    if _REPLAY_CTX is not None:
+        # Replay: payloads are served from the snapshot's own
+        # directory (dir-parameterized load, design §3.4.2).
+        return Path(_REPLAY_CTX["payload_dir"])
     return SCRIPT_DIR / "preview" / ".checkpoints" / book_key
 
 
@@ -12910,6 +14441,19 @@ def _checkpoint_flags_hash():
     vals = {k: CONFIG.get(k) for k in _CHECKPOINT_FLAGS}
     vals["_code_sha"] = _git_commit_sha() or "unknown"
     return _hl.sha256(_js.dumps(vals, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _config_digest():
+    """Digest of the output-affecting CONFIG (spine §3.4.2): the
+    _CHECKPOINT_FLAGS set in canonical form. Two runs with the same
+    digest ran the same effective configuration; the replay marker
+    and the snapshot manifest pin it so a pipeline-vs-draw comparison
+    can prove the config did not move. (No credential keys appear in
+    _CHECKPOINT_FLAGS.)"""
+    import hashlib as _hl
+    vals = {k: CONFIG.get(k) for k in _CHECKPOINT_FLAGS}
+    return _hl.sha256(json.dumps(vals, sort_keys=True,
+                                 default=str).encode()).hexdigest()[:16]
 
 
 def _ckpt_json_safe(obj):
@@ -13022,6 +14566,8 @@ def _ckpt_restore_roster_entry(entry):
 
 
 def _checkpoint_save_meta(book_key, total_chapters, fingerprint=None):
+    if _REPLAY_CTX is not None:
+        return  # replay never writes into the snapshot (spine §3.4)
     d = _checkpoint_dir(book_key)
     d.mkdir(parents=True, exist_ok=True)
     meta = {"book_key": book_key, "total_chapters": total_chapters,
@@ -13034,6 +14580,8 @@ def _checkpoint_save_meta(book_key, total_chapters, fingerprint=None):
 
 
 def _checkpoint_purge_stale(book_key, total_chapters, fingerprint=None):
+    if _REPLAY_CTX is not None:
+        return 0  # replay never purges the snapshot (spine §3.4)
     """Remove a DIFFERENT book's chapter files + roster from a
     checkpoint directory before a fresh run (re)writes its meta.
 
@@ -13076,6 +14624,8 @@ def _checkpoint_purge_stale(book_key, total_chapters, fingerprint=None):
 
 
 def _checkpoint_save_chapter(book_key, idx, a, b):
+    if _REPLAY_CTX is not None:
+        return  # replay never writes into the snapshot (spine §3.4)
     d = _checkpoint_dir(book_key)
     d.mkdir(parents=True, exist_ok=True)
     with open(d / f"chapter_{idx}.json", "w", encoding="utf-8") as f:
@@ -13084,6 +14634,8 @@ def _checkpoint_save_chapter(book_key, idx, a, b):
 
 
 def _checkpoint_save_roster(book_key, roster):
+    if _REPLAY_CTX is not None:
+        return  # replay never writes into the snapshot (spine §3.4)
     d = _checkpoint_dir(book_key)
     d.mkdir(parents=True, exist_ok=True)
     with open(d / "roster.json", "w", encoding="utf-8") as f:
@@ -13126,6 +14678,8 @@ def _checkpoint_load(book_key):
 
 
 def _checkpoint_clear(book_key):
+    if _REPLAY_CTX is not None:
+        return  # a finished replay must not clear the snapshot
     import shutil as _sh
     d = _checkpoint_dir(book_key)
     if d.is_dir():
@@ -13190,6 +14744,221 @@ def _checkpoint_resume_check(book_key, total_chapters, fingerprint=None):
     print(f"  --resume: {n_done}/{total_chapters} chapters already complete, "
           f"skipping their LLM calls")
     return chapters, roster
+
+
+# ---------------------------------------------------------------------------
+# Spine: snapshot store + deterministic replay (design §3.4)
+#
+# A snapshot is one book's extracted chapter payloads, captured from
+# a fresh preview run and stored under
+# <learn_dir>/snapshots/<fingerprint>/<snapshot_id>/ — keyed by the
+# batch-1 book FINGERPRINT, not the file stem (amendment A5: two
+# different books can share a stem; they cannot share a snapshot).
+# Replay re-derives everything downstream of extraction from those
+# payloads inside a throwaway sandbox substrate (seeded through
+# SQLite's backup API from the live DB opened immutable, amendment
+# A2), so a replay can never write the live stores; decision calls
+# stay LIVE (OC-5) — what varies between a capture and its replay is
+# the code and the decision draws, never the extraction.
+# ---------------------------------------------------------------------------
+
+def _snapshot_root(learn_dir):
+    return Path(learn_dir) / "snapshots"
+
+
+def _arm_capture(snapshot_id, reason=""):
+    global _CAPTURE_CTX
+    _CAPTURE_CTX = {"snapshot_id": snapshot_id, "reason": reason}
+
+
+def capture_snapshot(snapshot_id, *, book_key, fingerprint, title,
+                     author, identifiers, chapter_count, reason=""):
+    """Copy the just-finished run's checkpoint payloads into the
+    snapshot store and write the manifest. Returns the snapshot id,
+    or None when there is nothing to capture / the id is taken."""
+    src = _checkpoint_dir(book_key)
+    if not src.is_dir() or not (src / "meta.json").is_file():
+        print("  Snapshot: no checkpoint payloads to capture")
+        return None
+    learn_dir = _learn().dir
+    dest = _snapshot_root(learn_dir) / fingerprint / snapshot_id
+    if dest.exists():
+        print(f"  Snapshot: '{snapshot_id}' already exists for this "
+              "book; refusing to overwrite a captured baseline")
+        return None
+    dest.mkdir(parents=True)
+    import hashlib as _hl
+    digest = _hl.sha256()
+    for p in sorted(src.iterdir()):
+        if p.is_file():
+            data = p.read_bytes()
+            digest.update(p.name.encode())
+            digest.update(data)
+            with open(dest / p.name, "wb") as f:
+                f.write(data)
+    extraction = {
+        "llm": CONFIG.get("llm"), "model": CONFIG.get("model"),
+        "pipeline": CONFIG.get("pipeline"),
+        "portable_version": PORTABLE_VERSION,
+        "code_sha": _git_commit_sha(),
+        "flags_hash": _checkpoint_flags_hash(),
+        "config_digest": _config_digest(),
+    }
+    manifest = {
+        "snapshot_id": snapshot_id, "book_key": book_key,
+        "fingerprint": fingerprint, "title": title, "author": author,
+        "identifiers": {k: identifiers.get(k)
+                        for k in ("isbn", "asin") if identifiers},
+        "chapter_count": chapter_count,
+        "payload_sha256": digest.hexdigest(),
+        "created": _staging_today(), "reason": reason,
+        "extraction": extraction,
+    }
+    with open(dest / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=1, ensure_ascii=False)
+    db = _state_db_for(learn_dir)
+    if db is not None:
+        with db.write_txn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO snapshots VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (snapshot_id, book_key, fingerprint, title, author,
+                 chapter_count, manifest["payload_sha256"], str(dest),
+                 None, manifest["created"], reason,
+                 json.dumps(extraction, ensure_ascii=False)))
+    print(f"  Snapshot captured: {snapshot_id} "
+          f"(fingerprint {fingerprint}, {chapter_count} chapters)")
+    return snapshot_id
+
+
+def find_snapshot(learn_dir, snapshot_id):
+    """(snapshot_dir, manifest) for an id, or None. Scans every
+    fingerprint bucket — the id is the handle the user holds."""
+    root = _snapshot_root(learn_dir)
+    if not root.is_dir():
+        return None
+    for man_path in sorted(root.glob(f"*/{snapshot_id}/manifest.json")):
+        try:
+            manifest = json.loads(
+                man_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        return man_path.parent, manifest
+    return None
+
+
+def _presented_fingerprint(fpath):
+    """The batch-1 checkpoint fingerprint of the book file presented
+    for replay, computed from a fresh parse (no LLM calls)."""
+    fpath = Path(fpath)
+    if fpath.suffix.lower() == ".epub":
+        units, title, author, identifiers = extract_epub_units(fpath)
+        chapters = split_chapters(units)
+    else:
+        extracted = read_ebook(fpath)
+        if extracted is None:
+            return None
+        text, title, author, identifiers = extracted
+        chapters = _prose_chapters(text)
+    return _checkpoint_fingerprint(
+        identifiers, title, author, _checkpoint_text_sample(chapters))
+
+
+def run_replay(snapshot_id, book_path, learn_dir, process_fn=None):
+    """Replay one snapshot against the presented book file.
+
+    Returns (exit_code, report). The run is forced preview, executes
+    inside a sandbox substrate seeded from the live stores (backup
+    API, live DB opened immutable — A2), and the sandbox is deleted
+    afterwards: the durable record of a replay is the preview
+    artefact's `replay` marker, never sandbox state. The replay_runs
+    row is written into the SANDBOX substrate (it is the run's own
+    working record; report["replay_run_recorded"] attests it)."""
+    if process_fn is None:
+        process_fn = process_file_v2
+    report = {"snapshot_id": snapshot_id,
+              "replay_run_recorded": False, "sandbox_deleted": False}
+    found = find_snapshot(learn_dir, snapshot_id)
+    if not found:
+        print(f"  --replay: snapshot '{snapshot_id}' not found under "
+              f"{_snapshot_root(learn_dir)}")
+        report["refusal"] = "snapshot not found"
+        return 1, report
+    snap_dir, manifest = found
+    presented = _presented_fingerprint(book_path)
+    if presented != manifest.get("fingerprint"):
+        # The batch-1 refusal shape: a different book never replays
+        # another book's extraction, and no flag overrides it.
+        print(f"  --replay REFUSED: the presented file's fingerprint "
+              f"({presented}) does not match the snapshot's "
+              f"({manifest.get('fingerprint')}) — a snapshot replays "
+              "only its own book")
+        report["refusal"] = "fingerprint mismatch"
+        return 1, report
+    import shutil as _sh
+    import tempfile as _tf
+    sandbox = Path(_tf.mkdtemp(prefix="ebook-replay-"))
+    sb_learn = sandbox / "learned"
+    sb_learn.mkdir(parents=True)
+    live_db = Path(learn_dir) / _STATE_DB_NAME
+    try:
+        if live_db.exists():
+            with _STATE_DBS_LOCK:
+                live_handle = _STATE_DBS.get(
+                    str(Path(learn_dir).resolve()))
+            if live_handle is not None:
+                live_handle.checkpoint()
+            src = sqlite3.connect(
+                f"file:{live_db}?immutable=1", uri=True)
+            try:
+                dst = sqlite3.connect(str(sb_learn / _STATE_DB_NAME))
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+        else:
+            for p in _migration_sources(Path(learn_dir)):
+                rel = p.relative_to(Path(learn_dir))
+                target = sb_learn / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _sh.copyfile(p, target)
+        global _LEARNED, _STAGING_STATE, _REPLAY_CTX
+        saved_learned, saved_staging = _LEARNED, _STAGING_STATE
+        saved_replay = _REPLAY_CTX
+        _LEARNED = LearnedState(
+            learn_dir=sb_learn,
+            enabled=(saved_learned.enabled if saved_learned else True))
+        _STAGING_STATE = None
+        _REPLAY_CTX = {"snapshot_id": snapshot_id,
+                       "payload_dir": str(snap_dir),
+                       "manifest": manifest}
+        try:
+            ok = process_fn(Path(book_path), dry_run=False,
+                            preview=True)
+            db = _state_db_for(sb_learn)
+            if db is not None:
+                with db.write_txn() as conn:
+                    conn.execute(
+                        "INSERT INTO replay_runs VALUES (?,?,?,?,?,?)",
+                        (f"replay-{snapshot_id}-"
+                         f"{_staging_today()}",
+                         snapshot_id, _staging_today(),
+                         _git_commit_sha(), _config_digest(),
+                         str(SCRIPT_DIR / "preview")))
+                report["replay_run_recorded"] = True
+        finally:
+            _LEARNED, _STAGING_STATE = saved_learned, saved_staging
+            _REPLAY_CTX = saved_replay
+            with _STATE_DBS_LOCK:
+                sb_db = _STATE_DBS.pop(str(sb_learn.resolve()), None)
+            if sb_db is not None:
+                sb_db.close()
+        return (0 if ok else 1), report
+    finally:
+        _sh.rmtree(sandbox, ignore_errors=True)
+        report["sandbox_deleted"] = not sandbox.exists()
 
 
 def process_file_v2(fpath, dry_run=False, preview=False):
@@ -13302,7 +15071,17 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         identifiers, title, author, _checkpoint_text_sample(chapters))
     _resumed_chapters = {}  # idx -> (a, b) loaded from checkpoints
     _resumed_roster = None
-    if CONFIG.get("resume"):
+    if _REPLAY_CTX is not None:
+        # Spine replay (design §3.4): the payloads ARE the run's
+        # extraction. _checkpoint_resume_check is NOT consulted — its
+        # flags-hash refusal (which embeds the git SHA) is exactly
+        # what made cross-code-version replay impossible before the
+        # spine; the fingerprint was already verified against the
+        # manifest by run_replay before this process started.
+        _loaded = _checkpoint_load(_ckpt_key)
+        if _loaded is not None:
+            _rmeta, _resumed_roster, _resumed_chapters = _loaded
+    elif CONFIG.get("resume"):
         _rc, _rr = _checkpoint_resume_check(_ckpt_key, n, _ckpt_fp)
         if _rc is not None:
             _resumed_chapters = _rc
@@ -13635,6 +15414,54 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     red["tropes"] = tropes
     red["trope_confidence"] = trope_conf
 
+
+    # Spine §3.5: per-work verdict read-back + suppression net A.
+    # Runs only when Supabase is configured (the fields below exist
+    # on the result only when a fetch was attempted, so runs without
+    # read-back are byte-identical to before). Confirmed verdicts
+    # do nothing here — no force-ship, no boost (authority creep
+    # is forbidden by the design); rejected verdicts suppress.
+    _verdict_attempted = False
+    _verdict_note = None
+    _rejected_keys = set()
+    _supp_keys = set()
+    _supp_names = []
+    if not dry_run and not aborted \
+            and CONFIG.get("supabase_url") \
+            and CONFIG.get("supabase_key"):
+        _verdict_attempted = True
+        _vwid = None
+        try:
+            _vwid, _vhow = resolve_work(
+                title or fpath.stem, author, identifiers, False,
+                create=False)
+        except Exception:
+            _vwid = None
+        if _vwid:
+            _vs, _verdict_note = work_verdicts(str(_vwid),
+                                               _learn().dir)
+            if _vs is not None:
+                _rejected_keys = _vs.rejected_keys()
+            if _rejected_keys:
+                _cat_map = red.get("trope_catalog_map") or {}
+                (tropes, trope_conf, red["triggers"], _supp_keys,
+                 _supp_names) = apply_verdict_suppression(
+                    tropes, trope_conf, red["triggers"],
+                    _rejected_keys, _cat_map)
+                red["tropes"] = tropes
+                red["trope_confidence"] = trope_conf
+
+                def _cand_key(c):
+                    return staging_claim_key(
+                        "trope", name=c,
+                        catalog_id=_cat_map.get(_tnorm(c)))
+                _sb_auto = [c for c in _sb_auto
+                            if _cand_key(c) not in _rejected_keys]
+                _sb_gated = [c for c in _sb_gated
+                             if _cand_key(c) not in _rejected_keys]
+        if _verdict_note:
+            print(f"  Verdicts: {_verdict_note}")
+
     # Option G trigger retrieval (design section 8): evidence-less
     # triggers are retrieved for BEFORE the staging seam, so a
     # trigger that gains judge-supported passages has them in its
@@ -13659,6 +15486,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         if _filled:
             print(f"  Trigger evidence: {_filled} evidence-less "
                   f"trigger(s) gained retrieved passages")
+
 
     # Option F staging seam (design section 5): ONE split point,
     # after the trope gate + rejection learning and the trigger
@@ -13711,6 +15539,9 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                 "trope_ship": tropes, "trope_conf": trope_conf,
                 "catalog_map": red.get("trope_catalog_map") or {},
                 "triggers": red["triggers"],
+                # Spine §3.5 net B: the seam drops promoted
+                # re-ships of human-rejected claims itself.
+                "verdict_rejected": _rejected_keys,
             }, _st, independent=not _resumed_chapters)
             tropes = _sg["ship_tropes"]
             trope_conf = _sg["trope_conf"]
@@ -13724,6 +15555,24 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                   f"back, {len(_staging_marker['promoted'])} promoted, "
                   f"{_staging_marker['trapped_total']} trapped for "
                   f"this work")
+            # Net B's suppressed set joins the counter union.
+            _supp_keys |= set(_sg.get("suppressed_keys") or set())
+            for _nm in (_sg.get("suppressed_names") or []):
+                if _nm not in _supp_names:
+                    _supp_names.append(_nm)
+
+    # Spine §3.5.3: the suppression counter — one rejection_events
+    # row per suppressed claim per run, counted on the UNION of
+    # both nets (before dedup the same claim could be caught twice;
+    # it is still one suppressed claim).
+    if _supp_keys:
+        record_rejection_events(
+            _learn().dir, f"v2:{fpath.stem}",
+            staging_work_key(None, identifiers.get("isbn"),
+                             title or fpath.stem, author),
+            _supp_keys)
+        print(f"  Suppressed {len(_supp_keys)} human-rejected "
+              f"claims for this work")
 
     # Option G trope retrieval (design section 8): runs AFTER the
     # staging seam — staged tropes are retrieved for too, because
@@ -13911,6 +15760,55 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         print(f"  Work: matched via {how} -> {wid[:8]}")
     else:
         print(f"  Work: resolution failed ({how})")
+
+    # Spine §3.4: snapshot capture rides a fresh preview run (the
+    # payloads are complete here, before the preview epilogue clears
+    # the checkpoint dir), and a replay stamps its provenance marker.
+    # Spine §3.5: the verdict fields exist ONLY when a fetch was
+    # attempted, so unconfigured runs stay byte-identical.
+    if _verdict_attempted:
+        result["verdicts_note"] = _verdict_note
+        result["suppressed_rejected"] = sorted(set(_supp_names))
+    if CONFIG.get("emit_uncertainty") and not aborted:
+        # Amendment A6: during a replay, _learn().dir is the
+        # sandbox, so these emissions land in the throwaway
+        # substrate and are discarded with it — by design. A
+        # replay's uncertainty describes a discarded world; the
+        # live queue only ever holds real runs' items.
+        try:
+            _uq = collect_uncertainty_items(
+                result,
+                book_label=f"{result.get('title')} "
+                           f"({result.get('author')})",
+                work_key=staging_work_key(
+                    None, identifiers.get("isbn"),
+                    title or fpath.stem, author),
+                suspects=roster_split_suspects(_learn().dir))
+            _uq_n = emit_uncertainty(_learn().dir,
+                                     f"v2:{fpath.stem}", _uq)
+            if _uq_n:
+                print(f"  Uncertainty queue: {_uq_n} item(s) "
+                      "emitted for labelling")
+        except Exception as _uq_e:
+            print(f"  Uncertainty queue emission failed ({_uq_e})")
+    if _CAPTURE_CTX is not None and not aborted:
+        _cap_id = capture_snapshot(
+            _CAPTURE_CTX["snapshot_id"], book_key=_ckpt_key,
+            fingerprint=_ckpt_fp, title=result.get("title"),
+            author=result.get("author"), identifiers=identifiers,
+            chapter_count=n, reason=_CAPTURE_CTX.get("reason", ""))
+        if _cap_id:
+            result["snapshot_captured"] = _cap_id
+    if _REPLAY_CTX is not None:
+        _src_ext = (_REPLAY_CTX["manifest"].get("extraction")
+                    or {})
+        result["replay"] = {
+            "snapshot_id": _REPLAY_CTX["snapshot_id"],
+            "source_code_sha": _src_ext.get("code_sha"),
+            "source_config_digest": _src_ext.get("config_digest"),
+            "replay_code_sha": _git_commit_sha(),
+            "replay_config_digest": _config_digest(),
+        }
 
     smsg = f" ({a_fallback} via simple fallback)" if a_fallback else ""
     UI.book_done(_book_key)
@@ -14496,6 +16394,13 @@ def save_preview(fpath, result):
         md.append(f"**Staging:** this preview recorded {_ns} "
                   f"sighting{'s' if _ns != 1 else ''} in the local "
                   f"staging store")
+    _supp_md = result.get("suppressed_rejected")
+    if _supp_md:
+        md.append(f"**Suppressed (human-rejected):** "
+                  f"{len(_supp_md)} claim(s) withheld: "
+                  f"{', '.join(_supp_md)}")
+    if result.get("verdicts_note"):
+        md.append(f"**Verdicts:** {result['verdicts_note']}")
     md.append("")
     md.append(f"## Tropes ({len(result['tropes'])})")
     for t in result["tropes"]:
@@ -14909,6 +16814,7 @@ def _build_parser():
                          "recurs across independent runs, grows into "
                          "the auto band, or gains evidence (default "
                          "off; see eval/f-staging-design.md)")
+
     g_merge.add_argument("--evidence-retrieval", action="store_true",
                     help="option G (v2): targeted evidence retrieval "
                          "for trope claims — literal passages from "
@@ -14916,6 +16822,16 @@ def _build_parser():
                          "by the local model, attached as quote "
                          "evidence with a retrieval stamp (default "
                          "off; see eval/g-evidence-design.md)")
+
+    g_merge.add_argument("--emit-uncertainty", action="store_true",
+                    help="measurement spine: emit this run's "
+                         "uncertain items (tier-vs-judge "
+                         "disagreements, near-threshold pairs, "
+                         "split suspects, form-changed promotions, "
+                         "plus decided-pair controls) to the local "
+                         "uncertainty queue for labelling (default "
+                         "off)")
+
     g_merge.add_argument("--persist-roster", action="store_true",
                     help="option B (v2): persist per-work roster "
                          "identity across runs — stable minted entity "
@@ -14935,6 +16851,28 @@ def _build_parser():
     g_learn.add_argument("--learn-status", action="store_true",
                     help="print a summary of the learning system state "
                          "and exit (no books processed)")
+    g_learn.add_argument("--apply-uncertainty-labels", metavar="FILE",
+                    default=None,
+                    help="apply a labelling round's labels file "
+                         "([{queue_id, label, labeller}]) to the "
+                         "uncertainty queue and exit; merge-pair "
+                         "labels also append to eval/merge_pairs.json")
+    g_learn.add_argument("--capture-snapshot", metavar="ID",
+                    default=None,
+                    help="with a fresh --preview run, capture the "
+                         "run's extracted chapter payloads as replay "
+                         "snapshot ID (measurement spine)")
+    g_learn.add_argument("--snapshot-reason", metavar="TEXT",
+                    default="",
+                    help="reason recorded on a --capture-snapshot "
+                         "manifest")
+    g_learn.add_argument("--replay", metavar="ID", default=None,
+                    help="replay snapshot ID against the --file book: "
+                         "re-derives everything downstream of "
+                         "extraction from the captured payloads in a "
+                         "throwaway sandbox (live stores untouched); "
+                         "the book's fingerprint must match the "
+                         "snapshot's")
     g_learn.add_argument("--staging-report", action="store_true",
                     help="print the staging gate's trapped report "
                          "(staged/promoted/expired claims per work) "
@@ -15085,6 +17023,15 @@ def main():
                      "(--list-profiles to see available)")
         _apply_profile(args, defaults, profile)
 
+    # Spine OC-7: the state stores migrate to the SQLite substrate
+    # automatically on the first run that touches state. Placed
+    # before every state-reading dispatch below (and before the
+    # _LEARNED construction further down).
+    ensure_state_migrated(
+        Path(args.learn_dir) if getattr(args, "learn_dir", None)
+        else Path(os.path.expanduser("~")) / ".ebook-processor"
+        / "learned")
+
     if args.trope_map:
         load_config()
         cmd_trope_map(args.trope_map)
@@ -15121,6 +17068,14 @@ def main():
     if args.learn_status:
         load_config()
         cmd_learn_status(args.learn_dir or None)
+        return
+    if getattr(args, "apply_uncertainty_labels", None):
+        load_config()
+        cmd_apply_uncertainty_labels(
+            Path(args.learn_dir) if args.learn_dir
+            else Path(os.path.expanduser("~")) / ".ebook-processor"
+            / "learned",
+            args.apply_uncertainty_labels)
         return
     if args.staging_report:
         load_config()
@@ -15197,6 +17152,12 @@ def main():
               f"({len(_LEARNED.nicknames)} nicknames, "
               f"{len(_LEARNED.trusted_titles())} trusted titles, "
               f"{len(_LEARNED.rejected_tropes)} rejected tropes)")
+    if getattr(args, "capture_snapshot", None):
+        if getattr(args, "replay", None):
+            print("  --capture-snapshot and --replay cannot combine")
+            return
+        _arm_capture(args.capture_snapshot,
+                     getattr(args, "snapshot_reason", "") or "")
     if args.import_labels:
         n_imp = _LEARNED.import_labels(args.import_labels)
         print(f"  Imported {n_imp} labeled merge pairs from "
@@ -15258,8 +17219,13 @@ def main():
         CONFIG["roster_reconcile"] = True
     if args.staging_gate:
         CONFIG["staging_gate"] = True
+
     if args.evidence_retrieval:
         CONFIG["evidence_retrieval"] = True
+
+    if getattr(args, "emit_uncertainty", False):
+        CONFIG["emit_uncertainty"] = True
+
     if args.persist_roster:
         CONFIG["persist_roster"] = True
     if args.preview_summary:
@@ -15305,6 +17271,14 @@ def main():
         print("Preview mode: results saved to preview/, nothing written to Supabase, files not moved")
     elif args.dry_run:
         print("Dry run: nothing written, files not moved")
+
+    if getattr(args, "replay", None):
+        if not args.file:
+            print("  --replay needs --file <book>: the snapshot "
+                  "replays against its own book file")
+            sys.exit(2)
+        _code, _rep = run_replay(args.replay, args.file, _LEARNED.dir)
+        sys.exit(_code)
 
     if args.watch:
         print(f"Watching {IMPORT_DIR}... (Ctrl+C to stop)")
