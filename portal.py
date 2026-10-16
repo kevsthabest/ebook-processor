@@ -684,6 +684,10 @@ _GAP4_NOTE = (
     "evidence; this page shows the evidence and leaves the "
     "gate to its work.")
 
+# Placeholder in PortalContext._ruling_jobs between claiming an
+# item's in-flight slot and the launched job landing in it.
+_RULING_SENTINEL = object()
+
 
 def _labels_for_kind(kind):
     return list(_DESK_LABELS.get(kind, _DESK_LABELS_DEFAULT))
@@ -698,6 +702,17 @@ def _json_list(raw):
     except (TypeError, ValueError):
         return []
     return value if isinstance(value, list) else []
+
+
+def _num(value):
+    """A store cell as an ordering number: pipeline-written
+    counts are ints, but the Desk treats the store as untrusted
+    data — a non-numeric cell orders as 0 and is displayed
+    (escaped) as what it is, never crashed on."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _desk_claims(conn):
@@ -734,7 +749,7 @@ def _desk_claims(conn):
             "name_forms": _json_list(row[9]),
         })
     claims.sort(key=lambda c: (-c["sightings_count"],
-                               -c["best_chapters"],
+                               -_num(c["best_chapters"]),
                                c["work_title"], c["display"]))
     return claims
 
@@ -2456,7 +2471,7 @@ def _claim_row(claim):
         f"<td>{_esc(claim['work_title'])}</td>"
         f"<td>{_esc(claim['class'])}</td>"
         f"<td>{claim['sightings_count']}</td>"
-        f"<td>{claim['best_chapters']}</td>"
+        f"<td>{_esc(claim['best_chapters'])}</td>"
         f"<td>{_esc(claim['first_seen'] or '')}</td>"
         f"<td>{_esc(claim['last_seen'] or '')}</td>"
         f"<td>{forms_cell}</td></tr>")
@@ -2561,11 +2576,14 @@ def _render_desk(desk):
         for p in desk["proposals"]:
             near = p["nearest_catalog_id"] or "—"
             sim = p["nearest_similarity"]
+            # The review files are untrusted data (a broken one
+            # is skipped and counted); their numeric-looking
+            # fields are escaped like everything else they carry.
             out.append(
                 f"<tr><td>{_esc(p['label'] or '')}</td>"
                 f"<td>{_esc(near)}</td>"
-                f"<td>{'' if sim is None else sim}</td>"
-                f"<td>{p['chapter_count'] or ''}</td>"
+                f"<td>{'' if sim is None else _esc(sim)}</td>"
+                f"<td>{_esc(p['chapter_count'] or '')}</td>"
                 f"<td>{_esc(p['book'] or '')}</td>"
                 f"<td>{_esc(p['file'])}</td></tr>")
         out.append("</tbody></table>")
@@ -3011,6 +3029,16 @@ class PortalContext:
         self.registry = JobRegistry(
             self, popen_factory=popen_factory,
             stop_grace=stop_grace)
+        # Rulings in flight, queue_id -> job (or the _RULING_SENTINEL
+        # while the launch is being built). A queue row stays
+        # 'pending' in the store until its apply job actually
+        # runs — behind a long writer, that can be a while — and
+        # the CLI intake has no idempotence backstop (it would
+        # apply a second ruling too, and append a second merge
+        # pair). The Desk's guard therefore lives here: one
+        # ruling per item at a time (Advisor F1).
+        self._ruling_jobs = {}
+        self._ruling_lock = threading.Lock()
 
     @property
     def cover_cache_dir(self):
@@ -3080,6 +3108,31 @@ class PortalContext:
                 or "(--explain produced no output)"
         return text
 
+    def _claim_ruling(self, queue_id):
+        """Claim the in-flight slot for one item, or refuse.
+        The claim is recorded under the lock before the launch
+        is built, so two handler threads cannot both pass; a
+        settled job's claim prunes itself here, so a ruling
+        whose job failed (the item is still pending) can be
+        made again."""
+        with self._ruling_lock:
+            existing = self._ruling_jobs.get(queue_id)
+            if existing is _RULING_SENTINEL or (
+                    existing is not None
+                    and existing.state in ("queued", "running")):
+                raise PortalError(
+                    f"uncertainty item {queue_id} already has a "
+                    f"ruling queued or running — wait for it to "
+                    f"settle")
+            self._ruling_jobs[queue_id] = _RULING_SENTINEL
+
+    def _release_ruling(self, queue_id, job=None):
+        with self._ruling_lock:
+            if job is None:
+                self._ruling_jobs.pop(queue_id, None)
+            else:
+                self._ruling_jobs[queue_id] = job
+
     def rule(self, queue_id, label):
         """A6: rule one pending uncertainty item from its
         evidence view. The item is re-read fresh (a ruling never
@@ -3087,7 +3140,11 @@ class PortalContext:
         verdict strings that item's packet kind offers, and the
         apply runs as a writer job through the registry — the
         Desk's ruling takes the one-writer slot like every
-        other state-changing launch (§7)."""
+        other state-changing launch (§7). One ruling per item
+        at a time: the row stays pending until the job runs, so
+        without the in-flight claim a second ruling (a second
+        tab, a revisit while queued) would also be accepted and
+        the CLI would apply both."""
         item = uncertainty_item(self.learn_dir, queue_id)
         if item is None:
             raise PortalError(
@@ -3096,10 +3153,17 @@ class PortalContext:
             raise PortalError(
                 f"{label!r} is not a verdict for this item "
                 f"(choose: {', '.join(item['labels'])})")
-        path = self._write_labels_file(item, label)
-        return self.registry.launch(build_launch(
-            self, {"action": "apply_labels",
-                   "labels_file": str(path)}))
+        self._claim_ruling(queue_id)
+        try:
+            path = self._write_labels_file(item, label)
+            job = self.registry.launch(build_launch(
+                self, {"action": "apply_labels",
+                       "labels_file": str(path)}))
+        except Exception:
+            self._release_ruling(queue_id)
+            raise
+        self._release_ruling(queue_id, job)
+        return job
 
     def _write_labels_file(self, item, label):
         """The CLI's labels intake, verbatim: a JSON list of
@@ -3233,10 +3297,12 @@ def make_server(host, port, ctx):
             """A6 from the Desk: validate the body's shape here;
             the item, its status, and its label vocabulary are
             validated against the store in ctx.rule (PortalError
-            -> the do_POST handler's 400)."""
-            try:
-                queue_id = int(body.get("queue_id"))
-            except (TypeError, ValueError):
+            -> the do_POST handler's 400). The id must be a JSON
+            integer exactly — a float or boolean is refused, not
+            truncated into a neighbour's id."""
+            queue_id = body.get("queue_id")
+            if isinstance(queue_id, bool) \
+                    or not isinstance(queue_id, int):
                 self._json(400, {
                     "error": "queue_id must be an integer"})
                 return

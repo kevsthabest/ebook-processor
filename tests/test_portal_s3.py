@@ -14,6 +14,7 @@ leaves the queue.
 """
 import hashlib
 import importlib.util
+import io
 import json
 import shutil
 import sqlite3
@@ -515,6 +516,17 @@ class TestRulingValidation(_ServerCase):
             self.assertEqual(status, 400, payload)
         self._assert_still_pending(self.ids["merge_pair"])
 
+    def test_coerced_queue_ids_are_400_not_truncated(self):
+        # A float or boolean id must be refused outright: int()
+        # would silently truncate it into a neighbour item's id
+        # and rule THAT item (Advisor F3).
+        for payload in ({"queue_id": 1.9, "label": "same"},
+                        {"queue_id": True, "label": "same"}):
+            status, _body = self._req("POST", "/api/desk/rule",
+                                      payload)
+            self.assertEqual(status, 400, payload)
+        self._assert_still_pending(self.ids["merge_pair"])
+
     def test_foreign_origin_rule_is_403_and_launches_nothing(self):
         qid = self.ids["merge_pair"]
         status, _body = self._req(
@@ -540,6 +552,138 @@ class TestRulingValidation(_ServerCase):
             status = e.code
         self.assertEqual(status, 400)
         self._assert_still_pending(self.ids["merge_pair"])
+
+
+class _BlockingProc:
+    """A Popen stand-in whose wait() blocks until release() —
+    the in-flight tests need a ruling job that provably has not
+    settled while a second ruling is attempted."""
+
+    def __init__(self, argv, lines=(), rc=0):
+        self.argv = argv
+        self.stdout = io.StringIO(
+            "".join(l + "\n" for l in lines))
+        self._rc = rc
+        self._released = threading.Event()
+        self.signals = []
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self._rc if self._released.is_set() else None
+
+    def wait(self, timeout=None):
+        self._released.wait(timeout)
+        return self._rc
+
+    def release(self, rc=None):
+        if rc is not None:
+            self._rc = rc
+        self._released.set()
+
+    def send_signal(self, sig):
+        self.signals.append(sig)
+        self.release(-int(sig) if isinstance(sig, int) else 3)
+
+    def terminate(self):
+        self.terminated = True
+        self.release(3)
+
+    def kill(self):
+        self.killed = True
+        self.release(9)
+
+
+class TestRulingInFlight(_DeskCase):
+    """Advisor F1: the queue row stays 'pending' until its apply
+    job runs, and the CLI intake applies whatever it is fed — so
+    the Desk itself must refuse a second ruling for an item
+    whose first ruling is still queued or running."""
+
+    def setUp(self):
+        super().setUp()
+        self.procs = []
+
+        def factory(argv, **kwargs):
+            proc = _BlockingProc(argv)
+            self.procs.append(proc)
+            return proc
+
+        self.ctx = portal.PortalContext(
+            self.learn, self.script, popen_factory=factory)
+
+    def _settle_all(self, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for proc in self.procs:
+                proc.release()
+            states = [j.state for j in self.ctx.registry.jobs()]
+            if all(s in ("done", "failed", "stopped")
+                   for s in states):
+                return
+            time.sleep(0.05)
+        self.fail("jobs did not settle")
+
+    def test_second_ruling_refused_while_first_in_flight(self):
+        qid = self.ids["merge_pair"]
+        job = self.ctx.rule(qid, "same")
+        self.assertEqual(job.state, "running")
+        with self.assertRaises(portal.PortalError):
+            self.ctx.rule(qid, "different")
+        # A ruling for a DIFFERENT item is not blocked — it
+        # queues behind the running writer like any launch.
+        other = self.ctx.rule(self.ids["family_claim"], "family")
+        self.assertEqual(other.state, "queued")
+        with self.assertRaises(portal.PortalError):
+            self.ctx.rule(self.ids["family_claim"], "not-family")
+        self._settle_all()
+        # Once settled, the slot frees: the stub child changed
+        # nothing in the store, so the item is still pending and
+        # a fresh ruling is legitimate (a failed job must not
+        # lock the item forever).
+        again = self.ctx.rule(qid, "different")
+        self.assertIn(again.state, ("queued", "running"))
+        self._settle_all()
+
+
+class TestDeskEscapesUntrustedFields(_ServerCase):
+    """Advisor F2: the trope-map files are untrusted data, and
+    staging columns are written by book-driven runs — the
+    numeric-looking cells are escaped like every other cell."""
+
+    def setUp(self):
+        super().setUp()
+        conn = sqlite3.connect(self.learn / "state.db")
+        conn.execute(
+            "INSERT INTO staging_claims (work_key, claim_key,"
+            " class, display, state, best_chapters, sightings,"
+            " name_forms, payload) VALUES (?, 'trope:evil',"
+            " 'trope', 'Evil Claim', 'staged', '<b>9</b>', '[]',"
+            " '[]', '{}')", (_WK,))
+        conn.commit()
+        conn.close()
+        (self.script / "preview" / "Evil-trope-map.json"
+         ).write_text(json.dumps({
+             "preview": "Evil.json", "threshold": 0.78,
+             "mappings": [],
+             "proposals": [{
+                 "pipeline_trope": "evil trope",
+                 "chapter_count": "<i>3</i>",
+                 "nearest_catalog_id": "t-x",
+                 "nearest_similarity":
+                     "<script>alert(1)</script>",
+                 "book": "Daemon", "isbn": "x"}]}),
+            encoding="utf-8")
+
+    def test_hostile_numeric_fields_render_escaped(self):
+        status, body = self._req("GET", "/desk")
+        self.assertEqual(status, 200)
+        self.assertNotIn("<script>alert(1)</script>", body)
+        self.assertIn("&lt;script&gt;alert(1)", body)
+        self.assertNotIn("<b>9</b>", body)
+        self.assertIn("&lt;b&gt;9&lt;/b&gt;", body)
+        self.assertNotIn("<i>3</i>", body)
+        self.assertIn("&lt;i&gt;3&lt;/i&gt;", body)
 
 
 if __name__ == "__main__":
