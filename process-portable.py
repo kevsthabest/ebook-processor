@@ -1493,6 +1493,36 @@ def _preview_summary(result):
         lines.append(f"  Staging: {len(_stg.get('staged') or [])} "
                      f"held back (staging gate)")
 
+    _er = r.get("evidence_retrieval")
+    if _er:
+        if _er.get("failed"):
+            lines.append(
+                "  Trope evidence: retrieval FAILED this run "
+                "(claims ship with today's evidence shapes)")
+        else:
+            _ec = [v for k, v in (_er.get("claims") or {}).items()
+                   if not k.startswith("trigger:")]
+            _with = _ec.count("supported-strong") \
+                + _ec.count("supported-single")
+            lines.append(
+                f"  Trope evidence: {_with} claims with passages "
+                f"({_ec.count('supported-strong')} strong), "
+                f"{_ec.count('abstained')} abstentions")
+            if _er.get("evidence_recorded"):
+                # F's OC-4 condition, inherited: a run that records
+                # staging state declares the recording on its face.
+                lines.append(
+                    f"  Staging evidence recorded: this run "
+                    f"recorded retrieved evidence for "
+                    f"{_er['evidence_recorded']} staged claim(s) "
+                    f"in the local staging store")
+            for _nm in _er.get("promotes_next") or []:
+                # Amendment G2 legibility: the one-run promotion
+                # lag must read as the design working, not a bug.
+                lines.append(
+                    f"    Staged with strong passages: {_nm} "
+                    f"(promotes on next sighting via evidence)")
+
     _rp = r.get("roster_persistence")
     if _rp:
         # OC-2: a preview that records observations declares it on

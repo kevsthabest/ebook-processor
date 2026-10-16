@@ -839,5 +839,116 @@ class TestTriggerRetrieval(unittest.TestCase):
         self.assertTrue(td["evidence"])
 
 
+# --- slice 5: reporting -----------------------------------------------------
+
+class _FlakyEmbedder(FakeEmbedder):
+    def __call__(self, texts):
+        if any("Explodium" in (t or "") for t in texts):
+            raise RuntimeError("embedding endpoint down")
+        return super().__call__(texts)
+
+
+class TestReporting(unittest.TestCase):
+    def _mixed_marker(self):
+        # The seam's real parts shape: claim specs + catalog +
+        # summaries-by-label. The failed claim goes last: the
+        # embedding breaker trips on it.
+        parts = {
+            "claims": [
+                {"name": "Betrayal",
+                 "support_refs": ["Chapter Two", "Chapter Five"],
+                 "catalog_id": None, "staged": False},
+                {"name": "Gate", "support_refs": ["Chapter Two"],
+                 "catalog_id": None, "staged": False},
+                {"name": "Council Politics",
+                 "support_refs": ["Chapter Three"],
+                 "catalog_id": None, "staged": False},
+                {"name": "Dragons", "support_refs": ["Chapter One"],
+                 "catalog_id": None, "staged": False},
+                {"name": "Explodium Sea",
+                 "support_refs": ["Chapter One"],
+                 "catalog_id": None, "staged": False},
+            ],
+            "catalog": {},
+            "summaries": {"Chapter Three": "The council debates the "
+                                            "old betrayal."},
+        }
+        chapters = [SEA_CH, SCENE_CH, TALK_CH, SCENE2_CH]
+        out = pp.evidence_retrieve_result(
+            parts, chapters, call=FakeJudgeCall(),
+            embedder=_FlakyEmbedder())
+        return out["marker"]
+
+    def test_accounting_identity_closes(self):
+        m = self._mixed_marker()
+        t = m["totals"]
+        self.assertEqual(t["attempted"], 5)
+        self.assertEqual(t["supported_strong"], 1)
+        self.assertEqual(t["supported_single"], 1)
+        self.assertEqual(t["adjacent_only"], 1)
+        self.assertEqual(t["abstained"], 1)
+        self.assertEqual(t["failed"], 1)
+        self.assertEqual(t["attempted"],
+                         t["supported_strong"] + t["supported_single"]
+                         + t["adjacent_only"] + t["abstained"]
+                         + t["failed"])
+        # The marker's failed flag means EVERY attempted claim
+        # failed; a partial failure keeps it clear.
+        self.assertFalse(m["failed"])
+
+    def test_accounting_identity_closes_after_merge(self):
+        m = self._mixed_marker()
+        trig = pp.evidence_retrieve_triggers(
+            [{"warning": "arson", "severity": "moderate",
+              "chapters": ["Chapter One"], "evidence": [],
+              "confidence": 0.0}],
+            [SEA_CH], call=FakeJudgeCall(), embedder=FakeEmbedder())
+        merged = pp._merge_evidence_markers(m, trig["marker"])
+        t = merged["totals"]
+        self.assertEqual(t["attempted"], 6)
+        self.assertEqual(t["abstained"], 2)
+        self.assertEqual(t["attempted"],
+                         t["supported_strong"] + t["supported_single"]
+                         + t["adjacent_only"] + t["abstained"]
+                         + t["failed"])
+        self.assertFalse(merged["failed"])
+
+    def _summary(self, marker):
+        result = {"title": "T", "author": "A", "characters": [],
+                  "relationships": [], "triggers": [],
+                  "tropes": ["Betrayal", "Dragons"]}
+        if marker is not None:
+            result["evidence_retrieval"] = marker
+        return pp._preview_summary(result)
+
+    def test_preview_summary_trope_evidence_line(self):
+        marker = {"claims": {"betrayal": "supported-strong",
+                             "dragons": "abstained",
+                             "trigger:arson": "supported-single"}}
+        text = self._summary(marker)
+        self.assertIn("Trope evidence: 1 claims with passages "
+                      "(1 strong), 1 abstentions", text)
+
+    def test_preview_summary_recording_declaration(self):
+        marker = {"claims": {"betrayal": "supported-strong"},
+                  "evidence_recorded": 2,
+                  "promotes_next": ["Betrayal"]}
+        text = self._summary(marker)
+        self.assertIn("Staging evidence recorded: this run recorded "
+                      "retrieved evidence for 2 staged claim(s)",
+                      text)
+        self.assertIn("Staged with strong passages: Betrayal "
+                      "(promotes on next sighting via evidence)",
+                      text)
+
+    def test_preview_summary_failed_marker(self):
+        text = self._summary({"failed": True, "claims": {}})
+        self.assertIn("Trope evidence: retrieval FAILED", text)
+        self.assertNotIn("claims with passages", text)
+
+    def test_preview_summary_absent_without_marker(self):
+        self.assertNotIn("Trope evidence", self._summary(None))
+
+
 if __name__ == "__main__":
     unittest.main()
