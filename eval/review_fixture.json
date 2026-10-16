@@ -1,0 +1,1898 @@
+{
+ "schema_version": 1,
+ "entries": [
+  {
+   "book": "Angels and Demons",
+   "trope": "Whodunit",
+   "claim_ids": [],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Angels and Demons",
+     "trope": "Whodunit",
+     "verdict": "CONFIRM",
+     "rationale": "Langdon investigates a sequence of murders to unmask the hidden culprit among Vatican/Illuminati suspects; the puzzle-mystery core runs the whole book, evidenced across 12 chapters.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:18"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Langdon investigates a sequence of murders to unmask the hidden culprit among Vatican/Illuminati suspects; the puzzle-mystery core runs the whole book, evidenced across 12 chapters."
+  },
+  {
+   "book": "Artemis: A Novel",
+   "trope": "Heist",
+   "claim_ids": [
+    "2880592c-52e7-4728-97a0-0e816a2978c7"
+   ],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Artemis: A Novel",
+     "trope": "Heist",
+     "verdict": "CONFIRM",
+     "rationale": "Tier 2, premise unambiguous: Jazz Bashara's central paid job is a planned infiltration/sabotage of industrial equipment requiring timing, deception, and accomplices — a planned infiltration under the catalog description; no rejection pattern matches.",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:27"
+    },
+    {
+     "book": "Artemis: A Novel",
+     "trope": "Heist",
+     "verdict": "CONFIRM",
+     "rationale": "Tier 2, prior CONFIRM held (2026-10-14, evidence unchanged); premise unambiguous: Jazz Bashara's central paid job is a planned infiltration/sabotage requiring timing, deception, and accomplices; no rejection pattern matches.",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:34"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, premise unambiguous: Jazz Bashara's central paid job is a planned infiltration/sabotage of industrial equipment requiring timing, deception, and accomplices — a planned infiltration under the catalog description; no rejection pattern matches."
+  },
+  {
+   "book": "Court of the Vampire Queen",
+   "trope": "Royalty",
+   "claim_ids": [
+    "a9aa7ed0-2319-4004-a670-4ea7e8b510eb"
+   ],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Court of the Vampire Queen",
+     "trope": "Royalty",
+     "verdict": "CONFIRM",
+     "rationale": "vampire court and the crown that should be hers are the engine.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:19"
+    }
+   ],
+   "flips": 0,
+   "rationale": "vampire court and the crown that should be hers are the engine."
+  },
+  {
+   "book": "Daemon",
+   "trope": "Enemies to Lovers",
+   "claim_ids": [
+    "a3ff53a3-aeb0-412b-9e30-1794a2544f72"
+   ],
+   "verdict": "REJECT",
+   "authority": "reviewer",
+   "seat_verdict": "REJECT",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "genre-mismatch",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Daemon",
+     "trope": "Enemies to Lovers",
+     "verdict": "REJECT",
+     "rationale": "Tier 2, new claim; rejection-pattern checklist match — romance trope on a non-romance book: Daemon is a techno-thriller with no central hostile-to-romance arc (chapter titles such as 'Succubus' are headings, not a romance arc).",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:32"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, new claim; rejection-pattern checklist match — romance trope on a non-romance book: Daemon is a techno-thriller with no central hostile-to-romance arc (chapter titles such as 'Succubus' are headings, not a romance arc)."
+  },
+  {
+   "book": "Daemon",
+   "trope": "Revenge",
+   "claim_ids": [
+    "3540d4c6-329e-4add-98e9-c3216ce83143"
+   ],
+   "verdict": "REJECT",
+   "authority": "reviewer",
+   "seat_verdict": "REJECT",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Daemon",
+     "trope": "Revenge",
+     "verdict": "REJECT",
+     "rationale": "the Daemon's campaign is driven by Sobol's ideology/system redesign, not a vengeance quest.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:23"
+    }
+   ],
+   "flips": 0,
+   "rationale": "the Daemon's campaign is driven by Sobol's ideology/system redesign, not a vengeance quest."
+  },
+  {
+   "book": "Delta-V",
+   "trope": "Betrayal",
+   "claim_ids": [],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Delta-V",
+     "trope": "Betrayal",
+     "verdict": "CONFIRM",
+     "rationale": "The sponsoring company/billionaire deceives and abandons the Cavendish crew in deep space — a trusted power turning on the protagonists is the climactic betrayal, evidenced across chapters 30-42.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:14"
+    }
+   ],
+   "flips": 0,
+   "rationale": "The sponsoring company/billionaire deceives and abandons the Cavendish crew in deep space — a trusted power turning on the protagonists is the climactic betrayal, evidenced across chapters 30-42."
+  },
+  {
+   "book": "Digital Fortress",
+   "trope": "Betrayal",
+   "claim_ids": [],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Digital Fortress",
+     "trope": "Betrayal",
+     "verdict": "CONFIRM",
+     "rationale": "Strathmore orchestrating the fake Digital Fortress and betraying the NSA is the central twist.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:15"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Strathmore orchestrating the fake Digital Fortress and betraying the NSA is the central twist."
+  },
+  {
+   "book": "Dungeon Crawler Carl",
+   "trope": "Deadly Trials",
+   "claim_ids": [
+    "0cc7b790-036a-48d8-93ad-d2fc34c0fd3e"
+   ],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Dungeon Crawler Carl",
+     "trope": "Deadly Trials",
+     "verdict": "CONFIRM",
+     "rationale": "the Crawl is a televised lethal game where death is permanent.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:15"
+    },
+    {
+     "book": "Dungeon Crawler Carl",
+     "trope": "Deadly Trials",
+     "verdict": "CONFIRM",
+     "rationale": "The dungeon crawl is explicitly a brutal competition where losing means death; no chapter evidence attached, but the premise is unambiguous.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:21"
+    }
+   ],
+   "flips": 0,
+   "rationale": "The dungeon crawl is explicitly a brutal competition where losing means death; no chapter evidence attached, but the premise is unambiguous."
+  },
+  {
+   "book": "Fourth Wing",
+   "trope": "Chosen One",
+   "claim_ids": [
+    "84ad7f3f-5b1c-4570-80b8-06bbe38bdb33"
+   ],
+   "verdict": "REJECT",
+   "authority": "reviewer",
+   "seat_verdict": "REJECT",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Fourth Wing",
+     "trope": "Chosen One",
+     "verdict": "REJECT",
+     "rationale": "Tier 2, new claim; Fourth Wing has no prophecy or destiny singling Violet out — she enters Basgiath by her mother's order and is chosen by dragons as riders are, which is not the catalog's prophecy/destiny mechanism.",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:22"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, new claim; Fourth Wing has no prophecy or destiny singling Violet out — she enters Basgiath by her mother's order and is chosen by dragons as riders are, which is not the catalog's prophecy/destiny mechanism."
+  },
+  {
+   "book": "Fourth Wing",
+   "trope": "Friends to Lovers",
+   "claim_ids": [
+    "47c41423-69f8-4f04-9dcb-16e615867d12"
+   ],
+   "verdict": "REJECT",
+   "authority": "reviewer",
+   "seat_verdict": "REJECT",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Fourth Wing",
+     "trope": "Friends to Lovers",
+     "verdict": "REJECT",
+     "rationale": "the central romance is enemies-to-lovers; there is no friends-first arc in the book.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:22"
+    },
+    {
+     "book": "Fourth Wing",
+     "trope": "Friends to Lovers",
+     "verdict": "REJECT",
+     "rationale": "Violet/Xaden is enemies-to-lovers, and Violet/Dain's childhood-friend tension never resolves into a relationship.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:17"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Violet/Xaden is enemies-to-lovers, and Violet/Dain's childhood-friend tension never resolves into a relationship."
+  },
+  {
+   "book": "Fourth Wing",
+   "trope": "Secret Relationship",
+   "claim_ids": [
+    "379db6ef-3a52-4cd3-b394-bd45ebf7638b"
+   ],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Fourth Wing",
+     "trope": "Secret Relationship",
+     "verdict": "ABSTAIN",
+     "rationale": "a secrecy element exists, but evidence is chapter refs only with no quotes; can't confirm it's a defining trope.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:26"
+    },
+    {
+     "book": "Fourth Wing",
+     "trope": "Secret Relationship",
+     "verdict": "CONFIRM",
+     "rationale": "Violet and Xaden conceal their romance from Basgiath's command structure.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:18"
+    }
+   ],
+   "flips": 1,
+   "rationale": "a secrecy element exists, but evidence is chapter refs only with no quotes; can't confirm it's a defining trope."
+  },
+  {
+   "book": "Harry Potter and the Order of the Phoenix",
+   "trope": "Political Intrigue",
+   "claim_ids": [
+    "997041e6-da26-40b1-aa09-d73825f42bc1"
+   ],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Harry Potter and the Order of the Phoenix",
+     "trope": "Political Intrigue",
+     "verdict": "CONFIRM",
+     "rationale": "Ministry power games and the anti-Dumbledore smear campaign run the whole book.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:16"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Ministry power games and the anti-Dumbledore smear campaign run the whole book."
+  },
+  {
+   "book": "Kidnapped by the Krampus",
+   "trope": "Captive / Captor",
+   "claim_ids": [
+    "af5b29c1-dab6-48bc-907e-3779c3433503"
+   ],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Kidnapped by the Krampus",
+     "trope": "Captive / Captor",
+     "verdict": "CONFIRM",
+     "rationale": "kidnapping is the premise; evidence shows her waking in his castle.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:18"
+    }
+   ],
+   "flips": 0,
+   "rationale": "kidnapping is the premise; evidence shows her waking in his castle."
+  },
+  {
+   "book": "Little Brother",
+   "trope": "Secret Identity",
+   "claim_ids": [],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Little Brother",
+     "trope": "Secret Identity",
+     "verdict": "CONFIRM",
+     "rationale": "Marcus operates under the hidden Xnet identity w1n5t0n, concealing who he really is.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:16"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Marcus operates under the hidden Xnet identity w1n5t0n, concealing who he really is."
+  },
+  {
+   "book": "Origin",
+   "trope": "Kidnapping",
+   "claim_ids": [],
+   "verdict": "REJECT",
+   "authority": "reviewer",
+   "seat_verdict": "REJECT",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Origin",
+     "trope": "Kidnapping",
+     "verdict": "REJECT",
+     "rationale": "Nobody is abducted; the plot is an assassination conspiracy and flight, not a kidnapping arc.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:14"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Nobody is abducted; the plot is an assassination conspiracy and flight, not a kidnapping arc."
+  },
+  {
+   "book": "Origin",
+   "trope": "Revenge",
+   "claim_ids": [],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Origin",
+     "trope": "Revenge",
+     "verdict": "CONFIRM",
+     "rationale": "Admiral Ávila's entire mission is vengeance against those he blames for his family's death.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:9"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Admiral Ávila's entire mission is vengeance against those he blames for his family's death."
+  },
+  {
+   "book": "Project Hail Mary",
+   "trope": "Amnesia",
+   "claim_ids": [
+    "0c3343c0-4693-45ca-8c47-0fb4fa01b919"
+   ],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Project Hail Mary",
+     "trope": "Amnesia",
+     "verdict": "CONFIRM",
+     "rationale": "Tier 2, premise unambiguous: Ryland Grace wakes with no memory of himself or his mission and recovers it in fragments — memory loss is the novel's opening and structuring device; no rejection pattern matches. Note: the catalog description frames amnesia as erasing a love story, which does not match this book — single-example catalog-description mismatch, noted for Kevin, not filed as a pipeline bug (feedback format requires at least two claim IDs).",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:30"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, premise unambiguous: Ryland Grace wakes with no memory of himself or his mission and recovers it in fragments — memory loss is the novel's opening and structuring device; no rejection pattern matches. Note: the catalog description frames amnesia as erasing a love story, which does not match this book — single-example catalog-description mismatch, noted for Kevin, not filed as a pipeline bug (feedback format requires at least two claim IDs)."
+  },
+  {
+   "book": "Project Hail Mary",
+   "trope": "First Contact",
+   "claim_ids": [],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Project Hail Mary",
+     "trope": "First Contact",
+     "verdict": "CONFIRM",
+     "rationale": "Ryland Grace's meeting and communication with Rocky is humanity's first contact with alien intelligence and is central to the novel.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:19"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Ryland Grace's meeting and communication with Rocky is humanity's first contact with alien intelligence and is central to the novel."
+  },
+  {
+   "book": "Project Hail Mary",
+   "trope": "Unlikely Alliance",
+   "claim_ids": [],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Project Hail Mary",
+     "trope": "Unlikely Alliance",
+     "verdict": "CONFIRM",
+     "rationale": "Grace and Rocky are strangers from different worlds forced to cooperate against the Astrophage threat endangering both species — an exact fit for the catalog description.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:24"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Grace and Rocky are strangers from different worlds forced to cooperate against the Astrophage threat endangering both species — an exact fit for the catalog description."
+  },
+  {
+   "book": "The Da Vinci Code",
+   "trope": "Missing Person",
+   "claim_ids": [],
+   "verdict": "REJECT",
+   "authority": "reviewer",
+   "seat_verdict": "REJECT",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Da Vinci Code",
+     "trope": "Missing Person",
+     "verdict": "REJECT",
+     "rationale": "The plot opens with a murder and chases a decoded secret; no central disappearance drives it.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:10"
+    }
+   ],
+   "flips": 0,
+   "rationale": "The plot opens with a murder and chases a decoded secret; no central disappearance drives it."
+  },
+  {
+   "book": "The Da Vinci Code",
+   "trope": "Secret Identity",
+   "claim_ids": [],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Da Vinci Code",
+     "trope": "Secret Identity",
+     "verdict": "CONFIRM",
+     "rationale": "The Teacher's hidden identity (Teabing) and Sophie's hidden Merovingian lineage are both central.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:20"
+    }
+   ],
+   "flips": 0,
+   "rationale": "The Teacher's hidden identity (Teabing) and Sophie's hidden Merovingian lineage are both central."
+  },
+  {
+   "book": "The Da Vinci Code",
+   "trope": "Whodunit",
+   "claim_ids": [],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Da Vinci Code",
+     "trope": "Whodunit",
+     "verdict": "CONFIRM",
+     "rationale": "Langdon and Sophie sift suspects to unmask the Teacher's identity — a genuine puzzle-mystery core.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:19"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Langdon and Sophie sift suspects to unmask the Teacher's identity — a genuine puzzle-mystery core."
+  },
+  {
+   "book": "The Darkness Within Us",
+   "trope": "Enemies to Lovers",
+   "claim_ids": [
+    "e9927a80-cd31-4814-a9e4-797494ef750e"
+   ],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Darkness Within Us",
+     "trope": "Enemies to Lovers",
+     "verdict": "CONFIRM",
+     "rationale": "Chrysantha starts out plotting Eryx Demos's murder and falls for him.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:17"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Chrysantha starts out plotting Eryx Demos's murder and falls for him."
+  },
+  {
+   "book": "The Hunger Games",
+   "trope": "Deadly Trials",
+   "claim_ids": [
+    "7e61bf13-f518-47cb-8167-053e34740484"
+   ],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Hunger Games",
+     "trope": "Deadly Trials",
+     "verdict": "CONFIRM",
+     "rationale": "the arena Games are literally a death competition.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:14"
+    },
+    {
+     "book": "The Hunger Games",
+     "trope": "Deadly Trials",
+     "verdict": "CONFIRM",
+     "rationale": "The Games are the archetypal deadly competition where losing means death.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:5"
+    }
+   ],
+   "flips": 0,
+   "rationale": "The Games are the archetypal deadly competition where losing means death."
+  },
+  {
+   "book": "The Hunger Games",
+   "trope": "Dystopia",
+   "claim_ids": [
+    "415fcf9c-aaca-44cd-811b-7f025c2c83a4"
+   ],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Hunger Games",
+     "trope": "Dystopia",
+     "verdict": "CONFIRM",
+     "rationale": "Panem's Capitol regime is a textbook oppressive-future-regime the characters resist/survive.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:13"
+    },
+    {
+     "book": "The Hunger Games",
+     "trope": "Dystopia",
+     "verdict": "CONFIRM",
+     "rationale": "Panem is an oppressive regime the characters resist and survive.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:6"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Panem's Capitol regime is a textbook oppressive-future-regime the characters resist/survive."
+  },
+  {
+   "book": "The Lost Symbol",
+   "trope": "Secret Identity",
+   "claim_ids": [],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Lost Symbol",
+     "trope": "Secret Identity",
+     "verdict": "CONFIRM",
+     "rationale": "Mal'akh is secretly Zachary Solomon, who faked his death to infiltrate — the book's central identity reveal.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:23"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Mal'akh is secretly Zachary Solomon, who faked his death to infiltrate — the book's central identity reveal."
+  },
+  {
+   "book": "The Lost Symbol",
+   "trope": "Whodunit",
+   "claim_ids": [],
+   "verdict": "REJECT",
+   "authority": "reviewer",
+   "seat_verdict": "REJECT",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Lost Symbol",
+     "trope": "Whodunit",
+     "verdict": "REJECT",
+     "rationale": "No classic suspect-list puzzle; the culprit (Mal'akh) is effectively known and the structure is chase-thriller, not a puzzle mystery.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:7"
+    }
+   ],
+   "flips": 0,
+   "rationale": "No classic suspect-list puzzle; the culprit (Mal'akh) is effectively known and the structure is chase-thriller, not a puzzle mystery."
+  },
+  {
+   "book": "Walkaway",
+   "trope": "Enemies to Lovers",
+   "claim_ids": [],
+   "verdict": "REJECT",
+   "authority": "reviewer",
+   "seat_verdict": "REJECT",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Walkaway",
+     "trope": "Enemies to Lovers",
+     "verdict": "REJECT",
+     "rationale": "No central hostile-to-romance arc; Walkaway's main relationships form among allies inside the walkaway community, not between former enemies or opponents.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:11"
+    }
+   ],
+   "flips": 0,
+   "rationale": "No central hostile-to-romance arc; Walkaway's main relationships form among allies inside the walkaway community, not between former enemies or opponents."
+  },
+  {
+   "book": "Walkaway",
+   "trope": "Found Family",
+   "claim_ids": [],
+   "verdict": "CONFIRM",
+   "authority": "reviewer",
+   "seat_verdict": "CONFIRM",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Walkaway",
+     "trope": "Found Family",
+     "verdict": "CONFIRM",
+     "rationale": "The walkaway communities are chosen family by premise: misfits leave default society, choose each other, and build new kinship together, with evidence spread across 8 chapters.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:9"
+    }
+   ],
+   "flips": 0,
+   "rationale": "The walkaway communities are chosen family by premise: misfits leave default society, choose each other, and build new kinship together, with evidence spread across 8 chapters."
+  }
+ ],
+ "abstains": [
+  {
+   "book": "Artemis: A Novel",
+   "trope": "Mentorship",
+   "claim_ids": [
+    "aa32ac0a-c208-4819-9cee-f95b34be9692"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "backstory-vs-in-book",
+   "interpretation_only": true,
+   "appearances": [
+    {
+     "book": "Artemis: A Novel",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "Jazz's trade skills come from backstory (her father), but no central mentor-training arc is established, and evidence is only 3 chapter refs.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:25"
+    },
+    {
+     "book": "Artemis: A Novel",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (1 prior abstain, 2026-10-13); Jazz's skills come from backstory (her father), with no central mentor-training arc established.",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:32"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (1 prior abstain, 2026-10-13); Jazz's skills come from backstory (her father), with no central mentor-training arc established."
+  },
+  {
+   "book": "Artemis: A Novel",
+   "trope": "Secret Identity",
+   "claim_ids": [
+    "91676ab8-0b45-4446-ad24-7418fdaf3c62"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Artemis: A Novel",
+     "trope": "Secret Identity",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, new claim; Jazz is an openly known smuggler in Artemis and no central character is established by refs/premise as hiding name, lineage, or allegiance.",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:28"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, new claim; Jazz is an openly known smuggler in Artemis and no central character is established by refs/premise as hiding name, lineage, or allegiance."
+  },
+  {
+   "book": "Artemis: A Novel",
+   "trope": "Whodunit",
+   "claim_ids": [
+    "45de4288-e843-4ab2-ae26-958e284532ff"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Artemis: A Novel",
+     "trope": "Whodunit",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, new claim; a double homicide occurs, but refs only (led by a chapter heading) do not establish a classic suspect-puzzle mystery as the book's core.",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:29"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, new claim; a double homicide occurs, but refs only (led by a chapter heading) do not establish a classic suspect-puzzle mystery as the book's core."
+  },
+  {
+   "book": "Delta-V",
+   "trope": "Mentorship",
+   "claim_ids": [
+    "f8538389-e993-4d36-8625-7dca6d3b278d"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Delta-V",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "Early-chapter training for the mission is not clearly an experienced-guide-trains-protagonist arc, and evidence is refs only.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:23"
+    },
+    {
+     "book": "Delta-V",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (1 prior abstain, 2026-10-13); early mission training is not clearly an experienced-guide-trains-protagonist arc.",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:19"
+    },
+    {
+     "book": "Delta-V",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-13/14); early mission training is not clearly an experienced-guide-trains-protagonist arc. ESCALATED — see Escalations (abstain count reaches 3 with this run).",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:25"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-13/14); early mission training is not clearly an experienced-guide-trains-protagonist arc. ESCALATED — see Escalations (abstain count reaches 3 with this run)."
+  },
+  {
+   "book": "Delta-V",
+   "trope": "Secret Identity",
+   "claim_ids": [
+    "b2bbf90a-8c5a-4fcd-9521-d717d07faed6"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Delta-V",
+     "trope": "Secret Identity",
+     "verdict": "ABSTAIN",
+     "rationale": "Chapter refs only, no quotes; no known central character in Suarez's asteroid-mining thriller hides name, lineage, or allegiance.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:8"
+    },
+    {
+     "book": "Delta-V",
+     "trope": "Secret Identity",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (1 prior abstain, 2026-10-13); no known central character hides name, lineage, or allegiance.",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:26"
+    },
+    {
+     "book": "Delta-V",
+     "trope": "Secret Identity",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-13/14); no known central character hides name, lineage, or allegiance. ESCALATED — see Escalations (abstain count reaches 3 with this run).",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:21"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-13/14); no known central character hides name, lineage, or allegiance. ESCALATED — see Escalations (abstain count reaches 3 with this run)."
+  },
+  {
+   "book": "Delta-V",
+   "trope": "Survivor Guilt",
+   "claim_ids": [
+    "894af9ac-6bdb-4881-915b-fd8a9fc79d74"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Delta-V",
+     "trope": "Survivor Guilt",
+     "verdict": "ABSTAIN",
+     "rationale": "Deaths and trauma occur, but refs only do not establish a character haunted specifically by surviving when others did not as a defining arc.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:13"
+    },
+    {
+     "book": "Delta-V",
+     "trope": "Survivor Guilt",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (1 prior abstain, 2026-10-13); deaths/trauma occur, but refs only do not establish survivor guilt as a defining haunting arc.",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:21"
+    },
+    {
+     "book": "Delta-V",
+     "trope": "Survivor Guilt",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-13/14); deaths/trauma occur, but refs only do not establish survivor guilt as a defining haunting arc. ESCALATED — see Escalations (abstain count reaches 3 with this run).",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:27"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-13/14); deaths/trauma occur, but refs only do not establish survivor guilt as a defining haunting arc. ESCALATED — see Escalations (abstain count reaches 3 with this run)."
+  },
+  {
+   "book": "Fourth Wing",
+   "trope": "Forced Proximity",
+   "claim_ids": [
+    "845eb8a5-1e7e-463f-b8b3-88418663cbf5"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Fourth Wing",
+     "trope": "Forced Proximity",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, new claim; the mated-dragon bond forcing Violet/Xaden together is a mid-book plot mechanism, not an unambiguous premise, and refs only cannot establish it as the defining proximity arc.",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:15"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, new claim; the mated-dragon bond forcing Violet/Xaden together is a mid-book plot mechanism, not an unambiguous premise, and refs only cannot establish it as the defining proximity arc."
+  },
+  {
+   "book": "Fourth Wing",
+   "trope": "Found Family",
+   "claim_ids": [
+    "1eb931c0-3392-4d51-95d8-b4acddb8251a"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Fourth Wing",
+     "trope": "Found Family",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, new claim; Violet's squad bonding is a real theme, but refs only do not establish chosen-family as the book's unambiguous premise the way Walkaway's communities did.",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:26"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, new claim; Violet's squad bonding is a real theme, but refs only do not establish chosen-family as the book's unambiguous premise the way Walkaway's communities did."
+  },
+  {
+   "book": "Fourth Wing",
+   "trope": "Mentorship",
+   "claim_ids": [
+    "f0fd3c68-3c38-4aa5-bf5f-68981876268b"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Fourth Wing",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, new claim; Basgiath has instructors and sparring training, but no single experienced guide training Violet as a central mentorship arc is established by refs only.",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:28"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, new claim; Basgiath has instructors and sparring training, but no single experienced guide training Violet as a central mentorship arc is established by refs only."
+  },
+  {
+   "book": "Fourth Wing",
+   "trope": "Secret Identity",
+   "claim_ids": [
+    "f25663b8-24eb-4d49-9acb-ebdcd13ab849"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Fourth Wing",
+     "trope": "Secret Identity",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, new claim; Xaden hides allegiance/activity and a second signet, but refs only do not establish a central hidden name/lineage identity arc of the kind the catalog describes.",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:19"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, new claim; Xaden hides allegiance/activity and a second signet, but refs only do not establish a central hidden name/lineage identity arc of the kind the catalog describes."
+  },
+  {
+   "book": "Freedom",
+   "trope": "Mentorship",
+   "claim_ids": [
+    "7bedbbf2-7df2-4bba-8817-dd0848f25583"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Freedom",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "same; book known (Suarez's Freedom™) but evidence is chapter refs only with no quotes.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:28"
+    }
+   ],
+   "flips": 0,
+   "rationale": "same; book known (Suarez's Freedom™) but evidence is chapter refs only with no quotes."
+  },
+  {
+   "book": "Freedom",
+   "trope": "Redemption",
+   "claim_ids": [
+    "3f5a3116-02d6-4630-b291-b67185a0afff"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Freedom",
+     "trope": "Redemption",
+     "verdict": "ABSTAIN",
+     "rationale": "this is Daniel Suarez's Freedom™ (Daemon sequel), but evidence is chapter refs only with no quotes.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:27"
+    }
+   ],
+   "flips": 0,
+   "rationale": "this is Daniel Suarez's Freedom™ (Daemon sequel), but evidence is chapter refs only with no quotes."
+  },
+  {
+   "book": "Highest Bidder",
+   "trope": "Forced Proximity",
+   "claim_ids": [
+    "968224c2-e55d-4983-bde9-bfc9765c2a7e"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Highest Bidder",
+     "trope": "Forced Proximity",
+     "verdict": "ABSTAIN",
+     "rationale": "month-long contract is suggestive, but the book is unknown and fit is unclear.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:35"
+    }
+   ],
+   "flips": 0,
+   "rationale": "month-long contract is suggestive, but the book is unknown and fit is unclear."
+  },
+  {
+   "book": "Homeland",
+   "trope": "Kidnapping",
+   "claim_ids": [
+    "d08aab08-990f-47be-b473-4eec58929f8a"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "standoff-vs-captor-captive",
+   "interpretation_only": true,
+   "appearances": [
+    {
+     "book": "Homeland",
+     "trope": "Kidnapping",
+     "verdict": "ABSTAIN",
+     "rationale": "No known abduction arc; unverified against the book.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:22"
+    },
+    {
+     "book": "Homeland",
+     "trope": "Kidnapping",
+     "verdict": "ABSTAIN",
+     "rationale": "No verified abduction-driven captor-captive arc; evidence is chapter refs only with no quotes.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:21"
+    },
+    {
+     "book": "Homeland",
+     "trope": "Kidnapping",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-12/13); no verified abduction-driven captor-captive arc, refs only. ESCALATED — see Escalations (abstain count reaches 3 with this run).",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:20"
+    },
+    {
+     "book": "Homeland",
+     "trope": "Kidnapping",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (3 prior abstains, 2026-10-12/13/14); no verified abduction-driven captor-captive arc, refs only. ESCALATED — already at count 3, see Escalations.",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:30"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-12/13); no verified abduction-driven captor-captive arc, refs only. ESCALATED — see Escalations (abstain count reaches 3 with this run)."
+  },
+  {
+   "book": "Origin",
+   "trope": "Secret Identity",
+   "claim_ids": [
+    "44ff5d6d-743b-415e-974d-cd40a6305fad"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Origin",
+     "trope": "Secret Identity",
+     "verdict": "ABSTAIN",
+     "rationale": "No clearly hidden identity central to the plot; Langdon/Ambra have no disguised allegiance twist.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:11"
+    },
+    {
+     "book": "Origin",
+     "trope": "Secret Identity",
+     "verdict": "ABSTAIN",
+     "rationale": "No clearly hidden identity central to the plot; the assassin/Regent mystery is a whodunit element, not a secret-identity arc, and evidence is refs only.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:15"
+    },
+    {
+     "book": "Origin",
+     "trope": "Secret Identity",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-12/13); the assassin/Regent mystery is a whodunit element, not a central hidden name/lineage/allegiance arc. ESCALATED — see Escalations (abstain count reaches 3 with this run).",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:23"
+    },
+    {
+     "book": "Origin",
+     "trope": "Secret Identity",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (3 prior abstains, 2026-10-12/13/14); the assassin/Regent mystery is a whodunit element, not a central hidden name/lineage/allegiance arc. ESCALATED — already at count 3, see Escalations.",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:16"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-12/13); the assassin/Regent mystery is a whodunit element, not a central hidden name/lineage/allegiance arc. ESCALATED — see Escalations (abstain count reaches 3 with this run)."
+  },
+  {
+   "book": "Pursuit",
+   "trope": "Serial Killer",
+   "claim_ids": [
+    "039bdadc-d64c-4f20-aae9-a1820d042544"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Pursuit",
+     "trope": "Serial Killer",
+     "verdict": "ABSTAIN",
+     "rationale": "killers are described, but nothing establishes a repeating murderer hunted across the story.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:31"
+    }
+   ],
+   "flips": 0,
+   "rationale": "killers are described, but nothing establishes a repeating murderer hunted across the story."
+  },
+  {
+   "book": "radicalized",
+   "trope": "Mentorship",
+   "claim_ids": [
+    "9266f899-73ea-4318-85f9-76a89932aedf"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "radicalized",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "Novella collection; no known central mentor-protagonist arc and no familiarity with its specifics.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:12"
+    },
+    {
+     "book": "radicalized",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "Novella collection with no known central mentor-protagonist arc, and evidence is chapter refs only.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:12"
+    },
+    {
+     "book": "radicalized",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-12/13); novella collection, no known central mentor-protagonist arc, refs only. ESCALATED — see Escalations (abstain count reaches 3 with this run).",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:25"
+    },
+    {
+     "book": "radicalized",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (3 prior abstains, 2026-10-12/13/14); novella collection, no known central mentor-protagonist arc, refs only. ESCALATED — already at count 3, see Escalations.",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:20"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-12/13); novella collection, no known central mentor-protagonist arc, refs only. ESCALATED — see Escalations (abstain count reaches 3 with this run)."
+  },
+  {
+   "book": "radicalized",
+   "trope": "Survivor Guilt",
+   "claim_ids": [
+    "14e43d42-9dca-4f77-9b42-e498c3a47b98"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "radicalized",
+     "trope": "Survivor Guilt",
+     "verdict": "ABSTAIN",
+     "rationale": "Novella collection; evidence is 3 chapter refs from a single section, with no known character haunted by surviving others.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:26"
+    },
+    {
+     "book": "radicalized",
+     "trope": "Survivor Guilt",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (1 prior abstain, 2026-10-13); novella collection, 3 refs from a single section, no known character haunted by surviving others.",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:31"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (1 prior abstain, 2026-10-13); novella collection, 3 refs from a single section, no known character haunted by surviving others."
+  },
+  {
+   "book": "The Da Vinci Code",
+   "trope": "Kidnapping",
+   "claim_ids": [
+    "6b9f10c4-40c8-4e10-b5ba-bb13891f77fb"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "standoff-vs-captor-captive",
+   "interpretation_only": true,
+   "appearances": [
+    {
+     "book": "The Da Vinci Code",
+     "trope": "Kidnapping",
+     "verdict": "ABSTAIN",
+     "rationale": "Teabing holds Sophie at gunpoint briefly, but it's a hostage standoff rather than an abduction-driven captor-captive dynamic.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:13"
+    },
+    {
+     "book": "The Da Vinci Code",
+     "trope": "Kidnapping",
+     "verdict": "ABSTAIN",
+     "rationale": "Brief hostage/gunpoint moments occur, but that is a standoff, not the abduction-driven twisted captor-captive dynamic the catalog describes.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:16"
+    },
+    {
+     "book": "The Da Vinci Code",
+     "trope": "Kidnapping",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-12/13); brief hostage/gunpoint moments are a standoff, not the catalog's abduction-driven captor-captive dynamic. ESCALATED — see Escalations (abstain count reaches 3 with this run).",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:24"
+    },
+    {
+     "book": "The Da Vinci Code",
+     "trope": "Kidnapping",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (3 prior abstains, 2026-10-12/13/14); brief hostage/gunpoint moments are a standoff, not the catalog's abduction-driven captor-captive dynamic. ESCALATED — already at count 3, see Escalations.",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:31"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-12/13); brief hostage/gunpoint moments are a standoff, not the catalog's abduction-driven captor-captive dynamic. ESCALATED — see Escalations (abstain count reaches 3 with this run)."
+  },
+  {
+   "book": "The Damned (Coven of Bones, #3)",
+   "trope": "Quest",
+   "claim_ids": [
+    "f44a44b2-8b8d-45e9-90b8-8b16c7c66148"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Damned (Coven of Bones, #3)",
+     "trope": "Quest",
+     "verdict": "ABSTAIN",
+     "rationale": "hell-journey quotes are suggestive, but the book is unknown and evidence is thin.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:29"
+    }
+   ],
+   "flips": 0,
+   "rationale": "hell-journey quotes are suggestive, but the book is unknown and evidence is thin."
+  },
+  {
+   "book": "The Great Big Beautiful Tomorrow",
+   "trope": "Revenge",
+   "claim_ids": [
+    "6a0120ca-5bf4-4688-9454-a9c48e214452"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "toc-as-evidence",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Great Big Beautiful Tomorrow",
+     "trope": "Revenge",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, new claim; refs only (including long chapter titles, which are headings, not evidence) do not establish a vengeance quest driving the plot of this novella.",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:33"
+    },
+    {
+     "book": "The Great Big Beautiful Tomorrow",
+     "trope": "Revenge",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (1 prior abstain, 2026-10-14); refs only (including long chapter titles, which are headings, not evidence) do not establish a vengeance quest driving this novella's plot.",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:33"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (1 prior abstain, 2026-10-14); refs only (including long chapter titles, which are headings, not evidence) do not establish a vengeance quest driving this novella's plot."
+  },
+  {
+   "book": "The Hunger Games",
+   "trope": "Coming of Age",
+   "claim_ids": [
+    "fe5cf8a9-1f69-47c3-8910-5ddc519989e2"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Hunger Games",
+     "trope": "Coming of Age",
+     "verdict": "ABSTAIN",
+     "rationale": "legacy metadata with no quotes; growing up is secondary to the survival engine in this book.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:36"
+    }
+   ],
+   "flips": 0,
+   "rationale": "legacy metadata with no quotes; growing up is secondary to the survival engine in this book."
+  },
+  {
+   "book": "The Lost Symbol",
+   "trope": "Mentorship",
+   "claim_ids": [
+    "43dfa4f3-c27e-4346-ae11-bee7a3ad2d5a"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "backstory-vs-in-book",
+   "interpretation_only": true,
+   "appearances": [
+    {
+     "book": "The Lost Symbol",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "No clear experienced-guide-trains-protagonist arc; Mal'akh manipulates Katherine but it's coercion, not mentorship.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:8"
+    },
+    {
+     "book": "The Lost Symbol",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "No clear experienced-guide-trains-protagonist arc; Peter Solomon is Langdon's friend/mentor in backstory, not training him through this book, and evidence is refs only.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:10"
+    },
+    {
+     "book": "The Lost Symbol",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-12/13); Peter Solomon is a friend/mentor in backstory, not an experienced guide training Langdon through this book. ESCALATED — see Escalations (abstain count reaches 3 with this run).",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:18"
+    },
+    {
+     "book": "The Lost Symbol",
+     "trope": "Mentorship",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (3 prior abstains, 2026-10-12/13/14); Peter Solomon is a friend/mentor in backstory, not an experienced guide training Langdon through this book. ESCALATED — already at count 3, see Escalations.",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:29"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-12/13); Peter Solomon is a friend/mentor in backstory, not an experienced guide training Langdon through this book. ESCALATED — see Escalations (abstain count reaches 3 with this run)."
+  },
+  {
+   "book": "The Lost Symbol",
+   "trope": "Sacrifice",
+   "claim_ids": [
+    "1acee5b8-f571-406f-b7c5-ad2a2e0e96e3"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "voluntary-vs-coerced",
+   "interpretation_only": true,
+   "appearances": [
+    {
+     "book": "The Lost Symbol",
+     "trope": "Sacrifice",
+     "verdict": "ABSTAIN",
+     "rationale": "Peter's mutilation is endured, not voluntarily given up for others; no clear sacrifice moment.",
+     "date": "2026-10-12",
+     "source": "2026-10-12-recommendations.md:24"
+    },
+    {
+     "book": "The Lost Symbol",
+     "trope": "Sacrifice",
+     "verdict": "ABSTAIN",
+     "rationale": "Peter's suffering is endured/coerced rather than clearly a voluntary giving-up of something precious for others, and evidence is refs only.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:22"
+    },
+    {
+     "book": "The Lost Symbol",
+     "trope": "Sacrifice",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-12/13); Peter's suffering is endured/coerced, not clearly a voluntary giving-up of something precious for others. ESCALATED — see Escalations (abstain count reaches 3 with this run).",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:16"
+    },
+    {
+     "book": "The Lost Symbol",
+     "trope": "Sacrifice",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (3 prior abstains, 2026-10-12/13/14); Peter's suffering is endured/coerced, not clearly a voluntary giving-up of something precious for others. ESCALATED — already at count 3, see Escalations.",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:23"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-12/13); Peter's suffering is endured/coerced, not clearly a voluntary giving-up of something precious for others. ESCALATED — see Escalations (abstain count reaches 3 with this run)."
+  },
+  {
+   "book": "The Martian",
+   "trope": "Survivor Guilt",
+   "claim_ids": [
+    "924e820c-10ff-40c2-b606-4d45047b3315"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Martian",
+     "trope": "Survivor Guilt",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, new claim; the Hermes crew's guilt over leaving Watney is a thread, but refs only (chapters 11–12) do not establish a character haunted by surviving when others did not — Watney's crewmates all lived.",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:34"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, new claim; the Hermes crew's guilt over leaving Watney is a thread, but refs only (chapters 11–12) do not establish a character haunted by surviving when others did not — Watney's crewmates all lived."
+  },
+  {
+   "book": "The Risk",
+   "trope": "Small-Town Secrets",
+   "claim_ids": [
+    "aeb49850-cbca-44aa-a961-314e2347f9d6"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Risk",
+     "trope": "Small-Town Secrets",
+     "verdict": "ABSTAIN",
+     "rationale": "college setting; town-secrets framing can't be verified from the evidence.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:34"
+    }
+   ],
+   "flips": 0,
+   "rationale": "college setting; town-secrets framing can't be verified from the evidence."
+  },
+  {
+   "book": "The Stranger in Her House",
+   "trope": "Unreliable Narrator",
+   "claim_ids": [
+    "d8f77aba-6af7-4edc-9c74-637e7452c9e7"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "The Stranger in Her House",
+     "trope": "Unreliable Narrator",
+     "verdict": "ABSTAIN",
+     "rationale": "single thin quote, book unknown.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:32"
+    }
+   ],
+   "flips": 0,
+   "rationale": "single thin quote, book unknown."
+  },
+  {
+   "book": "Twisted",
+   "trope": "Marriage of Convenience",
+   "claim_ids": [
+    "82a2b99d-1f71-47b6-a3e8-8bd04f58315d"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Twisted",
+     "trope": "Marriage of Convenience",
+     "verdict": "ABSTAIN",
+     "rationale": "characters Yasmin/Julian point to a different \"Twisted\" than expected; quotes show a forced deal, not the fall-in-love arc.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:30"
+    }
+   ],
+   "flips": 0,
+   "rationale": "characters Yasmin/Julian point to a different \"Twisted\" than expected; quotes show a forced deal, not the fall-in-love arc."
+  },
+  {
+   "book": "Untainted",
+   "trope": "Deadly Trials",
+   "claim_ids": [
+    "5fc7ad62-1d4e-4be6-a5cb-39c9ffb2d564"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Untainted",
+     "trope": "Deadly Trials",
+     "verdict": "ABSTAIN",
+     "rationale": "fight-to-the-death is shown, but the competition frame is unclear and the book is unknown.",
+     "date": "2026-10-10",
+     "source": "2026-10-10-recommendations.md:33"
+    }
+   ],
+   "flips": 0,
+   "rationale": "fight-to-the-death is shown, but the competition frame is unclear and the book is unknown."
+  },
+  {
+   "book": "Walkaway",
+   "trope": "Family Drama",
+   "claim_ids": [
+    "2bf6fbd5-3cd6-481a-b2f0-266231b1475b"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Walkaway",
+     "trope": "Family Drama",
+     "verdict": "ABSTAIN",
+     "rationale": "Chapter refs only, no quotes; Natalie's conflict with her wealthy family is a thread, but a central intergenerational family-drama arc is not clearly established.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:7"
+    },
+    {
+     "book": "Walkaway",
+     "trope": "Family Drama",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (1 prior abstain, 2026-10-13); Natalie's conflict with her wealthy family is a thread, not clearly a central intergenerational family-drama arc.",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:22"
+    },
+    {
+     "book": "Walkaway",
+     "trope": "Family Drama",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-13/14); Natalie's conflict with her wealthy family is a thread, not clearly a central intergenerational family-drama arc. ESCALATED — see Escalations (abstain count reaches 3 with this run).",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:17"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-13/14); Natalie's conflict with her wealthy family is a thread, not clearly a central intergenerational family-drama arc. ESCALATED — see Escalations (abstain count reaches 3 with this run)."
+  },
+  {
+   "book": "Walkaway",
+   "trope": "Kidnapping",
+   "claim_ids": [
+    "44b1c4e2-9f46-4c4b-9188-7b31d5fa1f82"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "standoff-vs-captor-captive",
+   "interpretation_only": true,
+   "appearances": [
+    {
+     "book": "Walkaway",
+     "trope": "Kidnapping",
+     "verdict": "ABSTAIN",
+     "rationale": "Capture/detention by default forces may occur, but refs only do not establish the twisted captor-captive dynamic the catalog describes.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:20"
+    },
+    {
+     "book": "Walkaway",
+     "trope": "Kidnapping",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (1 prior abstain, 2026-10-13); capture/detention may occur, but refs only do not establish the catalog's abduction-driven captor-captive dynamic.",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:15"
+    },
+    {
+     "book": "Walkaway",
+     "trope": "Kidnapping",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-13/14); capture/detention may occur, but refs only do not establish the catalog's abduction-driven captor-captive dynamic. ESCALATED — see Escalations (abstain count reaches 3 with this run).",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:18"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-13/14); capture/detention may occur, but refs only do not establish the catalog's abduction-driven captor-captive dynamic. ESCALATED — see Escalations (abstain count reaches 3 with this run)."
+  },
+  {
+   "book": "Walkaway",
+   "trope": "Survivor Guilt",
+   "claim_ids": [
+    "9d1a6ff0-e104-461a-8fa1-6296f536fdfc"
+   ],
+   "verdict": "ABSTAIN",
+   "authority": "reviewer",
+   "seat_verdict": "ABSTAIN",
+   "kevin_verdict": null,
+   "disagreement": false,
+   "failure_class": "premise-judgment",
+   "interpretation_only": false,
+   "appearances": [
+    {
+     "book": "Walkaway",
+     "trope": "Survivor Guilt",
+     "verdict": "ABSTAIN",
+     "rationale": "Characters grieve real losses, but refs only do not establish survivor guilt as a central haunting arc.",
+     "date": "2026-10-13",
+     "source": "2026-10-13-recommendations.md:17"
+    },
+    {
+     "book": "Walkaway",
+     "trope": "Survivor Guilt",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (1 prior abstain, 2026-10-13); grief/losses occur, but refs only do not establish a character haunted specifically by surviving when others did not.",
+     "date": "2026-10-14",
+     "source": "2026-10-14-recommendations.md:17"
+    },
+    {
+     "book": "Walkaway",
+     "trope": "Survivor Guilt",
+     "verdict": "ABSTAIN",
+     "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-13/14); grief/losses occur, but refs only do not establish a character haunted specifically by surviving when others did not. ESCALATED — see Escalations (abstain count reaches 3 with this run).",
+     "date": "2026-10-15",
+     "source": "2026-10-15-recommendations.md:24"
+    }
+   ],
+   "flips": 0,
+   "rationale": "Tier 2, prior verdict held (2 prior abstains, 2026-10-13/14); grief/losses occur, but refs only do not establish a character haunted specifically by surviving when others did not. ESCALATED — see Escalations (abstain count reaches 3 with this run)."
+  }
+ ],
+ "build_report": {
+  "files": [
+   "2026-10-10-recommendations.md",
+   "2026-10-12-recommendations.md",
+   "2026-10-13-recommendations.md",
+   "2026-10-14-recommendations.md",
+   "2026-10-15-recommendations.md"
+  ],
+  "lines_parsed": 160,
+  "unique_claims": 61,
+  "scored": 29,
+  "abstains_excluded": 32,
+  "flips": 1,
+  "unresolved": [],
+  "kevin_note": "Supabase not configured",
+  "per_class": {
+   "premise-judgment": 28,
+   "genre-mismatch": 1
+  },
+  "per_authority": {
+   "reviewer": 29
+  }
+ }
+}
