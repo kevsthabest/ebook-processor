@@ -87,6 +87,19 @@ The abort threshold is the `MAX_FAILED_CHUNK_RATIO = 0.5` constant
 (`:169`), not a flag; aborted runs still save a preview marked
 `"aborted": true`.
 
+## Operator portal (slice S1: Home)
+
+A localhost-only web console for the processor: `py portal.py`
+from the repo root, then open the URL it prints (127.0.0.1:8765
+by default; if that port is taken it takes the next free one
+and prints the actual URL). No dependencies — standard library
+only. Slice S1 is the read-only Control Room: corpus health,
+coverage, the book table, recent runs, and queue counts, read
+directly from `state.db` / `corpus.db`. It writes nothing and
+launches nothing; run launching, the Desk, and the Matrices
+panel are later slices (see `PORTAL-SPEC.md` in the sweep
+workspace).
+
 ## Two-task extraction (v1.19+)
 
 One mega-prompt made small models conflate everything. Each chunk now gets
