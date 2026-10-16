@@ -2877,6 +2877,17 @@ class StateDB:
             finally:
                 out.close()
 
+    def checkpoint(self):
+        """Fold the WAL back into the main file (a maintenance op:
+        logical content unchanged). Replay seeding opens the live DB
+        immutable (A2), which cannot recover a WAL — checkpointing
+        through this handle first makes the seeded copy complete."""
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                pass
+
     def dump_hash(self):
         """Canonical hash of the DB's LOGICAL content (A2): every
         table's rows in a fixed order, serialized deterministically.
@@ -7283,6 +7294,15 @@ def _staging():
 # _learn() always returns a usable object (disabled stub when off), so
 # call sites never need None checks.
 _LEARNED = None
+
+# Spine replay/capture contexts (design §3.4). _REPLAY_CTX is set
+# only inside run_replay: while it lives, _checkpoint_dir serves the
+# snapshot's payload directory, checkpoint WRITES are suppressed
+# (the snapshot stays pristine), and every store write lands in the
+# sandbox substrate. _CAPTURE_CTX arms snapshot capture for the
+# current (fresh, preview) run.
+_REPLAY_CTX = None
+_CAPTURE_CTX = None
 
 
 def _learn():
@@ -13073,6 +13093,10 @@ def _checkpoint_book_key(fpath):
 
 
 def _checkpoint_dir(book_key):
+    if _REPLAY_CTX is not None:
+        # Replay: payloads are served from the snapshot's own
+        # directory (dir-parameterized load, design §3.4.2).
+        return Path(_REPLAY_CTX["payload_dir"])
     return SCRIPT_DIR / "preview" / ".checkpoints" / book_key
 
 
@@ -13126,6 +13150,19 @@ def _checkpoint_flags_hash():
     vals = {k: CONFIG.get(k) for k in _CHECKPOINT_FLAGS}
     vals["_code_sha"] = _git_commit_sha() or "unknown"
     return _hl.sha256(_js.dumps(vals, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _config_digest():
+    """Digest of the output-affecting CONFIG (spine §3.4.2): the
+    _CHECKPOINT_FLAGS set in canonical form. Two runs with the same
+    digest ran the same effective configuration; the replay marker
+    and the snapshot manifest pin it so a pipeline-vs-draw comparison
+    can prove the config did not move. (No credential keys appear in
+    _CHECKPOINT_FLAGS.)"""
+    import hashlib as _hl
+    vals = {k: CONFIG.get(k) for k in _CHECKPOINT_FLAGS}
+    return _hl.sha256(json.dumps(vals, sort_keys=True,
+                                 default=str).encode()).hexdigest()[:16]
 
 
 def _ckpt_json_safe(obj):
@@ -13238,6 +13275,8 @@ def _ckpt_restore_roster_entry(entry):
 
 
 def _checkpoint_save_meta(book_key, total_chapters, fingerprint=None):
+    if _REPLAY_CTX is not None:
+        return  # replay never writes into the snapshot (spine §3.4)
     d = _checkpoint_dir(book_key)
     d.mkdir(parents=True, exist_ok=True)
     meta = {"book_key": book_key, "total_chapters": total_chapters,
@@ -13250,6 +13289,8 @@ def _checkpoint_save_meta(book_key, total_chapters, fingerprint=None):
 
 
 def _checkpoint_purge_stale(book_key, total_chapters, fingerprint=None):
+    if _REPLAY_CTX is not None:
+        return 0  # replay never purges the snapshot (spine §3.4)
     """Remove a DIFFERENT book's chapter files + roster from a
     checkpoint directory before a fresh run (re)writes its meta.
 
@@ -13292,6 +13333,8 @@ def _checkpoint_purge_stale(book_key, total_chapters, fingerprint=None):
 
 
 def _checkpoint_save_chapter(book_key, idx, a, b):
+    if _REPLAY_CTX is not None:
+        return  # replay never writes into the snapshot (spine §3.4)
     d = _checkpoint_dir(book_key)
     d.mkdir(parents=True, exist_ok=True)
     with open(d / f"chapter_{idx}.json", "w", encoding="utf-8") as f:
@@ -13300,6 +13343,8 @@ def _checkpoint_save_chapter(book_key, idx, a, b):
 
 
 def _checkpoint_save_roster(book_key, roster):
+    if _REPLAY_CTX is not None:
+        return  # replay never writes into the snapshot (spine §3.4)
     d = _checkpoint_dir(book_key)
     d.mkdir(parents=True, exist_ok=True)
     with open(d / "roster.json", "w", encoding="utf-8") as f:
@@ -13342,6 +13387,8 @@ def _checkpoint_load(book_key):
 
 
 def _checkpoint_clear(book_key):
+    if _REPLAY_CTX is not None:
+        return  # a finished replay must not clear the snapshot
     import shutil as _sh
     d = _checkpoint_dir(book_key)
     if d.is_dir():
@@ -13406,6 +13453,221 @@ def _checkpoint_resume_check(book_key, total_chapters, fingerprint=None):
     print(f"  --resume: {n_done}/{total_chapters} chapters already complete, "
           f"skipping their LLM calls")
     return chapters, roster
+
+
+# ---------------------------------------------------------------------------
+# Spine: snapshot store + deterministic replay (design §3.4)
+#
+# A snapshot is one book's extracted chapter payloads, captured from
+# a fresh preview run and stored under
+# <learn_dir>/snapshots/<fingerprint>/<snapshot_id>/ — keyed by the
+# batch-1 book FINGERPRINT, not the file stem (amendment A5: two
+# different books can share a stem; they cannot share a snapshot).
+# Replay re-derives everything downstream of extraction from those
+# payloads inside a throwaway sandbox substrate (seeded through
+# SQLite's backup API from the live DB opened immutable, amendment
+# A2), so a replay can never write the live stores; decision calls
+# stay LIVE (OC-5) — what varies between a capture and its replay is
+# the code and the decision draws, never the extraction.
+# ---------------------------------------------------------------------------
+
+def _snapshot_root(learn_dir):
+    return Path(learn_dir) / "snapshots"
+
+
+def _arm_capture(snapshot_id, reason=""):
+    global _CAPTURE_CTX
+    _CAPTURE_CTX = {"snapshot_id": snapshot_id, "reason": reason}
+
+
+def capture_snapshot(snapshot_id, *, book_key, fingerprint, title,
+                     author, identifiers, chapter_count, reason=""):
+    """Copy the just-finished run's checkpoint payloads into the
+    snapshot store and write the manifest. Returns the snapshot id,
+    or None when there is nothing to capture / the id is taken."""
+    src = _checkpoint_dir(book_key)
+    if not src.is_dir() or not (src / "meta.json").is_file():
+        print("  Snapshot: no checkpoint payloads to capture")
+        return None
+    learn_dir = _learn().dir
+    dest = _snapshot_root(learn_dir) / fingerprint / snapshot_id
+    if dest.exists():
+        print(f"  Snapshot: '{snapshot_id}' already exists for this "
+              "book; refusing to overwrite a captured baseline")
+        return None
+    dest.mkdir(parents=True)
+    import hashlib as _hl
+    digest = _hl.sha256()
+    for p in sorted(src.iterdir()):
+        if p.is_file():
+            data = p.read_bytes()
+            digest.update(p.name.encode())
+            digest.update(data)
+            with open(dest / p.name, "wb") as f:
+                f.write(data)
+    extraction = {
+        "llm": CONFIG.get("llm"), "model": CONFIG.get("model"),
+        "pipeline": CONFIG.get("pipeline"),
+        "portable_version": PORTABLE_VERSION,
+        "code_sha": _git_commit_sha(),
+        "flags_hash": _checkpoint_flags_hash(),
+        "config_digest": _config_digest(),
+    }
+    manifest = {
+        "snapshot_id": snapshot_id, "book_key": book_key,
+        "fingerprint": fingerprint, "title": title, "author": author,
+        "identifiers": {k: identifiers.get(k)
+                        for k in ("isbn", "asin") if identifiers},
+        "chapter_count": chapter_count,
+        "payload_sha256": digest.hexdigest(),
+        "created": _staging_today(), "reason": reason,
+        "extraction": extraction,
+    }
+    with open(dest / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=1, ensure_ascii=False)
+    db = _state_db_for(learn_dir)
+    if db is not None:
+        with db.write_txn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO snapshots VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (snapshot_id, book_key, fingerprint, title, author,
+                 chapter_count, manifest["payload_sha256"], str(dest),
+                 None, manifest["created"], reason,
+                 json.dumps(extraction, ensure_ascii=False)))
+    print(f"  Snapshot captured: {snapshot_id} "
+          f"(fingerprint {fingerprint}, {chapter_count} chapters)")
+    return snapshot_id
+
+
+def find_snapshot(learn_dir, snapshot_id):
+    """(snapshot_dir, manifest) for an id, or None. Scans every
+    fingerprint bucket — the id is the handle the user holds."""
+    root = _snapshot_root(learn_dir)
+    if not root.is_dir():
+        return None
+    for man_path in sorted(root.glob(f"*/{snapshot_id}/manifest.json")):
+        try:
+            manifest = json.loads(
+                man_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        return man_path.parent, manifest
+    return None
+
+
+def _presented_fingerprint(fpath):
+    """The batch-1 checkpoint fingerprint of the book file presented
+    for replay, computed from a fresh parse (no LLM calls)."""
+    fpath = Path(fpath)
+    if fpath.suffix.lower() == ".epub":
+        units, title, author, identifiers = extract_epub_units(fpath)
+        chapters = split_chapters(units)
+    else:
+        extracted = read_ebook(fpath)
+        if extracted is None:
+            return None
+        text, title, author, identifiers = extracted
+        chapters = _prose_chapters(text)
+    return _checkpoint_fingerprint(
+        identifiers, title, author, _checkpoint_text_sample(chapters))
+
+
+def run_replay(snapshot_id, book_path, learn_dir, process_fn=None):
+    """Replay one snapshot against the presented book file.
+
+    Returns (exit_code, report). The run is forced preview, executes
+    inside a sandbox substrate seeded from the live stores (backup
+    API, live DB opened immutable — A2), and the sandbox is deleted
+    afterwards: the durable record of a replay is the preview
+    artefact's `replay` marker, never sandbox state. The replay_runs
+    row is written into the SANDBOX substrate (it is the run's own
+    working record; report["replay_run_recorded"] attests it)."""
+    if process_fn is None:
+        process_fn = process_file_v2
+    report = {"snapshot_id": snapshot_id,
+              "replay_run_recorded": False, "sandbox_deleted": False}
+    found = find_snapshot(learn_dir, snapshot_id)
+    if not found:
+        print(f"  --replay: snapshot '{snapshot_id}' not found under "
+              f"{_snapshot_root(learn_dir)}")
+        report["refusal"] = "snapshot not found"
+        return 1, report
+    snap_dir, manifest = found
+    presented = _presented_fingerprint(book_path)
+    if presented != manifest.get("fingerprint"):
+        # The batch-1 refusal shape: a different book never replays
+        # another book's extraction, and no flag overrides it.
+        print(f"  --replay REFUSED: the presented file's fingerprint "
+              f"({presented}) does not match the snapshot's "
+              f"({manifest.get('fingerprint')}) — a snapshot replays "
+              "only its own book")
+        report["refusal"] = "fingerprint mismatch"
+        return 1, report
+    import shutil as _sh
+    import tempfile as _tf
+    sandbox = Path(_tf.mkdtemp(prefix="ebook-replay-"))
+    sb_learn = sandbox / "learned"
+    sb_learn.mkdir(parents=True)
+    live_db = Path(learn_dir) / _STATE_DB_NAME
+    try:
+        if live_db.exists():
+            with _STATE_DBS_LOCK:
+                live_handle = _STATE_DBS.get(
+                    str(Path(learn_dir).resolve()))
+            if live_handle is not None:
+                live_handle.checkpoint()
+            src = sqlite3.connect(
+                f"file:{live_db}?immutable=1", uri=True)
+            try:
+                dst = sqlite3.connect(str(sb_learn / _STATE_DB_NAME))
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+        else:
+            for p in _migration_sources(Path(learn_dir)):
+                rel = p.relative_to(Path(learn_dir))
+                target = sb_learn / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _sh.copyfile(p, target)
+        global _LEARNED, _STAGING_STATE, _REPLAY_CTX
+        saved_learned, saved_staging = _LEARNED, _STAGING_STATE
+        saved_replay = _REPLAY_CTX
+        _LEARNED = LearnedState(
+            learn_dir=sb_learn,
+            enabled=(saved_learned.enabled if saved_learned else True))
+        _STAGING_STATE = None
+        _REPLAY_CTX = {"snapshot_id": snapshot_id,
+                       "payload_dir": str(snap_dir),
+                       "manifest": manifest}
+        try:
+            ok = process_fn(Path(book_path), dry_run=False,
+                            preview=True)
+            db = _state_db_for(sb_learn)
+            if db is not None:
+                with db.write_txn() as conn:
+                    conn.execute(
+                        "INSERT INTO replay_runs VALUES (?,?,?,?,?,?)",
+                        (f"replay-{snapshot_id}-"
+                         f"{_staging_today()}",
+                         snapshot_id, _staging_today(),
+                         _git_commit_sha(), _config_digest(),
+                         str(SCRIPT_DIR / "preview")))
+                report["replay_run_recorded"] = True
+        finally:
+            _LEARNED, _STAGING_STATE = saved_learned, saved_staging
+            _REPLAY_CTX = saved_replay
+            with _STATE_DBS_LOCK:
+                sb_db = _STATE_DBS.pop(str(sb_learn.resolve()), None)
+            if sb_db is not None:
+                sb_db.close()
+        return (0 if ok else 1), report
+    finally:
+        _sh.rmtree(sandbox, ignore_errors=True)
+        report["sandbox_deleted"] = not sandbox.exists()
 
 
 def process_file_v2(fpath, dry_run=False, preview=False):
@@ -13518,7 +13780,17 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         identifiers, title, author, _checkpoint_text_sample(chapters))
     _resumed_chapters = {}  # idx -> (a, b) loaded from checkpoints
     _resumed_roster = None
-    if CONFIG.get("resume"):
+    if _REPLAY_CTX is not None:
+        # Spine replay (design §3.4): the payloads ARE the run's
+        # extraction. _checkpoint_resume_check is NOT consulted — its
+        # flags-hash refusal (which embeds the git SHA) is exactly
+        # what made cross-code-version replay impossible before the
+        # spine; the fingerprint was already verified against the
+        # manifest by run_replay before this process started.
+        _loaded = _checkpoint_load(_ckpt_key)
+        if _loaded is not None:
+            _rmeta, _resumed_roster, _resumed_chapters = _loaded
+    elif CONFIG.get("resume"):
         _rc, _rr = _checkpoint_resume_check(_ckpt_key, n, _ckpt_fp)
         if _rc is not None:
             _resumed_chapters = _rc
@@ -14021,6 +14293,28 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         print(f"  Work: matched via {how} -> {wid[:8]}")
     else:
         print(f"  Work: resolution failed ({how})")
+
+    # Spine §3.4: snapshot capture rides a fresh preview run (the
+    # payloads are complete here, before the preview epilogue clears
+    # the checkpoint dir), and a replay stamps its provenance marker.
+    if _CAPTURE_CTX is not None and not aborted:
+        _cap_id = capture_snapshot(
+            _CAPTURE_CTX["snapshot_id"], book_key=_ckpt_key,
+            fingerprint=_ckpt_fp, title=result.get("title"),
+            author=result.get("author"), identifiers=identifiers,
+            chapter_count=n, reason=_CAPTURE_CTX.get("reason", ""))
+        if _cap_id:
+            result["snapshot_captured"] = _cap_id
+    if _REPLAY_CTX is not None:
+        _src_ext = (_REPLAY_CTX["manifest"].get("extraction")
+                    or {})
+        result["replay"] = {
+            "snapshot_id": _REPLAY_CTX["snapshot_id"],
+            "source_code_sha": _src_ext.get("code_sha"),
+            "source_config_digest": _src_ext.get("config_digest"),
+            "replay_code_sha": _git_commit_sha(),
+            "replay_config_digest": _config_digest(),
+        }
 
     smsg = f" ({a_fallback} via simple fallback)" if a_fallback else ""
     UI.book_done(_book_key)
@@ -15038,6 +15332,22 @@ def _build_parser():
     g_learn.add_argument("--learn-status", action="store_true",
                     help="print a summary of the learning system state "
                          "and exit (no books processed)")
+    g_learn.add_argument("--capture-snapshot", metavar="ID",
+                    default=None,
+                    help="with a fresh --preview run, capture the "
+                         "run's extracted chapter payloads as replay "
+                         "snapshot ID (measurement spine)")
+    g_learn.add_argument("--snapshot-reason", metavar="TEXT",
+                    default="",
+                    help="reason recorded on a --capture-snapshot "
+                         "manifest")
+    g_learn.add_argument("--replay", metavar="ID", default=None,
+                    help="replay snapshot ID against the --file book: "
+                         "re-derives everything downstream of "
+                         "extraction from the captured payloads in a "
+                         "throwaway sandbox (live stores untouched); "
+                         "the book's fingerprint must match the "
+                         "snapshot's")
     g_learn.add_argument("--staging-report", action="store_true",
                     help="print the staging gate's trapped report "
                          "(staged/promoted/expired claims per work) "
@@ -15309,6 +15619,12 @@ def main():
               f"({len(_LEARNED.nicknames)} nicknames, "
               f"{len(_LEARNED.trusted_titles())} trusted titles, "
               f"{len(_LEARNED.rejected_tropes)} rejected tropes)")
+    if getattr(args, "capture_snapshot", None):
+        if getattr(args, "replay", None):
+            print("  --capture-snapshot and --replay cannot combine")
+            return
+        _arm_capture(args.capture_snapshot,
+                     getattr(args, "snapshot_reason", "") or "")
     if args.import_labels:
         n_imp = _LEARNED.import_labels(args.import_labels)
         print(f"  Imported {n_imp} labeled merge pairs from "
@@ -15415,6 +15731,14 @@ def main():
         print("Preview mode: results saved to preview/, nothing written to Supabase, files not moved")
     elif args.dry_run:
         print("Dry run: nothing written, files not moved")
+
+    if getattr(args, "replay", None):
+        if not args.file:
+            print("  --replay needs --file <book>: the snapshot "
+                  "replays against its own book file")
+            sys.exit(2)
+        _code, _rep = run_replay(args.replay, args.file, _LEARNED.dir)
+        sys.exit(_code)
 
     if args.watch:
         print(f"Watching {IMPORT_DIR}... (Ctrl+C to stop)")
