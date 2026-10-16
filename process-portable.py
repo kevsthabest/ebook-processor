@@ -5049,6 +5049,257 @@ def record_rejection_events(learn_dir, run_ref, work_key, keys):
                 (run_ref, work_key, cls, key, _now_iso()))
 
 
+# ---------------------------------------------------------------------------
+# Spine: the uncertainty queue (design §3.7 queue classes + OC-4
+# binding controls). The queue holds the runs' most informative
+# undecided items for labelling; packets are self-contained (the
+# pair/claim, both verdicts + scores, chapter co-listing, evidence
+# held, provenance) so a labeller never needs the run's context.
+# ---------------------------------------------------------------------------
+
+_UNCERTAINTY_CLASSES = ("tier-judge-disagreement", "near-threshold",
+                        "family-band", "split-suspect",
+                        "form-changed-promotion", "control")
+
+
+def collect_uncertainty_items(result, *, book_label, work_key,
+                              suspects=()):
+    """The run's uncertainty items (design classes 1, 2, 4 +
+    controls). Pure over the result dict."""
+    items = []
+    prov = {"book": book_label, "work_key": work_key}
+    roster = ((result.get("chapter_data") or {}).get("roster")
+              or {})
+
+    def _roster_entry(name):
+        for k, e in roster.items():
+            if _tnorm(k) == _tnorm(name) \
+                    or _tnorm(e.get("name") or "") == _tnorm(name):
+                return e
+        return {}
+
+    def _desc(entry):
+        descs = entry.get("descriptions") or []
+        if descs and isinstance(descs[0], (list, tuple)) \
+                and len(descs[0]) >= 2:
+            return descs[0][1] or ""
+        return ""
+
+    # Class 2 (merge half): pairs near the 0.85 merge bar.
+    for pm in result.get("possible_merges") or []:
+        p = pm.get("p_yes")
+        if p is None or abs(p - 0.85) > 0.10:
+            continue
+        ea, eb = _roster_entry(pm.get("name_a") or ""), \
+            _roster_entry(pm.get("name_b") or "")
+        both = sorted(set(ea.get("chapters") or [])
+                      & set(eb.get("chapters") or []))
+        items.append({
+            "class": "near-threshold",
+            "subject": f"merge: {pm.get('name_a')} ~ "
+                       f"{pm.get('name_b')}",
+            "packet": {
+                "kind": "merge_pair",
+                "name_a": pm.get("name_a"),
+                "name_b": pm.get("name_b"),
+                "p_yes": p, "reason": pm.get("reason"),
+                "chapters_both": both,
+                "desc_a": _desc(ea), "desc_b": _desc(eb),
+                "evidence_a": "", "evidence_b": "",
+                "book": book_label, "provenance": prov}})
+    # Classes 1 + 2 (family half) + controls, from the family
+    # validation outcomes recorded on the relationships.
+    for rel in result.get("relationships") or []:
+        if (rel.get("type") or "") not in _REL_FAMILY_TYPES:
+            continue
+        p = rel.get("validation_p")
+        if p is None:
+            continue
+        packet = {
+            "kind": "family_claim",
+            "from": rel.get("from"), "to": rel.get("to"),
+            "type": rel.get("type"), "judge_p": p,
+            "note": rel.get("validation_note"),
+            "evidence": rel.get("evidence_mined")
+                        or rel.get("evidence") or "",
+            "evidence_grade": rel.get("evidence_grade"),
+            "provenance": prov}
+        subject = (f"family: {rel.get('from')} — {rel.get('to')} "
+                   f"({rel.get('type')})")
+        binding = rel.get("evidence_grade") == "binding"
+        bare = not (rel.get("evidence") or "").strip() and not binding
+        if (binding and p < 0.30) or (p >= 0.70 and bare):
+            # Class 1: the deterministic evidence tier and the
+            # judge point opposite ways.
+            items.append({"class": "tier-judge-disagreement",
+                          "subject": subject, "packet": packet})
+        elif abs(p - 0.30) <= 0.10 or abs(p - 0.70) <= 0.10:
+            items.append({"class": "family-band",
+                          "subject": subject, "packet": packet})
+        elif p >= 0.80 or p <= 0.20:
+            # A decided pair: a control for the 4:1 batch mix.
+            items.append({"class": "control", "subject": subject,
+                          "packet": packet})
+    # Class 4: form-changed promotions (staging marker).
+    for prom in ((result.get("staging") or {}).get("promoted")
+                 or []):
+        if prom.get("form_changed"):
+            items.append({
+                "class": "form-changed-promotion",
+                "subject": f"claim: {prom.get('display')}",
+                "packet": {"kind": "claim", "key": prom.get("key"),
+                           "display": prom.get("display"),
+                           "via": prom.get("via"),
+                           "provenance": prov}})
+    items.extend(suspects)
+    return items
+
+
+def roster_split_suspects(learn_dir):
+    """Class 3: roster split-suspects still unresolved in a later
+    run than the one that recorded them (substrate query over the
+    roster payloads)."""
+    db = _state_db_for(learn_dir)
+    if db is None:
+        return []
+    items = []
+    for wk, runs, payload in db.query(
+            "SELECT work_key, runs_completed, payload FROM "
+            "roster_works ORDER BY rowid"):
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        for s in data.get("suspects") or []:
+            first = s.get("run")
+            if first is None or (runs or 0) - first < 1:
+                continue
+            items.append({
+                "class": "split-suspect",
+                "subject": f"split suspect: {s.get('a')} ~ "
+                           f"{s.get('b')} ({wk})",
+                "packet": {"kind": "split_suspect", "work_key": wk,
+                           "a": s.get("a"), "b": s.get("b"),
+                           "reason": s.get("reason"),
+                           "first_run": first,
+                           "runs_completed": runs}})
+    return items
+
+
+def emit_uncertainty(learn_dir, run_ref, items):
+    """Write queue rows (substrate only; JSON mode has no queue).
+    Controls are stored with status 'control', the rest 'pending'.
+    Returns rows written."""
+    db = _state_db_for(learn_dir)
+    if db is None or not items:
+        return 0
+    with db.write_txn() as conn:
+        for it in items:
+            conn.execute(
+                "INSERT INTO uncertainty_queue VALUES "
+                "(NULL,?,?,?,?,?,?,?,?,?,?)",
+                (_now_iso(), run_ref,
+                 (it["packet"].get("provenance") or {}).get(
+                     "work_key"),
+                 it["class"], it["subject"],
+                 json.dumps(it["packet"], ensure_ascii=False),
+                 "control" if it["class"] == "control" else "pending",
+                 None, None, None))
+    return len(items)
+
+
+def build_labelling_batch(learn_dir, cap=20):
+    """One labelling round (OC-4): pending uncertainty items mixed
+    4:1 with random controls (decided pairs from real runs), cap
+    ~20. Deterministic order (queue order); the mix ratio is the
+    binding control, randomness of the control draw is not."""
+    db = _state_db_for(learn_dir)
+    if db is None:
+        return []
+    rows = db.query(
+        "SELECT id, class, subject, packet FROM uncertainty_queue "
+        "WHERE status='pending' ORDER BY id")
+    controls = db.query(
+        "SELECT id, class, subject, packet FROM uncertainty_queue "
+        "WHERE status='control' ORDER BY id")
+    n_ctl = min(len(controls), cap // 5)
+    n_unc = min(len(rows), cap - n_ctl)
+    picked = [rows[i] for i in range(n_unc)] \
+        + [controls[i] for i in range(n_ctl)]
+    return [{"id": r[0], "class": r[1], "subject": r[2],
+             "packet": json.loads(r[3])} for r in picked]
+
+
+def apply_uncertainty_labels(learn_dir, labels_path,
+                             merge_pairs_path=None):
+    """Intake: apply a labels file ([{queue_id, label, labeller}])
+    to the queue; merge-pair labels also append to
+    eval/merge_pairs.json in the harness's entry shape."""
+    db = _state_db_for(learn_dir)
+    if db is None:
+        return {"labelled": 0, "merge_pairs_added": 0,
+                "missing": [], "error": "no substrate"}
+    labels = json.loads(
+        Path(labels_path).read_text(encoding="utf-8"))
+    if merge_pairs_path is None:
+        merge_pairs_path = SCRIPT_DIR / "eval" / "merge_pairs.json"
+    pairs = []
+    if Path(merge_pairs_path).exists():
+        pairs = json.loads(
+            Path(merge_pairs_path).read_text(encoding="utf-8"))
+    labelled = 0
+    added = 0
+    missing = []
+    with db.write_txn() as conn:
+        for lab in labels:
+            qid = lab.get("queue_id", lab.get("id"))
+            rows = db.query(
+                "SELECT class, packet FROM uncertainty_queue "
+                "WHERE id=?", (qid,))
+            if not rows:
+                missing.append(qid)
+                continue
+            conn.execute(
+                "UPDATE uncertainty_queue SET status='labelled', "
+                "label=?, labelled_by=?, labelled_at=? WHERE id=?",
+                (lab.get("label"), lab.get("labeller"),
+                 _now_iso(), qid))
+            labelled += 1
+            packet = json.loads(rows[0][1])
+            if packet.get("kind") == "merge_pair" \
+                    and lab.get("label") in ("same", "different"):
+                pairs.append({
+                    "name_a": packet.get("name_a"),
+                    "name_b": packet.get("name_b"),
+                    "label": lab["label"],
+                    "book": packet.get("book")
+                            or (packet.get("provenance") or {})
+                            .get("book"),
+                    "desc_a": packet.get("desc_a") or "",
+                    "desc_b": packet.get("desc_b") or "",
+                    "evidence_a": packet.get("evidence_a") or "",
+                    "evidence_b": packet.get("evidence_b") or "",
+                    "source": "uncertainty queue (spine)"})
+                added += 1
+    if added:
+        with open(merge_pairs_path, "w", encoding="utf-8") as f:
+            json.dump(pairs, f, indent=1, ensure_ascii=False)
+    return {"labelled": labelled, "merge_pairs_added": added,
+            "missing": missing}
+
+
+def cmd_apply_uncertainty_labels(learn_dir, labels_path):
+    rep = apply_uncertainty_labels(learn_dir, labels_path)
+    if rep.get("error"):
+        print(f"  --apply-uncertainty-labels: {rep['error']}")
+        return
+    print(f"  Uncertainty labels applied: {rep['labelled']} "
+          f"({rep['merge_pairs_added']} merge pair(s) appended to "
+          f"eval/merge_pairs.json"
+          + (f"; unknown queue ids: {rep['missing']}"
+             if rep["missing"] else "") + ")")
+
+
 def staging_observe_result(parts, state, *, independent):
     """Option F seam helper (design section 5): observe one completed
     run's stageable claims and compute the ship set. Called ONCE per
@@ -14613,6 +14864,28 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if _verdict_attempted:
         result["verdicts_note"] = _verdict_note
         result["suppressed_rejected"] = sorted(set(_supp_names))
+    if CONFIG.get("emit_uncertainty") and not aborted:
+        # Amendment A6: during a replay, _learn().dir is the
+        # sandbox, so these emissions land in the throwaway
+        # substrate and are discarded with it — by design. A
+        # replay's uncertainty describes a discarded world; the
+        # live queue only ever holds real runs' items.
+        try:
+            _uq = collect_uncertainty_items(
+                result,
+                book_label=f"{result.get('title')} "
+                           f"({result.get('author')})",
+                work_key=staging_work_key(
+                    None, identifiers.get("isbn"),
+                    title or fpath.stem, author),
+                suspects=roster_split_suspects(_learn().dir))
+            _uq_n = emit_uncertainty(_learn().dir,
+                                     f"v2:{fpath.stem}", _uq)
+            if _uq_n:
+                print(f"  Uncertainty queue: {_uq_n} item(s) "
+                      "emitted for labelling")
+        except Exception as _uq_e:
+            print(f"  Uncertainty queue emission failed ({_uq_e})")
     if _CAPTURE_CTX is not None and not aborted:
         _cap_id = capture_snapshot(
             _CAPTURE_CTX["snapshot_id"], book_key=_ckpt_key,
@@ -15636,6 +15909,14 @@ def _build_parser():
                          "recurs across independent runs, grows into "
                          "the auto band, or gains evidence (default "
                          "off; see eval/f-staging-design.md)")
+    g_merge.add_argument("--emit-uncertainty", action="store_true",
+                    help="measurement spine: emit this run's "
+                         "uncertain items (tier-vs-judge "
+                         "disagreements, near-threshold pairs, "
+                         "split suspects, form-changed promotions, "
+                         "plus decided-pair controls) to the local "
+                         "uncertainty queue for labelling (default "
+                         "off)")
     g_merge.add_argument("--persist-roster", action="store_true",
                     help="option B (v2): persist per-work roster "
                          "identity across runs — stable minted entity "
@@ -15655,6 +15936,12 @@ def _build_parser():
     g_learn.add_argument("--learn-status", action="store_true",
                     help="print a summary of the learning system state "
                          "and exit (no books processed)")
+    g_learn.add_argument("--apply-uncertainty-labels", metavar="FILE",
+                    default=None,
+                    help="apply a labelling round's labels file "
+                         "([{queue_id, label, labeller}]) to the "
+                         "uncertainty queue and exit; merge-pair "
+                         "labels also append to eval/merge_pairs.json")
     g_learn.add_argument("--capture-snapshot", metavar="ID",
                     default=None,
                     help="with a fresh --preview run, capture the "
@@ -15867,6 +16154,14 @@ def main():
         load_config()
         cmd_learn_status(args.learn_dir or None)
         return
+    if getattr(args, "apply_uncertainty_labels", None):
+        load_config()
+        cmd_apply_uncertainty_labels(
+            Path(args.learn_dir) if args.learn_dir
+            else Path(os.path.expanduser("~")) / ".ebook-processor"
+            / "learned",
+            args.apply_uncertainty_labels)
+        return
     if args.staging_report:
         load_config()
         cmd_staging_report(as_json=args.json,
@@ -16009,6 +16304,8 @@ def main():
         CONFIG["roster_reconcile"] = True
     if args.staging_gate:
         CONFIG["staging_gate"] = True
+    if getattr(args, "emit_uncertainty", False):
+        CONFIG["emit_uncertainty"] = True
     if args.persist_roster:
         CONFIG["persist_roster"] = True
     if args.preview_summary:
