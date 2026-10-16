@@ -11861,6 +11861,502 @@ def cmd_corpus_status(learn_dir=None, as_json=False):
         print(_corpus_status_text(learn_dir))
 
 
+# ---------------------------------------------------------------------------
+# --explain (§7.1): the forensics join over both stores. Read-only:
+# the corpus side is a report-mode handle, the state side a mode=ro
+# SQLite connection; the command writes nothing, and says plainly
+# which half is absent when a store is missing.
+# ---------------------------------------------------------------------------
+
+def _explain_learn_dir(learn_dir):
+    return (Path(learn_dir) if learn_dir
+            else Path(os.path.expanduser("~")) / ".ebook-processor"
+            / "learned")
+
+
+def _match_work_row(rows, work, key_idx, title_idx):
+    """Resolve a work query against store rows: exact fingerprint
+    / work_key first, then prefix, then title (exact, then
+    contains). rows are tuples with the key at key_idx and the
+    title at title_idx."""
+    if not rows:
+        return None
+    for row in rows:
+        if row[key_idx] == work:
+            return row
+    for row in rows:
+        if row[key_idx] and str(row[key_idx]).startswith(work):
+            return row
+    folded = str(work).casefold()
+    for row in rows:
+        if str(row[title_idx] or "").casefold() == folded:
+            return row
+    for row in rows:
+        if folded in str(row[title_idx] or "").casefold():
+            return row
+    return None
+
+
+def _explain_state_conn(d):
+    """A read-only connection to state.db, or None when absent."""
+    path = d / _STATE_DB_NAME
+    if not path.exists():
+        return None
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
+def explain_data(learn_dir, work, claim=None, character=None):
+    """The §7.1 read model: one work, both stores, joined. Pure
+    reads; absent halves are named in "absent", never papered
+    over."""
+    d = _explain_learn_dir(learn_dir)
+    data = {"work": work, "absent": [], "corpus": None,
+            "state": None, "claim": None, "character": None}
+    # -- corpus half ------------------------------------------------
+    cdb = _corpus_db_for(d, mode="report")
+    corpus_rec = None
+    if cdb is None:
+        data["absent"].append("corpus")
+    else:
+        rows = cdb.query(
+            "SELECT fingerprint, title, author, status, "
+            "chapter_count, series FROM corpus_works "
+            "ORDER BY title, fingerprint")
+        row = _match_work_row(rows, work, 0, 1)
+        if row is not None:
+            fp = row[0]
+            corpus_rec = {"fingerprint": fp, "title": row[1],
+                          "author": row[2],
+                          "status": corpus_work_state(cdb, fp),
+                          "chapter_count": row[4], "series": row[5],
+                          "quotes": [], "stages": {}}
+            for q in _corpus_quote_rows(cdb, fp, (
+                    "candidate", "verified", "selected",
+                    "rejected")):
+                entry = {"text": q["text"], "kind": q["kind"],
+                         "status": q["status"],
+                         "chapter_index": q["chapter_index"],
+                         "spoiler_tier": q["payload"].get(
+                             "spoiler_tier")}
+                poll = q["payload"].get("poll") or {}
+                if poll:
+                    entry["screens"] = {
+                        "spoiler": "pass" if poll.get(
+                            "spoiler", 1) < _QUOTE_SCREEN_MAX
+                        else "fail",
+                        "heat": "pass" if poll.get(
+                            "heat", 1) < _QUOTE_SCREEN_MAX
+                        else "fail"}
+                corpus_rec["quotes"].append(entry)
+            for stage, n in cdb.query(
+                    "SELECT stage, COUNT(*) FROM stage_outputs "
+                    "WHERE fingerprint=? GROUP BY stage", (fp,)):
+                corpus_rec["stages"][stage] = n
+            data["corpus"] = corpus_rec
+    # -- state half ---------------------------------------------------
+    conn = _explain_state_conn(d)
+    state_rec = None
+    work_key = work_id = None
+    claim_row = None
+    if conn is None:
+        data["absent"].append("state.db")
+    else:
+        try:
+            rows = conn.execute(
+                "SELECT work_key, work_id, title, author, "
+                "runs_completed, staged_ever FROM staging_works "
+                "ORDER BY title, work_key").fetchall()
+            row = _match_work_row(rows, work, 0, 2)
+            if row is None:
+                rows = conn.execute(
+                    "SELECT work_key, work_id, title, author, "
+                    "runs_completed, NULL FROM roster_works "
+                    "ORDER BY title, work_key").fetchall()
+                row = _match_work_row(rows, work, 0, 2)
+            if row is not None:
+                (work_key, work_id, title, author, runs,
+                 staged) = row
+                state_rec = {"work_key": work_key,
+                             "work_id": work_id, "title": title,
+                             "author": author,
+                             "runs_completed": runs,
+                             "staged_ever": staged}
+                data["state"] = state_rec
+            # -- claim block --------------------------------------
+            if claim is not None and work_key is not None:
+                crow = conn.execute(
+                    "SELECT claim_key, class, display, state, "
+                    "promoted_run, promoted_via, best_chapters, "
+                    "evidence_ever, first_seen, last_seen, "
+                    "sightings, name_forms FROM staging_claims "
+                    "WHERE work_key=? AND (claim_key=? OR "
+                    "claim_key=?)",
+                    (work_key, claim, _tnorm(claim))).fetchone()
+                if crow is not None:
+                    claim_row = crow
+                    block = {
+                        "claim_key": crow[0], "class": crow[1],
+                        "display": crow[2], "state": crow[3],
+                        "promotion": (
+                            {"run": crow[4], "via": crow[5]}
+                            if crow[4] is not None else None),
+                        "best_chapters": crow[6],
+                        "evidence_ever": bool(crow[7]),
+                        "first_seen": crow[8], "last_seen": crow[9],
+                        "sightings": _json_or(crow[10], []),
+                        "name_forms": _json_or(crow[11], []),
+                        "suppression": [
+                            {"id": r[0], "run_ref": r[1],
+                             "created": r[2]}
+                            for r in conn.execute(
+                                "SELECT id, run_ref, created FROM "
+                                "rejection_events WHERE work_key=? "
+                                "AND claim_key=? ORDER BY id",
+                                (work_key, crow[0]))],
+                        "verdict": None, "retrieve": None}
+                    vrow = conn.execute(
+                        "SELECT verdict, fetched_at FROM "
+                        "verdicts_cache WHERE work_id=? AND "
+                        "class=? AND claim_key=?",
+                        (work_id, crow[1], crow[0])).fetchone()
+                    if vrow is not None:
+                        block["verdict"] = {
+                            "verdict": vrow[0],
+                            "fetched_at": vrow[1]}
+                    data["claim"] = block
+            # -- character block ----------------------------------
+            if character is not None and work_key is not None:
+                data["character"] = _explain_character(
+                    conn, cdb, corpus_rec, work_key, character)
+        finally:
+            conn.close()
+    # The retrieve half of a claim lives in the corpus; join it
+    # once both halves are known.
+    if data["claim"] is not None and corpus_rec is not None \
+            and cdb is not None:
+        outputs = corpus_stage_outputs(cdb, corpus_rec["fingerprint"],
+                                       "retrieve")
+        row = outputs.get(data["claim"]["claim_key"])
+        if row is not None:
+            rec = (row.get("payload") or {}).get("record") or {}
+            data["claim"]["retrieve"] = {
+                "outcome": rec.get("outcome"),
+                "support": rec.get("support"),
+                "chapters_searched": rec.get("chapters_searched"),
+                "chapters_with_support":
+                    rec.get("chapters_with_support"),
+                "passages": (row.get("payload") or {}).get(
+                    "evidence") or []}
+    return data
+
+
+def _json_or(raw, default):
+    try:
+        parsed = json.loads(raw) if raw else default
+        return parsed if parsed is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _explain_character(conn, cdb, corpus_rec, work_key, character):
+    """Roster lineage + occurrences for one character (§7.1).
+    Occurrence counts come from the chapter texts themselves —
+    the same authority verify_quote answers to — with the first
+    and last citations as chapter + offset; the work's series, if
+    any, extends the scan across the series' ingested works."""
+    erow = None
+    for row in conn.execute(
+            "SELECT entity_id, status, canonical, payload FROM "
+            "roster_entities WHERE work_key=?", (work_key,)):
+        payload = _json_or(row[3], {})
+        forms = payload.get("name_forms") or [row[2]]
+        if any(str(f).casefold() == character.casefold()
+               for f in forms) \
+                or str(row[2]).casefold() == character.casefold():
+            erow = (row, payload, forms)
+            break
+    if erow is None:
+        return {"name": character, "found": False}
+    row, payload, forms = erow
+    entity_id, status, canonical = row[0], row[1], row[2]
+    block = {"name": character, "found": True,
+             "entity_id": entity_id, "status": status,
+             "canonical": canonical, "name_forms": forms,
+             "lineage": payload,
+             "no_pairs": [
+                 {"a": r[0], "b": r[1], "source": r[2]}
+                 for r in conn.execute(
+                     "SELECT a_key, b_key, source FROM "
+                     "roster_no_pairs WHERE work_key=? AND "
+                     "(a_key IN (%s) OR b_key IN (%s))"
+                     % (",".join("?" * len(forms)),
+                        ",".join("?" * len(forms))),
+                     (work_key, *[_tnorm(f) for f in forms],
+                      *[_tnorm(f) for f in forms]))],
+             "adoptions": [
+                 _json_or(r[0], {}) for r in conn.execute(
+                     "SELECT payload FROM roster_adoptions WHERE "
+                     "work_key=? ORDER BY seq", (work_key,))
+                 if any(f.casefold() in str(r[0]).casefold()
+                        for f in forms)],
+             "anchor_retirements": [
+                 {"entity_id": r[0], "run": r[1],
+                  "payload": _json_or(r[2], {})}
+                 for r in conn.execute(
+                     "SELECT entity_id, run, payload FROM "
+                     "roster_anchor_retirements WHERE work_key=? "
+                     "AND entity_id=?", (work_key, entity_id))],
+             "occurrences": None}
+    if cdb is not None and corpus_rec is not None:
+        fps = [corpus_rec["fingerprint"]]
+        if corpus_rec.get("series"):
+            fps = [r[0] for r in cdb.query(
+                "SELECT fingerprint FROM corpus_works WHERE "
+                "series=? ORDER BY fingerprint",
+                (corpus_rec["series"],))]
+        block["occurrences"] = _character_occurrences(
+            cdb, fps, forms)
+    return block
+
+
+def _character_occurrences(cdb, fingerprints, forms):
+    by_form = {f: 0 for f in forms}
+    chapters_hit, first, last = [], None, None
+    for fp in fingerprints:
+        for ch in corpus_chapters_for(cdb, fp):
+            text = ch["text"]
+            folded = text.casefold()
+            hit = False
+            for form in forms:
+                n = folded.count(form.casefold())
+                if n:
+                    by_form[form] += n
+                    hit = True
+            if hit:
+                chapters_hit.append(ch["index"])
+                for form in forms:
+                    off = folded.find(form.casefold())
+                    if off >= 0:
+                        cite = {"fingerprint": fp,
+                                "chapter_index": ch["index"],
+                                "offset": off}
+                        if first is None:
+                            first = cite
+                        last = cite
+                        break
+    return {"by_form": by_form, "chapters": chapters_hit,
+            "first": first, "last": last}
+
+
+def explain_text(learn_dir, work, claim=None, character=None):
+    data = explain_data(learn_dir, work, claim=claim,
+                        character=character)
+    lines = [f"Explain: {work}"]
+    if data["corpus"] is None:
+        lines.append("  corpus: absent" if "corpus" in data["absent"]
+                     else "  corpus: no matching work")
+    else:
+        c = data["corpus"]
+        lines.append(
+            f"  corpus: {c['title']} [{c['fingerprint'][:12]}…] "
+            f"state {c['status']}, {c['chapter_count']} chapters")
+        for q in c["quotes"]:
+            lines.append(
+                f"    quote ({q['kind']}/{q['status']}, "
+                f"ch {q['chapter_index']}): {q['text']!r}")
+    if data["state"] is None:
+        lines.append("  state.db: absent"
+                     if "state.db" in data["absent"]
+                     else "  state.db: no matching work")
+    else:
+        s = data["state"]
+        lines.append(
+            f"  state.db: {s['title']} (work_key {s['work_key']}, "
+            f"{s['runs_completed']} runs)")
+    if claim is not None:
+        cl = data["claim"]
+        if cl is None:
+            lines.append(f"  claim {claim}: not found in staging")
+        else:
+            lines.append(
+                f"  claim {cl['display']}: state {cl['state']}, "
+                f"{len(cl['sightings'])} sightings, "
+                f"promotion {cl['promotion']}, "
+                f"verdict {cl['verdict']}, "
+                f"suppressions {len(cl['suppression'])}")
+            if cl["retrieve"]:
+                lines.append(
+                    f"    retrieve: {cl['retrieve']['outcome']} "
+                    f"(support {cl['retrieve']['support']}), "
+                    f"searched {cl['retrieve']['chapters_searched']}")
+    if character is not None:
+        ch = data["character"]
+        if not ch or not ch.get("found"):
+            lines.append(f"  character {character}: not on the "
+                         f"work's roster")
+        else:
+            lines.append(
+                f"  character {ch['canonical']} ({ch['entity_id']}): "
+                f"forms {ch['name_forms']}, "
+                f"no-pairs {len(ch['no_pairs'])}")
+            if ch["occurrences"]:
+                lines.append(
+                    f"    occurrences: {ch['occurrences']['by_form']}"
+                    f" in chapters "
+                    f"{ch['occurrences']['chapters']}")
+    return "\n".join(lines)
+
+
+def cmd_explain(work, claim=None, character=None, learn_dir=None):
+    """--explain (§7.1): print the forensics report and return the
+    read model. Human-invoked, read-only."""
+    print(explain_text(learn_dir, work, claim=claim,
+                       character=character))
+    return explain_data(learn_dir, work, claim=claim,
+                        character=character)
+
+
+# ---------------------------------------------------------------------------
+# --backup-state / --restore-state (§7.2): the PAIR as one act.
+# A backup is both stores, copied via the backup API, plus a
+# manifest carrying each file's logical dump hash, both schema
+# versions, the portable version and the timestamp; a directory
+# missing any element is not a backup. Restore verifies every
+# hash BEFORE touching a live file, refuses a major schema
+# mismatch up front, and keeps the replaced live pair as
+# <name>.pre-restore-<date>. Human-invoked only; no run path ever
+# calls these.
+# ---------------------------------------------------------------------------
+
+def cmd_backup_state(dest_dir, learn_dir=None):
+    d = _explain_learn_dir(learn_dir)
+    dest = Path(dest_dir)
+    stores = {}
+    plan = []
+    if (d / _STATE_DB_NAME).exists():
+        plan.append(("state", _state_db_for(d), StateDB))
+    if (d / _CORPUS_DB_NAME).exists():
+        plan.append(("corpus", _corpus_db_for(d, mode="report"),
+                     CorpusDB))
+    plan = [(k, h, cls) for k, h, cls in plan if h is not None]
+    if not plan:
+        print(f"  --backup-state: no stores present under {d} — "
+              f"nothing to back up")
+        return {"ok": False, "reason": "no stores present"}
+    dest.mkdir(parents=True, exist_ok=True)
+    for key, handle, cls in plan:
+        handle.backup_to(dest / cls._DB_NAME)
+        entry = {"present": True, "file": cls._DB_NAME,
+                 "dump_hash": handle.dump_hash(),
+                 "user_version": handle.query(
+                     "PRAGMA user_version")[0][0]}
+        if key == "corpus":
+            entry["corpus_v"] = handle.meta_get("corpus_v")
+        stores[key] = entry
+    manifest = {"portable_version": PORTABLE_VERSION,
+                "created": _corpus_now(), "stores": stores}
+    (dest / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=1),
+        encoding="utf-8")
+    print(f"  Backup written to {dest}: "
+          + ", ".join(sorted(stores)))
+    return {"ok": True, "manifest": manifest, "dir": str(dest)}
+
+
+def cmd_restore_state(src_dir, learn_dir=None):
+    d = _explain_learn_dir(learn_dir)
+    src = Path(src_dir)
+    man_path = src / "manifest.json"
+    if not man_path.exists():
+        print(f"  --restore-state: {src} has no manifest.json — "
+              f"not a backup; nothing touched")
+        return {"ok": False, "reason": "no manifest"}
+    try:
+        manifest = json.loads(man_path.read_text(encoding="utf-8"))
+    except (TypeError, ValueError) as e:
+        print(f"  --restore-state: manifest unreadable ({e}); "
+              f"nothing touched")
+        return {"ok": False, "reason": "manifest unreadable"}
+    stores = manifest.get("stores") or {}
+    if not stores:
+        print("  --restore-state: manifest lists no stores; "
+              "nothing touched")
+        return {"ok": False, "reason": "manifest lists no stores"}
+    # Phase 1: verify EVERYTHING — hashes and versions — before a
+    # single live file moves.
+    plan = []
+    for key, cls in (("state", StateDB), ("corpus", CorpusDB)):
+        entry = stores.get(key)
+        if entry is None or not entry.get("present"):
+            plan.append((key, cls, None))
+            continue
+        backup_file = src / entry["file"]
+        if not backup_file.exists():
+            print(f"  --restore-state: backup file "
+                  f"{entry['file']} missing; nothing touched")
+            return {"ok": False,
+                    "reason": f"backup file missing: {entry['file']}"}
+        if entry.get("user_version") != cls._SCHEMA_VERSION:
+            print(f"  --restore-state: {key} schema version "
+                  f"mismatch (backup user_version "
+                  f"{entry.get('user_version')} vs current "
+                  f"{cls._SCHEMA_VERSION}) — major mismatch "
+                  f"refused; nothing touched")
+            return {"ok": False,
+                    "reason": f"schema version mismatch for {key}"}
+        try:
+            conn = sqlite3.connect(
+                f"file:{backup_file}?mode=ro", uri=True)
+            try:
+                digest = _dump_hash_conn(conn, cls._TABLES)
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"  --restore-state: backup file "
+                  f"{entry['file']} unreadable ({e}); nothing "
+                  f"touched")
+            return {"ok": False,
+                    "reason": f"backup file unreadable: "
+                              f"{entry['file']}"}
+        if digest != entry.get("dump_hash"):
+            print(f"  --restore-state: dump hash mismatch for "
+                  f"{key} — the backup file does not match its "
+                  f"manifest; nothing touched")
+            return {"ok": False,
+                    "reason": f"dump hash mismatch for {key}"}
+        plan.append((key, cls, backup_file))
+    # Phase 2: close live handles, set the live pair aside
+    # (rename-in-place, the F8/A11 posture), copy the verified
+    # backups in through the backup API.
+    _close_state_dbs()
+    _close_corpus_dbs()
+    stamp = _staging_today()
+    for key, cls, backup_file in plan:
+        live = d / cls._DB_NAME
+        if live.exists():
+            aside = live.with_name(
+                live.name + f".pre-restore-{stamp}")
+            for suffix in ("", "-wal", "-shm"):
+                side = Path(str(live) + suffix)
+                if side.exists():
+                    os.replace(side, Path(str(aside) + suffix))
+            print(f"  {cls._DB_NAME}: live file kept as "
+                  f"{aside.name}")
+        if backup_file is not None:
+            src_conn = sqlite3.connect(
+                f"file:{backup_file}?mode=ro", uri=True)
+            try:
+                dst_conn = sqlite3.connect(str(live))
+                try:
+                    src_conn.backup(dst_conn)
+                finally:
+                    dst_conn.close()
+            finally:
+                src_conn.close()
+            print(f"  {cls._DB_NAME}: restored from backup")
+    return {"ok": True}
+
+
 def _effective_titles():
     """Hardcoded titles plus learned trusted titles."""
     return _TITLES | _learn().trusted_titles()
@@ -20440,6 +20936,34 @@ def _build_parser():
                          "vector coverage vs the current generation, "
                          "quotes, sizes; corpus design §7.4) and exit "
                          "(no books processed)")
+    g_learn.add_argument("--explain", metavar="WORK", default=None,
+                    help="forensics report for one work, joining "
+                         "state.db and corpus.db read-only: staging "
+                         "history, roster lineage, retrieve records, "
+                         "quotes (corpus design §7.1); then exit")
+    g_learn.add_argument("--explain-claim", metavar="CLAIM",
+                    default=None,
+                    help="with --explain: focus one claim (its "
+                         "sightings, promotion, suppressions, "
+                         "verdict and retrieve record)")
+    g_learn.add_argument("--explain-character", metavar="NAME",
+                    default=None,
+                    help="with --explain: focus one character "
+                         "(roster lineage + corpus occurrences)")
+    g_learn.add_argument("--backup-state", metavar="DIR",
+                    default=None,
+                    help="back up state.db + corpus.db as one act "
+                         "into DIR (backup API copies + a manifest "
+                         "of dump hashes and schema versions; "
+                         "corpus design §7.2); then exit")
+    g_learn.add_argument("--restore-state", metavar="DIR",
+                    default=None,
+                    help="restore the store pair from a "
+                         "--backup-state DIR: manifest hashes are "
+                         "verified before any live file is touched "
+                         "and the replaced pair is kept as "
+                         "<name>.pre-restore-<date> (corpus design "
+                         "§7.2); then exit")
     g_learn.add_argument("--ingest", metavar="PATH", default=None,
                     help="importer mode: ingest a book file (or every "
                          "supported book in a directory) into the "
@@ -20628,6 +21152,23 @@ def main():
     if args.corpus_status:
         load_config()
         cmd_corpus_status(args.learn_dir or None, as_json=args.json)
+        return
+    if args.explain:
+        load_config()
+        cmd_explain(args.explain,
+                    claim=args.explain_claim or None,
+                    character=args.explain_character or None,
+                    learn_dir=args.learn_dir or None)
+        return
+    if args.backup_state:
+        load_config()
+        cmd_backup_state(args.backup_state,
+                         learn_dir=args.learn_dir or None)
+        return
+    if args.restore_state:
+        load_config()
+        cmd_restore_state(args.restore_state,
+                          learn_dir=args.learn_dir or None)
         return
     if args.ingest:
         load_config()
