@@ -11,7 +11,9 @@
 Stdlib unittest only. No network, no Supabase, no real ebook files.
 Run: python -m unittest discover -s tests -v
 """
+import contextlib
 import importlib.util
+import io
 import json
 import unittest
 from pathlib import Path
@@ -164,22 +166,31 @@ class TestEmptyEvidenceConfidence(unittest.TestCase):
         self.assertTrue(t["evidence"])
         self.assertGreater(t["confidence"], 0.0)
 
-    def test_write_claims_trope_no_chapters_clamped(self):
+    def test_write_claims_trope_no_chapters_held(self):
+        # Cheap-wins Item 2 (evidence floor) supersedes this test's
+        # old clamp contract: a trope whose recorded support is
+        # empty (no supporting chapters, no chapter-provenanced
+        # quotes) is HELD — nothing is posted — instead of shipping
+        # at confidence 0.0.
         fake = _FakeSB()
         old_sb = pp.sb
         pp.sb = fake
+        buf = io.StringIO()
         try:
             res = _result(
                 tropes=["Mind Game"],
                 trope_confidence={pp._tnorm("Mind Game"): 0.75},
                 trope_chapters={},  # no supporting chapters recorded
             )
-            pp.write_claims(1, res, trope_mappings={"Mind Game": "cat-1"})
+            with contextlib.redirect_stdout(buf):
+                pp.write_claims(1, res,
+                                trope_mappings={"Mind Game": "cat-1"})
         finally:
             pp.sb = old_sb
-        rows = [d for tbl, d in fake.posts if tbl == "book_trope_claims"]
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][0]["confidence"], 0.0)
+        rows = [row for tbl, d in fake.posts
+                if tbl == "book_trope_claims" for row in d]
+        self.assertEqual(rows, [])
+        self.assertIn("Evidence floor", buf.getvalue())
 
     def test_write_claims_trope_with_chapters_keeps_confidence(self):
         fake = _FakeSB()

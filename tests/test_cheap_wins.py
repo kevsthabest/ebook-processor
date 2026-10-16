@@ -246,6 +246,27 @@ class TestEvidenceFloor(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertNotIn("Evidence floor", out)
 
+    def test_trope_legacy_shape_outside_floor(self):
+        # Legacy-pipeline results record no support at all (no
+        # trope_chapters key): the floor judges RECORDED support
+        # only, so the claim ships exactly as before (0.0-clamped).
+        result = {"tropes": ["Mind Game"], "trope_confidence": {},
+                  "chapter_summaries": []}
+        rows, _, _, out = _trope_rows(result)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["confidence"], 0.0)
+        self.assertNotIn("Evidence floor", out)
+
+    def test_trigger_legacy_shape_outside_floor(self):
+        # Legacy trigger dicts are {warning, detail, spoiler} — no
+        # support keys; their support test is the upstream
+        # multi-chunk hit count, not a chapter list.
+        result = {"triggers": [{"warning": "Violence", "detail": "d",
+                                 "spoiler": False, "confidence": 0.9}]}
+        rows, out = _trigger_rows(result)
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("Evidence floor", out)
+
 
 _SPLIT_LABEL = "part0007_split_000 (part 4)"
 _SUMMARIES = [{"index": 1, "label": "Prologue"},

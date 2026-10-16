@@ -393,6 +393,12 @@ class TestPreviewPlanReadOnly(_ReplaceBase):
     def _plan_result(self):
         return _result(
             tropes=["Mind Game", "Dark Secret", "Human Trope", "Fresh Trope"],
+            # The two tropes expected to insert carry recorded
+            # support (the evidence floor holds support-less claims);
+            # the rejected/contributor tropes are skipped before the
+            # floor ever sees them.
+            trope_chapters={pp._tnorm("Mind Game"): ["Ch 1"],
+                            pp._tnorm("Fresh Trope"): ["Ch 1"]},
             triggers=[_trig("murder"), _trig("violence")],
             characters=[{"name": "Hero", "role": "protagonist"},
                         {"name": "Rejected Char", "role": "minor"}],

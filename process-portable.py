@@ -13384,6 +13384,58 @@ def _delete_processor_claims(table, work_id):
     return None if gone is None else len(gone)
 
 
+_SPLIT_PART_SUFFIX_RE = re.compile(r"\s*\(part \d+\)\s*$")
+
+
+def _looks_like_file_label(label):
+    """True for split-file chapter labels ("part0007_split_000",
+    "text_split_002", "part0007") as opposed to real chapter titles
+    ("Prologue", "Chapter Two")."""
+    if not isinstance(label, str):
+        return False
+    base = _SPLIT_PART_SUFFIX_RE.sub("", label).strip().lower()
+    if not base:
+        return False
+    return ("_split_" in base
+            or re.fullmatch(r"part\d+", base) is not None
+            or base.count("_") >= 2)
+
+
+def _chapter_label_map(result):
+    """{chapter label: index} from the result's chapter map
+    (result["chapter_summaries"]); {} when the run carried none."""
+    cmap = {}
+    for s in (result.get("chapter_summaries") or []):
+        if isinstance(s, dict) and s.get("label") is not None \
+                and s.get("index") is not None:
+            cmap[s["label"]] = s["index"]
+    return cmap
+
+
+def _normalize_chapter_label(label, cmap):
+    """Split-file labels become "Chapter N" using the label's OWN
+    index from the chapter map (each split part has its own index,
+    so parts stay distinct). Titled labels and labels outside the
+    map pass through unchanged, as do non-string entries (chapter
+    indices from the fallback path are already numbers)."""
+    if not isinstance(label, str) or label not in cmap:
+        return label
+    if _looks_like_file_label(label):
+        return f"Chapter {cmap[label]}"
+    return label
+
+
+def _normalize_quote_chapter(q, cmap):
+    """A quote dict with its chapter label normalized. The original
+    dict belongs to the result and is never mutated; non-dict or
+    chapter-less entries pass through unchanged."""
+    if isinstance(q, dict) and q.get("chapter"):
+        _nc = _normalize_chapter_label(q["chapter"], cmap)
+        if _nc != q["chapter"]:
+            return {**q, "chapter": _nc}
+    return q
+
+
 def _build_trope_rows(work_id, result, cat_map, trope_mappings, model, skip_ids):
     """Build book_trope_claims rows for the new run. skip_ids holds the
     lowercased trope_ids that survive in the DB (contributor/rejected) —
@@ -13392,6 +13444,11 @@ def _build_trope_rows(work_id, result, cat_map, trope_mappings, model, skip_ids)
     catalog lookup FAILED (DB error) is in neither rows nor unmatched:
     it is an error for the book, never a proposal."""
     conf_t = result.get("trope_confidence", {})
+    _cmap = _chapter_label_map(result)
+    # The evidence floor judges RECORDED support only: v2 results
+    # always carry trope_chapters; legacy results (and pre-support
+    # saved results) carry none and are outside the floor's terms.
+    _floor_on = "trope_chapters" in result
     rows, unmatched, lookup_failed, used = [], [], [], set(skip_ids)
     for t in result["tropes"]:
         tid = cat_map.get(_tnorm(t))
@@ -13410,13 +13467,26 @@ def _build_trope_rows(work_id, result, cat_map, trope_mappings, model, skip_ids)
             continue
         used.add(str(tid).lower())
         _chaps = (result.get("trope_chapters") or {}).get(_tnorm(t), [])
+        _passages = (result.get("trope_evidence") or {}).get(_tnorm(t))
+        _quoted = [p for p in (_passages or []) if p.get("chapter")]
+        if _floor_on and not _chaps and not _quoted:
+            # Evidence floor (fail-closed, mirroring the family
+            # posture): where the run records support, a claim with
+            # no supporting chapters and no chapter-provenanced
+            # quotes does not ship.
+            print(f"  Evidence floor: trope claim '{t}' held — no "
+                  "supporting chapters and no chapter-provenanced "
+                  "quotes; not written.")
+            continue
         _tconf = conf_t.get(_tnorm(t), 0.7)
         if not _chaps:
-            # No supporting chapters recorded: the claim has no
-            # evidence, so it must not carry real confidence.
+            # No supporting chapters recorded (the claim ships on
+            # chapter-provenanced quotes alone): it must not carry
+            # real confidence.
             _tconf = 0.0
         _ev = {"source": "ebook-extraction",
-               "chapters": _chaps,
+               "chapters": [_normalize_chapter_label(c, _cmap)
+                            for c in _chaps],
                "chapter_count": len(_chaps)}
         # Option F (OC-7, a requirement): a claim shipping via the
         # persistence gate carries its stamp in the row, so a reviewer
@@ -13436,11 +13506,10 @@ def _build_trope_rows(work_id, result, cat_map, trope_mappings, model, skip_ids)
         # own face from "never ran" (no retrieval key at all). A
         # failed retrieval leaves no stamp — failure must not
         # masquerade as a negative result.
-        _passages = (result.get("trope_evidence") or {}).get(
-            _tnorm(t))
         if _passages:
             _ev["quotes"] = [
-                {"quote": p["quote"], "chapter": p["chapter"]}
+                {"quote": p["quote"],
+                 "chapter": _normalize_chapter_label(p["chapter"], _cmap)}
                 for p in _passages[:_EVIDENCE_MAX_PASSAGES]
                 if p.get("chapter")]
         _rec = (result.get("trope_retrieval") or {}).get(_tnorm(t))
@@ -13462,6 +13531,7 @@ def _build_trope_rows(work_id, result, cat_map, trope_mappings, model, skip_ids)
 def _build_trigger_rows(work_id, result, model, skip_warnings):
     """Build book_trigger_claims rows, skipping warnings that survive in
     the DB (contributor/rejected rows)."""
+    _cmap = _chapter_label_map(result)
     rows, seen = [], set(skip_warnings)
     for t in result["triggers"]:
         warn = t["warning"] if isinstance(t, dict) else t
@@ -13470,6 +13540,20 @@ def _build_trigger_rows(work_id, result, model, skip_warnings):
         seen.add(str(warn).lower())
         td = t if isinstance(t, dict) else {}
         _tev = td.get("evidence") or []
+        if "chapters" in td or "evidence" in td:
+            # Evidence floor (fail-closed, as for tropes): where the
+            # claim records support, no supporting chapters and no
+            # chapter-provenanced quotes means it does not ship.
+            # Trigger dicts carrying no support keys at all (legacy
+            # pipeline — its support test is the upstream multi-chunk
+            # hit count) are outside the floor's terms.
+            _quoted = [q for q in _tev
+                       if isinstance(q, dict) and q.get("chapter")]
+            if not (td.get("chapters") or []) and not _quoted:
+                print(f"  Evidence floor: trigger claim '{warn}' "
+                      "held — no supporting chapters and no "
+                      "chapter-provenanced quotes; not written.")
+                continue
         _tconf = td.get("confidence", 0.7)
         if not _tev:
             # No textual evidence -> no real confidence.
@@ -13477,11 +13561,13 @@ def _build_trigger_rows(work_id, result, model, skip_warnings):
         _ev = {"source": "ebook-extraction",
                "severity": td.get("severity", ""),
                "severity_claimed": td.get("severity_claimed", ""),
-               "chapters": td.get("chapters", []),
+               "chapters": [_normalize_chapter_label(c, _cmap)
+                            for c in td.get("chapters", [])],
                "chapter_count": td.get("chapter_count", 0),
                "frequency": td.get("frequency", 0),
                "prominence": td.get("prominence", ""),
-               "quotes": td.get("evidence", [])}
+               "quotes": [_normalize_quote_chapter(q, _cmap)
+                          for q in td.get("evidence", [])]}
         # Option F (OC-7): persistence stamp, as in _build_trope_rows.
         _stamp = (result.get("trigger_persistence") or {}).get(
             str(warn).lower())
