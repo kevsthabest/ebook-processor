@@ -72,6 +72,84 @@ Closed as written, no text changed: the backup posture
 input-hash-over-stored-hashes rule (§4.1), the §3.2 proof
 shape, and the §2.3 adoption-trigger shape.
 
+### Verification amendments (team verification round, 2026-10-16 — seven seats, all AGREE-WITH-CHANGES, zero dissents)
+
+Folded the same way: in place, in the sections named.
+
+- **CozyLibram Builder (4, data-shape):** source edition
+  identity (fingerprint + ISBN-13) stated on the quote
+  payload: §10.6. The envelope taxonomy is a registry,
+  with value shapes fixed before the app builds
+  consumers: §6.4. `kind='opening'` verified quotes ship
+  as their own payload kind: §10.6. Series-scope facts
+  get a named home — **resolved by user ruling**: the
+  bibliographic skeleton is pulled from a Cozy-persisted
+  Hardcover table via the verdict read-back pattern, and
+  processor series judgments are computed against it:
+  §6.4.
+- **Codebase Reviewer (6, build-level):** shared
+  substrate base, parameterized, with the divergences
+  enumerated: §1.1 (and §0). The snapshot corpus block
+  records the capture run's own chapter hashes, never
+  corpus read-backs: §4.3. Replay corpus access is
+  read-only, pinned: §4.3, §4.4, §4.5. Envelope refresh
+  discipline: corpus-sourced sections refresh in the
+  writing transaction; state.db-sourced sections are
+  composed live, never materialized: §6.4. The
+  `ingesting` commit ordering converged with A9 and was
+  verified already folded: §3.3. The FTS mechanism: the
+  A7 triggers stand; the rowid-instability pin added:
+  §1.3, §3.5. Build notes folded: write guards in handle
+  construction from slice 1 (§5.2, §11); per-adopter
+  hashed-input enumeration (§4.2); slice 5 reproduces
+  the acquisition block's full output surface (§3.1,
+  §11, §13); the numpy parity test forces the pure path
+  (§2.5); §1.2's duplicated primary key written once;
+  slice 4 gains the scoped dump-hash helper (§11).
+- **Product Strategist (2):** library coverage rollup
+  added as §6.1 query 7. The first post-gate field wave
+  is named — the book-facts stage (ending guarantee +
+  trigger depth), sequenced after the gate, which it
+  does not touch: §11.
+- **UI Designer (2):** `spoiler_tier` display contract —
+  the screens' pass is the display fact; the tier is a
+  field-class policy marker, never a per-line gate:
+  §10.6. The raw-confidence payload boundary — payloads
+  carry state + evidence tier + provenance; confidence
+  stays processor-side: §6.4.
+- **UX Tester (6):** sentence-boundary rule for
+  signature spans: §10.1, §10.7, §13. The rendering
+  contract (unknown = silence; assessed-none = no
+  positive claim below full coverage; a `coverage` field
+  on safety-relevant sections): §6.4. Provenance
+  vocabulary fixed at design time ("From the text" /
+  "From readers" / "From the publisher"; "Checked
+  against the text"): §6.4. Chapter label from the
+  chapter's own heading, with the source-edition caveat:
+  §10.6, §10.7, §13. Retraction as a consumer
+  requirement (drop from rendered surfaces and local
+  caches on next sync): §10.6. Poll-shed books render
+  nothing: §10.5, §6.4.
+- **Data & Sync Engineer (5):** retraction as a named
+  operation — explicit record, supersession, envelope
+  trace, one transaction; authorization stays D1's:
+  §6.4. Currency enforced at the payload boundary, with
+  its pin: §6.4, §6.6. The envelope retraction trace
+  (`retracted_at` + `reason`): §6.4. Envelope refresh on
+  ingest events, in the generation swap's transaction:
+  §6.4, §3.4. The multi-edition payload rule
+  (edition-scoped sections ship per edition, keyed by
+  edition identity): §6.4.
+- **Trope Review seat (4):** VERIFY match multiplicity
+  + occurrence preference (earliest occurrence; support
+  set diagnostic): §10.1, §10.3, §10.7. The SELECT audit
+  surface — selected quotes listed in `--explain`, counts
+  in `--corpus-status`: §7.1, §7.4. The calibration
+  decision rule printed beside the limit (threshold
+  moves require outcome-joined calibration): §6.3. The
+  churn query names emission volume beside Jaccard:
+  §6.1.
+
 ---
 
 ## 0. What the code actually looks like today (evidence base)
@@ -121,8 +199,9 @@ All citations are process-portable.py on master @ 6e1476a
   rolling backup via SQLite's backup API (`backup_to`,
   :2909; `_maybe_backup`, :2872), a canonical logical
   `dump_hash`, and the A1 migration idiom (build into
-  `.migrating`, verify, rename). §1 mirrors this pattern
-  rather than inventing a parallel one.
+  `.migrating`, verify, rename). §1 shares this machinery
+  through a common base rather than inventing a parallel
+  one (§1.1).
 - **Book identity is the fingerprint, everywhere.**
   `_checkpoint_fingerprint` (:14553) — ISBN/ASIN +
   normalized title/author + hash of the first substantial
@@ -177,8 +256,15 @@ All citations are process-portable.py on master @ 6e1476a
 ### 1.1 The handle and the file
 
 `corpus.db` lives in the learn dir beside `state.db`
-(OC-1), opened through a `CorpusDB` handle that mirrors
-`StateDB` exactly: one connection per process per learn dir
+(OC-1), opened through a `CorpusDB` handle that **shares
+`StateDB`'s substrate machinery rather than copying it**:
+the generic handle code (connection management, schema
+creation, corruption preservation, backup, checkpoint,
+`dump_hash`, write transactions — roughly 200 of
+StateDB's ~250 lines) is factored into a shared base
+parameterized by (filename, DDL list, table list, schema
+version, corruption-consequence), and each handle
+supplies only its policy. One connection per process per learn dir
 (a registry beside `_STATE_DBS`), `check_same_thread=False`,
 writes serialized by an RLock and executed as single
 transactions (`write_txn`), WAL journal, `synchronous=FULL`,
@@ -190,6 +276,24 @@ not discovered). Schema version is `PRAGMA user_version`
 carrying `corpus_v` as a string for the envelope (§6.4) —
 the D&S seat's rule: a corpus schema version on the record
 from day one, additive-only within a version.
+
+The sharing is not identity. The enumerated divergences,
+complete in v1: (a) **no rolling backup on corpus
+writes** — StateDB's per-write backup hook stays
+state-only (§7.2's ordering: the substrate is precious,
+the corpus is rebuildable); (b) **corruption consequence
+differs** — corpus corruption falls back to file parsing
+(§5.3), where state corruption starts empty under the
+F8 warning, because corpus content is re-derivable and
+state content is not; (c) **creation posture differs** —
+corpus.db is create-on-ingest, where StateDB's running
+stores are open-only (creation there is migration/tests).
+Any future divergence joins this list in the build, by
+name; an unlisted behavioural difference between the
+handles is a bug, not a style. The shared base is also
+the codebase's natural future extraction seam — the two
+handles + registries as a "stores" unit — should the
+single file ever split (§5.1).
 
 `PRAGMA user_version` mismatch on open follows the substrate
 precedent: additive DDL is re-applied (`CREATE TABLE IF NOT
@@ -234,9 +338,9 @@ corpus_passages(
   passage_id TEXT PRIMARY KEY,        -- §1.4 content-derived id
   fingerprint TEXT, chapter_index INTEGER,
   start_offset INTEGER, end_offset INTEGER,
-  text_hash TEXT,                     -- sha256 of the sliced span
-  PRIMARY KEY (passage_id))           -- (fingerprint, chapter_index
-                                      --  indexed for range reads)
+  text_hash TEXT)                     -- sha256 of the sliced span;
+                                      -- (fingerprint, chapter_index)
+                                      -- indexed for range reads
 
 passage_vectors(
   passage_id TEXT PRIMARY KEY,
@@ -344,8 +448,16 @@ write. There is no application-level "remember to sync
 the index" step to forget, so a generation replacement
 (§3.4: old chapters deleted, new ones inserted, one
 transaction) cannot desync text from index: they commit
-or roll back together. §3.2's self-check closes the
-loop with FTS5's own `integrity-check`.
+or roll back together. The mechanism is load-bearing
+precisely because `corpus_chapters` rowids are **not
+stable** across that replacement (rows are deleted and
+rewritten) and an external-content FTS5 index does not
+track base-table changes by itself — triggers are what
+keep the index honest through the rewrite. §3.2's
+self-check closes the loop with FTS5's own
+`integrity-check`, and §3.5 pins the behaviour: after a
+parser-bump re-ingest, FTS finds the new generation's
+text and no longer finds removed text.
 
 ### 1.4 Identity, versions, and stamps
 
@@ -566,7 +678,13 @@ outside a test.
   back is bit-identical (float32 LE pack/unpack).
 - `test_search_parity_numpy_vs_pure` — top-k over a fixture
   book identical (same ids, order within float tolerance)
-  under both engines.
+  under both engines. The pure path is **forced** in the
+  test (engine selection stubbed to pure), never
+  discovered from ambient numpy presence: the user's
+  Windows Python may lack numpy, and a parity test that
+  silently runs numpy-vs-numpy on the build machine
+  proves nothing about the fallback the user may
+  actually run.
 - `test_foreign_model_vector_never_served` — rows stamped
   with another model are invisible to search under the
   configured model (the §4.4 staleness rule at the vector
@@ -611,6 +729,13 @@ faithful — a much smaller claim, and the right one.
 Frontmatter tagging, fallback heading splits, and chapter
 detection diagnostics (`_DIAG.chapter_detection_fallback`)
 behave identically, because it is the same code executing.
+The fallback flag itself is part of the ingest record —
+stored in `corpus_works.payload` at ingest — so a
+corpus-sourced run (§11 slice 5) reproduces the
+acquisition block's **full** output surface (chapters,
+word_count, and the `_DIAG` / `_chap_fallback`
+diagnostics downstream code reads) without re-deriving
+any of it.
 
 Ingest deliberately does **not** run any model: no Call A,
 no Call B, no judge. Acquisition is deterministic — the
@@ -735,6 +860,10 @@ any state ──parser_version ≠ current──▶ stale
   collected by the same maintenance pass that reports
   them. An `ingest_runs` tombstone row preserves the fact
   and date of the superseded generation for forensics.
+  The generation swap also refreshes the work's envelope
+  **in the same transaction** (§6.4): a payload must
+  never pair a new text generation with sections computed
+  against the old one.
 - **Embedding model/format change** ⇒ text untouched;
   only the vector generation turns over (§2.4). This is
   the cheap re-ingest: minutes of embedding, zero
@@ -778,6 +907,12 @@ any state ──parser_version ≠ current──▶ stale
 - `test_fts_integrity_check_gates_ingest` — a corrupted
   FTS index at self-check ⇒ ingest `failed`, no
   `text_complete` flip (A7).
+- `test_fts_reingest_finds_new_not_removed` — after a
+  parser-bump re-ingest, FTS finds the new generation's
+  text and no longer finds text the replacement removed
+  (the §1.3 trigger mechanism's pin: rowids are not
+  stable across generation replacement, and the index
+  must stay honest through the rewrite).
 
 ---
 
@@ -865,6 +1000,17 @@ scope.
 3. **`quote-verify` / `quote-select`** — §10's two layers,
    stage-shaped from birth.
 
+**The enumeration rule (every adopter, no exceptions):**
+a stage joins the contract only with its hashed inputs
+enumerated in its design entry, the way `retrieve`'s
+entry above enumerates its own. `input_hash` completeness
+is the contract's hard invariant: reuse over inputs
+nobody hashed serves outputs derived from unexamined
+state, silently — the exact staleness class §4.4's
+content key exists to exclude. An adopter whose inputs
+cannot be enumerated does not adopt; it stays a per-run
+computation until they can.
+
 **Wave 2 (named, not built here):** extraction payload
 *references* (a stage row pointing at a snapshot's frozen
 draw — §4.3 — not a copy of it); the emission design's
@@ -904,8 +1050,24 @@ block:
            "chapter_hashes": ["…", …]}
 ```
 
-— written when a complete corpus ingest of the book
-exists at capture time, absent otherwise. The snapshot's
+— written at **every** capture, from the capture run's
+own parse: `chapter_hashes` and `text_root_hash` are the
+hashes of the text the run itself extracted, recorded
+independently — **never read back from the corpus row**.
+That independence is the property the block exists for:
+hashes copied from the corpus would make replay
+validation degenerate to "corpus unchanged since
+capture," attesting nothing about the draw. Run-recorded
+hashes attest the wanted thing — corpus text == the text
+the snapshot's draw was extracted from — including the
+case the fingerprint cannot see: it samples only the
+first substantial chapter (:14553), so a same-fingerprint
+file with different later chapters is exactly what
+per-chapter hash validation exists to catch.
+`parser_version` rides along as the run's own stamp. The
+block does not depend on a corpus ingest existing at
+capture time; it is absent only for captures that
+predate this design. The snapshot's
 own payload files stay exactly as they are
 (self-contained: a snapshot must remain valid if
 corpus.db is deleted, rebuilt, or never existed — its
@@ -919,7 +1081,16 @@ snapshot's recorded chapter hashes match the corpus's
 (per-chapter hash comparison; a mismatch — different
 parser generation, edited corpus — refuses the corpus
 path for that replay and falls back to today's behaviour,
-printed). Passage ids (§1.4) are the join key, and they
+printed). **Replay corpus access is read-only, pinned.**
+Under replay the corpus tier serves reads only: §4.4's
+gap-fill write-back does not apply, and a retrieval miss
+under replay embeds in-memory (G5's original behaviour)
+rather than writing. A measurement instrument mutating
+the library's working memory would be a new hole in
+replay's isolation doctrine — replays write only inside
+the sandbox substrate, and the live substrate's dump
+hash must not move — so the corpus inherits the doctrine
+whole. The pin sits in §4.5. Passage ids (§1.4) are the join key, and they
 are safe to reference precisely because they are
 content-derived: a snapshot naming a passage id names a
 span of text, and either the corpus holds that exact span
@@ -961,7 +1132,8 @@ two-tier lookup — memory, then corpus `passage_vectors`
 (read when the run is corpus-sourced or the work is
 `complete` in the corpus), then `embed_vectors` with the
 result written back to the corpus *when the run holds a
-complete ingest to write against* (a run on an uningested
+complete ingest to write against* (and never under
+replay — §4.3's read-only rule; a run on an uningested
 book does not sprout a partial corpus entry as a side
 effect — ingest is a named act, §3; the run's embeddings
 for such a book stay in-memory, G5's original behaviour,
@@ -1006,6 +1178,11 @@ rather than asserting it.
   retrieval from corpus passages; one hash mutated ⇒
   corpus path refused for that replay, fallback printed,
   replay itself unaffected.
+- `test_replay_corpus_access_read_only` — a `--use-corpus`
+  replay leaves the corpus dump-hash unchanged: no
+  gap-fill write-back, misses embed in-memory, reads only
+  (the §4.3 rule, pinned beside
+  `test_writer_family_discipline`).
 
 ---
 
@@ -1033,10 +1210,19 @@ one-repo cost.
 | Table family | Writer | Readers |
 |---|---|---|
 | `corpus_works/chapters/passages`, FTS | importer mode only | processor, reports, explain |
-| `passage_vectors` | importer phase 2; `--corpus-reembed`; a corpus-sourced run filling gaps in a `complete` work (§4.4) | retrieval, analytics |
+| `passage_vectors` | importer phase 2; `--corpus-reembed`; a corpus-sourced run filling gaps in a `complete` work (§4.4; never under replay, §4.3) | retrieval, analytics |
 | `stage_runs/stage_outputs`, `quotes` | processor stages | reports, explain, payload builder |
-| `work_envelope` | the envelope refresh (§6.4), run at stage-write time | explain, payload path |
+| `work_envelope` | the envelope refresh (§6.4), run at stage-write and ingest-event time | explain, payload path |
 | `meta` | CorpusDB open (probes, generation stamps) | all |
+
+The mode-scoped write guards this table names are a
+property of **handle construction**, not convention: a
+handle is built *in* a mode and refuses other families'
+writes from its first day (§5.4's
+`test_writer_family_discipline` enforces them). Slice 1
+builds the guard into the handle (§11), because
+retrofitting it after slices 2–4 land their writers is
+where the mechanism would hurt.
 
 SQLite serializes writers anyway (WAL: one writer, many
 readers); the rule's purpose is not lock avoidance but
@@ -1154,7 +1340,12 @@ promotion rule runs both ways).
    residual variance is draw/prompt/model — attribution
    the dashboard's two numbers (spine §1.4) approximate
    today and the corpus makes exact for every stage that
-   adopts §4. Sources: `corpus_works.text_root_hash`,
+   adopts §4. The query names **emission volume beside the
+   Jaccard** — each run's set sizes printed next to the
+   similarity — because the churn history this program
+   measured was dominated by yield collapse, and a Jaccard
+   printed alone invites reading a collapse as
+   instability. Sources: `corpus_works.text_root_hash`,
    `stage_runs.input_hash`, preview artefacts.
 3. **Series identity drift.** A character's canonical
    forms, aliases, and roster outcomes across every work
@@ -1178,11 +1369,20 @@ promotion rule runs both ways).
    D5's eventual ruling gets numbers instead of a guess.
 5. **Threshold calibration.** §6.3.
 6. **The envelope.** §6.4.
+7. **Library coverage rollup.** Per-section presence and
+   state counts across every ingested work — one
+   `GROUP BY` over `work_envelope` — answering "are we
+   there yet" for the feature gates that wait on corpus
+   facts (the Previously On trigger, Finale's honesty
+   rule, the mood gate from the new-data consult).
+   Feature readiness stops being an impression: a gate
+   names the section and the count it needs, and the
+   rollup says whether the library has it.
 
 **Generation honesty (A8).** A work's text is anchored
 to its parser generation (§1.4), and generations can
 segment the same book differently. Cross-work queries
-(1, 3, 4, and every rollup built on them) therefore
+(1, 3, 4, 7, and every rollup built on them) therefore
 restrict to the **current parser generation** by
 default; a report that deliberately spans generations
 prints the generation mix on its face — §6.3's rule (a
@@ -1231,6 +1431,12 @@ the relationship-validation stage adopts the §4 contract
 calibration becomes possible from adoption forward. The
 v1 report prints this limit on its face (the G3 rule: a
 number without its provenance is not a measurement).
+Beside the limit, the report prints its **decision
+rule**: distributional shape may inform a threshold
+conversation; it may not move one. **A threshold move
+requires the wave-2 outcome-joined calibration** — only
+samples joined to their fates can say what a score was
+worth, and v1's samples cannot be joined (§0).
 
 ### 6.4 The completeness/confidence envelope (Data & Sync spec)
 
@@ -1239,8 +1445,21 @@ Per the Data & Sync seat's consult additions (provenance,
 `~/workspace/ebook-processor-sweep/new-data-consult/
 data-sync.md`), every work carries an **envelope**: a
 per-section record of what the system knows about the
-work, materialized in `work_envelope` and refreshed
-whenever a stage writes for that work. Sections and
+work, materialized in `work_envelope`. Refresh
+discipline splits by source family: **corpus-sourced
+sections** (text, vectors, retrieval, quotes) are
+materialized and refreshed in the same transaction as
+the write that changes them — a stage write, or an
+ingest event including a generation swap (a payload must
+never pair a new text generation with sections computed
+against the old one, §3.4). **State.db-sourced sections**
+(roster, staging, verdicts, claims shipped) change
+through non-corpus paths — ordinary runs, `--roster-*`
+commands, verdict fetches — so they are **composed live
+at read / payload-build time** from state.db's current
+contents and never materialized at all: there is no
+refresh trigger to forget, and they cannot publish stale
+facts between corpus stage writes. Sections and
 their sources:
 
 | Section | Presence source | Scope |
@@ -1253,6 +1472,7 @@ their sources:
 | claims shipped | last run's result markers | work |
 | quotes | `quotes` counts by status (§10) | edition |
 | verdicts | `verdicts_cache` freshness (state.db) | work |
+| series | Cozy skeleton pull (read-back) + series-judgment stage outputs | series |
 
 The vectors section is the **normative coverage
 statement** for a work (A5): composed against the
@@ -1261,30 +1481,152 @@ under a superseded embedder reports its true current
 coverage — 0% until re-embedded — and never the bare
 status word `complete` (§3.3).
 
+**The series section's home (user ruling, 2026-10-16).**
+Series-scoped facts have no single source, and the
+design splits them by kind. The **bibliographic
+skeleton** — membership, order, published totals,
+completion — is **pulled from Cozy Libram, not derived
+by the processor**: Cozy persists the series skeleton it
+already fetches from Hardcover (series, author, ordered
+books with positions and ISBNs) into a shared corpus-level
+table, and the processor reads it through the **verdict
+read-back pattern** — GET-only, cached locally, stamped
+with its fetched-at time, degrading gracefully when
+unavailable. Provenance on the section reads "via
+Hardcover, via Cozy, fetched <time>"; no Hardcover
+credential and no new network dependency enters the
+processor. The **text-derived series judgments** —
+standalone-safety, reading-order necessity, recurring
+cast — stay processor-side, computed as stage outputs
+**against that skeleton**: the pull is what tells the
+processor two books share a series and in what order,
+which is the precondition for computing them at all. An
+unavailable pull leaves the section `unknown`
+(first-class, per the state rule below) — never guessed
+from text. **Named dependency:** the app-side
+persistence (Cozy writing the skeleton at fetch time) is
+a companion item owned by the app side (Builder / Data &
+Sync seats); until it exists, the pull has no source and
+the series section is `unknown` for every work — a
+designed absence, not a defect. Finale's honesty rule
+consumes series totals from this section, which is why
+totals come from the curated skeleton and not from
+counting ingested books.
+
 Each section record is `{state, confidence?, evidence_tier?,
-stage, model, stage_version, updated_at, scope}` where
+coverage?, stage, model, stage_version, updated_at, scope,
+retracted_at?, reason?}` where
 **`state` ∈ {present, unknown}** — the seat's first-class
 rule, adopted verbatim: absence renders as `unknown`,
 never as `none`; "assessed, none found" is a *present*
 section whose payload says so (G's abstention records are
-exactly this shape). `corpus_v` rides the envelope from
+exactly this shape). **`coverage`** rides sections whose
+"present, none found" could render as a safety claim
+(triggers at minimum): the fraction of the work the
+assessment actually covered, so a partial assessment can
+never present as a whole-book clearance (the rendering
+contract below). **The retraction trace** — `retracted_at`
++ `reason` on a withdrawn section's record — keeps "never
+assessed" and "assessed, then withdrawn" distinguishable
+downstream forever; safety-class facts need exactly that
+distinction, and an envelope that collapses them has
+forgotten the one fact a later reader most needs.
+`corpus_v` rides the envelope from
 day one; additive-only within a version. The envelope is
-what the publication payload (§10.5, §6.5) is built from:
-Cozy Libram receives per-section facts with their
-confidence and provenance attached — Advisor addition A
-from the same consult (provenance + confidence as data,
-per field, from birth) — rather than bare values whose
-certainty the app must guess.
+what the publication payload (§10.5, §6.5) is built from
+— with a **boundary**: the payload carries each section's
+**state, evidence tier, and provenance — never the raw
+confidence number**. Confidence stays processor-side (the
+envelope record keeps it; `--explain` and the calibration
+report consume it), extending §10.2's doctrine — votes
+never ship as a number — to envelope confidence: a
+decimal in a payload reads as a measurement and invites
+the app to re-gate on it, which is the processor's job,
+done once. What Cozy Libram receives is per-section facts
+with their state, tier, and provenance attached — Advisor
+addition A from the same consult (provenance + confidence
+*recorded* as data, per field, from birth) — rather than
+bare values whose certainty the app must guess.
 
-**Retraction** (the seat's third addition) is designed
-in at this layer: a section's facts are withdrawn by
-superseding the envelope entry and the underlying stage
-output through the ordinary stage replacement (§4.1) —
-the payload builder reads only current outputs, so a
-retraction propagates to the next payload by
-construction. What *authorizes* a retraction of
+**The rendering contract (fixed at design time).**
+Payload strings have a way of becoming UI strings
+verbatim, so the state→rendering map is part of this
+design, not an app afterthought: **`unknown` renders as
+silence** — no badge, no "unknown" text on user surfaces
+(curator/admin views may show "not yet assessed");
+**assessed-none renders as no positive claim except at
+full coverage** — a triggers section below full
+`coverage` never renders as "No content warnings" or
+anything a reader can take as certified clean; and a
+section **present with zero selected** (the poll-shed
+quotes state, §10.5) renders as silence too — no surface
+shows a "nothing available" placeholder for a garnish
+that was never promised. **Provenance vocabulary is fixed
+here**: source renders as **"From the text" / "From
+readers" / "From the publisher"**; evidence strength
+renders at most as **"Checked against the text"** vs
+unmarked. Tier enums and confidence decimals are
+machine-side only and never cross into user-visible
+strings.
+
+**Retraction is a named operation** (the seat's third
+addition), designed in at this layer — a verb, not an
+emergent behaviour. A retraction: (1) writes an **explicit
+retraction record** in the stage layer (the `ingest_runs`
+tombstone precedent: what was withdrawn, when, and the
+reason class, preserved for forensics); (2) supersedes
+the underlying stage output through the ordinary stage
+replacement (§4.1); and (3) refreshes the envelope
+entry, stamping its `retracted_at` + `reason` trace —
+**all in one transaction**, so no reader ever sees the
+record without the withdrawal or the withdrawal without
+the record. The payload builder reads only current
+outputs, so a retraction propagates to the next payload
+by construction. What *authorizes* a retraction of
 human-corrected data is D1's question (§0's scoping
-rule); the mechanism waits for it without blocking.
+rule) — this is mechanism only, and it waits for D1
+without blocking.
+
+**Currency is enforced at the payload boundary.** The
+payload builder ships a section only if its stage output
+is **current** — its `input_hash` recomputes equal
+against the corpus's present state (§4.1's rule, checked
+at build time, not assumed). A section that fails the
+check is omitted (it renders `unknown`), never shipped
+stale; and because an output's hash covers its upstream
+inputs, retracting or replacing an upstream output
+cascade-invalidates its downstream sections at the same
+boundary — the pin (§6.6): retract upstream ⇒ the next
+payload omits the downstream fact.
+
+**Multi-edition rule.** A work with several ingested
+editions has one envelope per fingerprint; the payload
+ships work-scoped sections once and **edition-scoped
+sections per edition**, each block keyed by its source
+edition's identity (fingerprint + ISBN-13 — the same
+identity §10.6 attaches to quotes). Two editions'
+edition-scoped facts are never silently merged into one
+section: the consumer picks the block matching the
+reader's edition, and any surface showing another
+edition's facts can say which edition they came from,
+because the block says so.
+
+**The taxonomy is a registry.** The section table above
+is the one place new-data sections join; a future section
+is registered here — name, source, scope, and **value
+shape** (the enum or band set its payload may carry) —
+*before* the app builds a consumer for it, so value
+shapes are fixed in one place and never reverse-engineered
+from a payload. Registered now, built later: **ending**
+(work scope; enumerated outcome classes, fixed by the
+book-facts stage, §11), **heat shape** (work; bands only,
+never counts or locations), **POV** (work; enumerated
+person + tense), **mood** (work; derived coarse bands
+only — never extracted claims), **setting facets** (work;
+facet enumerations), **series** (series scope; per the
+series paragraph above). Each inherits the section record
+wholesale — state, evidence tier, provenance, coverage
+where safety-relevant — from birth.
 
 ### 6.5 DuckDB: the read-only escape hatch
 
@@ -1311,6 +1653,15 @@ DuckDB code; it designs the door and labels it.
 - `test_envelope_refreshes_on_stage_write` — a stage
   write for a work updates its envelope sections and
   `computed_at` in the same transaction.
+- `test_envelope_state_sections_never_stale` — a roster
+  change made through a non-corpus path (no corpus stage
+  write) is reflected in the next envelope read, because
+  state.db-sourced sections are composed live, never
+  materialized (§6.4).
+- `test_payload_omits_noncurrent_section` — an upstream
+  output retracted or replaced ⇒ the next payload omits
+  the downstream section whose input hash no longer
+  recomputes (currency at the payload boundary, §6.4).
 - `test_calibration_report_prints_provenance_limit` —
   the v1 report carries its distributional-only notice
   and per-trigger n beside every decile table.
@@ -1345,6 +1696,14 @@ One read-only report joining both stores for one work:
   span citation, and every name form's occurrence counts
   across the work (and, with a series flag, across the
   series' ingested works — §6.1 query 3 in command form).
+- **For quotes:** the work's selected quotes with their
+  verbatim text, screen results, and spoiler tier — the
+  SELECT layer's audit surface. Sampling audit,
+  deliberately not a queue: VERIFY is deterministic
+  truth and needs no approval flow, but a screen miss
+  would otherwise publish silently; the listing makes
+  selection *inspectable* per work, which is the
+  proportionate check.
 - Read-only in the strong sense: opens both DBs read-only
   where they exist, works with either store missing
   (prints which half is absent), writes nothing.
@@ -1396,7 +1755,7 @@ per-work lines (title, fingerprint prefix, status, parser
 version vs current, chapters, passages, vector coverage
 % — always against the **current** (model, format)
 generation, §3.3/A5 — stage summary, envelope freshness),
-totals (works by status, corpus.db bytes broken into
+totals (works by status, quotes by status, corpus.db bytes broken into
 text / FTS / vectors / other via page counts per table),
 the vector generations with their canary state — a
 generation marked **suspect** by the drift canary (§2.4,
@@ -1540,7 +1899,7 @@ A pure corpus function:
 
 ```
 verify_quote(fingerprint, candidate_text)
-    -> {chapter_index, start, end, snapped, drift} | None
+    -> {chapter_index, start, end, snapped, drift, occurrences} | None
 ```
 
 - **Scope is the work's own rows.** The match runs against
@@ -1563,6 +1922,21 @@ verify_quote(fingerprint, candidate_text)
   for the signature and opening kinds, and for candidates
   carrying no chapter assertion; there, the chapter the
   line is found in *becomes* its assertion.
+- **Occurrence discipline.** A line can occur more than
+  once, and the wrong occurrence is a wrong chapter
+  attribution. The verify record therefore carries
+  **match multiplicity** (`occurrences`: how many spans
+  in scope matched), and the choice rule is fixed:
+  signature and opening kinds take the **earliest**
+  occurrence in the book; an evidence-kind match is
+  already confined to its asserted chapter (A3), and
+  within that chapter the earliest occurrence ships.
+  When a claim's support-chapter set is known and a
+  book-wide-verified span lands outside it, the record
+  says so (`outside_support_chapters`) as a diagnostic —
+  G's grading reads the claim's chapters, and the record
+  must not let a found-elsewhere line masquerade as
+  support.
 - **Matching discipline:** normalize both sides with the
   existing `_norm_quote` discipline (the `verify_evidence`
   machinery, :11613, generalized from a chunk to the
@@ -1583,6 +1957,19 @@ verify_quote(fingerprint, candidate_text)
   way, every shipped quote carries **chapter + offset +
   verification status** (§10.3), so its truth is checkable
   from its own record forever.
+- **Sentence boundaries for signature spans.**
+  Verification proves the words exist contiguously; it
+  does not prove the span is a complete thought, and a
+  fragment reads on a share card exactly like a
+  misquote. A **signature-kind** span must therefore
+  begin and end at sentence boundaries in its chapter —
+  checkable at verify time against `_sentence_spans`
+  (:5699) — and a candidate that verifies only as a
+  fragment is ineligible for signature selection, full
+  stop. Fragments remain fine as *evidence* quotes, where
+  the claim carries the meaning; the opening line is
+  sentence-bounded by construction. Snap fixes drift,
+  not truncation; this rule is the truncation half.
 - **Where it lives:** a standalone stage over the corpus
   (`stage = "quote-verify"`, §4 contract), with three
   call sites — (a) **ingest-time**, for the deterministic
@@ -1638,7 +2025,8 @@ the **verbatim span text**, `kind`
 
 ```json
 {"verify": {"candidate_text": "…", "snapped": true,
-            "drift": "punctuation", "stage_run": "…"},
+            "drift": "punctuation", "occurrences": 1,
+            "stage_run": "…"},
  "source": "extraction|deterministic|manual",
  "poll":   {"model": "…", "quotability": 0, "representative": 0,
             "spoiler": "pass", "heat": "pass", "rank": 1},
@@ -1699,7 +2087,10 @@ and **no signature line ships for that book** —
 selection without screens is not a degraded mode this
 design offers; the envelope (§6.4) records the quotes
 section as present with zero selected, which is the
-honest rendering. A separate allowance was considered
+honest rendering. Under §6.4's rendering contract that
+state renders as **silence** in the UI: a missing
+garnish is not a gap state, and no surface ever shows a
+"no signature line available" placeholder. A separate allowance was considered
 and rejected: a second ledger re-opens the contention
 accounting the shared budget exists to close, and
 enrichment that can starve family validation — the worst
@@ -1711,16 +2102,51 @@ garnish; its absence costs a garnish.
 
 Selected quotes ride the **work-level corpus payload** —
 the server-authoritative channel the D&S seat specified
-(§6.4's envelope is its carrier): the payload's quote
-section carries `{text, chapter_label, kind,
-spoiler_tier, screens: {spoiler, heat}}` per selected
-quote. Candidate debris and poll internals stay
+(§6.4's envelope is its carrier). The quote section is
+**edition-scoped** and states its source edition's
+identity — **fingerprint + ISBN-13 when known** — at
+section level: a verified quote is a fact about one
+edition's text, and the payload says which. Per selected
+quote it carries `{text, chapter_label, kind,
+spoiler_tier, screens: {spoiler, heat}}`. **Verified
+`opening` quotes ship as their own payload kind**, in
+their own right — not only when the opening line is also
+the selected signature (the app's dormant first-line
+clue consumes them directly); they pass the same
+screens, and the §10.4 caps hold app-side as fixed text
+zones the payload does not relax. **`chapter_label` is
+the chapter's own heading** where the ingested text
+provides one (the stored `label`), falling back to
+`Chapter N`: it is a pointer into the *source* edition
+named by the section, and surfaces must not present it
+as a pointer into the reader's own edition — prologue
+and frontmatter counting diverges across editions, so a
+bare index can be wrong for the copy in the reader's
+hands even when it is right for ours. Candidate debris
+and poll internals stay
 processor-side (reachable via `--explain`); the payload
 carries the attestation (verified, screened, tiered),
 not the paperwork. Unselecting a quote — a stage
 replacement under §4.1 — removes it from the next payload
 by construction, which is the seat's retraction
-requirement met by the ordinary mechanism. What the app
+requirement met by the ordinary mechanism; the consumer
+half is a stated requirement, not a hope: **the app
+drops an unselected quote from rendered surfaces on
+next sync, including any locally cached copy** — a
+retraction the app keeps rendering from cache is only
+half real.
+
+**Display contract for `spoiler_tier`.** The screens'
+pass is the display fact: a selected quote ships because
+it passed. `spoiler_tier` is a **field-class policy
+marker** — it classifies the *field* (signature quotes
+as a class are `mild`, §10.4), informing which surfaces
+may carry the field at all; it is never a per-line
+grade, gate, or label, and no surface re-gates, badges,
+or warns on a cleared line using its tier. Double-gating
+a line the screens cleared would make the payload
+contradict itself; the tier's consumer is placement
+policy, not the reader. What the app
 does with the section (About zone, italic, attributed —
 the Designer's placement) is app doctrine consuming
 payload facts; this design's boundary is the payload.
@@ -1756,6 +2182,20 @@ payload facts; this design's boundary is the payload.
 - `test_final_quarter_ineligible` — a verified,
   screen-passing candidate from the final quarter is not
   signature-selected in v1.
+- `test_verify_records_occurrence_preference` — a line
+  occurring three times in scope: signature selection
+  ships the earliest occurrence, the record carries
+  `occurrences: 3`, and a span landing outside a known
+  support-chapter set records the
+  `outside_support_chapters` diagnostic.
+- `test_signature_span_sentence_bounded` — a candidate
+  that verifies only as a mid-sentence fragment is
+  ineligible for signature selection; the same fragment
+  verifies as an evidence quote.
+- `test_payload_chapter_label_from_heading` — the
+  payload's `chapter_label` is the chapter's stored
+  heading where one exists, `Chapter N` only as the
+  fallback.
 
 ---
 
@@ -1770,10 +2210,14 @@ The calibration report is the exception — it needs no
 corpus at all and ships in slice 1's train as the
 analytics down payment (§7.3).
 
-1. **CorpusDB core + reports.** Handle, schema, probes
+1. **CorpusDB core + reports.** Handle (on the shared
+   substrate base, §1.1), schema, probes
    (§1.5), F8 discipline, `--corpus-status` (correct on an
    absent/empty corpus), `--calibration-report` (§7.3).
-   Tests: §1.6 probe/degraded pins.
+   The **mode-scoped write guards are built into handle
+   construction in this slice** (§5.2) — slices 2–4 land
+   writers against guards that already exist, never the
+   reverse. Tests: §1.6 probe/degraded pins.
 2. **Ingest phase 1.** `--ingest` (file + dir), one parse
    path, text/passages/FTS, completeness machine,
    round-trip self-check. Tests: §3.5.
@@ -1783,12 +2227,23 @@ analytics down payment (§7.3).
 4. **Stage contract + retrieve adoption.** `stage_runs` /
    `stage_outputs`; G's records become stage outputs;
    two-tier cache (§4.4) behind corpus-sourced reads.
-   Tests: §4.5.
+   Tests: §4.5. Note for this slice: stage accounting
+   needs a **scoped dump hash** (per fingerprint + stage
+   key space) for §4.5's pins and §13 signal 8 — the
+   substrate's `_dump_hash_conn` is whole-DB over a fixed
+   table list, so this slice adds the small variant
+   helper here rather than discovering the need mid-gate.
 5. **Corpus-sourced runs + replay composition.**
    `--use-corpus` (default OFF) chapter acquisition in
    `process_file_v2`; snapshot manifest corpus block;
    replay hash validation + corpus retrieval path.
-   Tests: §5.4, §4.5 replay pin.
+   Corpus-sourced acquisition must reproduce the :15121
+   block's **full output surface** — chapters,
+   `word_count`, and the `_DIAG` / `_chap_fallback`
+   diagnostics (the fallback flag read from
+   `corpus_works.payload`, §3.1) — not chapter text
+   alone; §13 signal 2a is read as covering the whole
+   surface. Tests: §5.4, §4.5 replay pin.
 6. **Quote verification.** `verify_quote` + stage
    adoption; deterministic opening-line candidates at
    ingest; run-time evidence-quote verification for
@@ -1802,6 +2257,15 @@ analytics down payment (§7.3).
 9. **Validation gate (not code).** §13's protocol, run
    and scored, scorecard written to `eval/` beside this
    doc.
+
+**Post-gate, named now so substrate-first has a
+terminus:** the first new-field build after the §13 gate
+passes is the **book-facts stage** — ending guarantee +
+trigger depth — riding the §4 contract and registered in
+§6.4's taxonomy. It is sequenced *after* the gate, not
+inside it: the gate's signals are untouched by its
+existence, and no field ships on a substrate that has
+not passed.
 
 ---
 
@@ -1887,10 +2351,13 @@ the pipeline computes is not a retention layer.
    fresh parse of each gate EPUB vs corpus — every
    chapter hash equal, root hashes equal, passage slice
    identity 100%. Any mismatch fails the build.
-2. **Sourcing identity.** (a) Chapter-object identity:
-   corpus-sourced acquisition returns chapter hashes
-   identical to file-sourced acquisition, per book —
-   deterministic and absolute. (b) Replay on one snapshot
+2. **Sourcing identity.** (a) Acquisition-surface
+   identity: corpus-sourced acquisition returns chapter
+   hashes identical to file-sourced acquisition, per
+   book — and the rest of the :15121 block's output
+   surface with them (`word_count`, the chapter-detection
+   fallback diagnostics; §11 slice 5) — deterministic and
+   absolute. (b) Replay on one snapshot
    per book, G flag on, retrieval corpus-sourced vs
    payload-sourced: retrieval *candidates* identical
    (pre-judge, deterministic); deterministic sections of
@@ -1928,7 +2395,13 @@ the pipeline computes is not a retention layer.
    a one-word-substituted line fails closed; a genuine
    Daemon line proposed for Freedom™ never verifies;
    budget exhaustion during a poll ⇒ no signature ships
-   and the run is otherwise unaffected.
+   and the run is otherwise unaffected. A
+   verified-but-fragment candidate ⇒ ineligible for
+   signature selection (§10.1's sentence-boundary rule);
+   a human-legitimate elided quote ⇒ fails closed — the
+   accepted trade, confirmed on the record; a quote from
+   a chapter with its own heading ⇒ the payload label is
+   the heading, not the index (§10.6).
 8. **Stage accounting.** Re-running a stage over
    unchanged inputs writes nothing (dump-hash over the
    stage's key space identical) and reports reuse;
