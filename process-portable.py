@@ -3397,22 +3397,21 @@ def _register_corpus_db(db):
 
 
 def _corpus_db_for(learn_dir, mode="processor"):
-    """The corpus handle for a learn dir in the given mode, or None
-    when the dir has no corpus.db (open NEVER creates one, §1.1
-    (c)). A registered handle in a different mode is closed and
-    re-opened in the requested mode — a handle's mode is its write
-    authority, never silently widened."""
+    """The corpus handle for a learn dir, or None when the dir has
+    no corpus.db (open NEVER creates one, §1.1 (c)). The mode
+    applies when this call opens the handle; a handle's mode is
+    its write authority, enforced by its own write_txn."""
     if learn_dir is None:
         return None
     key = str(Path(learn_dir).resolve())
     with _CORPUS_DBS_LOCK:
         db = _CORPUS_DBS.get(key)
     if db is not None:
-        if db.mode == mode:
-            return db
-        db.close()
-        with _CORPUS_DBS_LOCK:
-            _CORPUS_DBS.pop(key, None)
+        # One handle per process per learn dir: a registered handle
+        # is returned as-is — its construction mode governs its own
+        # writes (write_txn checks the handle's mode, not the
+        # requester's), and a CLI process runs in one mode anyway.
+        return db
     if not (Path(learn_dir) / _CORPUS_DB_NAME).exists():
         return None
     return CorpusDB.open(learn_dir, mode=mode)
@@ -3425,6 +3424,596 @@ def _close_corpus_dbs():
         _CORPUS_DBS.clear()
     for db in dbs:
         db.close()
+
+
+
+
+# ---------------------------------------------------------------------------
+# Corpus ingest — the importer mode (corpus-design §3). Acquisition is
+# separated from analysis: --ingest parses a book ONCE, through the
+# pipeline's own parse functions in the same order process_file_v2
+# calls them (§3.1 — there is no second parser to drift), and stores
+# chapter text, passage spans, and the FTS index in corpus.db.
+# Ingest runs no model: the same file under the same parser version
+# ingests to the same corpus, bit for bit, on any machine.
+# ---------------------------------------------------------------------------
+
+_CORPUS_BOOK_SUFFIXES = (".epub", ".mobi", ".azw3")
+
+
+class CorpusIngestError(RuntimeError):
+    """An ingest failed in a way the state machine records as
+    outcome='failed' (losslessness self-check, no chapters)."""
+
+
+def _corpus_sha256(data):
+    import hashlib as _hl
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    return _hl.sha256(data).hexdigest()
+
+
+def _corpus_text_hash(text):
+    return _corpus_sha256(text or "")
+
+
+def _corpus_root_hash(chapter_hashes):
+    """Root hash over the ORDERED chapter hashes (§3.2)."""
+    return _corpus_sha256("\n".join(chapter_hashes))
+
+
+def _corpus_passage_id(fingerprint, chapter_index, start, end):
+    """Content-derived passage identity (§1.4): the same book under
+    the same versions produces the same ids; a window-format change
+    produces a new passage population, stated in the ids."""
+    raw = "\x1f".join([str(fingerprint), str(chapter_index),
+                       str(start), str(end), _CORPUS_WINDOW_FORMAT])
+    return _corpus_sha256(raw)[:32]
+
+
+def _corpus_now():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _corpus_parse_book(fpath):
+    """Parse a book exactly as process_file_v2's acquisition block
+    does — same functions, same order, same diagnostics (§3.1).
+    Returns a dict, or None when the format yields no text."""
+    fpath = Path(fpath)
+    if fpath.suffix.lower() == ".epub":
+        _DIAG.chapter_detection_fallback = False  # reset per book
+        units, title, author, identifiers = extract_epub_units(fpath)
+        chapters = split_chapters(units)
+        fallback = bool(getattr(_DIAG, "chapter_detection_fallback",
+                                False))
+        word_count = sum(len(u["text"].split()) for u in units)
+    else:
+        extracted = read_ebook(fpath)
+        if extracted is None:
+            return None
+        text, title, author, identifiers = extracted
+        _DIAG.chapter_detection_fallback = False  # reset per book
+        chapters = _prose_chapters(text)
+        fallback = bool(getattr(_DIAG, "chapter_detection_fallback",
+                                False))
+        word_count = len(text.split())
+    chapters = sorted(chapters, key=lambda c: c.get("index", 0))
+    return {"chapters": chapters, "title": title, "author": author,
+            "identifiers": identifiers or {},
+            "word_count": word_count,
+            "chapter_detection_fallback": fallback,
+            "source_name": fpath.name}
+
+
+def _corpus_series_offline(fpath, identifiers):
+    """Series as resolved at ingest, from OFFLINE sources only —
+    _detect_series' flag/calibre/filename steps. The Open Library
+    step is a network call, and §3.1 makes acquisition deterministic
+    (same file + parser version -> same corpus on any machine); the
+    run's own _detect_series remains the processing-time authority.
+    Returns (name, index, source)."""
+    flag_name = (CONFIG.get("series_override") or "").strip()
+    if flag_name:
+        return flag_name, CONFIG.get("series_position_override"), "flag"
+    if identifiers:
+        s = (identifiers.get("series") or "").strip()
+        if s:
+            return s, identifiers.get("series_index"), "epub"
+    name, pos = _parse_series_from_filename(Path(fpath).name)
+    if name:
+        return name, pos, "filename"
+    return None, None, "none"
+
+
+def _corpus_fingerprint(parsed):
+    return _checkpoint_fingerprint(
+        parsed["identifiers"], parsed["title"], parsed["author"],
+        _checkpoint_text_sample(parsed["chapters"]))
+
+
+# -- consumer gates (§3.3: consumers gate on status, by family) ------
+
+def corpus_work_record(db, fingerprint):
+    rows = db.query(
+        "SELECT fingerprint, book_key, work_id, title, author, "
+        "identifiers, series, series_index, parser_version, "
+        "chapter_count, text_root_hash, source_hash, status, "
+        "ingested_at, updated_at, payload FROM corpus_works "
+        "WHERE fingerprint=?", (fingerprint,))
+    if not rows:
+        return None
+    cols = ("fingerprint", "book_key", "work_id", "title", "author",
+            "identifiers", "series", "series_index", "parser_version",
+            "chapter_count", "text_root_hash", "source_hash", "status",
+            "ingested_at", "updated_at", "payload")
+    return dict(zip(cols, rows[0]))
+
+
+def corpus_work_state(db, fingerprint):
+    """The composed state every consumer reads (§3.3): the stored
+    status, with staleness composed in — a work stamped by an older
+    parser generation is 'stale' whatever its stored status says."""
+    rec = corpus_work_record(db, fingerprint)
+    if rec is None:
+        return "absent"
+    if rec["status"] in ("ingesting", "failed"):
+        return rec["status"]
+    if rec["parser_version"] != CORPUS_PARSER_VERSION:
+        return "stale"
+    return rec["status"]
+
+
+def corpus_chapters_for(db, fingerprint):
+    """Chapter dicts for text consumers, or None. Text consumers
+    need >= text_complete under the current parser generation
+    (§3.3); a work in ingesting/failed/stale reads as absent."""
+    if corpus_work_state(db, fingerprint) not in (
+            "text_complete", "vectors_partial", "complete"):
+        return None
+    rows = db.query(
+        "SELECT chapter_index, label, text, is_frontmatter FROM "
+        "corpus_chapters WHERE fingerprint=? ORDER BY chapter_index",
+        (fingerprint,))
+    return [{"index": ci, "label": label, "text": text,
+             "is_frontmatter": bool(fm)} for ci, label, text, fm in rows]
+
+
+def corpus_retrieval_ready(db, fingerprint):
+    """Retrieval's gate (§3.3): only a complete work under the
+    current parser generation serves retrieval as a corpus; the
+    gap-filling fallback for lesser states is §4.4's, at the vector
+    layer, never a status shortcut here."""
+    return corpus_work_state(db, fingerprint) == "complete"
+
+
+# -- envelope (v1 sections; §6.4's refresh discipline) ---------------
+
+def _corpus_refresh_envelope_in_txn(db, conn, fingerprint):
+    """Refresh the corpus-sourced envelope sections (text, vectors)
+    INSIDE the caller's transaction — the refresh rides the write
+    that changes the facts (§6.4), so a payload can never pair a
+    new text generation with sections computed against the old
+    one. Other sections (written by later slices) are preserved."""
+    now = _corpus_now()
+    row = conn.execute(
+        "SELECT envelope FROM work_envelope WHERE fingerprint=?",
+        (fingerprint,)).fetchone()
+    env = {}
+    if row and row[0]:
+        try:
+            env = json.loads(row[0])
+        except (TypeError, ValueError):
+            env = {}
+    sections = env.setdefault("sections", {})
+    w = conn.execute(
+        "SELECT status, chapter_count FROM corpus_works "
+        "WHERE fingerprint=?", (fingerprint,)).fetchone()
+    status = w[0] if w else None
+    n_pass = conn.execute(
+        "SELECT COUNT(*) FROM corpus_passages WHERE fingerprint=?",
+        (fingerprint,)).fetchone()[0]
+    text_state = ("present" if status in (
+        "text_complete", "vectors_partial", "complete") else "unknown")
+    sections["text"] = {
+        "state": text_state, "stage": "ingest",
+        "model": "deterministic", "stage_version": CORPUS_PARSER_VERSION,
+        "updated_at": now, "scope": "edition",
+        "value": {"chapters": w[1] if w else 0, "passages": n_pass,
+                  "status": status}}
+    # Vectors is the normative coverage statement (A5): composed
+    # against the CURRENT (model, format) generation, never the
+    # bare ingest-time status.
+    gen = None
+    cur = db.meta_get("generation_current")
+    if cur:
+        try:
+            gen = json.loads(cur)
+        except (TypeError, ValueError):
+            gen = None
+    coverage = None
+    if gen is not None and n_pass:
+        n_vec = conn.execute(
+            "SELECT COUNT(*) FROM passage_vectors pv JOIN "
+            "corpus_passages p ON p.passage_id = pv.passage_id "
+            "WHERE p.fingerprint=? AND pv.model=? AND pv.format=?",
+            (fingerprint, gen.get("model"), gen.get("format"))
+            ).fetchone()[0]
+        coverage = round(n_vec / n_pass, 4)
+    sections["vectors"] = {
+        "state": "present" if coverage is not None else "unknown",
+        "stage": "embed", "model": (gen or {}).get("model"),
+        "stage_version": _CORPUS_VECTOR_FORMAT,
+        "updated_at": now, "scope": "edition",
+        "coverage": coverage,
+        "value": {"coverage": coverage,
+                  "generation": ({"model": gen.get("model"),
+                                  "format": gen.get("format")}
+                                 if gen else None)}}
+    conn.execute(
+        "INSERT OR REPLACE INTO work_envelope (fingerprint, corpus_v,"
+        " envelope, computed_at) VALUES (?, ?, ?, ?)",
+        (fingerprint, CORPUS_V, json.dumps(env, ensure_ascii=False),
+         now))
+
+
+# -- ingest steps ------------------------------------------------------
+
+def _corpus_ingest_bookkeeping(db, parsed, fingerprint, source_hash,
+                               reason=""):
+    """A9: the bookkeeping — the corpus_works row at 'ingesting'
+    plus its ingest_runs row — commits in its OWN small transaction
+    BEFORE phase 1 begins. A crash afterwards leaves the 'ingesting'
+    row as observable evidence instead of silence, and the next
+    ingest of the fingerprint re-enters idempotently (§3.3)."""
+    now = _corpus_now()
+    ids = parsed["identifiers"]
+    prior = db.query(
+        "SELECT status, parser_version FROM corpus_works "
+        "WHERE fingerprint=?", (fingerprint,))
+    detail = {"reason": reason or None, "source_name":
+              parsed["source_name"], "source_hash": source_hash}
+    if prior and prior[0][1] and prior[0][1] != CORPUS_PARSER_VERSION:
+        detail["supersedes"] = {"parser_version": prior[0][1]}
+    series, series_index, _src = _corpus_series_offline(
+        parsed["source_name"], ids)
+    book_key = staging_work_key(
+        isbn=ids.get("isbn") or ids.get("asin"),
+        title=parsed["title"] or "", author=parsed["author"] or "")
+    with db.write_txn("text") as conn:
+        cur = conn.execute(
+            "INSERT INTO ingest_runs (fingerprint, started, finished,"
+            " parser_version, embed_model, outcome, detail) VALUES "
+            "(?, ?, NULL, ?, NULL, NULL, ?)",
+            (fingerprint, now, CORPUS_PARSER_VERSION,
+             json.dumps(detail, ensure_ascii=False)))
+        run_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO corpus_works (fingerprint, book_key, title,"
+            " author, identifiers, series, series_index, status,"
+            " ingested_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?,"
+            " 'ingesting', ?, ?) "
+            "ON CONFLICT(fingerprint) DO UPDATE SET book_key="
+            "excluded.book_key, title=excluded.title, author="
+            "excluded.author, identifiers=excluded.identifiers, "
+            "series=excluded.series, series_index="
+            "excluded.series_index, status='ingesting', updated_at="
+            "excluded.updated_at, ingested_at=COALESCE("
+            "corpus_works.ingested_at, excluded.ingested_at)",
+            (fingerprint, book_key, parsed["title"], parsed["author"],
+             json.dumps(ids, ensure_ascii=False), series, series_index,
+             now, now))
+    return run_id, (prior[0][0] if prior else None)
+
+
+def _corpus_fts_integrity_ok(conn):
+    """A7's gate, as a seam: FTS5's own integrity-check over
+    corpus_fts. A mismatch fails the ingest exactly as a hash
+    mismatch does (§3.2 step 4)."""
+    try:
+        conn.execute(
+            "INSERT INTO corpus_fts(corpus_fts) "
+            "VALUES ('integrity-check')")
+        return True
+    except Exception:
+        return False
+
+
+def _corpus_selfcheck_in_txn(db, conn, fingerprint, chapters,
+                             root_hash):
+    """§3.2's losslessness self-check, inside the phase-1
+    transaction, before the work may flip to text_complete:
+    re-read + re-hash every chapter, recompute the root, re-slice
+    EVERY passage span (100%, A2), and run FTS integrity-check."""
+    rows = conn.execute(
+        "SELECT chapter_index, text, text_hash FROM corpus_chapters "
+        "WHERE fingerprint=? ORDER BY chapter_index",
+        (fingerprint,)).fetchall()
+    if len(rows) != len(chapters):
+        raise CorpusIngestError(
+            f"self-check: stored {len(rows)} chapters, parsed "
+            f"{len(chapters)}")
+    texts = {}
+    stored_hashes = []
+    for ci, text, th in rows:
+        if _corpus_text_hash(text) != th:
+            raise CorpusIngestError(
+                f"self-check: chapter {ci} text hash mismatch")
+        texts[ci] = text
+        stored_hashes.append(th)
+    if _corpus_root_hash(stored_hashes) != root_hash:
+        raise CorpusIngestError("self-check: root hash mismatch")
+    for ci, start, end, th in conn.execute(
+            "SELECT chapter_index, start_offset, end_offset, "
+            "text_hash FROM corpus_passages WHERE fingerprint=?",
+            (fingerprint,)):
+        span = texts[ci][start:end]
+        if _corpus_text_hash(span) != th:
+            raise CorpusIngestError(
+                f"self-check: passage slice mismatch in chapter {ci}")
+    if db.fts_available and not _corpus_fts_integrity_ok(conn):
+        raise CorpusIngestError("self-check: FTS integrity-check "
+                                "failed")
+
+
+def _corpus_phase1_write(db, parsed, fingerprint, source_hash):
+    """Phase 1 (one transaction, §3.3): chapters + passages against
+    the pre-committed bookkeeping row; the previous generation's
+    passages and their vectors are deleted in the same transaction
+    (§3.4 — superseded generations do not accumulate); FTS rows
+    follow via triggers (A7). The §3.2 self-check runs before the
+    status flip; any failure rolls the whole book back."""
+    chapters = parsed["chapters"]
+    hashes = [_corpus_text_hash(ch["text"]) for ch in chapters]
+    root = _corpus_root_hash(hashes)
+    n_passages = 0
+    with db.write_txn("text") as conn:
+        conn.execute(
+            "DELETE FROM passage_vectors WHERE passage_id IN "
+            "(SELECT passage_id FROM corpus_passages "
+            "WHERE fingerprint=?)", (fingerprint,))
+        conn.execute("DELETE FROM corpus_passages WHERE fingerprint=?",
+                     (fingerprint,))
+        conn.execute("DELETE FROM corpus_chapters WHERE fingerprint=?",
+                     (fingerprint,))
+        for ch, th in zip(chapters, hashes):
+            ci = ch.get("index")
+            text = ch["text"]
+            conn.execute(
+                "INSERT INTO corpus_chapters (fingerprint, "
+                "chapter_index, label, text, text_hash, char_count, "
+                "word_count, is_frontmatter) VALUES (?, ?, ?, ?, ?, "
+                "?, ?, ?)",
+                (fingerprint, ci, ch.get("label"), text, th,
+                 len(text), len(text.split()),
+                 1 if ch.get("is_frontmatter") else 0))
+            for w in _evidence_windows(text):
+                start = w["offset"]
+                end = start + len(w["text"])
+                conn.execute(
+                    "INSERT INTO corpus_passages (passage_id, "
+                    "fingerprint, chapter_index, start_offset, "
+                    "end_offset, text_hash) VALUES (?, ?, ?, ?, ?, ?)",
+                    (_corpus_passage_id(fingerprint, ci, start, end),
+                     fingerprint, ci, start, end,
+                     _corpus_text_hash(w["text"])))
+                n_passages += 1
+        payload = {
+            "chapter_detection_fallback":
+                parsed["chapter_detection_fallback"],
+            "word_count": parsed["word_count"],
+            "source_name": parsed["source_name"],
+            "series_source": _corpus_series_offline(
+                parsed["source_name"], parsed["identifiers"])[2],
+        }
+        conn.execute(
+            "UPDATE corpus_works SET chapter_count=?, "
+            "text_root_hash=?, source_hash=?, parser_version=?, "
+            "status='text_complete', payload=?, updated_at=? "
+            "WHERE fingerprint=?",
+            (len(chapters), root, source_hash, CORPUS_PARSER_VERSION,
+             json.dumps(payload, ensure_ascii=False), _corpus_now(),
+             fingerprint))
+        _corpus_selfcheck_in_txn(db, conn, fingerprint, chapters, root)
+        _corpus_refresh_envelope_in_txn(db, conn, fingerprint)
+    return {"chapters": len(chapters), "passages": n_passages,
+            "text_root_hash": root}
+
+
+def _corpus_finalize_run(db, run_id, outcome, detail):
+    """Close out an ingest_runs row, MERGING the outcome detail into
+    the bookkeeping detail (reason, source, supersession record) —
+    the run's forensic record keeps both halves (§3.4)."""
+    with db.write_txn("text") as conn:
+        row = conn.execute(
+            "SELECT detail FROM ingest_runs WHERE id=?",
+            (run_id,)).fetchone()
+        merged = {}
+        if row and row[0]:
+            try:
+                merged = json.loads(row[0])
+            except (TypeError, ValueError):
+                merged = {}
+        merged.update(detail)
+        conn.execute(
+            "UPDATE ingest_runs SET finished=?, outcome=?, detail=? "
+            "WHERE id=?",
+            (_corpus_now(), outcome,
+             json.dumps(merged, ensure_ascii=False), run_id))
+
+
+def corpus_ingest_book(db, fpath, reason="", force=False,
+                       embedder=None):
+    """Ingest one book file into the corpus (§3). Returns a result
+    dict {fingerprint, outcome, chapters, passages, detail,
+    source_name}; outcome is noop | partial | complete | failed.
+    With no embedder the ingest stops at text_complete (outcome
+    'partial' — vectors pending); slice 3's command wiring passes
+    the real embedder for phase 2."""
+    fpath = Path(fpath)
+    result = {"fingerprint": None, "outcome": "failed",
+              "source_name": fpath.name, "chapters": 0, "passages": 0,
+              "detail": None}
+    try:
+        parsed = _corpus_parse_book(fpath)
+    except Exception as e:
+        parsed = None
+        result["detail"] = f"parse failed: {e}"
+    if parsed is None or not parsed["chapters"]:
+        if parsed is not None:
+            result["detail"] = "no chapters extracted"
+        try:
+            with db.write_txn("text") as conn:
+                conn.execute(
+                    "INSERT INTO ingest_runs (fingerprint, started, "
+                    "finished, parser_version, embed_model, outcome, "
+                    "detail) VALUES (NULL, ?, ?, ?, NULL, 'failed', "
+                    "?)",
+                    (_corpus_now(), _corpus_now(),
+                     CORPUS_PARSER_VERSION,
+                     json.dumps({"source_name": fpath.name,
+                                 "error": result["detail"]},
+                                ensure_ascii=False)))
+        except Exception:
+            pass
+        return result
+    fingerprint = _corpus_fingerprint(parsed)
+    result["fingerprint"] = fingerprint
+    source_hash = _corpus_sha256(fpath.read_bytes())
+    rec = corpus_work_record(db, fingerprint)
+    if (not force and rec is not None
+            and rec["source_hash"] == source_hash
+            and rec["parser_version"] == CORPUS_PARSER_VERSION
+            and rec["status"] in ("text_complete", "vectors_partial",
+                                  "complete")):
+        result.update({"outcome": "noop",
+                       "chapters": rec["chapter_count"] or 0,
+                       "passages": db.query(
+                           "SELECT COUNT(*) FROM corpus_passages "
+                           "WHERE fingerprint=?",
+                           (fingerprint,))[0][0],
+                       "detail": "already ingested, parser v"
+                                 f"{rec['parser_version']}, "
+                                 f"{rec['ingested_at']}"})
+        return result
+    run_id, prior_status = _corpus_ingest_bookkeeping(
+        db, parsed, fingerprint, source_hash, reason=reason)
+    try:
+        stats = _corpus_phase1_write(db, parsed, fingerprint,
+                                     source_hash)
+    except Exception as e:
+        # The phase-1 transaction rolled back: no partial book is
+        # committed. Restore the pre-attempt status when a previous
+        # generation survives intact; a first ingest reads 'failed'.
+        with db.write_txn("text") as conn:
+            conn.execute(
+                "UPDATE corpus_works SET status=? WHERE fingerprint=?",
+                (prior_status or "failed", fingerprint))
+            row = conn.execute(
+                "SELECT detail FROM ingest_runs WHERE id=?",
+                (run_id,)).fetchone()
+            merged = {}
+            if row and row[0]:
+                try:
+                    merged = json.loads(row[0])
+                except (TypeError, ValueError):
+                    merged = {}
+            merged.update({"error": str(e)})
+            conn.execute(
+                "UPDATE ingest_runs SET finished=?, outcome='failed'"
+                ", detail=? WHERE id=?",
+                (_corpus_now(),
+                 json.dumps(merged, ensure_ascii=False), run_id))
+        result["detail"] = str(e)
+        return result
+    result.update(stats)
+    if embedder is not None:
+        outcome = corpus_embed_work(db, fingerprint, embedder,
+                                    run_id=run_id)
+        result["outcome"] = outcome
+    else:
+        _corpus_finalize_run(db, run_id, "partial", {
+            "source_name": parsed["source_name"], "phases": [1],
+            "vectors": "pending", "reason": reason or None,
+            "chapters": stats["chapters"],
+            "passages": stats["passages"]})
+        result["outcome"] = "partial"
+    return result
+
+
+def corpus_remove_work(db, fingerprint):
+    """--corpus-remove (A10, §3.4): ONE transaction across every
+    corpus table keyed by the fingerprint — works, chapters,
+    passages, vectors, stage runs and outputs, quotes, envelope —
+    with per-table counts. Partial removal is not offered: an
+    orphaned stage output or quote would resurrect on re-ingest.
+    Removal never cascades into state.db. ingest_runs rows stay:
+    they are the forensic record of what was ingested when."""
+    if db.mode == "report":
+        raise CorpusWriteRefused(
+            "a report-mode handle cannot remove a corpus work")
+    counts = {}
+    with db.write_txn() as conn:
+        for table in ("passage_vectors", "corpus_passages",
+                      "corpus_chapters", "stage_outputs",
+                      "stage_runs", "quotes", "work_envelope",
+                      "corpus_works"):
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE fingerprint=?",
+                (fingerprint,))
+            counts[table] = cur.rowcount
+    return counts
+
+
+def cmd_ingest(paths, learn_dir=None, reason="", force=False):
+    """--ingest (file|dir): importer mode, then exit (§3.1). A
+    directory ingests every supported book file in it (sorted,
+    per-book outcome lines, failures isolated per book)."""
+    d = (Path(learn_dir) if learn_dir
+         else Path(os.path.expanduser("~")) / ".ebook-processor"
+         / "learned")
+    db = CorpusDB.create(d, mode="importer")
+    files = []
+    for p in paths:
+        p = Path(p)
+        if p.is_dir():
+            files.extend(sorted(
+                f for f in p.iterdir()
+                if f.is_file()
+                and f.suffix.lower() in _CORPUS_BOOK_SUFFIXES))
+        elif p.is_file():
+            files.append(p)
+        else:
+            print(f"  --ingest: no such file or directory: {p}")
+    results = []
+    for f in files:
+        r = corpus_ingest_book(db, f, reason=reason, force=force)
+        fp8 = (r["fingerprint"] or "????????")[:8]
+        line = (f"  {r['source_name']}: {r['outcome']} [{fp8}] "
+                f"{r['chapters']} chapters, {r['passages']} passages")
+        if r["outcome"] == "failed" and r["detail"]:
+            line += f" — {r['detail']}"
+        print(line)
+        results.append(r)
+    return results
+
+
+def cmd_corpus_remove(fingerprint, learn_dir=None):
+    """--corpus-remove <fingerprint>: the named, printed removal
+    act (A10). Human-invoked only; never cascades into state.db."""
+    d = (Path(learn_dir) if learn_dir
+         else Path(os.path.expanduser("~")) / ".ebook-processor"
+         / "learned")
+    db = _corpus_db_for(d, mode="importer")
+    if db is None:
+        print(f"  No corpus in {d} — nothing to remove.")
+        return
+    if corpus_work_record(db, fingerprint) is None:
+        print(f"  No corpus work with fingerprint {fingerprint}.")
+        return
+    counts = corpus_remove_work(db, fingerprint)
+    parts = ", ".join(f"{t} {n}" for t, n in counts.items() if n)
+    print(f"  Removed corpus work {fingerprint}: {parts}.")
 
 
 # ---------------------------------------------------------------------------
@@ -17819,6 +18408,25 @@ def _build_parser():
                          "vector coverage vs the current generation, "
                          "quotes, sizes; corpus design §7.4) and exit "
                          "(no books processed)")
+    g_learn.add_argument("--ingest", metavar="PATH", default=None,
+                    help="importer mode: ingest a book file (or every "
+                         "supported book in a directory) into the "
+                         "corpus store (corpus.db), then exit; "
+                         "deterministic, runs no model (corpus "
+                         "design §3)")
+    g_learn.add_argument("--ingest-reason", metavar="TEXT", default="",
+                    help="reason recorded on the ingest run "
+                         "(deliberate-refresh bookkeeping, §3.4)")
+    g_learn.add_argument("--ingest-force", action="store_true",
+                    help="with --ingest: re-run phase 1 even when "
+                         "the work is already ingested at the current "
+                         "parser version (the §3.4 force refresh)")
+    g_learn.add_argument("--corpus-remove", metavar="FINGERPRINT",
+                    default=None,
+                    help="remove one work (all its corpus rows, "
+                         "one transaction, counts printed; A10) "
+                         "from the corpus store and exit; never "
+                         "touches state.db")
     g_learn.add_argument("--calibration-report", action="store_true",
                     help="print the threshold calibration report "
                          "(per-trigger kept/dropped score "
@@ -17981,6 +18589,17 @@ def main():
     if args.corpus_status:
         load_config()
         cmd_corpus_status(args.learn_dir or None, as_json=args.json)
+        return
+    if args.ingest:
+        load_config()
+        cmd_ingest([args.ingest], learn_dir=args.learn_dir or None,
+                   reason=args.ingest_reason or "",
+                   force=args.ingest_force)
+        return
+    if args.corpus_remove:
+        load_config()
+        cmd_corpus_remove(args.corpus_remove,
+                          learn_dir=args.learn_dir or None)
         return
     if args.calibration_report:
         load_config()
