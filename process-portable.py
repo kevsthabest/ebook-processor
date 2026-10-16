@@ -4200,6 +4200,41 @@ def _corpus_generation_suspect(db, model, fmt=_CORPUS_VECTOR_FORMAT):
 
 # -- phase 2: embedding (§3.3) -----------------------------------------
 
+def _corpus_note_embed_stop(db, run_id, fingerprint, reason):
+    """Surface why a work's embedding stopped: one printed line for
+    the operator watching the run, and the reason merged into the
+    run row's detail (the "embed_error" key) for later inspection.
+    The exception text is the only diagnostic a real endpoint
+    offers — embed_vectors' carries the HTTP status and the
+    server's own error body — and discarding it once turned a
+    one-character model-name typo into a multi-round blind
+    diagnosis. The record is written at stop time, not at finalize,
+    because on the ingest path the caller finalizes this row
+    afterwards and its merge preserves keys it does not own. The
+    write is best-effort and never raises: bookkeeping must not
+    change the outcome the phase returns."""
+    print(f"  [{fingerprint[:8]}] embed stopped: {reason}")
+    if run_id is None:
+        return
+    try:
+        with db.write_txn("text") as conn:
+            row = conn.execute(
+                "SELECT detail FROM ingest_runs WHERE id=?",
+                (run_id,)).fetchone()
+            merged = {}
+            if row and row[0]:
+                try:
+                    merged = json.loads(row[0])
+                except (TypeError, ValueError):
+                    merged = {}
+            merged["embed_error"] = reason
+            conn.execute(
+                "UPDATE ingest_runs SET detail=? WHERE id=?",
+                (json.dumps(merged, ensure_ascii=False), run_id))
+    except Exception:
+        pass
+
+
 def corpus_embed_work(db, fingerprint, embed_fn, model,
                       fmt=_CORPUS_VECTOR_FORMAT, run_id=None):
     """Embed every passage of a work that lacks a current-stamp
@@ -4210,7 +4245,9 @@ def corpus_embed_work(db, fingerprint, embed_fn, model,
     leaves vectors_partial with the landed rows committed, and
     resume is gap-filling by content key. Returns 'complete' |
     'partial' | 'suspect' (canary drift: nothing is embedded into
-    a suspect generation)."""
+    a suspect generation). Wherever embedding stops early, the
+    reason is surfaced via _corpus_note_embed_stop — a failure
+    whose reason is discarded cannot be diagnosed from outside."""
     own_run = run_id is None
     if own_run:
         with db.write_txn() as conn:
@@ -4228,7 +4265,10 @@ def corpus_embed_work(db, fingerprint, embed_fn, model,
             try:
                 gen = _corpus_generation_birth(db, embed_fn, model,
                                                fmt)
-            except Exception:
+            except Exception as e:
+                _corpus_note_embed_stop(
+                    db, run_id, fingerprint,
+                    f"canary birth failed: {e}")
                 return "partial"
         elif gen.get("canary") == "suspect" or (
                 (str(db.path), model, fmt)
@@ -4251,12 +4291,22 @@ def corpus_embed_work(db, fingerprint, embed_fn, model,
             texts = [chapters[ci][s:e] for _pid, ci, s, e in batch]
             try:
                 vecs = embed_fn(texts)
-            except Exception:
+            except Exception as e:
+                _corpus_note_embed_stop(
+                    db, run_id, fingerprint, f"embedder failed: {e}")
                 break  # landed batches stay committed (§3.3)
             if len(vecs) != len(texts) or not vecs:
+                _corpus_note_embed_stop(
+                    db, run_id, fingerprint,
+                    f"embedder returned {len(vecs)} vectors for "
+                    f"{len(texts)} passages")
                 break
             dim = len(vecs[0])
             if any(len(v) != dim for v in vecs):
+                _corpus_note_embed_stop(
+                    db, run_id, fingerprint,
+                    "embedder returned inconsistent vector "
+                    "dimensions in one batch")
                 break
             with db.write_txn("vectors") as conn:
                 for (pid, _ci, _s, _e), vec in zip(batch, vecs):

@@ -8,6 +8,7 @@ resume, and phase 2 completing the ingest state machine.
 """
 import hashlib
 import importlib.util
+import io
 import json
 import sqlite3
 import tempfile
@@ -23,6 +24,7 @@ import sys  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_corpus_ingest import _make_epub, _fixture_files  # noqa: E402
+from contextlib import redirect_stdout  # noqa: E402
 
 _DIM = 8
 _MODEL = "fake-embed-v1"
@@ -316,6 +318,118 @@ class TestSearch(_Base):
             engine="pure")
         self.assertEqual(out[0][0], pid)
         self.assertAlmostEqual(out[0][1], 1.0, places=5)
+
+
+class TestEmbedFailureSurfacing(_Base):
+    """A stopped embed phase must SAY why — printed for the operator
+    watching the run, and recorded in the run row's detail for later
+    inspection. The exception text is the only diagnostic a real
+    endpoint offers (for embed_vectors it carries the HTTP status
+    and the server's own error body); discarding it once cost a
+    multi-round blind diagnosis over a one-character model-name
+    typo. Outcomes and statuses stay exactly as the silent version
+    behaved — these tests pin surfacing, not new semantics."""
+
+    def _last_run_detail(self):
+        rows = self.db.query(
+            "SELECT detail FROM ingest_runs WHERE fingerprint=? "
+            "ORDER BY id DESC LIMIT 1", (self.fp,))
+        return json.loads(rows[0][0])
+
+    def _canary_then(self, fn):
+        """Wrap fn so call 1 (the generation-birth canary embed)
+        succeeds and every later call — the passage batches — is
+        fn's to misbehave on."""
+        calls = {"n": 0}
+
+        def wrapper(texts):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return fake_embed(texts)
+            return fn(texts)
+
+        return wrapper
+
+    def test_batch_failure_surfaces_reason(self):
+        def dies(texts):
+            raise RuntimeError(
+                "http://127.0.0.1:8888/v1/embeddings -> HTTP 404: "
+                "{\"error\": {\"code\": \"model_not_found\"}}")
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            outcome = self.embed(fn=self._canary_then(dies))
+        self.assertEqual(outcome, "partial")
+        self.assertIn("model_not_found", out.getvalue())
+        self.assertIn("model_not_found",
+                      self._last_run_detail()["embed_error"])
+
+    def test_birth_failure_surfaces_reason(self):
+        def always_dies(texts):
+            raise RuntimeError("endpoint exploded")
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            outcome = self.embed(fn=always_dies)
+        self.assertEqual(outcome, "partial")
+        # Nothing embedded and no status movement — the behaviour
+        # is unchanged, only the silence is gone.
+        self.assertEqual(self.db.query(
+            "SELECT COUNT(*) FROM passage_vectors WHERE "
+            "fingerprint=?", (self.fp,))[0][0], 0)
+        self.assertEqual(pp.corpus_work_state(self.db, self.fp),
+                         "text_complete")
+        self.assertIn("endpoint exploded", out.getvalue())
+        self.assertIn("endpoint exploded",
+                      self._last_run_detail()["embed_error"])
+
+    def test_wrong_count_surfaces_reason(self):
+        def short_count(texts):
+            return fake_embed(texts)[:-1]
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            outcome = self.embed(fn=self._canary_then(short_count))
+        self.assertEqual(outcome, "partial")
+        self.assertIn("vectors",
+                      self._last_run_detail()["embed_error"])
+        self.assertIn("embed stopped", out.getvalue())
+
+    def test_dim_mismatch_surfaces_reason(self):
+        def ragged(texts):
+            vecs = fake_embed(texts)
+            return [vecs[0][:-1]] + vecs[1:]
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            outcome = self.embed(fn=self._canary_then(ragged))
+        self.assertEqual(outcome, "partial")
+        self.assertIn("dimension",
+                      self._last_run_detail()["embed_error"])
+
+    def test_ingest_path_reason_survives_finalize(self):
+        # On the ingest path the caller finalizes the run row AFTER
+        # phase 2, merging its own detail keys over the row — the
+        # recorded reason must survive that merge, alongside the
+        # caller's keys.
+        book2 = _make_epub(self.dir / "third.epub", _fixture_files(),
+                           title="Third Book", isbn="9780525951630")
+
+        def dies(texts):
+            raise RuntimeError("HTTP 500: embedding backend gone")
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            res = pp.corpus_ingest_book(
+                self.db, book2,
+                embedder=(self._canary_then(dies), _MODEL))
+        self.assertEqual(res["outcome"], "partial")
+        row = self.db.query(
+            "SELECT detail FROM ingest_runs WHERE fingerprint=?",
+            (res["fingerprint"],))[0]
+        detail = json.loads(row[0])
+        self.assertIn("embedding backend gone", detail["embed_error"])
+        self.assertEqual(detail["phases"], [1, 2])
 
 
 if __name__ == "__main__":
