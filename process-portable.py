@@ -55,6 +55,7 @@ import os
 import posixpath
 import re
 import shutil
+import sqlite3
 import struct
 import sys
 import threading
@@ -2569,6 +2570,413 @@ class DecisionValidator:
 
 
 # ---------------------------------------------------------------------------
+# The measurement spine: SQLite state substrate (eval/spine-design.md).
+#
+# One local SQLite database (stdlib sqlite3 — no dependency, identical
+# on Windows and Linux) replaces the JSON persistence layer beneath
+# LearnedState, StagingState and the per-work RosterStore files. THE
+# STORES KEEP THEIR IN-MEMORY MODELS AND ALL DECISION LOGIC; only the
+# persistence seam changes (design §3.2, OC-2). Keys and counters are
+# promoted to columns so the spine's queries (§3.4) are SQL; nested
+# per-entry records ride as JSON payload columns, sufficient with the
+# columns to reconstruct each store's dict EXACTLY (round-trip is
+# pinned by tests). The spine decides nothing about any claim.
+#
+# A learn dir uses the substrate iff state.db is present in it.
+# Migration (spine slice 2) creates state.db from the JSON stores,
+# triggered from main() on the first run on the new code (OC-7) —
+# bare store construction never creates one, so JSON-mode behaviour
+# is byte-identical until migration.
+#
+# Failure posture (design §3.8, at least as safe as the JSON status
+# quo): every save is a transaction; quick_check on open; corruption
+# gets the F8 discipline (loud warning, original bytes preserved as
+# .corrupt incl. WAL sidecars, stores start empty, NO automatic
+# restore — recovery is a human act). Before the first write in a
+# process, the DB is copied to state.db.bak via SQLite's backup API
+# (Advisor A2 — under WAL a raw file copy can miss the WAL tail).
+# ---------------------------------------------------------------------------
+
+SUBSTRATE_SCHEMA_VERSION = 1
+_STATE_DB_NAME = "state.db"
+_STATE_DB_MIGRATING_NAME = "state.db.migrating"
+_STATE_DB_BAK_NAME = "state.db.bak"
+
+_SUBSTRATE_DDL = [
+    "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)",
+    # LearnedState (mirrors the four JSON files + series tree).
+    """CREATE TABLE IF NOT EXISTS learned_nicknames (
+         nkey TEXT PRIMARY KEY, full TEXT, count INTEGER,
+         books TEXT, human INTEGER, manual INTEGER, payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS learned_titles (
+         title TEXT PRIMARY KEY, count INTEGER, rests TEXT,
+         payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS learned_threshold_stats (
+         trigger TEXT PRIMARY KEY, kept TEXT, dropped TEXT)""",
+    """CREATE TABLE IF NOT EXISTS learned_rejected_tropes (
+         trej_key TEXT PRIMARY KEY, count INTEGER, books TEXT,
+         reasons TEXT, human INTEGER, payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS series_state (
+         series_key TEXT PRIMARY KEY, payload TEXT)""",
+    # StagingState.
+    """CREATE TABLE IF NOT EXISTS staging_works (
+         work_key TEXT PRIMARY KEY, work_id TEXT, title TEXT,
+         author TEXT, runs_completed INTEGER, staged_ever INTEGER,
+         payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS staging_claims (
+         work_key TEXT, claim_key TEXT, class TEXT, display TEXT,
+         state TEXT, promoted_run INTEGER, promoted_via TEXT,
+         best_chapters INTEGER, evidence_ever INTEGER,
+         first_seen TEXT, last_seen TEXT, sightings TEXT,
+         name_forms TEXT, payload TEXT,
+         PRIMARY KEY (work_key, claim_key))""",
+    """CREATE TABLE IF NOT EXISTS staging_expired (
+         work_key TEXT, claim_key TEXT, expired_run INTEGER,
+         sightings TEXT, payload TEXT)""",
+    # RosterStore (work_key is the partition).
+    """CREATE TABLE IF NOT EXISTS roster_works (
+         work_key TEXT PRIMARY KEY, work_id TEXT, title TEXT,
+         author TEXT, runs_completed INTEGER,
+         last_run_fingerprint TEXT, next_entity_seq INTEGER,
+         minted_total INTEGER, payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS roster_entities (
+         work_key TEXT, entity_id TEXT, status TEXT, canonical TEXT,
+         payload TEXT, PRIMARY KEY (work_key, entity_id))""",
+    """CREATE TABLE IF NOT EXISTS roster_retired (
+         work_key TEXT, entity_id TEXT, payload TEXT,
+         PRIMARY KEY (work_key, entity_id))""",
+    """CREATE TABLE IF NOT EXISTS roster_no_pairs (
+         work_key TEXT, a_key TEXT, b_key TEXT, source TEXT,
+         payload TEXT, PRIMARY KEY (work_key, a_key, b_key))""",
+    """CREATE TABLE IF NOT EXISTS roster_adoptions (
+         work_key TEXT, seq INTEGER, payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS roster_anchor_retirements (
+         work_key TEXT, entity_id TEXT, run INTEGER, payload TEXT)""",
+    # Spine tables (design §3.5).
+    """CREATE TABLE IF NOT EXISTS snapshots (
+         snapshot_id TEXT PRIMARY KEY, book_key TEXT, fingerprint TEXT,
+         title TEXT, author TEXT, chapter_count INTEGER,
+         payload_sha256 TEXT, store_path TEXT, baseline_preview TEXT,
+         created TEXT, reason TEXT, extraction TEXT)""",
+    """CREATE TABLE IF NOT EXISTS replay_runs (
+         run_id TEXT PRIMARY KEY, snapshot_id TEXT, started TEXT,
+         replay_code_sha TEXT, replay_config_digest TEXT,
+         preview_path TEXT)""",
+    """CREATE TABLE IF NOT EXISTS verdicts_cache (
+         work_id TEXT, class TEXT, claim_key TEXT, verdict TEXT,
+         fetched_at TEXT, PRIMARY KEY (work_id, class, claim_key))""",
+    """CREATE TABLE IF NOT EXISTS verdict_fetches (
+         id INTEGER PRIMARY KEY, fetched_at TEXT, ok INTEGER,
+         works INTEGER, claims INTEGER, note TEXT)""",
+    """CREATE TABLE IF NOT EXISTS fixture_scores (
+         id INTEGER PRIMARY KEY, release TEXT, fixture_version TEXT,
+         scored_at TEXT, payload TEXT)""",
+    """CREATE TABLE IF NOT EXISTS uncertainty_queue (
+         id INTEGER PRIMARY KEY, created TEXT, run_ref TEXT,
+         work_key TEXT, class TEXT, subject TEXT, packet TEXT,
+         status TEXT, label TEXT, labelled_by TEXT, labelled_at TEXT)""",
+    """CREATE TABLE IF NOT EXISTS rejection_events (
+         id INTEGER PRIMARY KEY, run_ref TEXT, work_key TEXT,
+         class TEXT, claim_key TEXT, created TEXT)""",
+    # NOTE: a correction_events table is RESERVED by the design
+    # (§3.6) for decision D1's future corrections ledger. It is
+    # deliberately NOT created here: its semantics are D1's to rule.
+]
+
+# Tables whose logical content the replay-never-writes pin covers
+# (A2): every table in the schema. Replays write only inside their
+# throwaway sandbox substrate, so a live DB's dump hash must not move
+# across a replay at all.
+_SUBSTRATE_TABLES = [
+    "meta", "learned_nicknames", "learned_titles",
+    "learned_threshold_stats", "learned_rejected_tropes",
+    "series_state", "staging_works", "staging_claims",
+    "staging_expired", "roster_works", "roster_entities",
+    "roster_retired", "roster_no_pairs", "roster_adoptions",
+    "roster_anchor_retirements", "snapshots", "replay_runs",
+    "verdicts_cache", "verdict_fetches", "fixture_scores",
+    "uncertainty_queue", "rejection_events",
+]
+
+
+class StateDB:
+    """The substrate handle for one learn dir's state.db.
+
+    One connection per process per learn dir (registry below),
+    check_same_thread=False, writes serialized by an RLock and
+    executed as single transactions — the same discipline as the
+    JSON stores' load-modify-save, with strictly less lost-update
+    surface. Reads come from the same connection.
+    """
+
+    def __init__(self, path, conn):
+        self.path = Path(path)
+        self._conn = conn
+        self._lock = threading.RLock()
+        self.corrupt_at_open = False
+        self._backup_done = False
+
+    # -- construction ---------------------------------------------------
+    @staticmethod
+    def _connect(path):
+        conn = sqlite3.connect(str(path), check_same_thread=False,
+                               timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        return conn
+
+    @classmethod
+    def _create_schema(cls, conn):
+        with conn:
+            for ddl in _SUBSTRATE_DDL:
+                conn.execute(ddl)
+            conn.execute(f"PRAGMA user_version="
+                         f"{SUBSTRATE_SCHEMA_VERSION}")
+
+    @classmethod
+    def create(cls, learn_dir):
+        """Create state.db in learn_dir if absent (schema applied),
+        else open the existing one. Used by migration and tests; the
+        running stores never call this (they open only)."""
+        d = Path(learn_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / _STATE_DB_NAME
+        if p.exists():
+            return cls.open(learn_dir)
+        conn = cls._connect(p)
+        cls._create_schema(conn)
+        db = cls(p, conn)
+        _register_state_db(db)
+        return db
+
+    @classmethod
+    def open(cls, learn_dir):
+        """Open the learn dir's state.db, or None when there is none.
+        A corrupt DB gets the F8 discipline: loud warning, original
+        bytes (incl. WAL sidecars) preserved as .corrupt, and a fresh
+        empty DB in its place — stores start empty and NOTHING is
+        auto-restored (a restore could resurrect retracted state
+        without a sound; recovery is a human act, §3.8)."""
+        d = Path(learn_dir)
+        p = d / _STATE_DB_NAME
+        if not p.exists():
+            return None
+        try:
+            conn = cls._connect(p)
+            row = conn.execute("PRAGMA quick_check").fetchone()
+            if not row or row[0] != "ok":
+                raise sqlite3.DatabaseError(
+                    f"quick_check: {row[0] if row else 'no result'}")
+            ver = conn.execute("PRAGMA user_version").fetchone()[0]
+            if ver != SUBSTRATE_SCHEMA_VERSION:
+                # Unknown future/past schema: re-applying DDL is
+                # additive-safe (IF NOT EXISTS) and user_version is
+                # re-stamped; store payloads are versioned by the
+                # stores themselves.
+                cls._create_schema(conn)
+            db = cls(p, conn)
+        except Exception as e:
+            print(f"  !! WARNING: state substrate {p} could not be "
+                  f"opened ({e}); starting the state stores EMPTY. "
+                  f"The original file will be preserved as a .corrupt "
+                  f"backup. State was NOT carried over — staging "
+                  f"sightings reset (promotions delayed), learning "
+                  f"resets, roster continuity resets for affected "
+                  f"works; no output is created by the loss.")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            cls._preserve_corrupt(p)
+            conn = cls._connect(p)
+            cls._create_schema(conn)
+            db = cls(p, conn)
+            db.corrupt_at_open = True
+        _register_state_db(db)
+        return db
+
+    @staticmethod
+    def _preserve_corrupt(path):
+        """Rename a corrupt state.db (and its WAL sidecars, which are
+        part of the state) to .corrupt siblings. Never clobbers an
+        existing backup."""
+        path = Path(path)
+        try:
+            dest = path.with_name(path.name + ".corrupt")
+            n = 1
+            while dest.exists():
+                dest = path.with_name(f"{path.name}.corrupt-{n}")
+                n += 1
+            for suffix in ("", "-wal", "-shm"):
+                src = Path(str(path) + suffix)
+                if src.exists():
+                    os.replace(src, Path(str(dest) + suffix))
+            print(f"  !! Preserved corrupt state substrate as {dest}")
+        except Exception as e:
+            print(f"  !! WARNING: could not preserve corrupt substrate "
+                  f"{path} ({e})")
+
+    def close(self):
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+    # -- access -----------------------------------------------------------
+    def query(self, sql, params=()):
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            return cur.fetchall()
+
+    def write_txn(self):
+        """Context manager: one write transaction. Before the first
+        write of this process, the rolling backup is refreshed if
+        the DB changed since it was taken (A2: via the backup API,
+        never a raw file copy)."""
+        return _StateDBWriteTxn(self)
+
+    def _maybe_backup(self):
+        if self._backup_done:
+            return
+        self._backup_done = True
+        try:
+            if not self.path.exists():
+                return
+            n_rows = 0
+            for t in ("learned_nicknames", "staging_works",
+                      "roster_works", "meta"):
+                n_rows += self.query(f"SELECT COUNT(*) FROM {t}")[0][0]
+            if n_rows == 0:
+                return  # nothing worth recovering yet
+            bak = self.path.with_name(_STATE_DB_BAK_NAME)
+            if bak.exists():
+                try:
+                    other = sqlite3.connect(str(bak))
+                    try:
+                        same = _dump_hash_conn(other) == self.dump_hash()
+                    finally:
+                        other.close()
+                except Exception:
+                    same = False
+                if same:
+                    return
+            self.backup_to(bak)
+        except Exception as e:
+            print(f"  !! WARNING: state substrate backup failed ({e}); "
+                  f"continuing without a fresh backup")
+
+    def backup_to(self, dest_path):
+        """Copy the whole DB to dest via SQLite's backup API (A2:
+        consistent under WAL, includes the WAL tail)."""
+        dest = Path(dest_path)
+        with self._lock:
+            out = sqlite3.connect(str(dest))
+            try:
+                self._conn.backup(out)
+            finally:
+                out.close()
+
+    def dump_hash(self):
+        """Canonical hash of the DB's LOGICAL content (A2): every
+        table's rows in a fixed order, serialized deterministically.
+        Immune to WAL checkpointing and file-layout noise — two DBs
+        with the same content hash identically."""
+        with self._lock:
+            return _dump_hash_conn(self._conn)
+
+    def size_info(self):
+        try:
+            total = self.path.stat().st_size
+        except OSError:
+            total = 0
+        for suffix in ("-wal", "-shm"):
+            try:
+                total += Path(str(self.path) + suffix).stat().st_size
+            except OSError:
+                pass
+        return {"bytes": total, "path": str(self.path)}
+
+
+class _StateDBWriteTxn:
+    def __init__(self, db):
+        self._db = db
+
+    def __enter__(self):
+        self._db._lock.acquire()
+        self._db._maybe_backup()
+        self._db._conn.execute("BEGIN IMMEDIATE")
+        return self._db._conn
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self._db._conn.execute("COMMIT")
+            else:
+                self._db._conn.execute("ROLLBACK")
+        finally:
+            self._db._lock.release()
+        return False
+
+
+def _dump_hash_conn(conn):
+    import hashlib as _hl
+    h = _hl.sha256()
+    existing = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    for t in _SUBSTRATE_TABLES:
+        if t not in existing:
+            h.update(f"{t}:absent;".encode())
+            continue
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({t})")]
+        rows = conn.execute(
+            f"SELECT * FROM {t} ORDER BY {', '.join(cols[:2])}").fetchall()
+        h.update(f"{t}:{len(rows)};".encode())
+        for row in rows:
+            h.update(repr(tuple(row)).encode("utf-8", "replace"))
+            h.update(b"\n")
+    return h.hexdigest()
+
+
+_STATE_DBS = {}
+_STATE_DBS_LOCK = threading.Lock()
+
+
+def _register_state_db(db):
+    with _STATE_DBS_LOCK:
+        _STATE_DBS[str(db.path.parent.resolve())] = db
+
+
+def _state_db_for(learn_dir):
+    """The substrate for a learn dir, or None when the dir has no
+    state.db (JSON mode). Positive hits are cached per process;
+    opening applies the corruption discipline in StateDB.open."""
+    if learn_dir is None:
+        return None
+    key = str(Path(learn_dir).resolve())
+    with _STATE_DBS_LOCK:
+        db = _STATE_DBS.get(key)
+    if db is not None:
+        return db
+    if not (Path(learn_dir) / _STATE_DB_NAME).exists():
+        return None
+    return StateDB.open(learn_dir)
+
+
+def _close_state_dbs():
+    """Close every registered substrate (tests, process hygiene)."""
+    with _STATE_DBS_LOCK:
+        dbs = list(_STATE_DBS.values())
+        _STATE_DBS.clear()
+    for db in dbs:
+        db.close()
+
+
+def _substrate_active(learn_dir):
+    return _state_db_for(learn_dir) is not None
+
+
+# ---------------------------------------------------------------------------
 # Cross-run learning: the pipeline gets smarter with every book processed.
 #
 # LearnedState persists four kinds of knowledge under <learn_dir>/:
@@ -2728,6 +3136,14 @@ class LearnedState:
 
     def _load_all(self):
         with self._lock:
+            db = self._db()
+            if db is not None:
+                (self.nicknames, self.titles, self.threshold_stats,
+                 self.rejected_tropes) = self._db_load_all(db)
+                self._titles_cache = None
+                if db.corrupt_at_open:
+                    self._corrupt_seen.add("state.db")
+                return
             self.nicknames = self._load_json("nicknames.json", {})
             self.titles = self._load_json("titles.json", {})
             self.threshold_stats = self._load_json("threshold_stats.json", {})
@@ -2739,10 +3155,83 @@ class LearnedState:
         if not self.enabled:
             return
         with self._lock:
+            db = self._db()
+            if db is not None:
+                try:
+                    self._db_save_all(db)
+                except Exception as e:
+                    self._writable = False
+                    self._warn_once(
+                        f"  State substrate write failed ({e}); "
+                        f"learning state not persisted this run")
+                return
             self._save_json("nicknames.json", self.nicknames)
             self._save_json("titles.json", self.titles)
             self._save_json("threshold_stats.json", self.threshold_stats)
             self._save_json("rejected_tropes.json", self.rejected_tropes)
+
+    # -- substrate seam (spine §3.2: persistence only; the in-memory
+    #    model above is unchanged) ------------------------------------
+    def _db(self):
+        return _state_db_for(self.dir)
+
+    @staticmethod
+    def _db_load_all(db):
+        nicknames = {}
+        for nkey, payload in db.query(
+                "SELECT nkey, payload FROM learned_nicknames "
+                "ORDER BY rowid"):
+            nicknames[nkey] = json.loads(payload)
+        titles = {}
+        for title, payload in db.query(
+                "SELECT title, payload FROM learned_titles "
+                "ORDER BY rowid"):
+            titles[title] = json.loads(payload)
+        threshold_stats = {}
+        for trigger, kept, dropped in db.query(
+                "SELECT trigger, kept, dropped FROM "
+                "learned_threshold_stats ORDER BY rowid"):
+            threshold_stats[trigger] = {"kept": json.loads(kept),
+                                        "dropped": json.loads(dropped)}
+        rejected = {}
+        for key, payload in db.query(
+                "SELECT trej_key, payload FROM learned_rejected_tropes "
+                "ORDER BY rowid"):
+            rejected[key] = json.loads(payload)
+        return nicknames, titles, threshold_stats, rejected
+
+    def _db_save_all(self, db):
+        jd = lambda o: json.dumps(o, ensure_ascii=False)
+        with db.write_txn() as conn:
+            conn.execute("DELETE FROM learned_nicknames")
+            for k, e in self.nicknames.items():
+                conn.execute(
+                    "INSERT INTO learned_nicknames VALUES "
+                    "(?,?,?,?,?,?,?)",
+                    (k, e.get("full"), int(e.get("count", 0)),
+                     jd(e.get("books", [])),
+                     1 if e.get("human") else 0,
+                     1 if e.get("manual") else 0, jd(e)))
+            conn.execute("DELETE FROM learned_titles")
+            for k, e in self.titles.items():
+                conn.execute(
+                    "INSERT INTO learned_titles VALUES (?,?,?,?)",
+                    (k, int(e.get("count", 0)), jd(e.get("rests", [])),
+                     jd(e)))
+            conn.execute("DELETE FROM learned_threshold_stats")
+            for k, e in self.threshold_stats.items():
+                conn.execute(
+                    "INSERT INTO learned_threshold_stats VALUES "
+                    "(?,?,?)",
+                    (k, jd(e.get("kept", [])), jd(e.get("dropped", []))))
+            conn.execute("DELETE FROM learned_rejected_tropes")
+            for k, e in self.rejected_tropes.items():
+                conn.execute(
+                    "INSERT INTO learned_rejected_tropes VALUES "
+                    "(?,?,?,?,?,?)",
+                    (k, int(e.get("count", 0)), jd(e.get("books", [])),
+                     jd(e.get("reasons", [])),
+                     1 if e.get("human") else 0, jd(e)))
 
     # -- nicknames ------------------------------------------------------
     def record_alias(self, alias_name, canonical_name):
@@ -3029,12 +3518,63 @@ class LearnedState:
         safe = re.sub(r"\W+", "_", series_key)[:64].strip("_") or "unknown"
         return self.dir / "series" / (safe + ".json")
 
+    # -- series persistence seam (spine: series/*.json files become
+    #    series_state rows keyed by their path under series/, minus
+    #    the .json suffix — "author_x" flat, "daemon/roster" named) --
+    def _series_db_key(self, p):
+        rel = Path(p).relative_to(self.dir / "series").as_posix()
+        return rel[:-5] if rel.endswith(".json") else rel
+
+    def _db_series_get(self, p):
+        """Parsed series payload from the substrate: the dict, or
+        None when no row exists. A corrupt payload is LOUD and reads
+        as {} (the F8 rule: preserved by the substrate's own
+        discipline at open; a bad payload never silently merges)."""
+        db = self._db()
+        if db is None:
+            return None
+        rows = db.query(
+            "SELECT payload FROM series_state WHERE series_key=?",
+            (self._series_db_key(p),))
+        if not rows:
+            return None
+        try:
+            data = json.loads(rows[0][0])
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            print(f"  !! WARNING: series state row for {p} could not "
+                  f"be parsed ({e}); treating it as EMPTY")
+            return {}
+
+    def _db_series_put(self, p, data):
+        db = self._db()
+        with db.write_txn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO series_state VALUES (?,?)",
+                (self._series_db_key(p),
+                 json.dumps(data, ensure_ascii=False)))
+
+    def _write_series_data(self, p, data):
+        """Persist one series payload: a series_state row on the
+        substrate, else the atomic file write."""
+        if self._db() is not None:
+            self._db_series_put(p, data)
+            return
+        self._preserve_corrupt(p)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, p)
+
     def _load_series_data(self, p):
         """Load a series-roster file for a save-side merge. A corrupt
         file starts empty LOUDLY and its bytes are preserved as a
         .corrupt backup before the overwrite — the same rule as the
         learned files (a silent reset here used to erase the roster
         the merge was supposed to extend)."""
+        if self._db() is not None:
+            data = self._db_series_get(p)
+            return data if data is not None else {}
         if not p.exists():
             return {}
         try:
@@ -3050,14 +3590,9 @@ class LearnedState:
         if not self.enabled or not series_key:
             return {}
         p = self._series_path(series_key)
-        if not p.exists():
+        if self._db() is None and not p.exists():
             return {}
-        try:
-            with open(p, encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            self._note_corrupt(p, e)
-            return {}
+        data = self._load_series_data(p)
         hints = {}
         for ch in data.get("characters", []):
             canon = norm_name(ch.get("name", ""))
@@ -3093,11 +3628,7 @@ class LearnedState:
             data["books"].append({"isbn": isbn, "title": title})
         # Atomic write.
         try:
-            self._preserve_corrupt(p)
-            tmp = p.with_suffix(p.suffix + ".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, p)
+            self._write_series_data(p, data)
         except Exception as e:
             self._warn_once(f"  Could not save series roster ({e})")
             return
@@ -3126,14 +3657,9 @@ class LearnedState:
         if not self.enabled or not series_key:
             return {}
         p = self._named_series_path(series_key)
-        if not p.exists():
+        if self._db() is None and not p.exists():
             return {}
-        try:
-            with open(p, encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            self._note_corrupt(p, e)
-            return {}
+        data = self._load_series_data(p)
         hints = {}
         for ch in data.get("characters", []):
             canon = norm_name(ch.get("name", ""))
@@ -3176,11 +3702,7 @@ class LearnedState:
                                   "position": series_position})
         # Atomic write.
         try:
-            self._preserve_corrupt(p)
-            tmp = p.with_suffix(p.suffix + ".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, p)
+            self._write_series_data(p, data)
         except Exception as e:
             self._warn_once(f"  Could not save named-series roster ({e})")
             return
@@ -6321,7 +6843,32 @@ def _count_series_rosters(state):
     Counts each series bucket once: author-based flat files
     (series/*.json) and named-series rosters (series/*/roster.json).
     Pure (no I/O beyond reading); returns (0, 0) when the dir is absent.
-    """
+    On the substrate the same buckets are series_state rows, keyed
+    "author_x" (flat) and "<name>/roster" (named)."""
+    db = _state_db_for(state.dir)
+    if db is not None:
+        n_series = 0
+        n_chars = 0
+        seen = set()
+        for (key, payload) in db.query(
+                "SELECT series_key, payload FROM series_state "
+                "ORDER BY rowid"):
+            bucket = key[:-len("/roster")] if key.endswith("/roster") \
+                else key
+            if not bucket or bucket in seen:
+                continue
+            seen.add(bucket)
+            try:
+                data = json.loads(payload)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            n_series += 1
+            chars = data.get("characters", [])
+            if isinstance(chars, list):
+                n_chars += len(chars)
+        return n_series, n_chars
     series_dir = state.dir / "series"
     if not series_dir.is_dir():
         return 0, 0
