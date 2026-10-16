@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.12.0"
+PORTABLE_VERSION = "2.13.0"
 
 
 import argparse
@@ -4421,6 +4421,440 @@ def cmd_corpus_reembed(learn_dir=None, work=None):
 
 
 # ---------------------------------------------------------------------------
+# Corpus stage contract (corpus-design §4): stage outputs are
+# stamped (input_hash, stage, model, stage_version), keyed by
+# (fingerprint, stage, output_key), and a re-run of a stage replaces
+# its own outputs — the whole (fingerprint, stage) key space, in one
+# transaction (A4). An output is current iff its input_hash equals
+# the hash recomputed from the corpus's present state; reuse over
+# inputs nobody hashed is the staleness class the contract exists
+# to exclude, so every adopter enumerates its hashed inputs (§4.2).
+# ---------------------------------------------------------------------------
+
+# The retrieve stage's own contract version (§4.1): bumped when the
+# judge prompt or the retrieval code path changes — it is named in
+# every retrieve input hash (A6), so a bump re-derives yesterday's
+# verdicts instead of serving them under a judge that no longer
+# exists. The query-shape version versions evidence_query_text /
+# evidence_query_terms (§4.2's enumerated hash input).
+RETRIEVE_STAGE_VERSION = "1"
+_EVIDENCE_QUERY_SHAPE_VERSION = "1"
+
+# Stage -> envelope section (§6.4): the sections a stage write
+# refreshes in its own transaction.
+_STAGE_SECTION = {"retrieve": "retrieval",
+                  "quote-verify": "quotes",
+                  "quote-select": "quotes"}
+
+
+def _corpus_stage_input_hash(material):
+    """sha256 over the canonical serialization of a stage's hashed
+    inputs (§4.1): sorted JSON, so the same material hashes equal
+    on any machine, in any dict order."""
+    blob = json.dumps(material, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"))
+    return _corpus_sha256(blob)
+
+
+def corpus_scoped_dump_hash(db, fingerprint, stage=None):
+    """Scoped dump hash over one (fingerprint[, stage]) stage-output
+    key space (§11 slice 4 — the substrate's _dump_hash_conn is
+    whole-DB; §4.5's pins and §13 signal 8 need the scoped variant):
+    hashes keys, input hashes, run ids, and payloads in key order."""
+    import hashlib as _hl
+    if stage is None:
+        rows = db.query(
+            "SELECT stage, output_key, input_hash, run_id, payload "
+            "FROM stage_outputs WHERE fingerprint=? "
+            "ORDER BY stage, output_key", (fingerprint,))
+    else:
+        rows = db.query(
+            "SELECT stage, output_key, input_hash, run_id, payload "
+            "FROM stage_outputs WHERE fingerprint=? AND stage=? "
+            "ORDER BY output_key", (fingerprint, stage))
+    h = _hl.sha256()
+    for row in rows:
+        h.update(repr(row).encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def corpus_stage_outputs(db, fingerprint, stage):
+    """{output_key: {"input_hash", "run_id", "payload"}} for one
+    (fingerprint, stage) key space — the read side of the contract."""
+    out = {}
+    for key, ih, rid, payload in db.query(
+            "SELECT output_key, input_hash, run_id, payload FROM "
+            "stage_outputs WHERE fingerprint=? AND stage=?",
+            (fingerprint, stage)):
+        try:
+            payload = json.loads(payload) if payload else {}
+        except (TypeError, ValueError):
+            payload = {}
+        out[key] = {"input_hash": ih, "run_id": rid, "payload": payload}
+    return out
+
+
+def _corpus_envelope_load(conn, fingerprint):
+    row = conn.execute(
+        "SELECT envelope FROM work_envelope WHERE fingerprint=?",
+        (fingerprint,)).fetchone()
+    if row and row[0]:
+        try:
+            env = json.loads(row[0])
+            if isinstance(env, dict):
+                return env
+        except (TypeError, ValueError):
+            pass
+    return {}
+
+
+def _corpus_envelope_store(conn, fingerprint, env):
+    conn.execute(
+        "INSERT OR REPLACE INTO work_envelope (fingerprint, corpus_v,"
+        " envelope, computed_at) VALUES (?, ?, ?, ?)",
+        (fingerprint, CORPUS_V, json.dumps(env, ensure_ascii=False),
+         _corpus_now()))
+
+
+def _corpus_refresh_stage_section_in_txn(db, conn, fingerprint, stage,
+                                         output_payloads, model,
+                                         stage_version, retracted=None):
+    """Refresh a stage's envelope section INSIDE the caller's
+    transaction (§6.4: the refresh rides the write that changes the
+    facts). The section records what the stage currently holds —
+    output count + outcome tally for record-shaped outputs — and,
+    on a retraction, the retracted_at + reason trace that keeps
+    'never assessed' and 'assessed, then withdrawn' distinguishable
+    after the section's state falls back to unknown."""
+    section_name = _STAGE_SECTION.get(stage)
+    if section_name is None:
+        return
+    env = _corpus_envelope_load(conn, fingerprint)
+    sections = env.setdefault("sections", {})
+    prior = sections.get(section_name) or {}
+    if model is None:
+        model = prior.get("model")
+    if stage_version is None:
+        stage_version = prior.get("stage_version")
+    outcomes = {}
+    for payload in output_payloads.values():
+        rec = (payload or {}).get("record") or {}
+        outcome = rec.get("outcome")
+        if outcome:
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+    section = {
+        "state": "present" if output_payloads else "unknown",
+        "stage": stage, "model": model,
+        "stage_version": stage_version,
+        "updated_at": _corpus_now(), "scope": "edition",
+        "value": {"outputs": len(output_payloads),
+                  "outcomes": outcomes}}
+    if retracted is not None:
+        section["retracted_at"] = retracted["at"]
+        section["reason"] = retracted["reason"]
+    sections[section_name] = section
+    _corpus_envelope_store(conn, fingerprint, env)
+
+
+def corpus_stage_settle(db, fingerprint, stage, *, stage_version,
+                        model, outputs, run_payload=None):
+    """Settle one stage run's outputs under the §4.1 contract.
+
+    outputs: {output_key: {"input_hash", "payload"}} — the FULL set
+    the run produces now. Inside one transaction: produced keys
+    whose stored input_hash differs are replaced; keys whose hash
+    matches are reused untouched (a same-inputs re-run writes no
+    output rows at all); every stored key for (fingerprint, stage)
+    NOT in the produced set is deleted — ghost outputs are half of
+    what replacement means (A4). The stage_runs accounting row is
+    written on every settle (it lives outside the output key space)
+    and the stage's envelope section refreshes in the same
+    transaction when — and only when — outputs changed.
+
+    Returns {"run_id", "written", "reused", "deleted"}."""
+    import uuid as _uuid
+    run_id = _uuid.uuid4().hex
+    now = _corpus_now()
+    existing = {r[0]: r[1] for r in db.query(
+        "SELECT output_key, input_hash FROM stage_outputs WHERE "
+        "fingerprint=? AND stage=?", (fingerprint, stage))}
+    written = reused = 0
+    for key, out in outputs.items():
+        if existing.get(key) == out["input_hash"]:
+            reused += 1
+        else:
+            written += 1
+    deleted = sum(1 for k in existing if k not in outputs)
+    run_hash = _corpus_stage_input_hash(
+        {k: outputs[k]["input_hash"] for k in sorted(outputs)})
+    accounting = {**(run_payload or {}), "written": written,
+                  "reused": reused, "deleted": deleted}
+    with db.write_txn("stages") as conn:
+        conn.execute(
+            "INSERT INTO stage_runs (run_id, fingerprint, stage, "
+            "stage_version, model, input_hash, started, finished, "
+            "status, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ok', ?)",
+            (run_id, fingerprint, stage, stage_version, model,
+             run_hash, now, now,
+             json.dumps(accounting, ensure_ascii=False)))
+        for key, out in outputs.items():
+            if existing.get(key) == out["input_hash"]:
+                continue  # reused: the row is already the truth
+            conn.execute(
+                "INSERT OR REPLACE INTO stage_outputs (fingerprint, "
+                "stage, output_key, input_hash, run_id, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (fingerprint, stage, key, out["input_hash"], run_id,
+                 json.dumps(out["payload"], ensure_ascii=False)))
+        for key in existing:
+            if key not in outputs:
+                conn.execute(
+                    "DELETE FROM stage_outputs WHERE fingerprint=? "
+                    "AND stage=? AND output_key=?",
+                    (fingerprint, stage, key))
+        if written or deleted:
+            _corpus_refresh_stage_section_in_txn(
+                db, conn, fingerprint, stage,
+                {k: v["payload"] for k, v in outputs.items()},
+                model, stage_version)
+    return {"run_id": run_id, "written": written, "reused": reused,
+            "deleted": deleted}
+
+
+def corpus_retract_stage_output(db, fingerprint, stage, output_key,
+                                reason):
+    """Retraction as a named operation (§6.4) — MECHANISM ONLY:
+    what authorizes retracting a human-corrected output is decision
+    D1's question, deliberately not pre-decided here (§0's scoping
+    rule); this verb is the machinery D1 will rule over.
+
+    One transaction: (1) an explicit retraction record — a
+    stage_runs row at status 'retracted' naming the output, the
+    reason class, and the withdrawn input hash (the ingest_runs
+    tombstone precedent); (2) the output row itself removed; (3)
+    the envelope section refreshed with its retracted_at + reason
+    trace stamped. No reader ever sees the withdrawal without the
+    record, or the record without the withdrawal. Returns True
+    when an output was actually withdrawn."""
+    import uuid as _uuid
+    rows = db.query(
+        "SELECT input_hash, run_id FROM stage_outputs WHERE "
+        "fingerprint=? AND stage=? AND output_key=?",
+        (fingerprint, stage, output_key))
+    if not rows:
+        return False
+    withdrawn_hash, withdrawn_run = rows[0]
+    now = _corpus_now()
+    record = {"output_key": output_key, "reason": reason,
+              "withdrawn_input_hash": withdrawn_hash,
+              "withdrawn_run_id": withdrawn_run}
+    with db.write_txn("stages") as conn:
+        conn.execute(
+            "INSERT INTO stage_runs (run_id, fingerprint, stage, "
+            "stage_version, model, input_hash, started, finished, "
+            "status, payload) VALUES (?, ?, ?, '', 'retraction', ?, "
+            "?, ?, 'retracted', ?)",
+            (_uuid.uuid4().hex, fingerprint, stage, withdrawn_hash,
+             now, now, json.dumps(record, ensure_ascii=False)))
+        conn.execute(
+            "DELETE FROM stage_outputs WHERE fingerprint=? AND "
+            "stage=? AND output_key=?",
+            (fingerprint, stage, output_key))
+        remaining = {}
+        for key, payload in conn.execute(
+                "SELECT output_key, payload FROM stage_outputs WHERE "
+                "fingerprint=? AND stage=?", (fingerprint, stage)):
+            try:
+                remaining[key] = json.loads(payload) if payload else {}
+            except (TypeError, ValueError):
+                remaining[key] = {}
+        _corpus_refresh_stage_section_in_txn(
+            db, conn, fingerprint, stage, remaining, None, None,
+            retracted={"at": now, "reason": reason})
+    return True
+
+
+# -- the two-tier window cache (§4.4) --------------------------------
+
+class _CorpusWindowCache(dict):
+    """The §4.4 two-tier window-embedding cache: the per-run memory
+    dict in front, the corpus's passage_vectors behind it, keyed by
+    CONTENT — window text hash + embed stamp (enforced by
+    corpus_vector_by_text_hash: a vector is served only when the
+    passage's present text, the model, and the format all match; any
+    mismatch is a miss and a re-embed, never a serve).
+
+    Windows the run embeds are buffered and written back by flush()
+    — only when this cache is writable (never under replay, §4.3)
+    and only for windows that ARE stored passages of the work with
+    matching text: a foreign span has nowhere honest to land, and a
+    vector is never written against text the corpus does not hold.
+    Stored values are the run's normalized vectors; every consumer
+    of passage_vectors ranks by cosine, which is scale-invariant,
+    so a normalized fill is the same vector for ranking purposes.
+    A locked corpus at flush time degrades (§5.2): the fills stay
+    unrecorded and the run proceeds — poorer, never wrong."""
+
+    def __init__(self, db, fingerprint, chapters, model,
+                 fmt=_CORPUS_VECTOR_FORMAT, writable=True):
+        super().__init__()
+        self._db = db
+        self._fp = fingerprint
+        self._model = model
+        self._fmt = fmt
+        self._writable = bool(writable)
+        self._pending = {}   # passage_id -> normalized vector
+        self._absent = set()  # (label, offset) confirmed corpus-absent
+        self._windows = {}   # (label, offset) -> (passage_id, text_hash)
+        stored = {r[0]: r[1] for r in db.query(
+            "SELECT passage_id, text_hash FROM corpus_passages WHERE "
+            "fingerprint=?", (fingerprint,))}
+        seen = set()
+        for ch in chapters or []:
+            label = ch.get("label")
+            text = ch.get("text") or ""
+            for w in _evidence_windows(text):
+                key = (label, w["offset"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                end = w["offset"] + len(w["text"])
+                pid = _corpus_passage_id(fingerprint, ch.get("index"),
+                                         w["offset"], end)
+                if stored.get(pid) == _corpus_text_hash(w["text"]):
+                    self._windows[key] = (
+                        pid, _corpus_text_hash(w["text"]))
+
+    def _corpus_vec(self, key):
+        if key in self._absent:
+            return None
+        info = self._windows.get(key)
+        if info is None:
+            self._absent.add(key)
+            return None
+        raw = corpus_vector_by_text_hash(self._db, self._fp, info[1],
+                                         self._model, self._fmt)
+        if raw is None:
+            self._absent.add(key)
+            return None
+        return _normalize(raw)
+
+    def __contains__(self, key):
+        if dict.__contains__(self, key):
+            return True
+        return self._corpus_vec(key) is not None
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            return dict.get(self, key)
+        vec = self._corpus_vec(key)
+        if vec is None:
+            return default
+        dict.__setitem__(self, key, vec)  # memoize; not a write-back
+        return vec
+
+    def __setitem__(self, key, value):
+        dict.__setitem__(self, key, value)
+        self._absent.discard(key)
+        if self._writable:
+            info = self._windows.get(key)
+            if info is not None:
+                self._pending[info[0]] = value
+
+    def flush(self):
+        """Write the buffered gap-fills back in one transaction and
+        refresh the envelope's vectors section in it (§6.4: the
+        refresh rides the write). Returns the number of rows
+        written; 0 for a read-only cache or a degraded (locked)
+        corpus — the run is never failed by its cache (§5.2)."""
+        if not self._writable or not self._pending:
+            return 0
+        pending, self._pending = self._pending, {}
+        try:
+            with self._db.write_txn("vectors") as conn:
+                for pid, vec in pending.items():
+                    conn.execute(
+                        "INSERT OR REPLACE INTO passage_vectors "
+                        "(passage_id, fingerprint, model, format, "
+                        "dim, vector) VALUES (?, ?, ?, ?, ?, ?)",
+                        (pid, self._fp, self._model, self._fmt,
+                         len(vec), _corpus_pack_vector(vec)))
+                _corpus_refresh_envelope_in_txn(self._db, conn,
+                                                self._fp)
+            self._absent.clear()  # fills landed; re-probe honestly
+            return len(pending)
+        except Exception:
+            return 0
+
+
+# -- retrieve adoption (§4.2, wave 1) ---------------------------------
+
+def corpus_retrieve_context(learn_dir, fingerprint, *, writable=True):
+    """The retrieve stage's adoption context for a run, or None when
+    the corpus cannot serve this work: no corpus in the learn dir,
+    the work not retrieval-ready (§3.3's gate: complete, current
+    parser generation), no embed model configured, or the vector
+    generation marked suspect by the drift canary (verdicts ranked
+    in a suspect space are neither reused nor settled — the run
+    proceeds per-run, exactly as before the corpus). writable=False
+    under replay (§4.3: reads only, no settling, no gap-fill
+    write-back). Corpus trouble degrades to None — slower, never
+    wrong (§5.3) — never to a failed run."""
+    try:
+        db = _corpus_db_for(learn_dir, mode="processor")
+        if db is None or not corpus_retrieval_ready(db, fingerprint):
+            return None
+        model = CONFIG.get("embed_model") or ""
+        if not model:
+            return None
+        if _corpus_generation_suspect(db, model,
+                                      _CORPUS_VECTOR_FORMAT):
+            return None
+        return {"db": db, "fingerprint": fingerprint,
+                "writable": bool(writable), "embed_model": model,
+                "embed_format": _CORPUS_VECTOR_FORMAT,
+                "judge_model": CONFIG.get("model") or "",
+                "judge_backend": CONFIG.get("llm") or ""}
+    except Exception:
+        return None
+
+
+def _retrieve_claim_input_hash(ctx, claim, floor):
+    """One claim's retrieve input hash over its ENUMERATED inputs
+    (§4.2): the support chapters' text hashes, the embed stamp,
+    the judge's identity AND configuration digest (backend, model,
+    prompt — A6), the retrieval floor, the query shape (the claim's
+    query text, terms, and definition are hashed as built), the
+    query-shape version, and the stage_version itself."""
+    support = []
+    for ch in claim.get("support") or []:
+        support.append({"index": ch.get("index"),
+                        "label": ch.get("label"),
+                        "text_hash": _corpus_text_hash(
+                            ch.get("text") or "")})
+    support.sort(key=lambda d: (d["index"] is None, d["index"],
+                                d["label"] or ""))
+    material = {
+        "stage": "retrieve", "stage_version": RETRIEVE_STAGE_VERSION,
+        "claim_key": claim.get("key"), "name": claim.get("name"),
+        "query_text": claim.get("query_text"),
+        "terms": sorted(claim.get("terms") or []),
+        "definition": claim.get("definition") or "",
+        "support": support,
+        "embed": {"model": ctx["embed_model"],
+                  "format": ctx["embed_format"]},
+        "judge": {"backend": ctx["judge_backend"],
+                  "model": ctx["judge_model"],
+                  "prompt_sha256": _corpus_sha256(
+                      PROMPT_EVIDENCE_JUDGE)},
+        "floor": floor,
+        "query_shape": _EVIDENCE_QUERY_SHAPE_VERSION,
+    }
+    return _corpus_stage_input_hash(material)
+
+
+# ---------------------------------------------------------------------------
 # Migration: JSON store files -> state.db (spine §3.7 + amendment A1)
 #
 # The build goes into state.db.migrating and is renamed into place
@@ -7436,7 +7870,8 @@ def _evidence_claim_record(spec, chapters, catalog,
             "staged": bool(spec.get("staged"))}
 
 
-def _evidence_run(claims, *, call, embedder, window_filter=None):
+def _evidence_run(claims, *, call, embedder, window_filter=None,
+                  stage_ctx=None):
     """The shared G engine: retrieval + judging over assembled
     claim records (see _evidence_claim_record). Returns (evidence,
     records, marker) — evidence {claim_key: [passage]}, records
@@ -7448,7 +7883,18 @@ def _evidence_run(claims, *, call, embedder, window_filter=None):
     records carry the outcome, the support grade (None when the
     claim was not judged), the chapters searched (Trope amendment
     B: a negative retrieval is an explicit recorded result), and
-    the judge's verdict counts as metadata."""
+    the judge's verdict counts as metadata.
+
+    With a stage context (corpus-design §4.2 — the retrieve
+    stage's adoption), the engine partitions the claims before any
+    work: a claim whose stored stage output is CURRENT (its input
+    hash recomputes equal over the enumerated inputs) is reused —
+    yesterday's verdict re-read, no retrieval, no judging — and
+    the rest derive exactly as today, through the two-tier cache
+    (§4.4), settling their outputs afterwards. Failed claims are
+    never settled: a failure is not a verdict, and the next run
+    must retry it, not reuse it. Without a context the engine is
+    byte-for-byte the per-run computation it has always been."""
     floor = CONFIG.get("evidence_retrieval_floor", 0.25)
     cache = {}
     evidence, records = {}, {}
@@ -7456,13 +7902,41 @@ def _evidence_run(claims, *, call, embedder, window_filter=None):
               "supported_single": 0, "adjacent_only": 0,
               "abstained": 0, "failed": 0, "skipped": 0}
     verify_failures = 0
+    fresh_vf = {}
     jobs = []
     embed_dead = False
     specs = list(claims or [])
-    for idx, claim in enumerate(specs):
+    reused = {}
+    input_hashes = {}
+    if stage_ctx is not None:
+        stored = corpus_stage_outputs(stage_ctx["db"],
+                                      stage_ctx["fingerprint"],
+                                      "retrieve")
+        for claim in specs:
+            ih = _retrieve_claim_input_hash(stage_ctx, claim, floor)
+            input_hashes[claim["key"]] = ih
+            row = stored.get(claim["key"])
+            if row is not None and row["input_hash"] == ih \
+                    and isinstance(row.get("payload"), dict) \
+                    and "record" in row["payload"]:
+                reused[claim["key"]] = row["payload"]
+        cache = _CorpusWindowCache(
+            stage_ctx["db"], stage_ctx["fingerprint"],
+            [ch for c in specs for ch in (c.get("support") or [])],
+            stage_ctx["embed_model"], stage_ctx["embed_format"],
+            writable=stage_ctx.get("writable", True))
+        for key, payload in reused.items():
+            rec = payload["record"]
+            records[key] = rec
+            if payload.get("evidence"):
+                evidence[key] = payload["evidence"]
+            verify_failures += payload.get("verify_failures", 0)
+            totals[rec["outcome"].replace("-", "_")] += 1
+    pending = [c for c in specs if c["key"] not in reused]
+    for idx, claim in enumerate(pending):
         if idx >= _EVIDENCE_MAX_CLAIMS \
                 or len(cache) >= _EVIDENCE_MAX_WINDOWS:
-            totals["skipped"] += len(specs) - idx
+            totals["skipped"] += len(pending) - idx
             break
         key = claim["key"]
         totals["attempted"] += 1
@@ -7486,6 +7960,7 @@ def _evidence_run(claims, *, call, embedder, window_filter=None):
             totals["failed"] += 1
             continue
         verify_failures += out["verify_failures"]
+        fresh_vf[key] = out["verify_failures"]
         cands = _select_judge_candidates(out["candidates"])
         if not cands:
             records[key] = {
@@ -7534,10 +8009,47 @@ def _evidence_run(claims, *, call, embedder, window_filter=None):
               "verify_failures": verify_failures,
               "failed": bool(totals["attempted"])
                         and totals["failed"] == totals["attempted"]}
+    if stage_ctx is not None:
+        if isinstance(cache, _CorpusWindowCache):
+            cache.flush()
+        if stage_ctx.get("writable", True) and specs:
+            # Settle the stage's full produced set: reused outputs
+            # (unchanged hashes — the settle leaves their rows
+            # untouched) plus this run's fresh non-failed verdicts.
+            # A claim that failed, or was capped out, produces
+            # nothing this run, so a stale row under its key is a
+            # ghost and the settle deletes it (A4). A corpus write
+            # must never fail the run (§5.2): degradation is
+            # proceeding unrecorded.
+            try:
+                produced = {}
+                for key, payload in reused.items():
+                    produced[key] = {
+                        "input_hash": input_hashes[key],
+                        "payload": payload}
+                for claim in pending:
+                    key = claim["key"]
+                    rec = records.get(key)
+                    if rec is None or rec.get("outcome") == "failed":
+                        continue
+                    produced[key] = {
+                        "input_hash": input_hashes[key],
+                        "payload": {
+                            "record": rec,
+                            "evidence": evidence.get(key, []),
+                            "verify_failures": fresh_vf.get(key, 0)}}
+                corpus_stage_settle(
+                    stage_ctx["db"], stage_ctx["fingerprint"],
+                    "retrieve", stage_version=RETRIEVE_STAGE_VERSION,
+                    model=stage_ctx["judge_model"], outputs=produced,
+                    run_payload={"claims": len(specs)})
+            except Exception:
+                pass
     return evidence, records, marker
 
 
-def evidence_retrieve_result(parts, chapters, *, call, embedder):
+def evidence_retrieve_result(parts, chapters, *, call, embedder,
+                             stage_ctx=None):
     """The trope half of the G seam (design §8): targeted retrieval
     + local-model judging for one run's confirmed trope claims —
     the ship set and the staged set alike.
@@ -7546,7 +8058,10 @@ def evidence_retrieve_result(parts, chapters, *, call, embedder):
     "staged"}], "catalog": {id: {"name", "description"}},
     "summaries": {chapter_label: summary}}.
 
-    Returns {"trope_evidence": {_tnorm(name): [passage]},
+    A stage context (corpus-design §4.2) makes the results stage
+    outputs: current verdicts are re-read instead of re-judged, and
+    fresh ones settle under the stage contract. Returns
+    {"trope_evidence": {_tnorm(name): [passage]},
     "trope_retrieval": {_tnorm(name): record}, "marker": {...}} —
     plain JSON types throughout."""
     catalog = parts.get("catalog") or {}
@@ -7555,7 +8070,7 @@ def evidence_retrieve_result(parts, chapters, *, call, embedder):
                                      summaries_by_label)
               for spec in list(parts.get("claims") or [])]
     evidence, records, marker = _evidence_run(
-        claims, call=call, embedder=embedder)
+        claims, call=call, embedder=embedder, stage_ctx=stage_ctx)
     return {"trope_evidence": evidence,
             "trope_retrieval": records, "marker": marker}
 
@@ -17478,6 +17993,16 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                 "support_refs": _g_chaps.get(_k, []),
                 "catalog_id": _g_catmap.get(_k),
                 "staged": _k in _g_staged})
+        # Corpus stage adoption (corpus-design §4.2): when the
+        # corpus holds this work complete, retrieval verdicts are
+        # stage outputs — current ones are re-read instead of
+        # re-judged, fresh ones settle. No corpus (or an
+        # incomplete/suspect one) => the context is None and the
+        # seam is exactly the per-run computation it has always
+        # been. (Under replay the learn dir is the sandbox, which
+        # holds no corpus: no adoption — replay corpus reads are
+        # §4.3's validated path, slice 5.)
+        _g_ctx = corpus_retrieve_context(_learn().dir, _ckpt_fp)
         _g = evidence_retrieve_result({
             "claims": _g_specs,
             "catalog": _trope_catalog_entries(),
@@ -17486,7 +18011,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                           or []},
         }, chapters, call=call, embedder=lambda texts:
             embed_vectors(CONFIG.get("embed_url", ""),
-                          CONFIG.get("embed_model", ""), texts))
+                          CONFIG.get("embed_model", ""), texts),
+            stage_ctx=_g_ctx)
         _trope_evidence = _g["trope_evidence"]
         _trope_retrieval = _g["trope_retrieval"]
         _evidence_marker = _merge_evidence_markers(
