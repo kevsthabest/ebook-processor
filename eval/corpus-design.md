@@ -38,6 +38,40 @@ re-run of a stage replaces its own outputs, so "process the
 same book several times" is a safe, ordinary operation instead
 of a fresh draw every time.
 
+### Red-team amendments (Security Advisor, 2026-10-16 — PROCEED-WITH-CHANGES)
+
+Folded into the sections named; where an amendment and the
+original draft disagreed, the amendment won and the
+contradiction was removed, not annotated.
+
+- **A1 — Drift canary** for vector generations: §2.4,
+  §1.2 (`meta`), §7.4.
+- **A2 — Embed from the stored span only; re-slice check
+  at 100%:** §3.3, §3.2.
+- **A3 — `verify_quote` scoped by kind + asserted
+  chapter:** §10.1, §10.7.
+- **A4 — Stage replacement scope = the full
+  `(fingerprint, stage)` key space:** §4.1, §4.5.
+- **A5 — Completeness is generation-relative:** §3.3,
+  §6.4, §7.4.
+- **A6 — `stage_version` named in the retrieve input
+  hash:** §4.2.
+- **A7 — FTS maintained by triggers; `integrity-check`
+  gates ingest:** §1.3, §3.2, §3.3.
+- **A8 — Cross-generation honesty in reports:** §6.1.
+- **A9 — Ingest bookkeeping commits before phase 1;
+  `busy_timeout` + contention directions ruled:** §3.3,
+  §5.2.
+- **A10 — `--corpus-remove` is one full-scope
+  transaction:** §3.4.
+- **A11 — F8 preservation for corpus.db is
+  rename-in-place, never a copy:** §5.3.
+
+Closed as written, no text changed: the backup posture
+(§7.2), the Q3 token-equality core (§10.1), the
+input-hash-over-stored-hashes rule (§4.1), the §3.2 proof
+shape, and the §2.3 adoption-trigger shape.
+
 ---
 
 ## 0. What the code actually looks like today (evidence base)
@@ -168,7 +202,9 @@ predecessor store. Its "migration" is ingest itself (§3).
 ### 1.2 Tables
 
 ```sql
-meta(k TEXT PRIMARY KEY, v TEXT)      -- corpus_v, created-by, …
+meta(k TEXT PRIMARY KEY, v TEXT)      -- corpus_v, created-by,
+                                      -- generation stamps, canary
+                                      -- sentinels (§2.4), probes (§1.5)
 
 corpus_works(
   fingerprint TEXT PRIMARY KEY,       -- _checkpoint_fingerprint
@@ -299,6 +335,17 @@ chapter-granular in v1 — passage-level FTS is named as
 not-built (§8.3): every v1 FTS consumer (explain search,
 alias evidence, duplicate detection) is served by
 chapter hits + span slicing.
+
+**Maintenance mechanism: triggers (A7).** The index is
+maintained by SQLite triggers on `corpus_chapters` —
+insert, update, and delete fire the matching FTS row
+operations inside the same transaction as the text
+write. There is no application-level "remember to sync
+the index" step to forget, so a generation replacement
+(§3.4: old chapters deleted, new ones inserted, one
+transaction) cannot desync text from index: they commit
+or roll back together. §3.2's self-check closes the
+loop with FTS5's own `integrity-check`.
 
 ### 1.4 Identity, versions, and stamps
 
@@ -484,6 +531,35 @@ ever possible, because the stamp check is on the read
 path, per row (the catalog cache's rule, §0, at row
 granularity).
 
+**The drift canary (A1).** The stamp check proves a
+row's *claimed* model; it cannot prove the endpoint
+still serves that model. Embeddings come from a
+configured endpoint under a model *string*, and an
+endpoint re-pointed to different weights under the same
+string would — now that vectors persist — poison the
+store permanently and silently: every stamp still
+matches, every cosine still computes, and the numbers
+are all in the wrong space. The per-run cache never
+faced this; persistence creates it, so persistence
+carries its detector. Each vector generation is born
+with a **sentinel set**: a small set of pinned probe
+texts (code constants, lexically varied, no book
+content), embedded at generation creation, with their
+reference vectors and pairwise cosines recorded in
+`meta` (§1.2) inside a tolerance band. The canary is
+re-checked at every generation write, on every ingest,
+on `--corpus-reembed`, and on `--corpus-status` (§7.4).
+Drift outside the band ⇒ the generation is marked
+**suspect** in `meta`; status prints the suspect state
+as a standing warning; and every vector read treats the
+generation's rows as misses (§4.4's rule) until the
+generation is re-embedded and the canary passes again.
+The §4.5 mutation test proves the *key* discipline in
+the lab; the canary is the only staleness detector that
+exists in production, and it is not optional machinery —
+it is the price of the G5 re-rule (§4.4) being safe
+outside a test.
+
 ### 2.5 Invariants (tests-to-be)
 
 - `test_vector_blob_roundtrip` — a vector written and read
@@ -495,6 +571,11 @@ granularity).
   with another model are invisible to search under the
   configured model (the §4.4 staleness rule at the vector
   layer).
+- `test_drift_canary_marks_generation_suspect` — probe
+  vectors perturbed beyond the tolerance band at a canary
+  check ⇒ generation marked suspect in `meta`, vector
+  reads miss its rows, and a re-embed with a passing
+  canary restores service (A1).
 - `test_corpus_readable_without_extension` — with extension
   loading disabled, every corpus table incl. vectors reads
   normally; only the (absent) shadow index is unavailable.
@@ -548,11 +629,18 @@ complete (§3.3), the importer verifies its own storage:
 2. Compute the **root hash** (sha256 over the ordered
    chapter hashes) and compare against the root computed
    from the in-memory parse.
-3. Re-slice every passage span from its stored chapter and
-   compare against the passage's stored `text_hash`
-   (sampled at 100% for books under a size cap, else a
-   deterministic every-Nth sample plus all of the first
-   and last chapters — the cap and rule named in code).
+3. Re-slice **every** passage span from its stored chapter
+   and compare against the passage's stored `text_hash` —
+   at 100%, at every book size, in v1 (A2). A sampled
+   check was considered and rejected: sampling re-opens
+   exactly the offset-corruption class the check exists
+   to close, to save seconds inside an ingest whose
+   embedding phase is measured in minutes.
+4. Run FTS5's `integrity-check` over `corpus_fts` (A7).
+   A mismatch fails the ingest exactly as a hash mismatch
+   does: the index is derived and rebuildable, but a
+   corrupt index at ingest time is evidence the write
+   path is broken, not a detail to repair quietly.
 
 Any mismatch ⇒ the ingest is `failed`, the work's rows are
 rolled back (the transaction never commits a partial
@@ -574,18 +662,33 @@ absent ──ingest──▶ ingesting ──▶ text_complete ──▶ complet
 any state ──parser_version ≠ current──▶ stale
 ```
 
-- **`ingesting`** exists only inside the ingest
-  transaction's bookkeeping row; a crash leaves it behind
-  as evidence, and the next ingest of that fingerprint
-  treats it as absent-and-redo (idempotent re-entry, §3.4).
-- **Phase 1 (one transaction):** work row + chapters +
-  passages + FTS. Commits to `text_complete` after the
-  §3.2 self-check. A book in `text_complete` is fully
+- **`ingesting`** is written by the ingest bookkeeping —
+  the `corpus_works` row at status `ingesting` plus its
+  `ingest_runs` row — and that bookkeeping **commits in
+  its own small transaction before phase 1 begins** (A9).
+  The ordering is load-bearing: bookkeeping riding inside
+  phase 1's transaction would roll back with it, and a
+  crash would leave no trace the book was ever mid-ingest.
+  Committed first, a crash leaves the `ingesting` row
+  behind as observable evidence, and the next ingest of
+  that fingerprint treats it as absent-and-redo
+  (idempotent re-entry, §3.4).
+- **Phase 1 (one transaction):** chapters + passages,
+  written against the pre-committed bookkeeping row; the
+  FTS rows follow the chapter writes via triggers inside
+  the same transaction (§1.3, A7). The transaction flips
+  the work row to `text_complete` after the §3.2
+  self-check. A book in `text_complete` is fully
   usable for text consumers (chapter sourcing, FTS,
   explain) — vectors are the only absence.
 - **Phase 2 (second transaction):** embeddings for every
   passage lacking a current-stamp vector, batched via
-  `embed_vectors` (:14151). Failure mid-phase leaves
+  `embed_vectors` (:14151). The text sent for each
+  passage is **re-sliced from the stored chapter at write
+  time** (A2) — never carried in memory from the parse —
+  so what the embedder receives is the stored span by
+  construction, and no vector is ever computed over text
+  the corpus does not hold. Failure mid-phase leaves
   `vectors_partial` with the per-passage rows that *did*
   land committed — resume is gap-filling by content key,
   never restart-from-zero. Completion flips status to
@@ -599,6 +702,18 @@ any state ──parser_version ≠ current──▶ stale
   can therefore never read as whole — the failure the
   brief names is excluded by the read path, not by
   ingest's good behaviour.
+- **Completeness is generation-relative (A5).**
+  `complete` records that an ingest finished under the
+  embedder then current; the word does not move when the
+  (model, format) generation does (§2.4). Every report
+  and consumer therefore *composes* the stored status
+  with current-generation vector coverage — the envelope
+  (§6.4) is the normative composition — so a work
+  completed under a superseded embedder presents its
+  true current coverage (0% until re-embedded), and
+  retrieval treats its vectors exactly as §4.4 treats
+  any stamped-otherwise row: absent. No surface prints
+  a bare `complete` as a coverage claim.
 
 ### 3.4 Idempotency and re-ingest triggers
 
@@ -629,7 +744,15 @@ any state ──parser_version ≠ current──▶ stale
   corpus remains until explicitly removed
   (`--corpus-remove <fingerprint>`, named for symmetry
   with `--roster-*` command precedents; removal is a
-  human act, printed, and never cascades into state.db).
+  human act, printed, and never cascades into state.db.
+  Its scope is **one transaction across every corpus
+  table keyed by the fingerprint** (A10) — works,
+  chapters, passages, vectors, stage runs and outputs,
+  quotes, and the envelope — with per-table counts
+  printed. Partial removal is not offered: an orphaned
+  stage output or quote record would resurrect on
+  re-ingest, including a selected signature quote the
+  removal existed to forget.)
 
 ### 3.5 Invariants (tests-to-be)
 
@@ -648,6 +771,13 @@ any state ──parser_version ≠ current──▶ stale
 - `test_parser_bump_stales_and_replaces` — version bump ⇒
   stale listing; re-ingest ⇒ new passage population, old
   vectors gone, tombstone present.
+- `test_ingest_bookkeeping_survives_crash` — ingest
+  killed between the bookkeeping commit and phase 1 ⇒
+  the `ingesting` row is observable in status, and the
+  next ingest re-enters cleanly (A9).
+- `test_fts_integrity_check_gates_ingest` — a corrupted
+  FTS index at self-check ⇒ ingest `failed`, no
+  `text_complete` flip (A7).
 
 ---
 
@@ -680,12 +810,24 @@ The rule that makes re-processing safe, stated once:
 input hash recomputed from the corpus's present state.**
 A stage re-run recomputes its input hashes; outputs whose
 hash matches are *reused* (the re-run is a no-op for
-them); outputs whose hash differs are **replaced inside
-one transaction** (delete own prior rows for the affected
-keys, insert the new, stamp the new `stage_runs` row —
-commit or nothing). A stage never touches another stage's
-rows, and a stage's replacement never reaches outside its
-own `(stage, output_key)` space. This is replace-wholesale
+them); the rest are settled **inside one transaction**
+whose delete scope is the stage's **whole
+`(fingerprint, stage)` key space** (A4): the re-run
+enumerates the output keys it produces now; rows for keys
+whose hash changed are replaced, and every stored key
+for that `(fingerprint, stage)` *not* in the current set
+is **deleted in the same transaction**. Deleting the
+no-longer-produced is half of what replacement means:
+without it, a stage that stops producing an output — a
+claim that no longer retrieves, a quote no longer
+proposed — leaves a ghost row indistinguishable from
+current output, and the envelope (§6.4) reads the latest
+stage output, which is exactly where a ghost surfaces
+(the sweep's F19 precedent, designed out here). The new
+`stage_runs` row stamps the same transaction — commit or
+nothing. A stage never touches another stage's rows, and
+a stage's replacement never reaches outside its own
+`(fingerprint, stage)` space. This is replace-wholesale
 (the corpus-write doctrine the program already proved on
 Supabase rows) turned inward, with content addressing
 doing the targeting that wholesale replacement does by
@@ -708,7 +850,11 @@ scope.
    recorded result, searched-chapters named) is re-derived
    or lost per run. As stage outputs keyed by claim key,
    with input hash over (support-chapter text hashes,
-   embed stamp, judge model, floor, query-shape version),
+   embed stamp, judge model, floor, query-shape version,
+   and the stage_version itself — A6: a judge-prompt edit
+   that left the hash unmoved would keep yesterday's
+   verdicts "current" under a judge that no longer
+   exists),
    retrieval becomes *reusable*: a re-run of the pipeline
    whose text and stamps are unchanged re-reads yesterday's
    verdicts instead of re-judging — and a text or model
@@ -844,6 +990,11 @@ rather than asserting it.
   input hashes ⇒ zero writes, outputs reused, the
   `stage_runs` row records `status: ok` with a reuse
   count.
+- `test_stage_rerun_deletes_unproduced_outputs` — a
+  re-run producing a strict subset of its previous keys
+  deletes the missing keys in the same transaction; the
+  envelope afterwards reflects the subset, not the ghost
+  (A4).
 - `test_input_hash_covers_upstream` — changing an
   upstream stage's output changes the downstream stage's
   input hash (retrieval re-derives when embeddings turn
@@ -898,6 +1049,20 @@ never raw copy — spine A2) applies to every corpus copy
 operation, including §7.2's backup and §5.3's mobility
 copies.
 
+**Contention directions, ruled (A9).** The corpus handle
+sets `busy_timeout` on open; beyond that, the failure
+directions are asymmetric on purpose. **Processor-side
+corpus writes degrade**: stage outputs, vector gap-fills,
+and envelope refreshes that meet a locked database print
+and proceed *unrecorded* — a corpus write never fails a
+run (§5.3's direction: slower or poorer, never wrong).
+**Ingest refuses**: an ingest that cannot take the write
+lock exits cleanly with a printed line rather than
+interleaving with another writer — two importers never
+share a book, and phase transactions stay whole-book
+regardless of contention. Readers are unaffected
+throughout (WAL).
+
 ### 5.3 Mobility: what travels, what does not
 
 corpus.db is designed to be copied between the user's
@@ -928,8 +1093,17 @@ GPU is — the user's stated shape). The copy discipline:
 
 **Corpus loss is a designed non-event.** corpus.db
 corrupt ⇒ F8 discipline (loud, `.corrupt` preserved, no
-auto-restore), and processing *falls back to file
-parsing* — today's behaviour — for every affected book.
+auto-restore), with one corpus-specific mechanics rule
+(A11): preservation is a **rename-in-place** — the file
+and its `-wal`/`-shm` sidecars are renamed to their
+`.corrupt` siblings, never copied. At §8's sizes (≈2.4 GB
+at 300 books) a preservation *copy* can fail on exactly
+the nearly-full disk that plausibly caused the
+corruption, and a copy that dies midway leaves the
+preservation itself in doubt; a rename is atomic on the
+same filesystem and cannot half-happen. Processing then
+*falls back to file parsing* — today's behaviour — for
+every affected book.
 The corpus's failure direction is **slower, never wrong**:
 it is retained work, and retained work can always be
 re-derived from the books themselves, which remain the
@@ -1005,6 +1179,18 @@ promotion rule runs both ways).
 5. **Threshold calibration.** §6.3.
 6. **The envelope.** §6.4.
 
+**Generation honesty (A8).** A work's text is anchored
+to its parser generation (§1.4), and generations can
+segment the same book differently. Cross-work queries
+(1, 3, 4, and every rollup built on them) therefore
+restrict to the **current parser generation** by
+default; a report that deliberately spans generations
+prints the generation mix on its face — §6.3's rule (a
+number without its provenance is not a measurement)
+applied to parser provenance. Silently joining across
+generations would manufacture apparent drift that is
+the parser's, not the books'.
+
 ### 6.2 What changes about answering
 
 Each query above is a SQL statement over files that
@@ -1060,13 +1246,20 @@ their sources:
 | Section | Presence source | Scope |
 |---|---|---|
 | text (chapters, passages) | corpus status (§3.3) | edition |
-| vectors | vector generation + coverage count | edition |
+| vectors | vector generation + coverage against the CURRENT (model, format) (A5) | edition |
 | retrieval (G) | latest `retrieve` stage output | edition |
 | characters / roster | `roster_works` (state.db) | work |
 | staging | `staging_works` (state.db) | work |
 | claims shipped | last run's result markers | work |
 | quotes | `quotes` counts by status (§10) | edition |
 | verdicts | `verdicts_cache` freshness (state.db) | work |
+
+The vectors section is the **normative coverage
+statement** for a work (A5): composed against the
+current (model, format) generation, so a work completed
+under a superseded embedder reports its true current
+coverage — 0% until re-embedded — and never the bare
+status word `complete` (§3.3).
 
 Each section record is `{state, confidence?, evidence_tier?,
 stage, model, stage_version, updated_at, scope}` where
@@ -1201,9 +1394,14 @@ a report, before the corpus holds a single book.
 The learn-status analogue (`cmd_learn_status`, :8673):
 per-work lines (title, fingerprint prefix, status, parser
 version vs current, chapters, passages, vector coverage
-%, stage summary, envelope freshness), totals (works by
-status, corpus.db bytes broken into text / FTS / vectors
-/ other via page counts per table), and the standing
+% — always against the **current** (model, format)
+generation, §3.3/A5 — stage summary, envelope freshness),
+totals (works by status, corpus.db bytes broken into
+text / FTS / vectors / other via page counts per table),
+the vector generations with their canary state — a
+generation marked **suspect** by the drift canary (§2.4,
+A1) prints as a standing warning line, because status is
+a canary check point, not just a report — and the standing
 sentence the substrate report taught us: **corpus.db IS
 retained book text, not a cache** — deleting it costs
 re-ingest, never correctness (§5.3) — printed so no
@@ -1351,6 +1549,20 @@ verify_quote(fingerprint, candidate_text)
   scan confirms). A quote from another book *cannot*
   verify against this one — wrong-book quotes are
   impossible by construction, not by vigilance.
+- **Scope is also kind- and chapter-scoped (A3).** An
+  **evidence-kind** candidate carries an asserted chapter
+  (its claim's), and verification searches **that chapter
+  only**. A match in a different chapter does not verify
+  it: the outcome records drift class `chapter` (the
+  found location rides the record as a diagnostic, §10.3)
+  and the verification fails — it never extends the
+  evidence claim's chapter set, because G grades support
+  by *distinct* chapters and a repeated line found
+  elsewhere would inflate that grade with a chapter the
+  claim never asserted. **Book-wide** search is reserved
+  for the signature and opening kinds, and for candidates
+  carrying no chapter assertion; there, the chapter the
+  line is found in *becomes* its assertion.
 - **Matching discipline:** normalize both sides with the
   existing `_norm_quote` discipline (the `verify_evidence`
   machinery, :11613, generalized from a chunk to the
@@ -1528,6 +1740,12 @@ payload facts; this design's boundary is the payload.
 - `test_cross_book_quote_never_verifies` — a genuine
   quote from book A, proposed for book B (both ingested),
   does not verify against B.
+- `test_evidence_quote_wrong_chapter_fails` — a genuine
+  line asserted against the wrong chapter fails
+  evidence-kind verification with drift class `chapter`
+  recorded and the claim's chapter set unchanged; the
+  same line as a signature candidate verifies book-wide
+  and adopts the found chapter (A3).
 - `test_poll_is_metadata_only` — poll votes alter rank
   within the passing set and nothing else: a screen-fail
   with top votes is not selected; poll output appears in
