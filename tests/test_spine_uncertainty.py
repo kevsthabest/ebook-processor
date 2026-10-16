@@ -210,6 +210,7 @@ class TestApplyLabelsIdempotence(_Base):
         self.assertEqual(row[7], "labelled")   # status
         self.assertEqual(row[8], "same")       # label
         self.assertEqual(row[9], "user")       # labelled_by
+        self.assertIsNotNone(row[10])          # labelled_at
         entries = json.loads(self._pairs_file().read_text())
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["name_a"], "Pete")
