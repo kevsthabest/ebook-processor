@@ -1,5 +1,5 @@
 """Operator portal for the ebook processor (PORTAL-SPEC.md,
-slices S1 + S2).
+slices S1 + S2 + S3).
 
 Run it beside process-portable.py:
 
@@ -18,8 +18,17 @@ behind its toggle, Stop (SIGINT -> checkpoints) and Resume,
 with the S0 run-events artifact tailed live for the pair /
 verdict / decision data stdout cannot carry. Every write still
 happens inside a CLI subprocess; the portal itself never opens
-a store writable. The Desk and the Matrices panel are later
-slices (S3/S4) and are deliberately absent here.
+a store writable.
+
+Slice S3 adds the Desk: the ruling queue over state.db's two
+stores (§5.2's mapping, confirmed as drafted in Q4) — today's
+trope batch and parked escalations with their evidence views,
+impulse proposals from the local trope-map review files (Q5),
+and uncertainty rulings through the CLI's labels intake (A6).
+Staged claims carry evidence only: the CLI has no ruling verb
+for them (GAP-4), and the Desk says so on its surface rather
+than drawing controls that cannot act. The Matrices panel is
+the remaining slice (S4) and is deliberately absent here.
 
 Stack: Python standard library only. The portal's whole job is
 reading two SQLite files and serving a dozen routes on the
@@ -632,6 +641,268 @@ def resolve_work(learn_dir, query):
 
 
 # ---------------------------------------------------------------------------
+# The Desk (slice S3): the ruling queue over state.db's two stores
+# ---------------------------------------------------------------------------
+
+# The batch window: one labelling round's worth of staged claims.
+# The spine design caps a round at ~20 (OC-4) because a queue that
+# becomes homework dies; the Desk's batch is that round, and every
+# staged claim past it is parked — §5.2's mapping, stated there so
+# the split is a decision and not an accident.
+_DESK_BATCH_WINDOW = 20
+
+# The labeller string the portal records on its rulings. The
+# labels intake stores it verbatim in the queue's audit columns
+# (label / labelled_by / labelled_at); the CLI's own intake test
+# files its labels as "user", and the portal rules as the
+# operator's hand, so it uses the same name.
+_DESK_LABELLER = "user"
+
+# The verdict strings the Desk offers per packet kind. Only
+# merge_pair's pair is machine-consumed — the CLI appends
+# same/different merge pairs to eval/merge_pairs.json, so a
+# different string would silently lose that flow. The rest are
+# the labeller's audit vocabulary, stored verbatim on the queue
+# row; each button therefore shows the exact string it records,
+# never a friendlier paraphrase of it.
+_DESK_LABELS = {
+    "merge_pair": ("same", "different"),
+    "split_suspect": ("same", "different"),
+    "family_claim": ("family", "not-family"),
+    "claim": ("correct", "incorrect"),
+}
+_DESK_LABELS_DEFAULT = ("correct", "incorrect")
+
+# GAP-4, stated on the Desk itself (Q4's ruling: an operator
+# surface should say what it cannot do). Staged claims have no
+# ruling verb — the staging gate promotes by recurrence, band,
+# or evidence — so the batch shows evidence and no controls.
+_GAP4_NOTE = (
+    "Staged claims cannot be ruled from the Desk: the CLI has "
+    "no verb to keep or drop a staged claim by hand (GAP-4). "
+    "The staging gate promotes by recurrence, band, or "
+    "evidence; this page shows the evidence and leaves the "
+    "gate to its work.")
+
+
+def _labels_for_kind(kind):
+    return list(_DESK_LABELS.get(kind, _DESK_LABELS_DEFAULT))
+
+
+def _json_list(raw):
+    """A stored JSON list column, read defensively: the Desk
+    renders operator evidence, and a malformed cell must degrade
+    to an empty list, never take the page down."""
+    try:
+        value = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        return []
+    return value if isinstance(value, list) else []
+
+
+def _desk_claims(conn):
+    """Every staged claim with its work, in staging currency.
+    Mirrors the claim shape of the CLI's own staging_report_data
+    (the §4 rule: portal SQL mirrors the CLI's read models).
+    Ordered most-judgeable first — sightings, then chapter
+    support (§5.2) — with title/display tiebreaks so the order
+    cannot wobble between polls."""
+    works = {}
+    for wk, wid, title, author in conn.execute(
+            "SELECT work_key, work_id, title, author "
+            "FROM staging_works"):
+        works[wk] = {"work_id": wid, "title": title or "",
+                     "author": author or ""}
+    claims = []
+    for row in conn.execute(
+            "SELECT work_key, claim_key, class, display, "
+            "promoted_via, best_chapters, first_seen, last_seen, "
+            "sightings, name_forms FROM staging_claims "
+            "WHERE state='staged'"):
+        work = works.get(row[0], {"work_id": None, "title": "",
+                                  "author": ""})
+        sightings = _json_list(row[8])
+        claims.append({
+            "work_key": row[0], "work_id": work["work_id"],
+            "work_title": work["title"],
+            "work_author": work["author"],
+            "key": row[1], "class": row[2], "display": row[3],
+            "promoted_via": row[4], "best_chapters": row[5] or 0,
+            "first_seen": row[6], "last_seen": row[7],
+            "sightings": sightings,
+            "sightings_count": len(sightings),
+            "name_forms": _json_list(row[9]),
+        })
+    claims.sort(key=lambda c: (-c["sightings_count"],
+                               -c["best_chapters"],
+                               c["work_title"], c["display"]))
+    return claims
+
+
+def _desk_uncertainty(conn):
+    """Pending uncertainty items, queue order — the parked half
+    of the Desk. Labelled rows have left the queue and control
+    rows were never in it (both stay in the table as the audit
+    trail; neither is the operator's homework). The packet
+    itself is not carried here; the evidence endpoint reads it
+    per item, so the list stays light."""
+    out = []
+    for row in conn.execute(
+            "SELECT id, created, run_ref, work_key, class, "
+            "subject, packet FROM uncertainty_queue "
+            "WHERE status='pending' ORDER BY id"):
+        try:
+            packet = json.loads(row[6]) if row[6] else {}
+        except (TypeError, ValueError):
+            packet = {}
+        kind = packet.get("kind") if isinstance(packet, dict) \
+            else None
+        out.append({
+            "id": row[0], "created": row[1], "run_ref": row[2],
+            "work_key": row[3], "class": row[4], "subject": row[5],
+            "kind": kind, "labels": _labels_for_kind(kind),
+        })
+    return out
+
+
+def uncertainty_item(learn_dir, queue_id):
+    """One pending uncertainty item with its full packet, or
+    None. The Desk rules only what it listed: an item that is
+    not pending (already labelled, or a control) is not here,
+    and a ruling re-reads through this function rather than
+    trusting the request's copy of the row."""
+    if not isinstance(queue_id, int):
+        return None
+    state_path = Path(learn_dir) / "state.db"
+    if not state_path.exists():
+        return None
+    conn = _ro_connect(state_path)
+    try:
+        row = conn.execute(
+            "SELECT id, created, run_ref, work_key, class, "
+            "subject, packet FROM uncertainty_queue "
+            "WHERE id=? AND status='pending'",
+            (queue_id,)).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    try:
+        packet = json.loads(row[6]) if row[6] else {}
+    except (TypeError, ValueError):
+        packet = {}
+    if not isinstance(packet, dict):
+        packet = {}
+    return {
+        "id": row[0], "created": row[1], "run_ref": row[2],
+        "work_key": row[3], "class": row[4], "subject": row[5],
+        "kind": packet.get("kind"), "packet": packet,
+        "labels": _labels_for_kind(packet.get("kind")),
+    }
+
+
+def desk_claim(learn_dir, work_key, claim_key):
+    """The staged claim the Desk listed, re-read fresh, with its
+    complete sightings history. Evidence endpoints verify
+    against the store rather than trusting request parameters:
+    a pair that is not a staged claim (unknown, or promoted
+    since the page loaded) is None."""
+    state_path = Path(learn_dir) / "state.db"
+    if not state_path.exists():
+        return None
+    conn = _ro_connect(state_path)
+    try:
+        for claim in _desk_claims(conn):
+            if claim["work_key"] == work_key \
+                    and claim["key"] == claim_key:
+                return claim
+        return None
+    finally:
+        conn.close()
+
+
+def _impulse_proposals(preview_dir):
+    """Q5: impulse proposals are the LOCAL --trope-map review
+    files' proposals[] — per-preview records, not the global
+    queue (write-runs record theirs in Supabase, which the
+    portal never reads, §4). A broken review file is skipped
+    and counted, never fatal: the Desk reports what it could
+    read and says that some of it could not be read."""
+    out = []
+    files = 0
+    broken = 0
+    preview_dir = Path(preview_dir)
+    if preview_dir.is_dir():
+        for path in sorted(preview_dir.glob("*-trope-map.json")):
+            try:
+                data = json.loads(
+                    path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                broken += 1
+                continue
+            if not isinstance(data, dict):
+                broken += 1
+                continue
+            files += 1
+            for entry in data.get("proposals") or []:
+                if not isinstance(entry, dict):
+                    continue
+                out.append({
+                    "file": path.name,
+                    "preview": data.get("preview"),
+                    "threshold": data.get("threshold"),
+                    "label": entry.get("pipeline_trope"),
+                    "chapter_count": entry.get("chapter_count"),
+                    "nearest_catalog_id":
+                        entry.get("nearest_catalog_id"),
+                    "nearest_similarity":
+                        entry.get("nearest_similarity"),
+                    "book": entry.get("book"),
+                    "isbn": entry.get("isbn"),
+                })
+    return out, files, broken
+
+
+def desk_data(learn_dir, script_dir):
+    """Assemble the Desk (§5.2): today's batch (staged claims,
+    sightings then chapter support, one round's window), parked
+    (pending uncertainty items + staged claims beyond the
+    window), and impulse proposals from the local trope-map
+    files. Missing stores degrade to empty sections with the
+    absence stated, Home's posture."""
+    learn_dir = Path(learn_dir)
+    script_dir = Path(script_dir)
+    proposals, files, broken = _impulse_proposals(
+        script_dir / "preview")
+    desk = {
+        "present": False, "busy": [],
+        "batch": [], "parked_claims": [], "parked_items": [],
+        "proposals": proposals, "proposals_files": files,
+        "proposals_broken": broken,
+        "gap4": _GAP4_NOTE, "batch_window": _DESK_BATCH_WINDOW,
+        "staged_total": 0,
+    }
+    state_path = learn_dir / "state.db"
+    if not state_path.exists():
+        return desk
+    conn = None
+    try:
+        conn = _ro_connect(state_path)
+        claims = _desk_claims(conn)
+        desk["batch"] = claims[:_DESK_BATCH_WINDOW]
+        desk["parked_claims"] = claims[_DESK_BATCH_WINDOW:]
+        desk["staged_total"] = len(claims)
+        desk["parked_items"] = _desk_uncertainty(conn)
+        desk["present"] = True
+    except sqlite3.Error:
+        desk["busy"] = ["state.db"]
+    finally:
+        if conn is not None:
+            conn.close()
+    return desk
+
+
+# ---------------------------------------------------------------------------
 # Launching (slice S2): the §6 action inventory as argv builders
 # ---------------------------------------------------------------------------
 
@@ -855,6 +1126,29 @@ def build_launch(ctx, spec):
                 "prompted per click)")
         argv = base + ["--backup-state", str(ctx.backup_dir)] + learn
         return LaunchSpec("backup", argv, "Backup now")
+
+    if action == "apply_labels":
+        # A6 (§6): the portal writes the labels file (the CLI's
+        # own intake format) and the CLI consumes it. Only a
+        # file the portal itself just wrote may be applied: the
+        # path must sit directly in the portal's labels dir, so
+        # a request can never aim the intake at an arbitrary
+        # file on the operator's disk.
+        raw = spec.get("labels_file") or ""
+        path = Path(str(raw))
+        labels_root = (ctx.script_dir / "portal-cache"
+                       / "labels").resolve()
+        try:
+            inside = path.resolve().parent == labels_root
+        except OSError:
+            inside = False
+        if not inside or not path.is_file():
+            raise PortalError(
+                "labels file is not a portal labels file")
+        argv = base + ["--apply-uncertainty-labels",
+                       str(path)] + learn
+        return LaunchSpec("apply_labels", argv,
+                          "Apply ruling — uncertainty labels")
 
     raise PortalError(f"unknown action: {action!r}")
 
@@ -1981,6 +2275,20 @@ tbody tr[data-fp]:hover { background: #faf6ee; }
 pre#explain { background: #fff; border: 1px solid #ddd5c7;
   border-radius: 8px; padding: 12px; white-space: pre-wrap;
   font-size: 12.5px; max-height: 480px; overflow: auto; }
+tbody tr.rowlink { cursor: pointer; }
+tbody tr.rowlink:hover { background: #faf6ee; }
+section#explain { background: #fff; border: 1px solid #ddd5c7;
+  border-radius: 8px; padding: 12px 16px; margin: 20px 0; }
+section#explain pre { white-space: pre-wrap; font-size: 12.5px;
+  max-height: 480px; overflow: auto; }
+dl.packet { display: grid; grid-template-columns: 140px 1fr;
+  gap: 3px 12px; font-size: 13px; margin: 8px 0; }
+dl.packet dt { color: #8a8175; }
+dl.packet dd { margin: 0; white-space: pre-wrap; word-break:
+  break-word; }
+.rulebar { margin: 12px 0 4px; display: flex; gap: 8px;
+  align-items: center; flex-wrap: wrap; }
+.rulebar .note { margin-right: 4px; }
 button, .btn { font: inherit; font-size: 13px; background: #2e4a34;
   color: #fff; border: 0; border-radius: 6px; padding: 6px 12px;
   cursor: pointer; text-decoration: none; display: inline-block; }
@@ -2093,6 +2401,9 @@ function wireRows() {
       }
     });
   });
+  // Page-specific wiring (the Desk's rows) rebinds after every
+  // poll swap, through the same single entry point.
+  if (window.wireDesk) window.wireDesk();
 }
 wireRows();
 // Backup now (A5): fires the CLI backup into the configured
@@ -2133,12 +2444,294 @@ def _page(title, main_html, ctx, extra_script=""):
         f"<script>{_PAGE_JS}</script>{extra_script}</body></html>")
 
 
-_DESK_HTML = (
-    "<h2>The Desk</h2><p class='muted'>The ruling queue arrives "
-    "in slice S3. Home's queue pointers already count it; the "
-    "queue itself — today's trope batch, parked escalations, "
-    "impulse proposals — is built on the staging and uncertainty "
-    "stores in S3.</p>")
+def _claim_row(claim):
+    forms = claim["name_forms"]
+    forms_cell = _esc(", ".join(str(f) for f in forms)) \
+        if len(forms) > 1 else ""
+    return (
+        f"<tr class='rowlink' data-claim='1' "
+        f"data-work-key='{_esc(claim['work_key'])}' "
+        f"data-claim-key='{_esc(claim['key'])}'>"
+        f"<td>{_esc(claim['display'])}</td>"
+        f"<td>{_esc(claim['work_title'])}</td>"
+        f"<td>{_esc(claim['class'])}</td>"
+        f"<td>{claim['sightings_count']}</td>"
+        f"<td>{claim['best_chapters']}</td>"
+        f"<td>{_esc(claim['first_seen'] or '')}</td>"
+        f"<td>{_esc(claim['last_seen'] or '')}</td>"
+        f"<td>{forms_cell}</td></tr>")
+
+
+_CLAIM_TABLE_HEAD = (
+    "<table><thead><tr><th>Claim</th><th>Work</th><th>Class</th>"
+    "<th>Sightings</th><th>Chapters</th><th>First seen</th>"
+    "<th>Last seen</th><th>Forms differ</th></tr></thead><tbody>")
+
+
+def _render_desk(desk):
+    """The Desk (§2.2): today's batch, parked escalations,
+    impulse proposals. Rows open evidence; the only ruling
+    controls in the building live inside an uncertainty item's
+    evidence view (§2.2's structural cut — no inline Keep/Drop,
+    and per GAP-4 no claim controls anywhere)."""
+    out = ["<h2>The Desk</h2>"]
+    if desk["busy"]:
+        out.append(
+            "<p class='warn'>state.db is busy — another process "
+            "holds it. The Desk retries on refresh; it never "
+            "opens a store writable.</p>")
+    if not desk["present"] and not desk["busy"]:
+        out.append(
+            "<p class='muted'>No state.db yet — nothing has "
+            "staged or queued. The Desk fills when runs leave "
+            "claims and uncertainty behind.</p>")
+
+    out.append("<section><h2>Today's trope batch</h2>")
+    if desk["present"]:
+        out.append(
+            f"<p class='note'>Staged claims, most sightings "
+            f"first, then chapter support — the first "
+            f"{desk['batch_window']} of {desk['staged_total']} "
+            f"staged (one labelling round's window). A row opens "
+            f"the claim's evidence.</p>")
+        out.append(
+            f"<p class='note'><strong>GAP-4:</strong> "
+            f"{_esc(desk['gap4'])}</p>")
+        if desk["batch"]:
+            out.append(_CLAIM_TABLE_HEAD)
+            out.extend(_claim_row(c) for c in desk["batch"])
+            out.append("</tbody></table>")
+        else:
+            out.append("<p class='muted'>No staged claims.</p>")
+    out.append("</section>")
+
+    out.append("<section><h2>Parked escalations</h2>")
+    if desk["present"]:
+        items = desk["parked_items"]
+        if items:
+            out.append(
+                "<table><thead><tr><th>#</th><th>Class</th>"
+                "<th>Subject</th><th>Packet</th><th>Filed</th>"
+                "</tr></thead><tbody>")
+            for item in items:
+                out.append(
+                    f"<tr class='rowlink' data-qid='{item['id']}'>"
+                    f"<td>{item['id']}</td>"
+                    f"<td>{_esc(item['class'])}</td>"
+                    f"<td>{_esc(item['subject'] or '')}</td>"
+                    f"<td>{_esc(item['kind'] or '')}</td>"
+                    f"<td>{_esc(item['created'] or '')}</td></tr>")
+            out.append("</tbody></table>")
+        else:
+            out.append(
+                "<p class='muted'>No uncertainty items awaiting "
+                "a ruling.</p>")
+        if desk["parked_claims"]:
+            out.append(
+                f"<h2>Staged beyond the batch window "
+                f"({len(desk['parked_claims'])})</h2>")
+            out.append(
+                "<p class='note'>These wait for a later round; "
+                "the window keeps the daily batch a round, not "
+                "a backlog.</p>")
+            out.append(_CLAIM_TABLE_HEAD)
+            out.extend(_claim_row(c)
+                       for c in desk["parked_claims"])
+            out.append("</tbody></table>")
+    out.append("</section>")
+
+    out.append("<section><h2>Impulse proposals</h2>")
+    out.append(
+        "<p class='note'>Off-catalogue trope labels from the "
+        "local <code>--trope-map</code> review files — "
+        "per-preview proposals (Q5), not the global queue. "
+        "Write-runs record theirs in Supabase, which the portal "
+        "never reads (§4).</p>")
+    if desk["proposals_broken"]:
+        out.append(
+            f"<p class='warn'>{desk['proposals_broken']} "
+            f"trope-map review file(s) could not be read and "
+            f"were skipped.</p>")
+    if desk["proposals"]:
+        out.append(
+            "<table><thead><tr><th>Label</th><th>Nearest "
+            "catalogue</th><th>Similarity</th><th>Chapters</th>"
+            "<th>Book</th><th>From file</th></tr></thead>"
+            "<tbody>")
+        for p in desk["proposals"]:
+            near = p["nearest_catalog_id"] or "—"
+            sim = p["nearest_similarity"]
+            out.append(
+                f"<tr><td>{_esc(p['label'] or '')}</td>"
+                f"<td>{_esc(near)}</td>"
+                f"<td>{'' if sim is None else sim}</td>"
+                f"<td>{p['chapter_count'] or ''}</td>"
+                f"<td>{_esc(p['book'] or '')}</td>"
+                f"<td>{_esc(p['file'])}</td></tr>")
+        out.append("</tbody></table>")
+    else:
+        out.append(
+            "<p class='muted'>No proposals in the local review "
+            "files.</p>")
+    out.append("</section>")
+
+    out.append(
+        "<section id='explain' hidden><h2 id='ev-title'>"
+        "Evidence</h2><div id='ev-body'></div></section>")
+    return "\n".join(out)
+
+
+_DESK_JS = """
+<script>
+// The Desk's wiring. Everything fetched is rendered with
+// textContent / createElement — evidence and packets are book
+// data, and book data never becomes markup.
+function _evSection() {
+  const sec = document.getElementById('explain');
+  sec.hidden = false;
+  return sec;
+}
+function _evSet(title, build) {
+  const sec = _evSection();
+  document.getElementById('ev-title').textContent = title;
+  const body = document.getElementById('ev-body');
+  body.replaceChildren();
+  build(body);
+  sec.scrollIntoView({block: 'nearest'});
+}
+function _evNote(body, text) {
+  const p = document.createElement('p');
+  p.className = 'note';
+  p.textContent = text;
+  body.appendChild(p);
+}
+async function _openClaim(row) {
+  _evSet('Claim evidence', (body) => {
+    _evNote(body, 'Loading evidence…');
+  });
+  try {
+    const res = await fetch('/api/desk/claim?work_key=' +
+      encodeURIComponent(row.dataset.workKey) + '&claim_key=' +
+      encodeURIComponent(row.dataset.claimKey));
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.status);
+    const claim = data.claim;
+    _evSet('Claim — ' + claim.display, (body) => {
+      // The evidence opens with the full sightings history:
+      // every run that has ever sighted this claim, from the
+      // store's own record.
+      const h = document.createElement('p');
+      const runs = claim.sightings.join(', ');
+      h.textContent = 'Sightings history — ' +
+        claim.sightings_count + ' sighting(s): run(s) ' + runs +
+        '. First seen ' + (claim.first_seen || '—') +
+        ', last seen ' + (claim.last_seen || '—') +
+        ', best chapter support ' + claim.best_chapters + '.';
+      body.appendChild(h);
+      if (claim.name_forms.length) {
+        _evNote(body, 'Name forms: ' +
+          claim.name_forms.join(' · '));
+      }
+      _evNote(body, 'Staged claims have no ruling verb ' +
+        '(GAP-4): this evidence is the whole of the Desk\\'s ' +
+        'offer for a claim.');
+      const pre = document.createElement('pre');
+      pre.textContent = data.text || 'No report.';
+      body.appendChild(pre);
+    });
+  } catch (e) {
+    _evSet('Claim evidence', (body) => {
+      _evNote(body, 'Evidence unavailable: ' + e.message);
+    });
+  }
+}
+function _packetDl(packet) {
+  const dl = document.createElement('dl');
+  dl.className = 'packet';
+  for (const [key, value] of Object.entries(packet)) {
+    const dt = document.createElement('dt');
+    dt.textContent = key;
+    const dd = document.createElement('dd');
+    dd.textContent = (value !== null &&
+      typeof value === 'object')
+      ? JSON.stringify(value) : String(value ?? '');
+    dl.appendChild(dt);
+    dl.appendChild(dd);
+  }
+  return dl;
+}
+async function _openItem(row) {
+  _evSet('Uncertainty item', (body) => {
+    _evNote(body, 'Loading evidence…');
+  });
+  try {
+    const res = await fetch('/api/desk/item?id=' +
+      encodeURIComponent(row.dataset.qid));
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.status);
+    const item = data.item;
+    _evSet(item.subject || ('Item #' + item.id), (body) => {
+      _evNote(body, 'Class ' + item.class + ' · filed ' +
+        (item.created || '—') + ' · run ' +
+        (item.run_ref || '—') + ' · packet kind ' +
+        (item.kind || '—') + '.');
+      body.appendChild(_packetDl(item.packet || {}));
+      // The ruling control lives here, in the evidence view
+      // (§2.2) — never on the queue row. Each button records
+      // the exact label string it shows.
+      const bar = document.createElement('div');
+      bar.className = 'rulebar';
+      const lead = document.createElement('span');
+      lead.className = 'note';
+      lead.textContent = 'Rule this item:';
+      bar.appendChild(lead);
+      for (const label of item.labels) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = label;
+        btn.addEventListener('click', async () => {
+          bar.querySelectorAll('button').forEach(
+            (b) => { b.disabled = true; });
+          try {
+            const r = await fetch('/api/desk/rule', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({queue_id: item.id,
+                                    label: label})});
+            const d = await r.json();
+            if (!r.ok) throw new Error(d.error || r.status);
+            location.href = '/run/' + d.job_id;
+          } catch (e) {
+            alert('Ruling refused: ' + e.message);
+            bar.querySelectorAll('button').forEach(
+              (b) => { b.disabled = false; });
+          }
+        });
+        bar.appendChild(btn);
+      }
+      body.appendChild(bar);
+      _evNote(body, 'A ruling writes the CLI\\'s labels file ' +
+        'and applies it through the one-writer queue ' +
+        '(--apply-uncertainty-labels); the item then leaves ' +
+        'this queue.');
+    });
+  } catch (e) {
+    _evSet('Uncertainty item', (body) => {
+      _evNote(body, 'Evidence unavailable: ' + e.message);
+    });
+  }
+}
+window.wireDesk = function () {
+  document.querySelectorAll('tr[data-claim]').forEach((row) => {
+    row.addEventListener('click', () => _openClaim(row));
+  });
+  document.querySelectorAll('tr[data-qid]').forEach((row) => {
+    row.addEventListener('click', () => _openItem(row));
+  });
+};
+wireDesk();
+</script>
+"""
 
 
 def _render_ingest(ctx):
@@ -2457,6 +3050,77 @@ class PortalContext:
                 or "(--explain produced no output)"
         return text
 
+    @property
+    def labels_dir(self):
+        # A6's scratch: the labels files the portal writes for
+        # the CLI to consume live in the portal's own cache dir,
+        # beside the cover cache (Q10's pattern) — never in the
+        # learned dir, never in a store (§4's posture).
+        return self.script_dir / "portal-cache" / "labels"
+
+    def desk(self):
+        return desk_data(self.learn_dir, self.script_dir)
+
+    def explain_claim(self, work_key, claim_key):
+        """Shell --explain for one staged claim (action A7,
+        read-only). The work argument is the claim's own
+        work_key: --explain resolves it exactly against
+        staging_works, where a title could collide across
+        editions; the claim key is the store's stored value,
+        passed as one argv item."""
+        script = self.script_dir / "process-portable.py"
+        result = subprocess.run(
+            [sys.executable, str(script), "--explain", work_key,
+             "--explain-claim", claim_key,
+             "--learn-dir", str(self.learn_dir)],
+            capture_output=True, text=True, timeout=120)
+        text = (result.stdout or "").strip()
+        if not text:
+            text = (result.stderr or "").strip() \
+                or "(--explain produced no output)"
+        return text
+
+    def rule(self, queue_id, label):
+        """A6: rule one pending uncertainty item from its
+        evidence view. The item is re-read fresh (a ruling never
+        trusts the page's copy), the label must be one of the
+        verdict strings that item's packet kind offers, and the
+        apply runs as a writer job through the registry — the
+        Desk's ruling takes the one-writer slot like every
+        other state-changing launch (§7)."""
+        item = uncertainty_item(self.learn_dir, queue_id)
+        if item is None:
+            raise PortalError(
+                f"no pending uncertainty item: {queue_id}")
+        if label not in item["labels"]:
+            raise PortalError(
+                f"{label!r} is not a verdict for this item "
+                f"(choose: {', '.join(item['labels'])})")
+        path = self._write_labels_file(item, label)
+        return self.registry.launch(build_launch(
+            self, {"action": "apply_labels",
+                   "labels_file": str(path)}))
+
+    def _write_labels_file(self, item, label):
+        """The CLI's labels intake, verbatim: a JSON list of
+        {queue_id, label, labeller}. One file per ruling, kept
+        in the portal's labels dir — the queue row the CLI
+        updates is the audit trail; the file is its receipt."""
+        self.labels_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = self.labels_dir / f"labels-{stamp}-{item['id']}.json"
+        n = 1
+        while path.exists():
+            n += 1
+            path = self.labels_dir / (
+                f"labels-{stamp}-{item['id']}-{n}.json")
+        entries = [{"queue_id": item["id"], "label": label,
+                    "labeller": _DESK_LABELLER}]
+        path.write_text(
+            json.dumps(entries, ensure_ascii=False, indent=1)
+            + "\n", encoding="utf-8")
+        return path
+
 
 def _host_allowed(host_header, port):
     """Whether a request's Host header names this portal.
@@ -2565,6 +3229,24 @@ def make_server(host, port, ctx):
                 return
             self._json(200, {"job_id": job.id, "state": job.state})
 
+        def _rule_response(self, body):
+            """A6 from the Desk: validate the body's shape here;
+            the item, its status, and its label vocabulary are
+            validated against the store in ctx.rule (PortalError
+            -> the do_POST handler's 400)."""
+            try:
+                queue_id = int(body.get("queue_id"))
+            except (TypeError, ValueError):
+                self._json(400, {
+                    "error": "queue_id must be an integer"})
+                return
+            label = body.get("label")
+            if not isinstance(label, str) or not label:
+                self._json(400, {"error": "label is required"})
+                return
+            job = ctx.rule(queue_id, label)
+            self._json(200, {"job_id": job.id, "state": job.state})
+
         def _origin_ok(self):
             """POSTs are state-changing, and the Host check
             alone cannot vet them: it validates the DESTINATION
@@ -2615,6 +3297,8 @@ def make_server(host, port, ctx):
                 body = self._read_json_body()
                 if parsed.path == "/api/launch":
                     self._launch_response(body)
+                elif parsed.path == "/api/desk/rule":
+                    self._rule_response(body)
                 elif parsed.path == "/api/backup":
                     self._launch_response({"action": "backup"})
                 elif parsed.path.startswith("/api/jobs/"):
@@ -2701,8 +3385,39 @@ def make_server(host, port, ctx):
                         "Control Room", _render_home(ctx.home()), ctx),
                         "text/html; charset=utf-8")
                 elif parsed.path == "/desk":
-                    self._send(200, _page("The Desk", _DESK_HTML, ctx),
-                               "text/html; charset=utf-8")
+                    self._send(200, _page(
+                        "The Desk", _render_desk(ctx.desk()), ctx,
+                        extra_script=_DESK_JS),
+                        "text/html; charset=utf-8")
+                elif parsed.path == "/api/desk":
+                    self._json(200, ctx.desk())
+                elif parsed.path == "/api/desk/claim":
+                    qs = parse_qs(parsed.query)
+                    claim = desk_claim(
+                        ctx.learn_dir, qs.get("work_key", [""])[0],
+                        qs.get("claim_key", [""])[0])
+                    if claim is None:
+                        self._json(404, {
+                            "error": "no such staged claim"})
+                        return
+                    self._json(200, {
+                        "claim": claim,
+                        "text": ctx.explain_claim(
+                            claim["work_key"], claim["key"])})
+                elif parsed.path == "/api/desk/item":
+                    raw = parse_qs(parsed.query).get("id", [""])[0]
+                    try:
+                        queue_id = int(raw)
+                    except (TypeError, ValueError):
+                        queue_id = None
+                    item = uncertainty_item(
+                        ctx.learn_dir, queue_id) \
+                        if queue_id is not None else None
+                    if item is None:
+                        self._json(404, {
+                            "error": f"no pending item: {raw}"})
+                        return
+                    self._json(200, {"item": item})
                 elif parsed.path == "/ingest":
                     self._send(200, _page(
                         "Ingest", _render_ingest(ctx), ctx,

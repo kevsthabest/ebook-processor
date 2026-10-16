@@ -451,7 +451,10 @@ class TestHTTPServer(unittest.TestCase):
         self.assertEqual(data["cards"]["quotes_verified"], 3)
         status, desk = self._get("/desk")
         self.assertEqual(status, 200)
-        self.assertIn("S3", desk)
+        # S1 pinned the placeholder ("arrives in S3"); S3 has
+        # landed, so the pin now names the real Desk surface.
+        self.assertIn("Today's trope batch", desk)
+        self.assertIn("Parked escalations", desk)
         with self.assertRaises(urllib.error.HTTPError) as cm:
             self._get("/api/explain?work=deadbeef00")
         self.assertEqual(cm.exception.code, 404)
