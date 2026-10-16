@@ -7,6 +7,8 @@ whatever ebook files you hand it. **Preview first, write later** — every run
 can save a full Markdown/JSON report for human review before anything
 touches the database.
 
+**Current version: 2.13.2** (`PORTABLE_VERSION` in `process-portable.py`).
+
 ## How it works
 
 1. Drop ebook files into `import/`
@@ -87,18 +89,97 @@ The abort threshold is the `MAX_FAILED_CHUNK_RATIO = 0.5` constant
 (`:169`), not a flag; aborted runs still save a preview marked
 `"aborted": true`.
 
-## Operator portal (slice S1: Home)
+## Corpus (v2.13)
+
+The corpus is a local store of book text that analysis stages read
+from, so a book is parsed once and re-used: `corpus.db`, beside
+`state.db` in the learn dir. Chapter text is stored once (with an
+FTS5 index where the SQLite build provides one — without it the
+store opens degraded, with a printed notice), passages are spans
+over that text, and passage vectors
+are kept per embedding generation with a drift canary watching the
+endpoint. `corpus.db` is retained book text, not a cache — deleting
+it costs a re-ingest, never correctness.
+
+- `--ingest FILE|DIR` — the named act that creates/fills the corpus for
+  a book (the pipeline's own parse, then embeddings; a directory is
+  also accepted). Completeness
+  is explicit (`text_complete` → `vectors_partial` → `complete`);
+  a half-ingested book never reads as whole.
+- `--corpus-status` — works, chapter/passage counts, vector
+  coverage, quote counts, and the current generation + canary state.
+- `--corpus-reembed` — gap-fill embeddings for works short on
+  vectors under the current generation.
+- `--use-corpus` — corpus-sourced acquisition for a run: when the
+  presented file's bytes hash to a `source_hash` ingest recorded
+  and the work is in a servable state, the text comes from the
+  corpus instead of a file parse (the run prints a `Corpus-sourced:`
+  line). On any mismatch the run falls back to parsing the file,
+  with no refusal printed — the signal that sourcing didn't engage
+  is the *absence* of that line. Per-chapter hash validation with
+  a printed refusal is the replay path; see `--replay`.
+- `--evidence-retrieval` — targeted trope-evidence retrieval
+  against the corpus. Stage outputs settle under an input hash, so
+  a change (judge, embedding generation, one chapter's text)
+  re-derives only the outputs whose hashes cover it; the rest are
+  re-read, not recomputed.
+- `--corpus-quotes` — verify the run's quotes against the corpus
+  text (verbatim match or snap-to-span; anything else fails
+  closed), then a decision-model selection poll over the verified
+  candidates only. Selection sheds fail closed: no poll, no quotes
+  ship.
+- `--backup-state DIR` / `--restore-state DIR` — one backup of
+  `state.db` + `corpus.db` with a manifest. Restore verifies the
+  manifest and hashes *before* any live file moves and refuses a
+  damaged backup with the live pair untouched.
+- `--capture-snapshot NAME` / `--replay NAME` — freeze a run's
+  extraction draws and replay them. Only the extraction draws are
+  frozen: decision calls stay live by design, so decision outcomes
+  can differ between capture and replay. The snapshot carries its
+  own chapter hashes; a replay validates them before the corpus
+  path engages and refuses it, in the open, when the corpus is
+  absent or mismatched.
+- `--explain <fingerprint>` — read-only forensics across both
+  stores: a work's quotes, a staged claim when one is named with
+  `--explain-claim`, and (with `--explain-character NAME`)
+  character occurrences, answered from the stored text. Character
+  answers need the work's persisted roster in `state.db` — a work
+  whose runs were all previews or replays reports the character
+  as not on the roster.
+
+Design of record: `eval/corpus-design.md`.
+
+## Operator portal
 
 A localhost-only web console for the processor: `py portal.py`
 from the repo root, then open the URL it prints (127.0.0.1:8765
 by default; if that port is taken it takes the next free one
 and prints the actual URL). No dependencies — standard library
-only. Slice S1 is the read-only Control Room: corpus health,
-coverage, the book table, recent runs, and queue counts, read
-directly from `state.db` / `corpus.db`. It writes nothing and
-launches nothing; run launching, the Desk, and the Matrices
-panel are later slices (see `PORTAL-SPEC.md` in the sweep
-workspace).
+only, bound to 127.0.0.1. The portal reads the stores directly
+(read-only) and launches runs through the same CLI — never a
+second pipeline path.
+
+- **Home (Control Room)** — corpus health (generation + canary),
+  coverage counts, the book table (a row opens read-only
+  `--explain` forensics), recent runs, queue counts, and a
+  running-now strip.
+- **Run launching** — standing command plus saved profiles;
+  write runs sit behind a confirm. Launches are jobs in a
+  one-writer FIFO queue — preview runs queue too; read-only page
+  reads and actions never enter the queue. The ingest picker
+  shows cover tiles extracted from the EPUBs themselves.
+- **Live Run page** — streamed log, stage progress, results feed,
+  and the Matrices panel (merge/trope decision grids computed
+  from the run's event artifact; pipeline launches add
+  `--emit-run-events`). Stop signals the run (`CTRL_BREAK_EVENT`
+  on Windows), then terminates after a short grace, then kills;
+  Resume re-runs the argv with `--resume` when checkpoints exist.
+- **The Desk** — the human-ruling surface: staged claims in
+  labelling batches and the parked uncertainty queue, each with a
+  full evidence view. Rulings apply through
+  `--apply-uncertainty-labels`, via the same job queue.
+- **Backup** — a Backup button writes `--backup-state` to a
+  configured directory; restore stays terminal-only.
 
 ## Two-task extraction (v1.19+)
 
@@ -342,10 +423,13 @@ Learning is on by default (`--learn`); `--no-learn` disables it.
 - `--import-labels PATH` — import hand-labeled merge pairs
   (`label-merges.py` output) into the nickname dictionary, then continue.
 
-`LearnedState` persists four kinds of knowledge: `nicknames.json` (short
-name → canonical name), `titles.json` (trusted title prefixes),
-`threshold_stats.json` (per-trigger keep/drop stats), and
-`series/<key>.json` (per-author character rosters used as alias hints).
+Learning state lives in the learn dir as two SQLite stores:
+`state.db` holds what runs have learned — nicknames (short name →
+canonical name), trusted title prefixes, per-trigger keep/drop
+threshold stats, per-author series rosters used as alias hints —
+plus staged claims, cached verdicts, and the persisted per-work
+rosters; `corpus.db` holds the book text itself (see Corpus).
+`--backup-state` backs up both stores as a unit.
 
 ## Helper scripts
 
