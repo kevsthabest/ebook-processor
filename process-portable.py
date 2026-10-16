@@ -14182,6 +14182,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                         if sim > best_sim:
                             best_id, best_sim = cid, sim
                     catalog_map[_tnorm(name)] = best_id if best_sim >= threshold else None
+                    # S0 emission: the impulse grid's raw material —
+                    # top-3 neighbours + fate for this candidate
+                    # (no-op unless a flagged run is live).
+                    _run_events_impulse(name, vec, catalog, best_id,
+                                        best_sim, threshold)
                 # Re-count chapters per displayed name (catalog name for mapped).
                 # One chapter can list two paraphrases of the same trope —
                 # count each key at most once per chapter.
@@ -16407,6 +16412,211 @@ _REL_DROP_THRESHOLD = 0.30
 # about friend/enemy/colleague.
 _REL_FAMILY_TYPES = frozenset({"spouse", "parent", "child", "sibling"})
 
+# ---------------------------------------------------------------------------
+# Run-event emission (PORTAL-SPEC §8 GAP-2/GAP-6, §10 S0; funded by Q2)
+#
+# With --emit-run-events, a run writes ONE JSONL artifact per run under
+# <learn_dir>/run-events/: every resolver pair score + verdict, every
+# trope-impulse neighbour set, and the decision-call counts as the
+# shared budget is claimed. The portal polls the file while the run is
+# live and reopens it afterwards ("last run's matrix"); nothing in the
+# pipeline reads it back. Emission is a pure observer: it never feeds
+# a verdict, and every failure mode — an unwritable directory, a disk
+# that dies mid-run — degrades to "no artifact", because a broken
+# observability file must never cost a book its run.
+# ---------------------------------------------------------------------------
+
+_RUN_EVENTS_SCHEMA = 1
+_RUN_EVENTS_DIRNAME = "run-events"
+_RUN_SINK = None  # _RunEventSink while a flagged run is live, else None
+
+
+class _RunEventSink:
+    """Append-only JSONL writer for one run's event artifact.
+
+    Events are stamped with a run-wide sequence number under the sink
+    lock, so parallel book threads can neither interleave a line nor
+    reorder the stream. The current book is thread-local — the run
+    wrapper sets it on the thread that processes the book, which is
+    the thread the resolver stages run on. Budget claims can arrive
+    from worker threads, so decision events carry no book field: the
+    shared counter they report is itself run-global once books run in
+    parallel, and a borrowed attribution would be a lie.
+    """
+
+    def __init__(self, fh, path):
+        self._fh = fh
+        self.path = path
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._dead = False
+        self._warned = False
+        self.books = 0
+        self._local = threading.local()
+
+    def set_book(self, book):
+        """Set this thread's current book; returns the previous one."""
+        prev = getattr(self._local, "book", None)
+        self._local.book = book
+        return prev
+
+    def book(self):
+        return getattr(self._local, "book", None)
+
+    def note_book(self):
+        with self._lock:
+            self.books += 1
+
+    def emit(self, event):
+        """Append one event; never raises. A write failure kills the
+        sink — later events become no-ops — and warns exactly once:
+        the run outranks its artifact, every time."""
+        if self._dead:
+            return
+        with self._lock:
+            if self._dead:
+                return
+            self._seq += 1
+            stamped = {"seq": self._seq, "ts": time.time(), **event}
+            try:
+                self._fh.write(
+                    json.dumps(stamped, ensure_ascii=False) + "\n")
+                self._fh.flush()
+            except Exception as e:
+                self._dead = True
+                if not self._warned:
+                    self._warned = True
+                    print(f"  WARNING: run-event emission stopped ({e}); "
+                          f"the run continues without its artifact")
+
+    def close(self):
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+
+def _run_events_active():
+    return _RUN_SINK is not None
+
+
+def _run_event(event):
+    """Record one event if a flagged run is live; a no-op otherwise.
+    Callers pass the event without seq/ts — the sink stamps both, so
+    the stream's order is the sink's, not the callers' clocks."""
+    sink = _RUN_SINK
+    if sink is not None:
+        sink.emit(event)
+
+
+def _run_events_book_name():
+    """The current thread's book inside a flagged run, else None."""
+    sink = _RUN_SINK
+    return sink.book() if sink is not None else None
+
+
+def _run_events_begin(learn_dir, preview=False, dry_run=False):
+    """Open this run's artifact and make it the live sink. Returns the
+    artifact path, or None when the location is unwritable — the run
+    proceeds unemitted rather than failing over a log file. The name
+    is pinned: run-<YYYYMMDD-HHMMSS>-<pid>.jsonl (a numeric suffix is
+    added if that exact name is somehow taken), inside run-events/
+    under the learn dir, so the portal finds runs by listing one
+    directory and reading the newest file's header."""
+    global _RUN_SINK
+    if _RUN_SINK is not None:
+        _run_events_finish(interrupted=True)
+    run_id = "run-" + time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+    try:
+        out_dir = Path(learn_dir) / _RUN_EVENTS_DIRNAME
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{run_id}.jsonl"
+        n = 2
+        while path.exists():
+            path = out_dir / f"{run_id}-{n}.jsonl"
+            n += 1
+        fh = open(path, "a", encoding="utf-8")
+    except Exception as e:
+        print(f"  WARNING: run events unavailable ({e}); "
+              f"continuing without the artifact")
+        return None
+    _RUN_SINK = _RunEventSink(fh, path)
+    _run_event({"v": _RUN_EVENTS_SCHEMA, "kind": "run-events",
+                "event": "run_start", "run_id": path.stem,
+                "preview": bool(preview), "dry_run": bool(dry_run)})
+    print(f"  Run events: {path}")
+    return path
+
+
+def _run_events_finish(failures=None, interrupted=False):
+    """Write run_end and close the artifact. Idempotent, and a no-op
+    when no flagged run is live — the unflagged path calls this too,
+    so finishing must cost nothing and change nothing there."""
+    global _RUN_SINK
+    sink = _RUN_SINK
+    if sink is None:
+        return
+    _RUN_SINK = None
+    sink.emit({"event": "run_end", "books": sink.books,
+               "failures": failures, "interrupted": bool(interrupted)})
+    sink.close()
+
+
+class _run_events_book:
+    """Bracket one book inside a flagged run: emits book_start /
+    book_end and attributes this thread's resolver events to the
+    book. With no live sink it is a pure pass-through, so the run
+    loop wraps every book unconditionally and the unflagged path
+    executes nothing but the context-manager protocol."""
+
+    def __init__(self, fpath):
+        self._book = Path(fpath).name
+        self._sink = None
+        self._prev = None
+
+    def __enter__(self):
+        sink = _RUN_SINK
+        if sink is None:
+            return self
+        self._sink = sink
+        self._prev = sink.set_book(self._book)
+        sink.note_book()
+        _run_event({"event": "book_start", "book": self._book,
+                    "decision_cap": _MERGE_TIER3_CAP})
+        return self
+
+    def __exit__(self, *exc):
+        if self._sink is not None:
+            _run_event({"event": "book_end", "book": self._book,
+                        "decision_calls": _DM_BUDGET_USED})
+            self._sink.set_book(self._prev)
+        return False
+
+
+def _run_events_impulse(label, vec, catalog, best_id, best_sim, threshold):
+    """Emit one trope-impulse event: the candidate label's top-3
+    nearest catalogue neighbours and its mapping fate. Called from
+    v2_reduce's catalog mapping with the outcome already decided —
+    the neighbour recomputation here re-runs the same _dot over the
+    same vectors purely to observe, so the mapping it describes
+    cannot be perturbed by being watched. No-op with no live sink."""
+    sink = _RUN_SINK
+    if sink is None:
+        return
+    scored = sorted(
+        ((_dot(vec, cvec), cid, cname) for cid, cname, cvec in catalog),
+        key=lambda t: t[0], reverse=True)[:3]
+    mapped = best_id is not None and best_sim >= threshold
+    _run_event({
+        "event": "impulse", "book": sink.book(), "label": label,
+        "neighbours": [{"id": cid, "name": cname, "score": round(sim, 6)}
+                       for sim, cid, cname in scored],
+        "fate": "mapped" if mapped else "unmapped",
+        "catalog_id": best_id if mapped else None,
+        "score": round(best_sim, 6) if best_sim is not None else None,
+    })
+
+
 # Shared decision-model call budget per book (merges + relationship
 # validation draw from the same pool; merges run first so they get priority).
 _DM_BUDGET_LOCK = threading.Lock()
@@ -16426,9 +16636,17 @@ def _dm_budget_claim(n=1):
     global _DM_BUDGET_USED
     with _DM_BUDGET_LOCK:
         if _DM_BUDGET_USED + n > _MERGE_TIER3_CAP:
-            return False
-        _DM_BUDGET_USED += n
-        return True
+            granted, used = False, _DM_BUDGET_USED
+        else:
+            _DM_BUDGET_USED += n
+            granted, used = True, _DM_BUDGET_USED
+    # The ticker truth (PORTAL-SPEC GAP-6): every claim, granted or
+    # refused, is one line in the run artifact. Emitted after the lock
+    # is released so the stream can never deadlock against the counter
+    # it reports; a no-op when no flagged run is live.
+    _run_event({"event": "decision", "n": n, "used": used,
+                "cap": _MERGE_TIER3_CAP, "granted": granted})
+    return granted
 
 
 def _strip_merge_noise(nkey):
@@ -18018,6 +18236,14 @@ def dedupe_characters(characters, relationships, povs):
         if key and len(idxs) > 1:
             for a, b in zip(idxs, idxs[1:]):
                 union(a, b)
+                # S0 emission: a Signal-1 verdict has no cosine —
+                # the artifact records score null rather than
+                # inventing one (PORTAL-SPEC GAP-2: no theatre).
+                _run_event({"event": "verdict",
+                            "book": _run_events_book_name(),
+                            "a": names[a], "b": names[b],
+                            "verdict": "merged", "via": "signal1",
+                            "score": None, "reason": None})
     s1_root = [find(i) for i in range(len(characters))]
 
     # Signal 2: embeddings
@@ -18041,6 +18267,13 @@ def dedupe_characters(characters, relationships, povs):
               f"applying DETERMINISTIC merges only — no embedding-based merges")
         vecs = None
     if vecs is not None:
+        # S0 emission hooks ride this loop only when a flagged run
+        # is live (_rev bound once, so the unflagged path executes
+        # the loop exactly as before). A guard-blocked pair never
+        # reaches the cosine, so its verdict records score null:
+        # the artifact shows the block and its reason, not a number
+        # the resolver never computed.
+        _rev = _RUN_SINK
         for i in range(len(characters)):
             for j in range(i + 1, len(characters)):
                 if s1_root[i] == s1_root[j]:
@@ -18050,11 +18283,28 @@ def dedupe_characters(characters, relationships, povs):
                     characters[i].get("description"),
                     characters[j].get("description"))
                 if not _allowed:
+                    if _rev is not None:
+                        _run_event({"event": "verdict",
+                                    "book": _rev.book(),
+                                    "a": names[i], "b": names[j],
+                                    "verdict": "blocked", "via": "guard",
+                                    "score": None, "reason": _reason})
                     if CONFIG.get("explain_blocks"):
                         print(f"  Merge blocked: '{names[i]}' vs "
                               f"'{names[j]}' \u2014 {_reason}")
                     continue
-                if _cos(vecs[i], vecs[j]) >= thr:
+                _sim = _cos(vecs[i], vecs[j])
+                if _rev is not None:
+                    _run_event({"event": "pair", "book": _rev.book(),
+                                "a": names[i], "b": names[j],
+                                "score": round(_sim, 6)})
+                    _run_event({"event": "verdict", "book": _rev.book(),
+                                "a": names[i], "b": names[j],
+                                "verdict": "merged" if _sim >= thr
+                                           else "split",
+                                "via": "signal2",
+                                "score": round(_sim, 6), "reason": None})
+                if _sim >= thr:
                     union(i, j)
 
     clusters = {}
@@ -20544,7 +20794,8 @@ def _process_one(args):
     f, dry_run, preview, per_book_batch = args
     _DIAG.batch_size_override = per_book_batch
     try:
-        ok = process_file(f, dry_run, preview)
+        with _run_events_book(f):
+            ok = process_file(f, dry_run, preview)
     except Exception as e:
         with _PRINT_LOCK:
             print(f"  Error processing {f.name}: {e}")
@@ -20585,17 +20836,26 @@ def run_once(dry_run, preview, max_books=None, file=None):
     if not files:
         print("No ebooks found.")
         return 0
+    if CONFIG.get("emit_run_events"):
+        _run_events_begin(_learn().dir, preview=preview, dry_run=dry_run)
     _CANCEL.clear()
     UI.start()
     try:
-        return _run_once_inner(dry_run, preview, files)
+        failures = _run_once_inner(dry_run, preview, files)
+        _run_events_finish(failures=failures)
     except KeyboardInterrupt:
+        _run_events_finish(interrupted=True)
         _CANCEL.set()
         UI.status("\nCancelled — stopping after current chapter...")
         print("  Checkpoint saved. Run with --resume to continue.")
         raise
     finally:
+        # No-op after a clean finish; closes the artifact if an
+        # unexpected exception escaped the book loop, so a flagged
+        # run never leaves a live sink (or a half-open file) behind.
+        _run_events_finish(interrupted=True)
         UI.stop()
+    return failures
 
 
 def _run_once_inner(dry_run, preview, files):
@@ -20624,7 +20884,8 @@ def _run_once_inner(dry_run, preview, files):
     failures = 0
     for f in files:
         try:
-            ok = process_file(f, dry_run, preview)
+            with _run_events_book(f):
+                ok = process_file(f, dry_run, preview)
         except Exception as e:
             print(f"  Error: {e}")
             traceback.print_exc()
@@ -20885,6 +21146,15 @@ def _build_parser():
                          "plus decided-pair controls) to the local "
                          "uncertainty queue for labelling (default "
                          "off)")
+
+    g_merge.add_argument("--emit-run-events", action="store_true",
+                    help="portal S0: write a per-run JSONL event "
+                         "artifact (resolver pair scores + verdicts, "
+                         "trope-impulse neighbours, decision-call "
+                         "counts) to <learn-dir>/run-events/ for the "
+                         "operator portal; observability only, no "
+                         "behaviour change (default off; see "
+                         "PORTAL-SPEC §10 S0)")
 
     g_merge.add_argument("--persist-roster", action="store_true",
                     help="option B (v2): persist per-work roster "
@@ -21394,6 +21664,9 @@ def main():
 
     if getattr(args, "emit_uncertainty", False):
         CONFIG["emit_uncertainty"] = True
+
+    if getattr(args, "emit_run_events", False):
+        CONFIG["emit_run_events"] = True
 
     if args.persist_roster:
         CONFIG["persist_roster"] = True
