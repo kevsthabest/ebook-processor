@@ -295,6 +295,31 @@ class TestJobQueue(unittest.TestCase):
         self.assertTrue(self.procs[0].signals)
         self.assertTrue(_wait_for(lambda: job.state == "stopped"))
 
+    def test_checkpointed_reflects_files_not_just_the_line(self):
+        # A child stopped mid-call never prints "Checkpoint
+        # saved", but its per-chapter files are on disk; the
+        # snapshot must agree with what Resume would find.
+        tmp = Path(tempfile.mkdtemp(prefix="portal-s2-ckpt-"))
+        procs = []
+        ctx = _ctx(tmp)
+        registry = portal.JobRegistry(
+            ctx, popen_factory=_fake_factory(procs), stop_grace=0.2)
+        book = ctx.script_dir / "preview" / ".checkpoints" \
+            / "some-book"
+        book.mkdir(parents=True)
+        (book / "chapter_0.json").write_text("{}", "utf-8")
+        spec = portal.LaunchSpec(
+            "preview", ["python", "x.py"], "Preview — some-book.epub",
+            file_path=ctx.script_dir / "some-book.epub")
+        job = registry.launch(spec)
+        job.stop()
+        procs[-1].release(-2)
+        self.assertTrue(
+            _wait_for(lambda: job.state == "stopped"))
+        snap = job.snapshot()
+        self.assertTrue(snap["checkpointed"])
+        self.assertTrue(snap["can_resume"])
+
     def test_stdout_lines_land_in_the_buffer(self):
         spec = portal.build_launch(self.ctx, {"action": "backup"})
         job = self.registry.launch(spec)

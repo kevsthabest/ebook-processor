@@ -1422,7 +1422,18 @@ class Job:
             "feed": track["feed"],
             "books_done": track["books_done"],
             "books_total": track["books_total"],
-            "checkpointed": track["checkpointed"],
+            # The tracker's flag comes from the child's own
+            # "Checkpoint saved" line — but a child stopped
+            # mid-call may never print it even though its
+            # per-chapter checkpoints are on disk (they are
+            # written as chapters complete, before any shutdown
+            # summary). The run page must not claim "no
+            # checkpoints" over files that Resume would use, so
+            # the filesystem is the second source of truth.
+            "checkpointed": track["checkpointed"] or (
+                self.spec.file_path is not None
+                and checkpoints_exist(self.ctx.script_dir,
+                                      self.spec.file_path)),
             "log": self.buffer.lines()[-400:],
             "events": agg,
             "can_stop": state in ("queued", "running"),
