@@ -1,0 +1,296 @@
+{
+ "about": "Option G section 10 judge fixture (design amendment G3): hand-labelled passages with known supports / adjacent / contradicts verdicts, including negation, discussion-not-depiction, accusation and backstory cases, over two fictional mini-books. Every passage is a literal span of its chapter's text. Run through the production judge via eval/g-gate.py; the adjacent->supports leakage rate is the headline number.",
+ "claims": {
+  "Betrayal": "A trusted ally betrays the protagonists or their cause.",
+  "Secret Identity": "A character's true identity is hidden and later revealed.",
+  "Found Family": "Characters form a chosen family that cares for its own.",
+  "Enemies to Lovers": "Rivals or enemies become lovers.",
+  "Dragons": "Dragons appear as real creatures in the story."
+ },
+ "books": {
+  "A": {
+   "title": "The Salt Harbour",
+   "chapters": [
+    {
+     "label": "Chapter One",
+     "text": "On the third night out, Joren slipped the harbour ledger from the captain's cabin and sold the watch rotation to the smugglers waiting beyond the point. The mild harbour clerk pulled off his gloves and the ring of the old admiralty showed plain; he had been Admiral Senn in hiding all along. The balladeers sang of rival captains who fell in love, but everyone in the harbour knew the song was older than any living feud. The tide came in over the mud flats and the gulls complained about the wind, which had veered north-east before dawn. 'Dragons,' the old ferryman scoffed, 'are what landsmen blame when a lantern gutters. There are no dragons in this harbour.'"
+    },
+    {
+     "label": "Chapter Two",
+     "text": "Maren found the second set of signals in his coat and understood, all at once, who had betrayed the watch on the night the lanterns died. The council debated the old betrayal for hours, though no one present had witnessed it and the records had long since burned. Only at the inquest did she give her true name, the name on the wanted posting from the capital, and the room went silent. The captain set a fourth bowl on the table for the stowaway and said, 'You eat with us now. That is what family means on this ship.' He wrote letters to his birth family every spring, and kept their replies bound in twine in the bottom of his sea chest. The two pilots hated each other roundly and said so at every opportunity; the feud over the north berth was the harbour's favourite entertainment. The stew needed salt, and then more salt, and the cook argued that the barrels had been packed wrong at the depot."
+    },
+    {
+     "label": "Chapter Three",
+     "text": "'I would never betray this crew,' Tomas said, and set his cup down hard. 'Not for coin, not for kin, not for anything you can name.' Her grandmother had betrayed a garrison once, forty years before, and the family still lowered its voice when the story came up at table. Perhaps the stranger was someone in hiding, Maren thought; perhaps he was nobody at all, and the ring meant nothing. When the fever took him, the whole crew kept the watch in turns, because that is what you do for your own. They had dueled over the harbour charts for a year; now, cornered by the storm in the chart room, she kissed her rival instead of arguing. The manifest listed forty barrels of tar, twelve coils of rope, and a crate of lamp oil consigned to the lighthouse keeper."
+    }
+   ]
+  },
+  "B": {
+   "title": "The Glass Observatory",
+   "chapters": [
+    {
+     "label": "Chapter One",
+     "text": "The great lens had to be aligned before the equinox, and the astronomers argued about the mounting brackets until the candles burned down. The director accused the caretaker of betraying the observatory's secrets to the newspapers, and the caretaker, red-faced, swore he had done no such thing. It was the caretaker after all: he had copied the observation keys and betrayed the observatory to the instrument-makers' guild for a share of the contract. Polishing the lens took three cloths and the whole of the afternoon, and the glass still showed a faint crescent of grit. The dome rotated on its iron track with a sound like distant thunder, and the shutters rattled in their frames."
+    },
+    {
+     "label": "Chapter Two",
+     "text": "The night assistants took the runaway in without questions, taught her the charts, and kept a cot for her by the stove; she was one of them by winter. They often talked about what made a family, in the long hours between transits, but talk was all it was. The charts for the southern sky were incomplete, and two constellations had to be re-inked where damp had blurred the lines. There was no hidden identity among them; every assistant's papers had been inspected twice and filed in the director's cabinet. The two rival astronomers had competed for the comet prize for a decade; the night it was announced they had tied, he took her hand and did not let go."
+    }
+   ]
+  }
+ },
+ "cases": [
+  {
+   "id": "GJF-01",
+   "book": "A",
+   "chapter": "Chapter One",
+   "claim": "Betrayal",
+   "expected": "supports",
+   "tag": "depiction",
+   "passage": "On the third night out, Joren slipped the harbour ledger from the captain's cabin and sold the watch rotation to the smugglers waiting beyond the point."
+  },
+  {
+   "id": "GJF-02",
+   "book": "A",
+   "chapter": "Chapter Two",
+   "claim": "Betrayal",
+   "expected": "supports",
+   "tag": "depiction",
+   "passage": "Maren found the second set of signals in his coat and understood, all at once, who had betrayed the watch on the night the lanterns died."
+  },
+  {
+   "id": "GJF-03",
+   "book": "A",
+   "chapter": "Chapter Two",
+   "claim": "Betrayal",
+   "expected": "adjacent",
+   "tag": "discussion",
+   "passage": "The council debated the old betrayal for hours, though no one present had witnessed it and the records had long since burned."
+  },
+  {
+   "id": "GJF-04",
+   "book": "A",
+   "chapter": "Chapter Three",
+   "claim": "Betrayal",
+   "expected": "adjacent",
+   "tag": "negation",
+   "passage": "'I would never betray this crew,' Tomas said, and set his cup down hard. 'Not for coin, not for kin, not for anything you can name.'"
+  },
+  {
+   "id": "GJF-05",
+   "book": "A",
+   "chapter": "Chapter Three",
+   "claim": "Betrayal",
+   "expected": "adjacent",
+   "tag": "backstory",
+   "passage": "Her grandmother had betrayed a garrison once, forty years before, and the family still lowered its voice when the story came up at table."
+  },
+  {
+   "id": "GJF-06",
+   "book": "A",
+   "chapter": "Chapter One",
+   "claim": "Secret Identity",
+   "expected": "supports",
+   "tag": "depiction",
+   "passage": "The mild harbour clerk pulled off his gloves and the ring of the old admiralty showed plain; he had been Admiral Senn in hiding all along."
+  },
+  {
+   "id": "GJF-07",
+   "book": "A",
+   "chapter": "Chapter Two",
+   "claim": "Secret Identity",
+   "expected": "supports",
+   "tag": "depiction",
+   "passage": "Only at the inquest did she give her true name, the name on the wanted posting from the capital, and the room went silent."
+  },
+  {
+   "id": "GJF-08",
+   "book": "A",
+   "chapter": "Chapter Three",
+   "claim": "Secret Identity",
+   "expected": "adjacent",
+   "tag": "hypothetical",
+   "passage": "Perhaps the stranger was someone in hiding, Maren thought; perhaps he was nobody at all, and the ring meant nothing."
+  },
+  {
+   "id": "GJF-09",
+   "book": "A",
+   "chapter": "Chapter Two",
+   "claim": "Found Family",
+   "expected": "supports",
+   "tag": "depiction",
+   "passage": "The captain set a fourth bowl on the table for the stowaway and said, 'You eat with us now. That is what family means on this ship.'"
+  },
+  {
+   "id": "GJF-10",
+   "book": "A",
+   "chapter": "Chapter Three",
+   "claim": "Found Family",
+   "expected": "supports",
+   "tag": "depiction",
+   "passage": "When the fever took him, the whole crew kept the watch in turns, because that is what you do for your own."
+  },
+  {
+   "id": "GJF-11",
+   "book": "A",
+   "chapter": "Chapter Two",
+   "claim": "Found Family",
+   "expected": "adjacent",
+   "tag": "mention",
+   "passage": "He wrote letters to his birth family every spring, and kept their replies bound in twine in the bottom of his sea chest."
+  },
+  {
+   "id": "GJF-12",
+   "book": "A",
+   "chapter": "Chapter Three",
+   "claim": "Enemies to Lovers",
+   "expected": "supports",
+   "tag": "depiction",
+   "passage": "They had dueled over the harbour charts for a year; now, cornered by the storm in the chart room, she kissed her rival instead of arguing."
+  },
+  {
+   "id": "GJF-13",
+   "book": "A",
+   "chapter": "Chapter Two",
+   "claim": "Enemies to Lovers",
+   "expected": "adjacent",
+   "tag": "enmity-only",
+   "passage": "The two pilots hated each other roundly and said so at every opportunity; the feud over the north berth was the harbour's favourite entertainment."
+  },
+  {
+   "id": "GJF-14",
+   "book": "A",
+   "chapter": "Chapter One",
+   "claim": "Enemies to Lovers",
+   "expected": "adjacent",
+   "tag": "discussion",
+   "passage": "The balladeers sang of rival captains who fell in love, but everyone in the harbour knew the song was older than any living feud."
+  },
+  {
+   "id": "GJF-15",
+   "book": "A",
+   "chapter": "Chapter One",
+   "claim": "Betrayal",
+   "expected": "contradicts",
+   "tag": "off-topic",
+   "passage": "The tide came in over the mud flats and the gulls complained about the wind, which had veered north-east before dawn."
+  },
+  {
+   "id": "GJF-16",
+   "book": "A",
+   "chapter": "Chapter Two",
+   "claim": "Secret Identity",
+   "expected": "contradicts",
+   "tag": "off-topic",
+   "passage": "The stew needed salt, and then more salt, and the cook argued that the barrels had been packed wrong at the depot."
+  },
+  {
+   "id": "GJF-17",
+   "book": "A",
+   "chapter": "Chapter One",
+   "claim": "Dragons",
+   "expected": "adjacent",
+   "tag": "mention",
+   "passage": "'Dragons,' the old ferryman scoffed, 'are what landsmen blame when a lantern gutters. There are no dragons in this harbour.'"
+  },
+  {
+   "id": "GJF-18",
+   "book": "A",
+   "chapter": "Chapter Three",
+   "claim": "Found Family",
+   "expected": "contradicts",
+   "tag": "off-topic",
+   "passage": "The manifest listed forty barrels of tar, twelve coils of rope, and a crate of lamp oil consigned to the lighthouse keeper."
+  },
+  {
+   "id": "GJF-19",
+   "book": "B",
+   "chapter": "Chapter One",
+   "claim": "Betrayal",
+   "expected": "contradicts",
+   "tag": "off-topic",
+   "passage": "The great lens had to be aligned before the equinox, and the astronomers argued about the mounting brackets until the candles burned down."
+  },
+  {
+   "id": "GJF-20",
+   "book": "B",
+   "chapter": "Chapter Two",
+   "claim": "Found Family",
+   "expected": "supports",
+   "tag": "depiction",
+   "passage": "The night assistants took the runaway in without questions, taught her the charts, and kept a cot for her by the stove; she was one of them by winter."
+  },
+  {
+   "id": "GJF-21",
+   "book": "B",
+   "chapter": "Chapter Two",
+   "claim": "Found Family",
+   "expected": "adjacent",
+   "tag": "discussion",
+   "passage": "They often talked about what made a family, in the long hours between transits, but talk was all it was."
+  },
+  {
+   "id": "GJF-22",
+   "book": "B",
+   "chapter": "Chapter One",
+   "claim": "Betrayal",
+   "expected": "adjacent",
+   "tag": "accusation",
+   "passage": "The director accused the caretaker of betraying the observatory's secrets to the newspapers, and the caretaker, red-faced, swore he had done no such thing."
+  },
+  {
+   "id": "GJF-23",
+   "book": "B",
+   "chapter": "Chapter Two",
+   "claim": "Betrayal",
+   "expected": "contradicts",
+   "tag": "off-topic",
+   "passage": "The charts for the southern sky were incomplete, and two constellations had to be re-inked where damp had blurred the lines."
+  },
+  {
+   "id": "GJF-24",
+   "book": "B",
+   "chapter": "Chapter One",
+   "claim": "Betrayal",
+   "expected": "supports",
+   "tag": "depiction",
+   "passage": "It was the caretaker after all: he had copied the observation keys and betrayed the observatory to the instrument-makers' guild for a share of the contract."
+  },
+  {
+   "id": "GJF-25",
+   "book": "B",
+   "chapter": "Chapter Two",
+   "claim": "Secret Identity",
+   "expected": "adjacent",
+   "tag": "negation",
+   "passage": "There was no hidden identity among them; every assistant's papers had been inspected twice and filed in the director's cabinet."
+  },
+  {
+   "id": "GJF-26",
+   "book": "B",
+   "chapter": "Chapter One",
+   "claim": "Enemies to Lovers",
+   "expected": "contradicts",
+   "tag": "off-topic",
+   "passage": "Polishing the lens took three cloths and the whole of the afternoon, and the glass still showed a faint crescent of grit."
+  },
+  {
+   "id": "GJF-27",
+   "book": "B",
+   "chapter": "Chapter Two",
+   "claim": "Enemies to Lovers",
+   "expected": "supports",
+   "tag": "depiction",
+   "passage": "The two rival astronomers had competed for the comet prize for a decade; the night it was announced they had tied, he took her hand and did not let go."
+  },
+  {
+   "id": "GJF-28",
+   "book": "B",
+   "chapter": "Chapter One",
+   "claim": "Secret Identity",
+   "expected": "contradicts",
+   "tag": "off-topic",
+   "passage": "The dome rotated on its iron track with a sound like distant thunder, and the shutters rattled in their frames."
+  }
+ ]
+}

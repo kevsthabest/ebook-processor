@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.9.14"
+PORTABLE_VERSION = "2.10.0"
 
 import argparse
 import difflib
@@ -118,6 +118,8 @@ DEFAULT_CONFIG = {
     "v2_enable_thinking_a": None,  # Call A override; None = use llm_enable_thinking
     "v2_enable_thinking_b": None,  # Call B override; None = use llm_enable_thinking
     "trope_map_threshold": 0.78,  # cosine threshold for catalog mapping
+    "evidence_retrieval_floor": 0.25,  # Option G (OC-3): cosine floor for
+    # retrieval candidates; a named tunable, reported in the run marker
     "trope_map_cache": "trope-vectors.json",  # cached catalog embeddings
     "v2_prompt_cache": False,  # put chapter first for llama.cpp KV cache reuse
     "proposer_user_id": "",  # Supabase users.id for trope_proposals.proposed_by
@@ -1490,6 +1492,36 @@ def _preview_summary(result):
     if _stg:
         lines.append(f"  Staging: {len(_stg.get('staged') or [])} "
                      f"held back (staging gate)")
+
+    _er = r.get("evidence_retrieval")
+    if _er:
+        if _er.get("failed"):
+            lines.append(
+                "  Trope evidence: retrieval FAILED this run "
+                "(claims ship with today's evidence shapes)")
+        else:
+            _ec = [v for k, v in (_er.get("claims") or {}).items()
+                   if not k.startswith("trigger:")]
+            _with = _ec.count("supported-strong") \
+                + _ec.count("supported-single")
+            lines.append(
+                f"  Trope evidence: {_with} claims with passages "
+                f"({_ec.count('supported-strong')} strong), "
+                f"{_ec.count('abstained')} abstentions")
+            if _er.get("evidence_recorded"):
+                # F's OC-4 condition, inherited: a run that records
+                # staging state declares the recording on its face.
+                lines.append(
+                    f"  Staging evidence recorded: this run "
+                    f"recorded retrieved evidence for "
+                    f"{_er['evidence_recorded']} staged claim(s) "
+                    f"in the local staging store")
+            for _nm in _er.get("promotes_next") or []:
+                # Amendment G2 legibility: the one-run promotion
+                # lag must read as the design working, not a bug.
+                lines.append(
+                    f"    Staged with strong passages: {_nm} "
+                    f"(promotes on next sighting via evidence)")
 
     _rp = r.get("roster_persistence")
     if _rp:
@@ -3649,6 +3681,15 @@ class StagingState:
                                    src["best_chapters"])
         dst["evidence_ever"] = dst["evidence_ever"] \
             or src["evidence_ever"]
+        # Option G: a folded entry's recorded support grade goes
+        # with it (strong wins) — the survivor's next observe is
+        # where promotion rule 4 evaluates it, never the fold.
+        _grades = (dst.get("evidence_grade"),
+                   src.get("evidence_grade"))
+        if "strong" in _grades:
+            dst["evidence_grade"] = "strong"
+        elif "single" in _grades:
+            dst["evidence_grade"] = "single"
         for f in ("first_seen",):
             a, b = _staging_day(dst.get(f)), _staging_day(src.get(f))
             if b is not None and (a is None or b < a):
@@ -3858,6 +3899,27 @@ class StagingState:
             item["key"] = key
             return {"action": "ship", "key": key, "stamp": None,
                     "form_changed": form_changed}
+        if independent and entry.get("evidence_grade") == "strong":
+            # Promotion rule 4 (Option G, OC-5): evidence recorded
+            # by an EARLIER run's retrieval, evaluated here at the
+            # one promotion decision point. This run's retrieval
+            # cannot fire it — recording happens after this observe
+            # in the pipeline (the G2 lag is structural, not a
+            # delay loop). Strong support only: >=2 distinct
+            # chapters, the same multiplicity persistence demands;
+            # single-chapter support records evidence but never
+            # promotes. Evidence outranks persistence when both
+            # qualify — the trigger path's precedent in
+            # _observe_trigger (evidence arrival before the
+            # persistence rule) — because the recorded passages are
+            # the more specific signal, and the OC-7 stamp must
+            # name the mechanism that earned the ship.
+            item = self._promote(work, entry, ordinal, "evidence",
+                                 form_changed, out, name)
+            item["key"] = key
+            stamp = self._persistence_stamp(entry, "evidence")
+            return {"action": "ship", "key": key, "stamp": stamp,
+                    "form_changed": form_changed}
         if independent and len(entry["sightings"]) >= 2:
             item = self._promote(work, entry, ordinal, "persistence",
                                  form_changed, out, name)
@@ -3870,6 +3932,35 @@ class StagingState:
              "sightings": len(entry["sightings"])})
         return {"action": "hold", "key": key, "stamp": None,
                 "form_changed": False}
+
+    def record_trope_evidence(self, work_key, name, catalog_id,
+                              grade):
+        """Option G (design §6): record one run's retrieved evidence
+        on a STAGED trope entry — evidence_ever plus the support
+        grade — so the NEXT run's observe can evaluate promotion
+        rule 4. Recording is all this does: promotion decisions
+        read recorded state at observe time, never the current
+        run's in-flight retrieval (amendment G2). Strong is sticky
+        (a later single-grade recording never downgrades it).
+        Returns True when an entry was updated; a missing or
+        already-promoted entry records nothing."""
+        if not self.enabled or grade not in ("strong", "single"):
+            return False
+        with self._lock:
+            work = self.data["works"].get(work_key)
+            if work is None:
+                return False
+            entry, _key, _fc = self._resolve_trope_entry(
+                work, {"name": name, "catalog_id": catalog_id})
+            if entry is None or entry.get("state") != "staged":
+                return False
+            entry["evidence_ever"] = True
+            if grade == "strong" \
+                    or entry.get("evidence_grade") not in (
+                        "strong", "single"):
+                entry["evidence_grade"] = grade
+            self.save()
+            return True
 
     def _observe_trigger(self, work, obs, independent, ordinal, today,
                          out):
@@ -4206,6 +4297,673 @@ def cmd_staging_report(as_json=False, learn_dir=None, state=None):
         print(json.dumps(data, ensure_ascii=False, indent=1))
     else:
         print(text)
+
+
+# ---------------------------------------------------------------------------
+# Option G — targeted evidence retrieval for trope/trigger claims
+# (design: eval/g-evidence-design.md; user-approved open choices
+# OC-1..OC-7 as amended, Advisor amendments G1-G5, Trope Review seat
+# amendments A/B). Doctrine, binding on everything in this section:
+# retrieval finds passages; it does not manufacture support. Every
+# attached passage is a literal span of the book's own text, produced
+# by the retriever and re-verified before attach; a passage attaches
+# only when the local-model judge rules it "supports" (depiction,
+# not topic). G never raises a claim's confidence, never drops a
+# claim, and never draws on the decision-model budget — the judge
+# is the pipeline's local model, batched like the trope gate.
+# ---------------------------------------------------------------------------
+
+_EVIDENCE_METHOD = "targeted-v1"
+_EVIDENCE_WINDOW_CHARS = 600     # attached-passage cap (OC-3)
+_EVIDENCE_MAX_PASSAGES = 3       # attached passages per claim (OC-3)
+_EVIDENCE_JUDGE_BATCH = 10       # claims per judge call (design §4)
+_EVIDENCE_MAX_CLAIMS = 250       # per-book claim cap (design §7)
+_EVIDENCE_MAX_WINDOWS = 5000     # per-book embedded-window cap (§7)
+_EVIDENCE_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "at", "by",
+    "for", "with", "from", "as", "is", "are", "was", "were", "be",
+    "been", "it", "its", "this", "that", "these", "those", "who",
+    "whom", "when", "where", "while", "into", "over", "under",
+    "about", "after", "before", "their", "they", "them", "then",
+    "than", "but", "not", "no", "yes", "one", "two", "all", "any",
+})
+
+
+def _evidence_tokens(text):
+    """Content tokens for the lexical prefilter: lowercase alpha
+    tokens of length >= 3, minus a small stopword set. One tokenizer
+    for query terms and window text alike, so the prefilter compares
+    like with like."""
+    return {t for t in re.findall(r"[a-z][a-z0-9']*",
+                                  (text or "").lower())
+            if len(t) >= 3 and t not in _EVIDENCE_STOPWORDS}
+
+
+def _evidence_stem(tok):
+    """Light suffix stem for prefilter matching, applied to both
+    sides alike: 'betrayal', 'betrays' and 'betrayed' must all meet
+    at 'betray', or the recall-oriented prefilter silently drops
+    depicting windows whose only query-term hit is a morphological
+    variant. Precision is not this stage's job (rank + judge are);
+    a missed window is unrecoverable downstream."""
+    for suf in ("ingly", "edly", "ing", "ed", "es", "al", "s"):
+        if tok.endswith(suf) and len(tok) - len(suf) >= 4:
+            return tok[:-len(suf)]
+    return tok
+
+
+def evidence_query_terms(name, description=None):
+    """Lexical-prefilter terms for a claim (design §3 stage 1):
+    content tokens from the claim name, plus — for catalog-mapped
+    claims — content tokens from the catalog description."""
+    terms = _evidence_tokens(name)
+    if description:
+        terms |= _evidence_tokens(description)
+    return terms
+
+
+def evidence_query_text(name, description=None, summaries=None):
+    """The embedding query for a claim, in a deliberately chosen
+    text shape (design §3 stage 2). Mapped claims embed in the
+    catalog's own shape — "name: description" (EMBED_TEXT_FORMAT) —
+    never as a bare name: cosine against prose windows must measure
+    trope presence, not name-mention. Unmapped claims (OC-7) use
+    the name plus the gate's own summaries of the claim's support
+    chapters, the richest honest description available."""
+    if description:
+        return f"{name}: {description}"
+    if summaries:
+        joined = " ".join(s.strip() for s in summaries if s and s.strip())
+        if joined:
+            return f"{name}: {joined}"
+    return name or ""
+
+
+def _sentence_spans(text):
+    """(start, end) offsets of the sentences _split_sentences would
+    return. Sentences are verbatim substrings; offsets are located
+    by a forward scan, so a repeated sentence resolves to successive
+    occurrences. The offsets are provenance (Trope amendment A);
+    the spans themselves are always literal slices."""
+    spans = []
+    pos = 0
+    for piece in re.split(r"(?<=[.!?])\s+", text or ""):
+        s = piece.strip()
+        if not s:
+            continue
+        start = text.find(s, pos)
+        if start == -1:
+            continue
+        spans.append((start, start + len(s)))
+        pos = start + len(s)
+    return spans
+
+
+def _evidence_windows(text):
+    """Sentence-anchored candidate windows over one chapter's text:
+    greedy runs of whole sentences up to _EVIDENCE_WINDOW_CHARS,
+    overlapping by one sentence when a window holds three or more
+    (a passage straddling a boundary is still whole somewhere). A
+    single sentence longer than the cap is hard-cut at the cap —
+    still a literal span. Every window is text[offset:offset+len],
+    an exact substring of the chapter."""
+    spans = _sentence_spans(text)
+    windows = []
+    prev = None
+    i = 0
+    while i < len(spans):
+        start = spans[i][0]
+        j = i
+        while j + 1 < len(spans) \
+                and spans[j + 1][1] - start <= _EVIDENCE_WINDOW_CHARS:
+            j += 1
+        end = spans[j][1]
+        if end - start > _EVIDENCE_WINDOW_CHARS:
+            end = start + _EVIDENCE_WINDOW_CHARS
+        # A window fully contained in its predecessor (the overlap
+        # tail at a chapter's end) adds no new span — its text is
+        # already covered, and as a standalone candidate its brevity
+        # would game the cosine rank.
+        if prev is None or start < prev[0] or end > prev[1]:
+            windows.append({"offset": start, "text": text[start:end]})
+            prev = (start, end)
+        n_sent = j - i + 1
+        i += (n_sent - 1) if n_sent >= 3 else n_sent
+    return windows
+
+
+def _resolve_support_chapters(refs, chapters):
+    """Resolve a claim's support-chapter references to chapter
+    dicts. References arrive as chapter LABELS from the reduce's
+    trope_chapters map, or as chapter INDICES from the seam's
+    fallback construction; both resolve, unknown refs are skipped,
+    order follows the refs, duplicates collapse."""
+    by_label = {c.get("label"): c for c in chapters}
+    by_index = {c.get("index"): c for c in chapters}
+    out, seen = [], set()
+    for ref in refs or []:
+        ch = None
+        if isinstance(ref, str) and ref in by_label:
+            ch = by_label[ref]
+        elif ref in by_index:
+            ch = by_index[ref]
+        elif isinstance(ref, str) and ref.isdigit() \
+                and int(ref) in by_index:
+            ch = by_index[int(ref)]
+        if ch is not None and id(ch) not in seen:
+            seen.add(id(ch))
+            out.append(ch)
+    return out
+
+
+def _select_judge_candidates(candidates, limit=_EVIDENCE_MAX_PASSAGES):
+    """The windows the judge sees for a claim (design §3/§4): the
+    top `limit` by score, chosen with a distinct-chapter preference
+    — the best window per chapter first, then fillers by score — so
+    three windows from one paragraph cannot impersonate book-wide
+    support at the judging stage either."""
+    picked, picked_keys, seen_ch = [], set(), set()
+    for p in candidates:
+        if len(picked) >= limit:
+            break
+        if p["chapter"] not in seen_ch:
+            picked.append(p)
+            picked_keys.add((p["chapter"], p["offset"]))
+            seen_ch.add(p["chapter"])
+    for p in candidates:
+        if len(picked) >= limit:
+            break
+        if (p["chapter"], p["offset"]) not in picked_keys:
+            picked.append(p)
+            picked_keys.add((p["chapter"], p["offset"]))
+    return picked
+
+
+def retrieve_claim_candidates(claim, embedder, cache, floor=None,
+                              window_filter=None):
+    """Two-stage targeted retrieval over a claim's OWN support
+    chapters (design §3): lexical prefilter, then embedding rank
+    against the claim's query. No whole-book scan: if the passages
+    are not in the support chapters, that absence is the finding
+    (the judge stage turns it into a recorded abstention).
+
+    claim: {"key", "name", "query_text", "terms", "support":
+    [chapter dicts {"label", "index", "text"}]}. embedder(texts)
+    -> [vectors] (the embed_vectors shape). cache is the per-run
+    window-embedding cache (amendment G5: in-memory only, keyed by
+    chapter label + window offset, shared across claims, discarded
+    when the run ends — never persisted, never the catalog cache).
+
+    Returns {"candidates": [passage, ...], "verify_failures": n}
+    with passages score-ranked and shaped {"quote", "chapter",
+    "chapter_index", "offset", "score"} — chapter + location
+    provenance on every passage (Trope amendment A). Every returned
+    span is re-verified as a literal span of its chapter before it
+    may attach; a verification failure is a build bug, dropped and
+    counted, never shipped."""
+    if floor is None:
+        floor = CONFIG.get("evidence_retrieval_floor", 0.25)
+    terms = {_evidence_stem(t) for t in (claim.get("terms") or set())}
+    cand = []
+    for ch in claim.get("support") or []:
+        for w in _evidence_windows(ch.get("text", "")):
+            if window_filter is not None \
+                    and not window_filter(w["text"]):
+                continue
+            if {_evidence_stem(t)
+                    for t in _evidence_tokens(w["text"])} & terms:
+                cand.append((ch, w))
+    if not cand:
+        return {"candidates": [], "verify_failures": 0}
+    qvec = _normalize(embedder([claim["query_text"]])[0])
+    missing = [(ch, w) for ch, w in cand
+               if (ch.get("label"), w["offset"]) not in cache]
+    if missing:
+        vecs = embedder([w["text"] for _, w in missing])
+        for (ch, w), v in zip(missing, vecs):
+            cache[(ch.get("label"), w["offset"])] = _normalize(v)
+    scored, vfails = [], 0
+    for ch, w in cand:
+        vec = cache.get((ch.get("label"), w["offset"]))
+        if vec is None:
+            continue
+        score = _dot(qvec, vec)
+        if score < floor:
+            continue
+        if not verify_evidence(w["text"], ch.get("text", "")):
+            vfails += 1
+            continue
+        scored.append({"quote": w["text"],
+                       "chapter": ch.get("label"),
+                       "chapter_index": ch.get("index"),
+                       "offset": w["offset"],
+                       "score": round(score, 4)})
+    scored.sort(key=lambda p: (-p["score"], p["chapter_index"]
+                               if p["chapter_index"] is not None
+                               else 0, p["offset"]))
+    return {"candidates": scored, "verify_failures": vfails}
+
+
+PROMPT_EVIDENCE_JUDGE = """You are checking whether passages from a book actually SHOW a claimed trope or content warning happening, for a book-catalog pipeline. Judge each passage on its own text only. Return ONLY valid JSON. No commentary, no markdown.
+
+VERDICTS:
+- "supports": the passage itself DEPICTS the claim's defining dynamic or event — a reader shown only this passage would say it is happening here.
+- "adjacent": the passage is merely ABOUT the claim's neighbourhood: the topic is mentioned, discussed, remembered as backstory, hypothesised, or negated ("she would never..."), or only a single ingredient is present. A discussion of betrayal is not a betrayal scene.
+- "contradicts": the passage is unrelated, or shows the claim is not happening.
+
+Claims and passages:
+{claims}
+
+{
+  "verdicts": [{"claim": 0, "passage": 0, "verdict": "supports|adjacent|contradicts"}]
+}
+
+RULES:
+1. One verdict per listed passage, using the claim and passage numbers shown.
+2. Judge ONLY from the passage text — never from the chapter title, the claim name alone, or the claim's plausibility elsewhere in the book.
+3. When torn between "supports" and "adjacent", choose "adjacent": evidence must depict, not suggest."""
+
+
+def _sanitize_evidence_judge(r):
+    """Coerce the judge's raw JSON to {"verdicts": [{claim, passage,
+    verdict}]} with integer indices and verdicts from the three
+    classes; anything else is dropped."""
+    if not isinstance(r, dict):
+        return None
+    verdicts = []
+    for v in _list(r.get("verdicts")):
+        if not isinstance(v, dict):
+            continue
+        try:
+            ci = int(v.get("claim"))
+            pi = int(v.get("passage"))
+        except (TypeError, ValueError):
+            continue
+        verdict = _s(v.get("verdict"), 12).lower()
+        if verdict in ("supports", "adjacent", "contradicts"):
+            verdicts.append({"claim": ci, "passage": pi,
+                             "verdict": verdict})
+    return {"verdicts": verdicts}
+
+
+def judge_evidence_batch(call, jobs):
+    """Batched local-model support verdicts (design §4, OC-2).
+
+    jobs: [{"key", "name", "definition", "passages": [passage]}] —
+    the judge is the pipeline's own local model on the same channel
+    as v2_trope_gate, batched _EVIDENCE_JUDGE_BATCH claims per call.
+    It NEVER claims decision-model budget: _dm_budget_claim is not
+    called anywhere on the G path (pinned by test, design §9.3).
+
+    Returns (verdicts, failed): verdicts {key: {passage_index:
+    verdict}}; failed is the set of claim keys that were not judged
+    (their batch errored, or the judge returned no verdict for the
+    claim at all). A claim whose batch succeeded but which is
+    missing a verdict for SOME passage was judged — the missing
+    passage simply does not support (fail-closed for attachment).
+    Failure is fail-open: failed claims proceed with no evidence,
+    counted as failed, never stamped as abstentions."""
+    verdicts, failed = {}, set()
+    for bi in range(0, len(jobs), _EVIDENCE_JUDGE_BATCH):
+        batch = jobs[bi:bi + _EVIDENCE_JUDGE_BATCH]
+        blocks = []
+        for ci, job in enumerate(batch):
+            head = f"CLAIM {ci}: {job['name']}"
+            if job.get("definition"):
+                head += f" — {job['definition']}"
+            blocks.append(head)
+            for pi, p in enumerate(job["passages"]):
+                blocks.append(f"PASSAGE {ci}.{pi} "
+                              f"(from {p['chapter']}): {p['quote']}")
+        prompt = PROMPT_EVIDENCE_JUDGE.replace(
+            "{claims}", "\n".join(blocks))
+        out = _run_task(
+            call, prompt, "", 1, 1,
+            f"evidence-judge-b{bi // _EVIDENCE_JUDGE_BATCH + 1}",
+            sanitize_fn=_sanitize_evidence_judge)
+        if not out or not out.get("verdicts"):
+            failed.update(j["key"] for j in batch)
+            continue
+        for v in out["verdicts"]:
+            if 0 <= v["claim"] < len(batch):
+                job = batch[v["claim"]]
+                if 0 <= v["passage"] < len(job["passages"]):
+                    verdicts.setdefault(job["key"], {})[
+                        v["passage"]] = v["verdict"]
+        for job in batch:
+            if job["key"] not in verdicts:
+                failed.add(job["key"])
+    return verdicts, failed
+
+
+def classify_evidence(passages, verdicts):
+    """Deterministic support grade + outcome for one judged claim
+    (design §4). Only "supports" passages attach; "adjacent" is a
+    named, counted outcome that never attaches — adjacency is the
+    laundering vector, so it must be visible to be governed.
+
+    Returns {"outcome": "supported-strong"|"supported-single"|
+    "adjacent-only"|"abstained", "support": "strong"|"single"|
+    "none", "attached": [passage] (cap _EVIDENCE_MAX_PASSAGES,
+    distinct-chapter preference), "chapters_with_support": n,
+    "adjacent": n, "supports": n, "contradicts": n}. The judge's
+    verdict rides as counts — metadata only; it never becomes a
+    confidence (design §6)."""
+    supports = [p for i, p in enumerate(passages)
+                if verdicts.get(i) == "supports"]
+    n_adjacent = sum(1 for v in verdicts.values() if v == "adjacent")
+    n_contra = sum(1 for v in verdicts.values()
+                   if v == "contradicts")
+    chapters = {p["chapter"] for p in supports}
+    if len(chapters) >= 2:
+        grade = "strong"
+    elif chapters:
+        grade = "single"
+    else:
+        grade = "none"
+    attached = _select_judge_candidates(
+        supports, limit=_EVIDENCE_MAX_PASSAGES) if supports else []
+    if supports:
+        outcome = f"supported-{grade}"
+    elif n_adjacent:
+        outcome = "adjacent-only"
+    else:
+        outcome = "abstained"
+    return {"outcome": outcome, "support": grade,
+            "attached": attached,
+            "chapters_with_support": len(chapters),
+            "adjacent": n_adjacent, "supports": len(supports),
+            "contradicts": n_contra}
+
+
+def _trope_catalog_entries():
+    """{catalog_id: {"name", "description"}} for G's query shapes,
+    read with the same select trope_catalog_vectors uses. {} when
+    the catalog cannot be read (no Supabase configured, fetch
+    error): mapped claims then fall back to the unmapped query
+    shape — weaker retrieval, never wronger claims."""
+    try:
+        if not CONFIG.get("supabase_url"):
+            return {}
+        rows = sb("tropes",
+                  params="?select=id,name,description&order=id")
+        return {r["id"]: {"name": r.get("name") or "",
+                           "description": r.get("description") or ""}
+                for r in rows or []}
+    except Exception:
+        return {}
+
+
+def _evidence_claim_record(spec, chapters, catalog,
+                           summaries_by_label):
+    """Assemble one retrieval claim from a seam spec {"name",
+    "support_refs", "catalog_id", "staged"}: support chapters
+    resolved, query shape chosen by mapping status (design §3)."""
+    name = spec.get("name") or ""
+    support = _resolve_support_chapters(spec.get("support_refs"),
+                                        chapters)
+    entry = (catalog or {}).get(spec.get("catalog_id")) \
+        if spec.get("catalog_id") else None
+    if entry:
+        desc = entry.get("description") or ""
+        query_text = evidence_query_text(entry.get("name") or name,
+                                         desc)
+        terms = evidence_query_terms(name, desc)
+        definition = desc
+    else:
+        sums = [summaries_by_label.get(ch.get("label"))
+                for ch in support]
+        sums = [s for s in sums if s]
+        query_text = evidence_query_text(name, summaries=sums)
+        terms = evidence_query_terms(name)
+        definition = " ".join(sums)[:500]
+    return {"key": _tnorm(name), "name": name,
+            "query_text": query_text, "terms": terms,
+            "support": support, "definition": definition,
+            "staged": bool(spec.get("staged"))}
+
+
+def _evidence_run(claims, *, call, embedder, window_filter=None):
+    """The shared G engine: retrieval + judging over assembled
+    claim records (see _evidence_claim_record). Returns (evidence,
+    records, marker) — evidence {claim_key: [passage]}, records
+    {claim_key: record}, marker the run accounting. Failure is
+    fail-open and loud (design §7): an embedding failure marks the
+    claim failed and trips a breaker so a dead endpoint is not
+    retried per claim; a judge failure fails the batch's claims;
+    nothing about any claim set changes either way. Per-claim
+    records carry the outcome, the support grade (None when the
+    claim was not judged), the chapters searched (Trope amendment
+    B: a negative retrieval is an explicit recorded result), and
+    the judge's verdict counts as metadata."""
+    floor = CONFIG.get("evidence_retrieval_floor", 0.25)
+    cache = {}
+    evidence, records = {}, {}
+    totals = {"attempted": 0, "supported_strong": 0,
+              "supported_single": 0, "adjacent_only": 0,
+              "abstained": 0, "failed": 0, "skipped": 0}
+    verify_failures = 0
+    jobs = []
+    embed_dead = False
+    specs = list(claims or [])
+    for idx, claim in enumerate(specs):
+        if idx >= _EVIDENCE_MAX_CLAIMS \
+                or len(cache) >= _EVIDENCE_MAX_WINDOWS:
+            totals["skipped"] += len(specs) - idx
+            break
+        key = claim["key"]
+        totals["attempted"] += 1
+        base = {"name": claim["name"], "staged": claim["staged"],
+                "chapters_searched": [ch.get("label")
+                                      for ch in claim["support"]]}
+        failed_rec = {**base, "outcome": "failed", "support": None,
+                      "passages": 0, "chapters_with_support": 0,
+                      "adjacent": 0}
+        if embed_dead:
+            records[key] = failed_rec
+            totals["failed"] += 1
+            continue
+        try:
+            out = retrieve_claim_candidates(
+                claim, embedder, cache, floor=floor,
+                window_filter=window_filter)
+        except Exception:
+            embed_dead = True
+            records[key] = failed_rec
+            totals["failed"] += 1
+            continue
+        verify_failures += out["verify_failures"]
+        cands = _select_judge_candidates(out["candidates"])
+        if not cands:
+            records[key] = {
+                **base, "outcome": "abstained", "support": "none",
+                "passages": 0, "chapters_with_support": 0,
+                "adjacent": 0,
+                "judge": {"supports": 0, "adjacent": 0,
+                          "contradicts": 0}}
+            totals["abstained"] += 1
+            continue
+        jobs.append({"key": key, "name": claim["name"],
+                     "definition": claim["definition"],
+                     "passages": cands, "_base": base})
+    if jobs:
+        try:
+            verdicts, failed = judge_evidence_batch(call, jobs)
+        except Exception:
+            verdicts, failed = {}, {j["key"] for j in jobs}
+        for job in jobs:
+            key, base = job["key"], job["_base"]
+            if key in failed:
+                records[key] = {
+                    **base, "outcome": "failed", "support": None,
+                    "passages": 0, "chapters_with_support": 0,
+                    "adjacent": 0}
+                totals["failed"] += 1
+                continue
+            cls = classify_evidence(job["passages"],
+                                    verdicts.get(key, {}))
+            records[key] = {
+                **base, "outcome": cls["outcome"],
+                "support": cls["support"],
+                "passages": len(cls["attached"]),
+                "chapters_with_support":
+                    cls["chapters_with_support"],
+                "adjacent": cls["adjacent"],
+                "judge": {"supports": cls["supports"],
+                          "adjacent": cls["adjacent"],
+                          "contradicts": cls["contradicts"]}}
+            totals[cls["outcome"].replace("-", "_")] += 1
+            if cls["attached"]:
+                evidence[key] = cls["attached"]
+    marker = {"method": _EVIDENCE_METHOD, "floor": floor,
+              "totals": totals,
+              "claims": {k: r["outcome"] for k, r in records.items()},
+              "verify_failures": verify_failures,
+              "failed": bool(totals["attempted"])
+                        and totals["failed"] == totals["attempted"]}
+    return evidence, records, marker
+
+
+def evidence_retrieve_result(parts, chapters, *, call, embedder):
+    """The trope half of the G seam (design §8): targeted retrieval
+    + local-model judging for one run's confirmed trope claims —
+    the ship set and the staged set alike.
+
+    parts: {"claims": [{"name", "support_refs", "catalog_id",
+    "staged"}], "catalog": {id: {"name", "description"}},
+    "summaries": {chapter_label: summary}}.
+
+    Returns {"trope_evidence": {_tnorm(name): [passage]},
+    "trope_retrieval": {_tnorm(name): record}, "marker": {...}} —
+    plain JSON types throughout."""
+    catalog = parts.get("catalog") or {}
+    summaries_by_label = parts.get("summaries") or {}
+    claims = [_evidence_claim_record(spec, chapters, catalog,
+                                     summaries_by_label)
+              for spec in list(parts.get("claims") or [])]
+    evidence, records, marker = _evidence_run(
+        claims, call=call, embedder=embedder)
+    return {"trope_evidence": evidence,
+            "trope_retrieval": records, "marker": marker}
+
+
+def _trigger_claim_record(td, chapters):
+    """Assemble one retrieval claim for an evidence-less trigger:
+    the query is the warning name plus the category definition's
+    depiction text where one exists (the _DECISION_TRIGGER_DEFS
+    shape), over the trigger's own chapters."""
+    warn = td.get("warning") or ""
+    d = _DECISION_TRIGGER_DEFS.get(warn) \
+        or _DECISION_TRIGGER_DEFS.get(str(warn).lower()) or ()
+    depicts = d[1] if len(d) > 1 else ""
+    return {"key": f"trigger:{str(warn).lower()}", "name": warn,
+            "query_text": evidence_query_text(warn, depicts)
+                          if depicts else warn,
+            "terms": evidence_query_terms(warn, depicts),
+            "support": _resolve_support_chapters(
+                td.get("chapters"), chapters),
+            "definition": depicts, "staged": False}
+
+
+def evidence_retrieve_triggers(triggers, chapters, *, call,
+                               embedder):
+    """The trigger half of the G seam (design §2/§6, OC-1): runs
+    BEFORE the staging seam for triggers whose extraction evidence
+    list is empty — the exact set F stages. Retrieved passages pass
+    the category's existing negative-regex discipline first
+    (_TRIGGER_NEGATIVE_RE hits disqualify a window outright, as in
+    the reduce gate), then the same retrieval + judge as tropes;
+    supported passages fill the trigger's evidence list in place,
+    stamped decision_gate "retrieval" so their provenance is never
+    confused with extraction evidence. Severity and confidence are
+    never touched, and no sighting is recorded — G is evidence,
+    not occurrence; the filled list is what the staging seam's
+    has_evidence then reads, so F's existing evidence-arrival
+    promotion fires with no staging change.
+
+    Returns {"trigger_retrieval": {warn_lower: record},
+    "marker": partial marker (claims keyed "trigger:<warn>")}."""
+    targets = [td for td in triggers or []
+               if isinstance(td, dict) and not td.get("evidence")]
+    claims = [_trigger_claim_record(td, chapters) for td in targets]
+
+    # The negative-regex discipline is per category; the shared
+    # engine takes one filter, so each claim's filter is applied
+    # via its own single-claim run only when its category has a
+    # regex — in practice _TRIGGER_NEGATIVE_RE is tiny, so claims
+    # are grouped: regex categories run individually, the rest in
+    # one shared run.
+    records, marker = {}, None
+    evidence_all = {}
+
+    def _merge(m):
+        nonlocal marker
+        marker = _merge_evidence_markers(marker, m)
+
+    plain = [c for c in claims
+             if not _TRIGGER_NEGATIVE_RE.get(c["name"])]
+    if plain:
+        ev, recs, m = _evidence_run(plain, call=call,
+                                    embedder=embedder)
+        evidence_all.update(ev)
+        records.update(recs)
+        _merge(m)
+    for c in claims:
+        neg = _TRIGGER_NEGATIVE_RE.get(c["name"])
+        if not neg:
+            continue
+        ev, recs, m = _evidence_run(
+            [c], call=call, embedder=embedder,
+            window_filter=lambda t, _n=neg: not _n.search(t))
+        evidence_all.update(ev)
+        records.update(recs)
+        _merge(m)
+    by_key = {c["key"]: td for c, td in zip(claims, targets)}
+    out_records = {}
+    for key, passages in evidence_all.items():
+        td = by_key[key]
+        td["evidence"] = [
+            {"quote": p["quote"], "chapter": p["chapter"],
+             "decision_gate": "retrieval"}
+            for p in passages[:_EVIDENCE_MAX_PASSAGES]]
+    for key, rec in records.items():
+        out_records[key.split(":", 1)[1]] = rec
+    return {"trigger_retrieval": out_records,
+            "marker": marker or _empty_evidence_marker()}
+
+
+def _empty_evidence_marker():
+    return {"method": _EVIDENCE_METHOD,
+            "floor": CONFIG.get("evidence_retrieval_floor", 0.25),
+            "totals": {"attempted": 0, "supported_strong": 0,
+                       "supported_single": 0, "adjacent_only": 0,
+                       "abstained": 0, "failed": 0, "skipped": 0},
+            "claims": {}, "verify_failures": 0, "failed": False}
+
+
+def _merge_evidence_markers(a, b):
+    """Combine the trigger-half and trope-half markers into the
+    run's single evidence_retrieval marker (design §8): totals
+    summed, per-claim outcomes merged, the run-level failed flag
+    recomputed from the merged totals."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    totals = {k: (a.get("totals") or {}).get(k, 0)
+                 + (b.get("totals") or {}).get(k, 0)
+              for k in set(a.get("totals") or {})
+              | set(b.get("totals") or {})}
+    return {"method": a.get("method", _EVIDENCE_METHOD),
+            "floor": a.get("floor"),
+            "totals": totals,
+            "claims": {**(a.get("claims") or {}),
+                       **(b.get("claims") or {})},
+            "verify_failures": a.get("verify_failures", 0)
+                               + b.get("verify_failures", 0),
+            "failed": bool(totals.get("attempted"))
+                      and totals.get("failed")
+                          == totals.get("attempted")}
 
 
 # ---------------------------------------------------------------------------
@@ -11082,6 +11840,32 @@ def _build_trope_rows(work_id, result, cat_map, trope_mappings, model, skip_ids)
         _stamp = (result.get("trope_persistence") or {}).get(_tnorm(t))
         if _stamp:
             _ev["persistence"] = dict(_stamp)
+        # Option G: retrieved passage evidence + the G1 retrieval
+        # stamp. Passages ship under the same "quotes" key and entry
+        # shape triggers already use; every passage carries chapter
+        # provenance (offset-level provenance rides in the result's
+        # trope_evidence, Trope amendment A). The stamp rides every
+        # G-processed claim: supported claims carry their grade,
+        # abstentions carry support "none" with zero counts, so
+        # "ran and found nothing" is distinguishable on the row's
+        # own face from "never ran" (no retrieval key at all). A
+        # failed retrieval leaves no stamp — failure must not
+        # masquerade as a negative result.
+        _passages = (result.get("trope_evidence") or {}).get(
+            _tnorm(t))
+        if _passages:
+            _ev["quotes"] = [
+                {"quote": p["quote"], "chapter": p["chapter"]}
+                for p in _passages[:_EVIDENCE_MAX_PASSAGES]
+                if p.get("chapter")]
+        _rec = (result.get("trope_retrieval") or {}).get(_tnorm(t))
+        if _rec and _rec.get("support") is not None:
+            _ev["retrieval"] = {
+                "method": _EVIDENCE_METHOD,
+                "support": _rec["support"],
+                "passages": len(_passages or []),
+                "chapters_with_support":
+                    _rec.get("chapters_with_support", 0)}
         rows.append({"work_id": work_id, "trope_id": tid, "status": "candidate",
                      "confidence": _tconf,
                      "source_type": "ai",
@@ -11118,6 +11902,18 @@ def _build_trigger_rows(work_id, result, model, skip_warnings):
             str(warn).lower())
         if _stamp:
             _ev["persistence"] = dict(_stamp)
+        # Option G (G1 discipline): the retrieval stamp rides every
+        # G-processed trigger row, "none" included, wherever the
+        # row ships; a failed retrieval leaves no stamp.
+        _trec = (result.get("trigger_retrieval") or {}).get(
+            str(warn).lower())
+        if _trec and _trec.get("support") is not None:
+            _ev["retrieval"] = {
+                "method": _EVIDENCE_METHOD,
+                "support": _trec["support"],
+                "passages": _trec.get("passages", 0),
+                "chapters_with_support":
+                    _trec.get("chapters_with_support", 0)}
         rows.append({"work_id": work_id, "warning": warn, "status": "candidate",
                      "confidence": _tconf,
                      "source_type": "ai",
@@ -12839,6 +13635,31 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     red["tropes"] = tropes
     red["trope_confidence"] = trope_conf
 
+    # Option G trigger retrieval (design section 8): evidence-less
+    # triggers are retrieved for BEFORE the staging seam, so a
+    # trigger that gains judge-supported passages has them in its
+    # evidence list when the seam computes has_evidence and F's
+    # existing evidence-arrival promotion fires unchanged. Flag
+    # off: the trigger list is untouched, byte-identical.
+    _trope_evidence = {}
+    _trope_retrieval = {}
+    _trigger_retrieval = {}
+    _evidence_marker = None
+    if CONFIG.get("evidence_retrieval") and not dry_run \
+            and not aborted:
+        _gtrig = evidence_retrieve_triggers(
+            red["triggers"], chapters, call=call,
+            embedder=lambda texts: embed_vectors(
+                CONFIG.get("embed_url", ""),
+                CONFIG.get("embed_model", ""), texts))
+        _trigger_retrieval = _gtrig["trigger_retrieval"]
+        _evidence_marker = _gtrig["marker"]
+        _filled = sum(1 for _r in _trigger_retrieval.values()
+                      if _r.get("passages"))
+        if _filled:
+            print(f"  Trigger evidence: {_filled} evidence-less "
+                  f"trigger(s) gained retrieved passages")
+
     # Option F staging seam (design section 5): ONE split point,
     # after the trope gate + rejection learning and the trigger
     # finalization in v2_reduce, before result assembly. Flag off
@@ -12850,6 +13671,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     _staging_marker = None
     _trope_persistence = {}
     _trigger_persistence = {}
+    _st = None
+    _sg_work_key = None
     if CONFIG.get("staging_gate") and not dry_run and not aborted:
         _st = _staging()
         if _st.enabled and _st.writable:
@@ -12874,10 +13697,11 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                     create=False)
             except Exception:
                 _sg_wid = None
+            _sg_work_key = staging_work_key(
+                _sg_wid, identifiers.get("isbn"),
+                title or fpath.stem, author)
             _sg = staging_observe_result({
-                "work_key": staging_work_key(
-                    _sg_wid, identifiers.get("isbn"),
-                    title or fpath.stem, author),
+                "work_key": _sg_work_key,
                 "work_id": _sg_wid, "title": title or fpath.stem,
                 "author": author, "isbn": identifiers.get("isbn"),
                 "auto_min": max(3, n // 20),
@@ -12900,6 +13724,76 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                   f"back, {len(_staging_marker['promoted'])} promoted, "
                   f"{_staging_marker['trapped_total']} trapped for "
                   f"this work")
+
+    # Option G trope retrieval (design section 8): runs AFTER the
+    # staging seam — staged tropes are retrieved for too, because
+    # their recorded evidence is what a later run's observe
+    # evaluates under promotion rule 4 — and before result
+    # assembly, so write_claims, plan_replace, save_preview and the
+    # dashboard all inherit the annotated result; there is no
+    # second copy of the evidence decision for a consumer to
+    # understate. Flag off (or dry-run, or aborted): no embed
+    # calls, no judge calls, no marker, byte-identical behaviour.
+    if CONFIG.get("evidence_retrieval") and not dry_run \
+            and not aborted:
+        _g_specs, _g_seen = [], set()
+        _g_staged = {}
+        if _staging_marker:
+            for _s in _staging_marker.get("staged") or []:
+                if _s.get("class") == "trope":
+                    _g_staged[_tnorm(_s.get("display") or "")] = \
+                        _s.get("display") or ""
+        _g_catmap = red.get("trope_catalog_map") or {}
+        _g_chaps = red.get("trope_chapters") or {}
+        for _nm in list(tropes) + sorted(_g_staged.values()):
+            _k = _tnorm(_nm)
+            if _k in _g_seen:
+                continue
+            _g_seen.add(_k)
+            _g_specs.append({
+                "name": _nm,
+                "support_refs": _g_chaps.get(_k, []),
+                "catalog_id": _g_catmap.get(_k),
+                "staged": _k in _g_staged})
+        _g = evidence_retrieve_result({
+            "claims": _g_specs,
+            "catalog": _trope_catalog_entries(),
+            "summaries": {s.get("label"): s.get("summary")
+                          for s in red.get("chapter_summaries")
+                          or []},
+        }, chapters, call=call, embedder=lambda texts:
+            embed_vectors(CONFIG.get("embed_url", ""),
+                          CONFIG.get("embed_model", ""), texts))
+        _trope_evidence = _g["trope_evidence"]
+        _trope_retrieval = _g["trope_retrieval"]
+        _evidence_marker = _merge_evidence_markers(
+            _evidence_marker, _g["marker"])
+        # Record this run's retrieved evidence for STAGED tropes
+        # into F's staging store (evidence_ever + grade): run
+        # N+1's observe evaluates it under promotion rule 4 —
+        # never this run (amendment G2). The recording is declared
+        # in the marker, and so on the preview's face (F's OC-4
+        # condition, inherited per design section 5).
+        _recorded, _promotes_next = 0, []
+        if _st is not None and _sg_work_key and _st.enabled \
+                and _st.writable:
+            for _k, _rec in _trope_retrieval.items():
+                if _rec.get("staged") and _rec.get("support") in (
+                        "strong", "single"):
+                    if _st.record_trope_evidence(
+                            _sg_work_key, _rec["name"],
+                            _g_catmap.get(_k), _rec["support"]):
+                        _recorded += 1
+                        if _rec["support"] == "strong":
+                            _promotes_next.append(_rec["name"])
+        _evidence_marker["evidence_recorded"] = _recorded
+        _evidence_marker["promotes_next"] = _promotes_next
+        _gt = _g["marker"]["totals"]
+        print(f"  Trope evidence: {_gt['supported_strong'] + _gt['supported_single']} "
+              f"claims with passages ({_gt['supported_strong']} strong), "
+              f"{_gt['abstained']} abstentions, "
+              f"{_gt['adjacent_only']} adjacent-only, "
+              f"{_gt['failed']} failed")
 
     reading_mins = word_count // 250
     result = {
@@ -12969,6 +13863,14 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         result["trope_persistence"] = _trope_persistence
     if _trigger_persistence:
         result["trigger_persistence"] = _trigger_persistence
+    if _evidence_marker is not None:
+        result["evidence_retrieval"] = _evidence_marker
+    if _trope_evidence:
+        result["trope_evidence"] = _trope_evidence
+    if _trope_retrieval:
+        result["trope_retrieval"] = _trope_retrieval
+    if _trigger_retrieval:
+        result["trigger_retrieval"] = _trigger_retrieval
     v = red["verification"]
     if v["evidence_checked"]:
         print(f"  Evidence: {v['evidence_verified']}/{v['evidence_checked']} verified")
@@ -14007,6 +14909,13 @@ def _build_parser():
                          "recurs across independent runs, grows into "
                          "the auto band, or gains evidence (default "
                          "off; see eval/f-staging-design.md)")
+    g_merge.add_argument("--evidence-retrieval", action="store_true",
+                    help="option G (v2): targeted evidence retrieval "
+                         "for trope claims — literal passages from "
+                         "each claim's own support chapters, judged "
+                         "by the local model, attached as quote "
+                         "evidence with a retrieval stamp (default "
+                         "off; see eval/g-evidence-design.md)")
     g_merge.add_argument("--persist-roster", action="store_true",
                     help="option B (v2): persist per-work roster "
                          "identity across runs — stable minted entity "
@@ -14349,6 +15258,8 @@ def main():
         CONFIG["roster_reconcile"] = True
     if args.staging_gate:
         CONFIG["staging_gate"] = True
+    if args.evidence_retrieval:
+        CONFIG["evidence_retrieval"] = True
     if args.persist_roster:
         CONFIG["persist_roster"] = True
     if args.preview_summary:

@@ -688,7 +688,56 @@ def compare_dashboard(old_d, new_d, labels_data=None, labels_source=None):
         f"triggers +{len(ng - og)}/-{len(og - ng)} "
         f"(lists in the Tropes/Triggers sections above)")
     lines += staging_section(old_d, new_d)
+    lines += trope_evidence_section(old_d, new_d)
     lines += entity_section(old_d, new_d)
+    return lines
+
+
+def trope_evidence_section(old_d, new_d):
+    """Option G trope-evidence readout, read off the NEW preview's
+    evidence_retrieval marker (design section 10 dashboard).
+    Additions only: returns [] when the new preview carries no
+    marker, so the dashboard's legacy output is byte-identical for
+    marker-less previews. Marker claim keys are the pipeline's
+    _tnorm keys; both sides are compared through this module's
+    norm() — the two normalizers differ on punctuation, and
+    applying one normalizer to both sides is what makes the keys
+    meet."""
+    nm = new_d.get("evidence_retrieval") or {}
+    if not nm:
+        return []
+    claims = {norm(k): v for k, v in (nm.get("claims") or {}).items()
+              if not k.startswith("trigger:")}
+    shipped, labels = extract_tropes(new_d)
+    with_support = sorted(
+        k for k in shipped
+        if claims.get(k) in ("supported-strong", "supported-single"))
+    zero = sorted(k for k in shipped
+                  if claims.get(k) == "abstained")
+    pct = round(100 * len(with_support) / len(shipped)) \
+        if shipped else 0
+    lines = ["  Trope evidence (option G):"]
+    lines.append(f"    shipped with passage support: "
+                 f"{len(with_support)}/{len(shipped)} ({pct}%)")
+    lines.append(f"    zero-support shipped (row stamp support "
+                 f"'none'): {len(zero)}")
+    for k in zero[:MAX_LIST]:
+        lines.append(f"      - {labels.get(k, k)}")
+    if len(zero) > MAX_LIST:
+        lines.append(f"      ... and {len(zero) - MAX_LIST} more")
+    n_abst = sum(1 for v in claims.values() if v == "abstained")
+    n_adj = sum(1 for v in claims.values() if v == "adjacent-only")
+    lines.append(f"    abstentions (all trope claims): {n_abst}; "
+                 f"adjacent-only: {n_adj}")
+    if nm.get("failed"):
+        lines.append("    retrieval FAILED for every attempted "
+                     "claim this run")
+    if nm.get("evidence_recorded"):
+        lines.append(
+            f"    staging evidence recorded: "
+            f"{nm['evidence_recorded']} staged claim(s); strong "
+            f"support promotes on next sighting via evidence "
+            f"({len(nm.get('promotes_next') or [])} claim(s))")
     return lines
 
 
