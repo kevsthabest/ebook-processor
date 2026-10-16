@@ -4923,6 +4923,26 @@ def corpus_acquire_for_run(learn_dir, fpath):
         return None
 
 
+def _effective_judge_identity():
+    """The (backend, model) of the judge that will actually judge
+    this run's calls, resolved exactly the way the call path
+    resolves it: the backend dispatch falls back to Ollama for an
+    unknown name, and each backend reads its model from its own
+    per-backend config key. The retrieve stage's input hash must
+    name THIS judge — reading a generic "model"/"llm" config pair
+    instead left the model component empty on any configuration
+    that names its models per-backend, so swapping the real judge
+    never invalidated a stored verdict (§4.2's contract is that
+    the hash covers the judge's backend, model and prompt)."""
+    backend = CONFIG.get("llm") or ""
+    if backend not in ("ollama", "openrouter", "openai"):
+        backend = "ollama"
+    models = {"ollama": CONFIG.get("ollama_model") or "",
+              "openrouter": CONFIG.get("openrouter_model") or "",
+              "openai": CONFIG.get("openai_model") or ""}
+    return backend, models[backend]
+
+
 def _corpus_retrieve_ctx_build(db, fingerprint, writable):
     """The context dict over an already-chosen handle, or None
     when the generation cannot serve (no embed model configured,
@@ -4933,11 +4953,12 @@ def _corpus_retrieve_ctx_build(db, fingerprint, writable):
         return None
     if _corpus_generation_suspect(db, model, _CORPUS_VECTOR_FORMAT):
         return None
+    judge_backend, judge_model = _effective_judge_identity()
     return {"db": db, "fingerprint": fingerprint,
             "writable": bool(writable), "embed_model": model,
             "embed_format": _CORPUS_VECTOR_FORMAT,
-            "judge_model": CONFIG.get("model") or "",
-            "judge_backend": CONFIG.get("llm") or ""}
+            "judge_model": judge_model,
+            "judge_backend": judge_backend}
 
 
 def corpus_retrieve_context(learn_dir, fingerprint, *, writable=True):

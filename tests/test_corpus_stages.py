@@ -412,6 +412,87 @@ class TestRetrieveAdoption(_CorpusBook):
             pp.corpus_stage_outputs(self.db, self.fp, "retrieve"), {})
 
 
+class TestJudgeIdentity(_CorpusBook):
+    """§4.2/A6 at the resolution seam: the retrieve context names
+    the EFFECTIVE judge — the backend the call dispatch selects
+    and that backend's own model key — not the generic config
+    pair. The fixture wears the production configuration's shape:
+    no literal "model" key, the model named per-backend."""
+
+    _KEYS = ("llm", "model", "ollama_model", "openrouter_model",
+             "openai_model")
+
+    def setUp(self):
+        super().setUp()
+        self._saved = {k: pp.CONFIG.get(k) for k in self._KEYS}
+        pp.CONFIG.pop("model", None)
+        pp.CONFIG["llm"] = "openai"
+        pp.CONFIG["openai_model"] = "judge-one"
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                pp.CONFIG.pop(k, None)
+            else:
+                pp.CONFIG[k] = v
+        super().tearDown()
+
+    def run_g(self, claims, ctx, judge=None, embedder=None):
+        return pp._evidence_run(
+            claims, call=judge or FakeJudgeCall(),
+            embedder=embedder or CountingEmbedder(FakeEmbedder()),
+            stage_ctx=ctx)
+
+    def test_ctx_names_the_effective_judge(self):
+        ctx = self.ctx()
+        self.assertEqual(ctx["judge_backend"], "openai")
+        self.assertEqual(ctx["judge_model"], "judge-one")
+
+    def test_unknown_backend_resolves_to_the_ollama_fallback(self):
+        # The call dispatch falls back to llm_ollama for a name it
+        # does not know; the identity must name that same fallback
+        # judge, or the hash would describe a judge that never ran.
+        pp.CONFIG["llm"] = "no-such-backend"
+        pp.CONFIG["ollama_model"] = "local-judge"
+        ctx = self.ctx()
+        self.assertEqual(ctx["judge_backend"], "ollama")
+        self.assertEqual(ctx["judge_model"], "local-judge")
+
+    def test_per_backend_model_change_rederives(self):
+        # With no "model" key in CONFIG, swapping the judging
+        # backend's model must still move every claim's input hash
+        # and break adoption of the stored verdict.
+        claim = self.betrayal()
+        ctx1 = self.ctx()
+        self.run_g([claim], ctx1)
+        pp.CONFIG["openai_model"] = "judge-two"
+        ctx2 = self.ctx()
+        floor = pp.CONFIG.get("evidence_retrieval_floor", 0.25)
+        self.assertNotEqual(
+            pp._retrieve_claim_input_hash(ctx1, claim, floor),
+            pp._retrieve_claim_input_hash(ctx2, claim, floor))
+        judge2 = FakeJudgeCall()
+        self.run_g([claim], ctx2, judge=judge2)
+        self.assertEqual(judge2.calls, 1)
+
+    def test_identical_effective_judge_identical_hash(self):
+        # The same effective judge yields the same hash and full
+        # adoption; config noise that never reaches the judge —
+        # the legacy generic key, another backend's model — must
+        # not move it.
+        claim = self.betrayal()
+        floor = pp.CONFIG.get("evidence_retrieval_floor", 0.25)
+        h1 = pp._retrieve_claim_input_hash(self.ctx(), claim, floor)
+        pp.CONFIG["model"] = "some-other-model"
+        pp.CONFIG["ollama_model"] = "not-the-judge"
+        h2 = pp._retrieve_claim_input_hash(self.ctx(), claim, floor)
+        self.assertEqual(h1, h2)
+        self.run_g([claim], self.ctx())
+        judge2 = FakeJudgeCall()
+        self.run_g([claim], self.ctx(), judge=judge2)
+        self.assertEqual(judge2.calls, 0)
+
+
 class TestWindowCache(_CorpusBook):
     def _drop_chapter_vectors(self, chapter_index):
         with self.db.write_txn("vectors") as conn:
