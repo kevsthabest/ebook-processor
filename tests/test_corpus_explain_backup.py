@@ -187,6 +187,56 @@ class TestExplain(_ExplainBase):
         self.assertIn("offset", occ["first"])
         self.assertIn("offset", occ["last"])
 
+    def test_character_absent_on_known_work_keeps_roster_line(self):
+        # The work HAS a persisted roster and the character is
+        # simply not on it: the original line stands.
+        data = pp.explain_data(self.learn, "Corpus Test Book",
+                               character="Petr Valen")
+        self.assertFalse(data["character"]["found"])
+        self.assertNotIn("no_roster", data["character"])
+        text = pp.explain_text(self.learn, "Corpus Test Book",
+                               character="Petr Valen")
+        self.assertIn("character Petr Valen: not on the work's "
+                      "roster", text)
+
+    def test_character_check_unavailable_without_any_roster(self):
+        # "G Fixture" is known to state.db through staging only —
+        # no roster_works row, no roster_entities: the report must
+        # name the missing precondition instead of blaming the
+        # character.
+        data = pp.explain_data(self.learn, "G Fixture",
+                               character="Mira Solace")
+        self.assertTrue(data["character"]["no_roster"])
+        text = pp.explain_text(self.learn, "G Fixture",
+                               character="Mira Solace")
+        self.assertIn("character Mira Solace: check unavailable",
+                      text)
+        self.assertIn("no persisted roster in state.db", text)
+        self.assertNotIn("not on the work's roster", text)
+
+    def test_character_check_unavailable_when_state_never_matched(
+            self):
+        # The drill-7 shape: the work lives in the corpus, state.db
+        # has no matching work at all (every run was a preview or
+        # replay, which persist no roster).
+        learn2 = self.dir / "learn2"
+        learn2.mkdir()
+        imp = pp.CorpusDB.create(learn2, mode="importer")
+        pp.corpus_ingest_book(imp, self.book_a)
+        db = pp.StateDB.create(learn2)
+        with db.write_txn() as conn:
+            conn.execute(
+                "INSERT INTO staging_works VALUES "
+                "(?,?,?,?,?,?,?)",
+                ("wk-x", "w-x", "Some Other Book", "An Author",
+                 1, 0, "{}"))
+        text = pp.explain_text(learn2, "G Fixture",
+                               character="Mira Solace")
+        self.assertIn("state.db: no matching work", text)
+        self.assertIn("character Mira Solace: check unavailable",
+                      text)
+        self.assertNotIn("not on the work's roster", text)
+
     def test_work_block_lists_quotes_audit_surface(self):
         data = pp.explain_data(self.learn, "G Fixture")
         quotes = data["corpus"]["quotes"]

@@ -12183,10 +12183,21 @@ def _explain_character(conn, cdb, corpus_rec, work_key, character):
     the same authority verify_quote answers to — with the first
     and last citations as chapter + offset; the work's series, if
     any, extends the scan across the series' ingested works."""
+    entity_rows = list(conn.execute(
+        "SELECT entity_id, status, canonical, payload FROM "
+        "roster_entities WHERE work_key=?", (work_key,)))
+    if not entity_rows and conn.execute(
+            "SELECT 1 FROM roster_works WHERE work_key=?",
+            (work_key,)).fetchone() is None:
+        # No roster record of either kind: the work has never had
+        # a roster persisted (previews and replays write none), so
+        # "not found" would blame the character for a missing
+        # precondition. The flag lets the report say which case
+        # it is — the fixes are entirely different.
+        return {"name": character, "found": False,
+                "no_roster": True}
     erow = None
-    for row in conn.execute(
-            "SELECT entity_id, status, canonical, payload FROM "
-            "roster_entities WHERE work_key=?", (work_key,)):
+    for row in entity_rows:
         payload = _json_or(row[3], {})
         forms = payload.get("name_forms") or [row[2]]
         if any(str(f).casefold() == character.casefold()
@@ -12310,7 +12321,18 @@ def explain_text(learn_dir, work, claim=None, character=None):
                     f"searched {cl['retrieve']['chapters_searched']}")
     if character is not None:
         ch = data["character"]
-        if not ch or not ch.get("found"):
+        if ch is None or ch.get("no_roster"):
+            # No persisted roster exists for this work (the state
+            # half never matched it, or matched it without any
+            # roster record), so the character check itself is
+            # unavailable — a different fact from an absent
+            # character, and one that sends the reader to a
+            # different fix (a roster-persisting run, not a roster
+            # correction).
+            lines.append(
+                f"  character {character}: check unavailable — "
+                f"this work has no persisted roster in state.db")
+        elif not ch.get("found"):
             lines.append(f"  character {character}: not on the "
                          f"work's roster")
         else:
