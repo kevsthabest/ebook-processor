@@ -8158,11 +8158,16 @@ def apply_uncertainty_labels(learn_dir, labels_path,
                              merge_pairs_path=None):
     """Intake: apply a labels file ([{queue_id, label, labeller}])
     to the queue; merge-pair labels also append to
-    eval/merge_pairs.json in the harness's entry shape."""
+    eval/merge_pairs.json in the harness's entry shape. Only
+    rows still 'pending' are applied: labels files are retained
+    (the portal keeps them, an operator can re-run one from a
+    terminal), so a replay must land as a counted skip, never as
+    a second application."""
     db = _state_db_for(learn_dir)
     if db is None:
         return {"labelled": 0, "merge_pairs_added": 0,
-                "missing": [], "error": "no substrate"}
+                "skipped": 0, "missing": [],
+                "error": "no substrate"}
     labels = json.loads(
         Path(labels_path).read_text(encoding="utf-8"))
     if merge_pairs_path is None:
@@ -8173,15 +8178,25 @@ def apply_uncertainty_labels(learn_dir, labels_path,
             Path(merge_pairs_path).read_text(encoding="utf-8"))
     labelled = 0
     added = 0
+    skipped = 0
     missing = []
     with db.write_txn() as conn:
         for lab in labels:
             qid = lab.get("queue_id", lab.get("id"))
             rows = db.query(
-                "SELECT class, packet FROM uncertainty_queue "
-                "WHERE id=?", (qid,))
+                "SELECT class, packet, status FROM "
+                "uncertainty_queue WHERE id=?", (qid,))
             if not rows:
                 missing.append(qid)
+                continue
+            # The pending precondition is what makes a replay
+            # harmless: without it, re-applying a retained file
+            # appended a duplicate merge pair and overwrote the
+            # first ruling's label and stamp. A row already
+            # labelled (or a control, or any non-pending state)
+            # is skipped, not re-decided.
+            if rows[0][2] != "pending":
+                skipped += 1
                 continue
             conn.execute(
                 "UPDATE uncertainty_queue SET status='labelled', "
@@ -8209,7 +8224,7 @@ def apply_uncertainty_labels(learn_dir, labels_path,
         with open(merge_pairs_path, "w", encoding="utf-8") as f:
             json.dump(pairs, f, indent=1, ensure_ascii=False)
     return {"labelled": labelled, "merge_pairs_added": added,
-            "missing": missing}
+            "skipped": skipped, "missing": missing}
 
 
 def cmd_apply_uncertainty_labels(learn_dir, labels_path):
@@ -8217,11 +8232,17 @@ def cmd_apply_uncertainty_labels(learn_dir, labels_path):
     if rep.get("error"):
         print(f"  --apply-uncertainty-labels: {rep['error']}")
         return
+    detail = (f"{rep['merge_pairs_added']} merge pair(s) appended "
+              f"to eval/merge_pairs.json")
+    if rep["missing"]:
+        detail += f"; unknown queue ids: {rep['missing']}"
+    if rep.get("skipped"):
+        # A replay is an operator accident, not a failure: the
+        # run still succeeds, it just says what it declined to
+        # re-apply.
+        detail += f"; {rep['skipped']} skipped (already applied)"
     print(f"  Uncertainty labels applied: {rep['labelled']} "
-          f"({rep['merge_pairs_added']} merge pair(s) appended to "
-          f"eval/merge_pairs.json"
-          + (f"; unknown queue ids: {rep['missing']}"
-             if rep["missing"] else "") + ")")
+          f"({detail})")
 
 
 def staging_observe_result(parts, state, *, independent):
