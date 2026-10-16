@@ -15,6 +15,7 @@ signature spans must align with sentence boundaries; fragments
 verify as evidence but are signature-ineligible.
 """
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -234,6 +235,219 @@ class TestVerifyStage(_QuoteBase):
         rows = db.query(
             "SELECT kind, status FROM quotes WHERE kind='opening'")
         self.assertEqual(rows, [("opening", "verified")])
+
+
+_HARBOUR = ("He betrayed the watch again when the second bell "
+            "rang over the water.")
+_TWO_FILLER = _FILLER.strip() + " " + _FILLER.strip()
+
+
+def _fake_ask(votes):
+    """A stand-in decision-model poll: votes maps a text fragment
+    to {"quotability","representative","spoiler","heat"} p_yes
+    values; anything unlisted gets middling quotability and clean
+    screens. The questions dict keys are q<i>_<aspect>; the state
+    lists each candidate's text under its index."""
+
+    def ask(questions, state):
+        out = {}
+        lines = state.splitlines()
+        texts = {}
+        for line in lines:
+            if line.startswith("CANDIDATE "):
+                idx, text = line[len("CANDIDATE "):].split(" ", 1)
+                texts[int(idx)] = text
+        for key in questions:
+            qpart, aspect = key.rsplit("_", 1)
+            i = int(qpart[1:])
+            text = texts.get(i, "")
+            v = {"quotability": 0.5, "representative": 0.5,
+                 "spoiler": 0.05, "heat": 0.05}
+            for frag, vals in votes.items():
+                if frag in text:
+                    v.update(vals)
+            out[key] = v[aspect]
+        return out
+
+    return ask
+
+
+class TestSelectAndPayload(_QuoteBase):
+    def setUp(self):
+        super().setUp()
+        pp.corpus_generate_opening_line(self.db, self.fp_a)
+        pp.corpus_verify_quotes(self.db, self.fp_a, [
+            {"text": _DAWN, "kind": "evidence", "chapter_index": 1,
+             "source": "run"},
+            {"text": _HARBOUR, "kind": "evidence",
+             "chapter_index": 3, "source": "run"},
+            {"text": _TWO_FILLER, "kind": "evidence",
+             "chapter_index": 1, "source": "run"},
+        ])
+        pp._dm_budget_reset()
+        self._saved_validator = pp._DECISION_VALIDATOR
+
+    def tearDown(self):
+        pp._DECISION_VALIDATOR = self._saved_validator
+        super().tearDown()
+
+    def _selected(self):
+        return self.db.query(
+            "SELECT text, kind, payload FROM quotes "
+            "WHERE fingerprint=? AND status='selected'",
+            (self.fp_a,))
+
+    def test_signature_cap_and_rank(self):
+        ask = _fake_ask({"before dawn": {"quotability": 0.95,
+                                         "representative": 0.9}})
+        out = pp.corpus_select_quotes(self.db, self.fp_a, ask=ask)
+        self.assertEqual(out["poll"], "ok")
+        sel = self._selected()
+        sigs = [r for r in sel
+                if json.loads(r[2]).get("selected_as")
+                == "signature"]
+        self.assertEqual(len(sigs), 1)  # ONE signature per book
+        self.assertEqual(sigs[0][0], _DAWN)
+
+    def test_opening_ships_as_its_own_kind(self):
+        ask = _fake_ask({"before dawn": {"quotability": 0.95}})
+        pp.corpus_select_quotes(self.db, self.fp_a, ask=ask)
+        payload = pp.corpus_build_payload(self.db, self.fp_a)
+        kinds = {q["kind"] for q in payload["quotes"]["quotes"]}
+        self.assertEqual(kinds, {"signature", "opening"})
+        opening = [q for q in payload["quotes"]["quotes"]
+                   if q["kind"] == "opening"][0]
+        first = pp._sentence_spans(self.chapters_a[1]["text"])[0]
+        self.assertEqual(opening["text"],
+                         self.chapters_a[1]["text"][first[0]:first[1]])
+
+    def test_poll_is_metadata_only(self):
+        ask = _fake_ask({"before dawn": {"quotability": 0.95}})
+        pp.corpus_select_quotes(self.db, self.fp_a, ask=ask)
+        payload = pp.corpus_build_payload(self.db, self.fp_a)
+        blob = json.dumps(payload)
+        self.assertNotIn("quotability", blob)
+        self.assertNotIn("representative", blob)
+        self.assertNotIn("confidence", blob)
+        self.assertNotIn("poll", blob)
+        # …while the processor-side record keeps the metadata.
+        row = [r for r in self._selected()
+               if r[0] == _DAWN][0]
+        poll = json.loads(row[2])["poll"]
+        self.assertEqual(poll["quotability"], 0.95)
+
+    def test_poll_shed_is_fail_closed(self):
+        # No validator, no injected ask: the poll is shed, nothing
+        # ships, and the envelope says present with zero selected.
+        pp._DECISION_VALIDATOR = None
+        out = pp.corpus_select_quotes(self.db, self.fp_a)
+        self.assertEqual(out["poll"], "skipped")
+        self.assertEqual(self._selected(), [])
+        payload = pp.corpus_build_payload(self.db, self.fp_a)
+        self.assertNotIn("quotes", payload)
+        import json
+        env = json.loads(self.db.query(
+            "SELECT envelope FROM work_envelope WHERE fingerprint=?",
+            (self.fp_a,))[0][0])
+        section = env["sections"]["quotes"]
+        self.assertEqual(section["state"], "present")
+        self.assertEqual(section["value"]["selected"], 0)
+
+    def test_budget_exhaustion_sheds(self):
+        self.assertTrue(pp._dm_budget_claim(50))
+        ask = _fake_ask({})
+        out = pp.corpus_select_quotes(self.db, self.fp_a, ask=ask)
+        self.assertEqual(out["poll"], "skipped")
+        self.assertEqual(out["reason"], "budget")
+        self.assertEqual(self._selected(), [])
+
+    def test_final_quarter_ineligible(self):
+        # The chapter-3 line gets the best votes and still cannot
+        # be the signature; the dawn line (first half) wins.
+        ask = _fake_ask({"second bell": {"quotability": 0.99,
+                                         "representative": 0.99},
+                         "before dawn": {"quotability": 0.6}})
+        pp.corpus_select_quotes(self.db, self.fp_a, ask=ask)
+        sel_texts = [r[0] for r in self._selected()]
+        self.assertNotIn(_HARBOUR, sel_texts)
+        self.assertIn(_DAWN, sel_texts)
+        # The harbour line is untouched: still verified, not
+        # rejected — ineligibility is not a screen failure.
+        row = self.db.query(
+            "SELECT status FROM quotes WHERE fingerprint=? "
+            "AND text=?", (self.fp_a, _HARBOUR))
+        self.assertEqual(row, [("verified",)])
+
+    def test_quote_never_ships_unverified(self):
+        # A rejected (never verified) candidate with irresistible
+        # votes is not in the pool at all.
+        pp.corpus_verify_quotes(self.db, self.fp_a, [
+            {"text": "A stirring line that is not in this book.",
+             "kind": "signature", "source": "extraction"}])
+        ask = _fake_ask({"stirring line": {"quotability": 0.99},
+                         "before dawn": {"quotability": 0.7}})
+        pp.corpus_select_quotes(self.db, self.fp_a, ask=ask)
+        sel_texts = [r[0] for r in self._selected()]
+        self.assertNotIn("A stirring line that is not in this "
+                         "book.", sel_texts)
+        payload = pp.corpus_build_payload(self.db, self.fp_a)
+        self.assertNotIn("stirring",
+                         json.dumps(payload))
+
+    def test_spoiler_screen_rejects(self):
+        ask = _fake_ask({"before dawn": {"spoiler": 0.9,
+                                         "quotability": 0.95}})
+        pp.corpus_select_quotes(self.db, self.fp_a, ask=ask)
+        row = self.db.query(
+            "SELECT status, payload FROM quotes WHERE fingerprint=? "
+            "AND text=?", (self.fp_a, _DAWN))
+        self.assertEqual(row[0][0], "rejected")
+        self.assertEqual(
+            json.loads(row[0][1])["reason"],
+            "spoiler_screen")
+
+    def test_payload_chapter_label_from_heading(self):
+        ask = _fake_ask({"before dawn": {"quotability": 0.95}})
+        pp.corpus_select_quotes(self.db, self.fp_a, ask=ask)
+        payload = pp.corpus_build_payload(self.db, self.fp_a)
+        sig = [q for q in payload["quotes"]["quotes"]
+               if q["kind"] == "signature"][0]
+        self.assertEqual(sig["chapter_label"], "Chapter 1")
+        self.assertEqual(sig["spoiler_tier"], "mild")
+        self.assertEqual(sig["screens"],
+                         {"spoiler": "pass", "heat": "pass"})
+        self.assertEqual(payload["quotes"]["edition"]["fingerprint"],
+                         self.fp_a)
+
+    def test_payload_omits_noncurrent_section(self):
+        ask = _fake_ask({"before dawn": {"quotability": 0.95}})
+        pp.corpus_select_quotes(self.db, self.fp_a, ask=ask)
+        payload = pp.corpus_build_payload(self.db, self.fp_a)
+        self.assertIn("quotes", payload)
+        # Tamper with the recorded span: the section's currency
+        # check must now refuse to ship it.
+        with self.db.write_txn("stages") as conn:
+            conn.execute(
+                "UPDATE quotes SET text='tampered text' "
+                "WHERE fingerprint=? AND status='selected' "
+                "AND kind='evidence'", (self.fp_a,))
+        payload2 = pp.corpus_build_payload(self.db, self.fp_a)
+        self.assertNotIn("quotes", payload2)
+
+    def test_payload_omits_section_after_verify_retraction(self):
+        ask = _fake_ask({"before dawn": {"quotability": 0.95}})
+        pp.corpus_select_quotes(self.db, self.fp_a, ask=ask)
+        self.assertIn("quotes",
+                      pp.corpus_build_payload(self.db, self.fp_a))
+        outputs = pp.corpus_stage_outputs(self.db, self.fp_a,
+                                          "quote-verify")
+        dawn_key = [k for k, v in outputs.items()
+                    if v["payload"].get("candidate_text") == _DAWN][0]
+        self.assertTrue(pp.corpus_retract_stage_output(
+            self.db, self.fp_a, "quote-verify", dawn_key,
+            "test withdrawal"))
+        self.assertNotIn("quotes",
+                         pp.corpus_build_payload(self.db, self.fp_a))
 
 
 if __name__ == "__main__":

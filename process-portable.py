@@ -5152,6 +5152,23 @@ def _quote_candidate_key(kind, asserted, text_hash):
         f"{kind}\x1f{asserted}\x1f{text_hash}")[:32]
 
 
+def _quote_verify_material(kind, asserted, text_hash, scope, by_index):
+    """The quote-verify stage's enumerated inputs (§4.1) for one
+    candidate: its text hash, kind and assertion, and the text
+    hashes of every chapter in its search scope. Shared by the
+    stage itself and the payload boundary's currency recompute
+    (§6.4) — one construction, so the two can never drift."""
+    return {
+        "stage": "quote-verify",
+        "stage_version": QUOTE_VERIFY_STAGE_VERSION,
+        "candidate_hash": text_hash, "kind": kind,
+        "asserted_chapter": asserted,
+        "scope": [{"index": ci,
+                   "text_hash": _corpus_text_hash(by_index[ci]["text"])}
+                  for ci in scope if ci in by_index],
+    }
+
+
 def _quote_row_id(fingerprint, kind, chapter_index, start, end, text):
     return _corpus_sha256("\x1f".join(
         [fingerprint, kind, str(chapter_index), str(start), str(end),
@@ -5194,7 +5211,20 @@ def corpus_verify_quotes(db, fingerprint, candidates):
         return None, "chapter_unresolved"
 
     stored = corpus_stage_outputs(db, fingerprint, "quote-verify")
-    produced, rows = {}, []
+    # Quote-verify ACCUMULATES across presentations: ingest's
+    # opening line, a run's quotes, and an on-demand batch are
+    # separate presentations of one stage, and no presentation is
+    # the stage's whole truth — so stored verdicts carry forward
+    # and this call's candidates overlay them (§4.1 replacement
+    # applies within the presented set). A carried verdict whose
+    # book text later changes goes stale silently here and is
+    # refused at every read boundary by hash recompute (§6.4);
+    # the explicit removal acts remain retraction and
+    # corpus_remove_work.
+    produced = {k: {"input_hash": v["input_hash"],
+                    "payload": v["payload"]}
+                for k, v in stored.items()}
+    rows = []
     summary = {"verified": 0, "rejected": 0, "reused": 0}
     for cand in candidates or []:
         text_c = cand.get("text") or ""
@@ -5204,17 +5234,8 @@ def corpus_verify_quotes(db, fingerprint, candidates):
         key = _quote_candidate_key(kind, asserted, text_hash)
         scope = ([asserted] if asserted is not None
                  else sorted(by_index))
-        material = {
-            "stage": "quote-verify",
-            "stage_version": QUOTE_VERIFY_STAGE_VERSION,
-            "candidate_hash": text_hash, "kind": kind,
-            "asserted_chapter": asserted,
-            "scope": [{"index": ci,
-                       "text_hash": _corpus_text_hash(
-                           by_index[ci]["text"])}
-                      for ci in scope if ci in by_index],
-        }
-        ih = _corpus_stage_input_hash(material)
+        ih = _corpus_stage_input_hash(_quote_verify_material(
+            kind, asserted, text_hash, scope, by_index))
         prior = stored.get(key)
         if prior is not None and prior["input_hash"] == ih:
             produced[key] = {"input_hash": ih,
@@ -5242,25 +5263,32 @@ def corpus_verify_quotes(db, fingerprint, candidates):
                 "sentence_bounded": record["sentence_bounded"]}
             if record.get("outside_support_chapters"):
                 verify_block["outside_support_chapters"] = True
+            row_id = _quote_row_id(fingerprint, kind,
+                                   record["chapter_index"],
+                                   record["start"], record["end"],
+                                   record["text"])
             payload = {"candidate_text": text_c, "kind": kind,
                        "source": cand.get("source"),
-                       "status": status, "verify": verify_block}
+                       "status": status, "verify": verify_block,
+                       "quote_id": row_id,
+                       "asserted_chapter": asserted}
             rows.append((
-                _quote_row_id(fingerprint, kind,
-                              record["chapter_index"], record["start"],
-                              record["end"], record["text"]),
+                row_id,
                 fingerprint, record["chapter_index"], record["start"],
                 record["end"], record["text"], kind, status,
                 json.dumps(payload, ensure_ascii=False)))
         else:
             status = "rejected"
+            row_id = _quote_row_id(fingerprint, kind, asserted, -1, -1,
+                                   text_c)
             payload = {"candidate_text": text_c, "kind": kind,
                        "source": cand.get("source"),
                        "status": status,
-                       "verify": {"candidate_text": text_c, **diag}}
+                       "verify": {"candidate_text": text_c, **diag},
+                       "quote_id": row_id,
+                       "asserted_chapter": asserted}
             rows.append((
-                _quote_row_id(fingerprint, kind, asserted, -1, -1,
-                              text_c),
+                row_id,
                 fingerprint, asserted, None, None, text_c, kind,
                 status, json.dumps(payload, ensure_ascii=False)))
         summary[status] += 1
@@ -5334,6 +5362,417 @@ def corpus_verify_run_quotes(db, fingerprint, run_quotes):
     if not candidates:
         return None
     return corpus_verify_quotes(db, fingerprint, candidates)
+
+
+# ---------------------------------------------------------------------------
+# Quote selection (§10.2/§10.5) + the publication payload (§10.6,
+# §6.4) — slice 7.
+#
+# SELECT is a decision-model poll over VERIFIED candidates only.
+# The votes are metadata: they rank, they never become a claim, a
+# confidence, or a number in any payload. The ship gate is
+# conjunctive (verified ∧ spoiler pass ∧ heat pass ∧ caps) and the
+# poll sits at the BOTTOM of the shared decision budget's priority
+# order and is its FIRST shed: exhausted pool, no validator, or a
+# failed call all record poll "skipped" and ship nothing.
+# ---------------------------------------------------------------------------
+
+_QUOTE_POLL_ASPECTS = ("quotability", "representative", "spoiler",
+                       "heat")
+_QUOTE_SCREEN_MAX = 0.5
+_SIGNATURE_MAX_CHARS = 140
+
+
+def _ask_noul_batch(validator, questions, state, label="quote poll"):
+    """One decision-model request carrying many noul questions —
+    _ask_noul's protocol and discipline (strict score validation,
+    circuit breaker) at batch shape. All-or-nothing: any missing
+    or malformed score fails the whole batch, because a partial
+    poll is not a poll."""
+    with validator._lock:
+        if validator._disabled:
+            return None
+    payload = json.dumps({
+        "model": validator.model, "state": state,
+        "questions": {k: {"type": "noul", "instructions": v}
+                      for k, v in questions.items()},
+    }).encode()
+    headers = {"Content-Type": "application/json"}
+    headers.update(validator.extra_headers)
+    if validator.api_key:
+        headers["Authorization"] = f"Bearer {validator.api_key}"
+    try:
+        req = urllib.request.Request(
+            validator.endpoint, data=payload, headers=headers)
+        with urllib.request.urlopen(req, timeout=validator.timeout) \
+                as resp:
+            result = json.loads(resp.read())
+        out = {}
+        for key in questions:
+            ans = result["answers"][key]
+            p_yes = ans.get("noul")
+            if p_yes is None:
+                p_yes = ans.get("probabilities", {}).get("yes")
+            if p_yes is None:
+                raise ValueError("response missing 'noul' score")
+            if isinstance(p_yes, bool) \
+                    or not isinstance(p_yes, (int, float)):
+                raise ValueError(f"non-numeric noul score: {p_yes!r}")
+            if math.isnan(p_yes) or math.isinf(p_yes):
+                raise ValueError(f"non-finite noul score: {p_yes}")
+            if not 0 <= p_yes <= 1:
+                raise ValueError(
+                    f"noul score out of range [0,1]: {p_yes}")
+            out[key] = float(p_yes)
+        validator._record_success()
+        return out
+    except Exception as e:
+        _tripped = validator._record_error()
+        if _tripped:
+            validator._note_disabled()
+        print(f"  Decision model error ({label}): {e}; "
+              f"quote poll shed")
+        return None
+
+
+def corpus_quote_poll(candidates, ask):
+    """The §10.2 poll: ONE batched call over the verified
+    candidates, returning {quote_id: {quotability, representative,
+    spoiler, heat}} — or None when the call fails or any score is
+    malformed. ask(questions, state) is injectable; production
+    passes a closure over the run's decision validator."""
+    questions, lines = {}, []
+    for i, cand in enumerate(candidates):
+        text = cand["text"]
+        lines.append(f"CANDIDATE {i} {text}")
+        questions[f"q{i}_quotability"] = (
+            "Would readers save and share this line as a quote "
+            f"from the book? Line: \"{text}\"")
+        questions[f"q{i}_representative"] = (
+            "Does this line represent the book — its voice and "
+            f"matter — fairly? Line: \"{text}\"")
+        questions[f"q{i}_spoiler"] = (
+            "Does this line spoil a plot development a new reader "
+            f"should discover in the reading? Line: \"{text}\"")
+        questions[f"q{i}_heat"] = (
+            "Is this line sexually explicit or graphic beyond a "
+            f"passing mention? Line: \"{text}\"")
+    raw = ask(questions, "\n".join(lines))
+    if raw is None:
+        return None
+    votes = {}
+    for i, cand in enumerate(candidates):
+        v = {}
+        for aspect in _QUOTE_POLL_ASPECTS:
+            p = raw.get(f"q{i}_{aspect}")
+            if p is None or isinstance(p, bool) \
+                    or not isinstance(p, (int, float)) \
+                    or not 0 <= p <= 1:
+                return None
+            v[aspect] = float(p)
+        votes[cand["quote_id"]] = v
+    return votes
+
+
+def _quote_select_material(entry, verify_input_hash, poll_model):
+    """The quote-select stage's enumerated inputs (§4.1) for one
+    candidate: the verified quote (span text hash, chapter, kind),
+    the verify stage output it rests on, and the poll model."""
+    return {
+        "stage": "quote-select",
+        "stage_version": QUOTE_SELECT_STAGE_VERSION,
+        "quote_id": entry["quote_id"],
+        "text_hash": _corpus_text_hash(entry["text"]),
+        "chapter_index": entry["chapter_index"],
+        "kind": entry["kind"],
+        "verify_input_hash": verify_input_hash,
+        "poll_model": poll_model,
+    }
+
+
+def _corpus_quote_rows(db, fingerprint, statuses):
+    rows = db.query(
+        "SELECT quote_id, chapter_index, start_offset, text, kind, "
+        "status, payload FROM quotes WHERE fingerprint=? "
+        "AND status IN (%s)" % ",".join("?" * len(statuses)),
+        (fingerprint, *statuses))
+    out = []
+    for qid, ci, start, text, kind, status, payload in rows:
+        try:
+            parsed = json.loads(payload) if payload else {}
+        except (TypeError, ValueError):
+            parsed = {}
+        out.append({"quote_id": qid, "chapter_index": ci,
+                    "start": start, "text": text, "kind": kind,
+                    "status": status, "payload": parsed,
+                    "sentence_bounded": bool(
+                        (parsed.get("verify") or {})
+                        .get("sentence_bounded"))})
+    return out
+
+
+def _quote_select_shed(db, fingerprint, reason):
+    """The fail-closed shed (§10.5): prior selections revert to
+    verified, the stage settles the empty set with the skip on its
+    run record, and the envelope's quotes section stands present
+    with zero selected — which renders as silence."""
+    with db.write_txn("stages") as conn:
+        for qid, payload in conn.execute(
+                "SELECT quote_id, payload FROM quotes WHERE "
+                "fingerprint=? AND status='selected'",
+                (fingerprint,)):
+            try:
+                parsed = json.loads(payload) if payload else {}
+            except (TypeError, ValueError):
+                parsed = {}
+            parsed["status"] = "verified"
+            parsed.pop("selected_as", None)
+            conn.execute(
+                "UPDATE quotes SET status='verified', payload=? "
+                "WHERE quote_id=?",
+                (json.dumps(parsed, ensure_ascii=False), qid))
+        _corpus_refresh_quotes_section_in_txn(db, conn, fingerprint)
+    corpus_stage_settle(
+        db, fingerprint, "quote-select",
+        stage_version=QUOTE_SELECT_STAGE_VERSION, model=None,
+        outputs={}, run_payload={"poll": "skipped", "reason": reason})
+    return {"poll": "skipped", "reason": reason, "selected": 0}
+
+
+def corpus_select_quotes(db, fingerprint, *, ask=None):
+    """The quote-select stage (§10.2–§10.5): poll the verified
+    candidates, apply the screens and caps, and record the
+    outcome on the quotes rows + stage outputs. Returns
+    {"poll": "ok"|"skipped", ...}."""
+    chapters = corpus_chapters_for(db, fingerprint)
+    if not chapters:
+        return {"poll": "skipped", "reason": "no_text", "selected": 0}
+    order = sorted(c["index"] for c in chapters)
+    rank = {ci: pos for pos, ci in enumerate(order)}
+    count = len(order)
+
+    def in_final_quarter(ci):
+        # Chapter granularity, safety-biased: a chapter whose span
+        # reaches into the book's final quarter counts as final-
+        # quarter (§10.4's categorical rule, read fail-safe).
+        return (rank.get(ci, 0) + 1) * 4 > 3 * count
+
+    def signature_eligible(e):
+        if in_final_quarter(e["chapter_index"]):
+            return False  # final quarter: categorically out (§10.4)
+        if not e["sentence_bounded"] or len(e["text"]) \
+                > _SIGNATURE_MAX_CHARS:
+            return False
+        if e["kind"] == "evidence" \
+                and rank.get(e["chapter_index"], 0) * 2 >= count:
+            return False  # source (b) is first-half only
+        return True
+
+    # The pool is every verified candidate; a previously selected
+    # row is a verified row wearing last run's choice, and this
+    # run's settle replaces that choice wholesale (§10.6).
+    pool = _corpus_quote_rows(db, fingerprint, ("verified",
+                                               "selected"))
+    if not pool:
+        return _quote_select_shed(db, fingerprint, "no_candidates")
+    opening = next((e for e in pool if e["kind"] == "opening"), None)
+    sig_pool = [e for e in pool if signature_eligible(e)]
+    poll_set = list({e["quote_id"]: e for e in
+                     sig_pool + ([opening] if opening else [])}
+                    .values())
+    if not poll_set:
+        return _quote_select_shed(db, fingerprint, "no_candidates")
+
+    poll_model = "injected-ask"
+    if ask is None:
+        validator = _DECISION_VALIDATOR
+        if validator is None:
+            return _quote_select_shed(db, fingerprint, "no_validator")
+        poll_model = validator.model
+
+        def ask(qs, st, _v=validator):
+            return _ask_noul_batch(_v, qs, st)
+    if not _dm_budget_claim(1):
+        # Lowest priority in the shared pool, first shed (§10.5).
+        return _quote_select_shed(db, fingerprint, "budget")
+    votes = corpus_quote_poll(poll_set, ask)
+    if votes is None:
+        return _quote_select_shed(db, fingerprint, "poll_failed")
+
+    def screens(e):
+        v = votes[e["quote_id"]]
+        if v["spoiler"] >= _QUOTE_SCREEN_MAX:
+            return "spoiler_screen"
+        if v["heat"] >= _QUOTE_SCREEN_MAX:
+            return "heat_screen"
+        return None
+
+    passing = [e for e in sig_pool if screens(e) is None]
+    passing.sort(key=lambda e: (
+        -(votes[e["quote_id"]]["quotability"]
+          + votes[e["quote_id"]]["representative"]),
+        e["chapter_index"], e["quote_id"]))
+    winner = passing[0] if passing else None
+    opening_ok = opening is not None and screens(opening) is None \
+        and (winner is None or opening["quote_id"]
+             != winner["quote_id"])
+
+    verify_hashes = {}
+    for key, row in corpus_stage_outputs(db, fingerprint,
+                                         "quote-verify").items():
+        qid = (row.get("payload") or {}).get("quote_id")
+        if qid:
+            verify_hashes[qid] = row["input_hash"]
+
+    produced = {}
+    with db.write_txn("stages") as conn:
+        # Unselection is replacement (§10.6): last run's selected
+        # rows revert before this run's outcome lands.
+        for qid, payload in conn.execute(
+                "SELECT quote_id, payload FROM quotes WHERE "
+                "fingerprint=? AND status='selected'",
+                (fingerprint,)):
+            try:
+                parsed = json.loads(payload) if payload else {}
+            except (TypeError, ValueError):
+                parsed = {}
+            parsed["status"] = "verified"
+            parsed.pop("selected_as", None)
+            conn.execute(
+                "UPDATE quotes SET status='verified', payload=? "
+                "WHERE quote_id=?",
+                (json.dumps(parsed, ensure_ascii=False), qid))
+        for e in poll_set:
+            qid = e["quote_id"]
+            v = votes[qid]
+            parsed = dict(e["payload"])
+            parsed["poll"] = {"model": poll_model, **v}
+            fail = screens(e)
+            selected_as = None
+            if fail is not None:
+                new_status = "rejected"
+                parsed["status"] = new_status
+                parsed["reason"] = fail
+            elif winner is not None and qid == winner["quote_id"]:
+                new_status, selected_as = "selected", "signature"
+                parsed["status"] = new_status
+                parsed["selected_as"] = selected_as
+                parsed["spoiler_tier"] = "mild"
+            elif opening_ok and opening is not None \
+                    and qid == opening["quote_id"]:
+                new_status, selected_as = "selected", "opening"
+                parsed["status"] = new_status
+                parsed["selected_as"] = selected_as
+                parsed["spoiler_tier"] = "mild"
+            else:
+                new_status = "verified"
+                parsed["status"] = new_status
+            conn.execute(
+                "UPDATE quotes SET status=?, payload=? "
+                "WHERE quote_id=?",
+                (new_status, json.dumps(parsed, ensure_ascii=False),
+                 qid))
+            produced[qid] = {
+                "input_hash": _corpus_stage_input_hash(
+                    _quote_select_material(
+                        e, verify_hashes.get(qid), poll_model)),
+                "payload": {"quote_id": qid, "status": new_status,
+                            "selected_as": selected_as, "poll": v}}
+        _corpus_refresh_quotes_section_in_txn(db, conn, fingerprint)
+    corpus_stage_settle(
+        db, fingerprint, "quote-select",
+        stage_version=QUOTE_SELECT_STAGE_VERSION, model=poll_model,
+        outputs=produced,
+        run_payload={"poll": "ok", "candidates": len(poll_set)})
+    n_selected = sum(1 for o in produced.values()
+                     if o["payload"]["status"] == "selected")
+    return {"poll": "ok", "selected": n_selected,
+            "signature": winner["quote_id"] if winner else None,
+            "opening": opening["quote_id"] if opening_ok else None}
+
+
+def corpus_build_payload(db, fingerprint):
+    """The work-level corpus payload (§10.6, §6.4): what may ship.
+    Sections carry state, evidence tier and provenance — never a
+    raw confidence, never poll votes. Currency is enforced HERE,
+    at the boundary: a section whose stage outputs no longer
+    recompute equal against the current store is omitted, and
+    omission renders as unknown downstream. Edition-scoped
+    sections (quotes) state their source edition at section
+    level; nothing merges editions."""
+    rec = corpus_work_record(db, fingerprint) or {}
+    identifiers = rec.get("identifiers")
+    if isinstance(identifiers, str):
+        try:
+            identifiers = json.loads(identifiers)
+        except ValueError:
+            identifiers = {}
+    payload = {"fingerprint": fingerprint,
+               "title": rec.get("title"),
+               "author": rec.get("author")}
+    quotes_section = _corpus_payload_quotes_section(
+        db, fingerprint, identifiers or {})
+    if quotes_section is not None:
+        payload["quotes"] = quotes_section
+    return payload
+
+
+def _corpus_payload_quotes_section(db, fingerprint, identifiers):
+    selected = _corpus_quote_rows(db, fingerprint, ("selected",))
+    if not selected:
+        return None
+    chapters = corpus_chapters_for(db, fingerprint)
+    by_index = {c["index"]: c for c in chapters}
+    select_outputs = corpus_stage_outputs(db, fingerprint,
+                                          "quote-select")
+    verify_outputs = corpus_stage_outputs(db, fingerprint,
+                                          "quote-verify")
+    verify_by_qid = {}
+    for key, row in verify_outputs.items():
+        qid = (row.get("payload") or {}).get("quote_id")
+        if qid:
+            verify_by_qid[qid] = row
+    entries = []
+    for e in selected:
+        qid = e["quote_id"]
+        poll = e["payload"].get("poll") or {}
+        so = select_outputs.get(qid)
+        vo = verify_by_qid.get(qid)
+        if so is None or vo is None or not poll:
+            return None  # not current: the section does not ship
+        vhash = vo["input_hash"]
+        material = _quote_select_material(e, vhash, poll.get("model"))
+        if _corpus_stage_input_hash(material) != so["input_hash"]:
+            return None
+        vp = vo["payload"]
+        scope = ([vp.get("asserted_chapter")]
+                 if vp.get("asserted_chapter") is not None
+                 else sorted(by_index))
+        vmat = _quote_verify_material(
+            vp.get("kind"), vp.get("asserted_chapter"),
+            _corpus_text_hash(vp.get("candidate_text") or ""),
+            scope, by_index)
+        if _corpus_stage_input_hash(vmat) != vhash:
+            return None
+        ch = by_index.get(e["chapter_index"]) or {}
+        entries.append({
+            "text": e["text"],
+            "chapter_label": ch.get("label")
+            or f"Chapter {e['chapter_index']}",
+            "kind": e["payload"].get("selected_as") or e["kind"],
+            "spoiler_tier": e["payload"].get("spoiler_tier", "mild"),
+            "screens": {"spoiler": "pass", "heat": "pass"},
+            "_sort": (e["chapter_index"], qid)})
+    entries.sort(key=lambda x: x["_sort"])
+    for entry in entries:
+        entry.pop("_sort", None)
+    return {"state": "present",
+            "evidence_tier": "Checked against the text",
+            "provenance": "From the text",
+            "edition": {"fingerprint": fingerprint,
+                        "isbn13": identifiers.get("isbn")},
+            "quotes": entries}
+
 
 
 # ---------------------------------------------------------------------------
@@ -18647,6 +19086,18 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                     print(f"  Corpus quotes: {_qv['verified']} "
                           f"verified, {_qv['rejected']} rejected "
                           f"against the corpus text")
+                # Selection (§10.2): the poll is the shared
+                # decision budget's lowest priority and its first
+                # shed; a shed ships nothing and never fails the
+                # run.
+                _qs = corpus_select_quotes(_qdb, _ckpt_fp)
+                if _qs.get("poll") == "ok":
+                    print(f"  Corpus quotes: {_qs['selected']} "
+                          f"selected for the payload")
+                else:
+                    print(f"  Corpus quotes: selection shed "
+                          f"({_qs.get('reason')}) — no quotes ship "
+                          f"from this run")
         except Exception:
             pass
 
