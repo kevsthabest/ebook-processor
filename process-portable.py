@@ -21170,6 +21170,9 @@ def _build_parser():
     g_in.add_argument("--file", metavar="EBOOK", default=None,
                     help="process a single ebook file instead of the import folder")
     g_in.add_argument("--watch", action="store_true", help="rescan the import folder every 60s")
+    g_in.add_argument("--watch-ingest", action="store_true",
+                    help="with --watch, ingest the import folder into the "
+                         "corpus before each rescan")
     g_in.add_argument("--max-books", type=int, default=None,
                         help="process at most N books from the import folder (e.g. --max-books 3)")
     g_in.add_argument("--isbn", metavar="ISBN", default="",
@@ -21525,6 +21528,29 @@ def _build_parser():
     return ap
 
 
+def _watch_cycle(args):
+    """One watch-mode cycle after the auto-update check: the optional
+    import-folder ingest, then the scan.
+
+    Split out of main()'s loop so the cycle's ordering is testable
+    without running the loop itself. Ingest runs before the scan of
+    the same cycle so a book dropped into the import folder is
+    corpus-sourced by that scan instead of one cycle late. The ingest
+    is guarded because watch mode's job is to keep scanning: a
+    corpus-side failure costs one printed warning and the scan still
+    runs, and the next cycle retries the ingest on its own.
+    """
+    if getattr(args, "watch_ingest", False):
+        try:
+            cmd_ingest([IMPORT_DIR],
+                       learn_dir=args.learn_dir or None,
+                       reason="watch cycle")
+        except Exception as e:
+            print(f"  watch: ingest failed this cycle ({e}); "
+                  "scanning anyway")
+    run_once(args.dry_run, args.preview, args.max_books, args.file)
+
+
 def main():
     ap = _build_parser()
     args = ap.parse_args()
@@ -21874,7 +21900,7 @@ def main():
                 # is preserved across the exec so later cycles keep checking.
                 if args.auto_update:
                     _do_auto_update(preserve_flag=True)
-                run_once(args.dry_run, args.preview, args.max_books, args.file)
+                _watch_cycle(args)
                 time.sleep(60)
         except KeyboardInterrupt:
             print("\nStopped.")
