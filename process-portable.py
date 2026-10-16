@@ -12335,6 +12335,64 @@ def cmd_explain(work, claim=None, character=None, learn_dir=None):
                         character=character)
 
 
+def cmd_corpus_verify_quote(fingerprint, quote, learn_dir=None):
+    """--corpus-verify-quote: check ONE candidate quote against
+    one work's corpus text, on demand (§10.1), and print the
+    verdict. The quote-verify STAGE settles its verdicts as stage
+    outputs; this command exists for the questions a human asks
+    outside any run — a planted candidate, a spot check — so it
+    deliberately records NOTHING: no quote row, no stage output,
+    no envelope change. Returns the exit code: 0 verified,
+    1 rejected, 2 when the question itself cannot be asked (no
+    corpus, an unknown or ambiguous fingerprint, no servable
+    text, or no --quote given)."""
+    d = _explain_learn_dir(learn_dir)
+    if quote is None:
+        print("  --corpus-verify-quote needs --quote \"<text>\": "
+              "the candidate wording to check.")
+        return 2
+    db = _corpus_db_for(d, mode="report")
+    if db is None:
+        print(f"  No corpus in {d} — nothing to verify against.")
+        return 2
+    rec = corpus_work_record(db, fingerprint)
+    if rec is None:
+        # Exact match failed; accept the prefix form the status
+        # and explain outputs print, but only when it names
+        # exactly one work — a guess here would verify against
+        # the wrong book.
+        matches = [r[0] for r in db.query(
+            "SELECT fingerprint FROM corpus_works")
+            if r[0].startswith(fingerprint)]
+        if len(matches) == 1:
+            rec = corpus_work_record(db, matches[0])
+        elif len(matches) > 1:
+            print(f"  Fingerprint {fingerprint} is ambiguous — "
+                  f"{len(matches)} corpus works start with it.")
+            return 2
+    if rec is None:
+        print(f"  No corpus work with fingerprint {fingerprint}.")
+        return 2
+    fp = rec["fingerprint"]
+    chapters = corpus_chapters_for(db, fp)
+    if chapters is None:
+        print(f"  Corpus work {fp[:12]}… has no servable text "
+              f"(state {corpus_work_state(db, fp)}) — nothing to "
+              f"verify against.")
+        return 2
+    record = verify_quote(db, fp, quote)
+    if record is None:
+        print("rejected — no matching chapter")
+        return 1
+    label = next((c["label"] for c in chapters
+                  if c["index"] == record["chapter_index"]), None)
+    where = f"chapter {record['chapter_index']}"
+    if label:
+        where += f" ({label})"
+    print(f"verified — {where}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # --backup-state / --restore-state (§7.2): the PAIR as one act.
 # A backup is both stores, copied via the backup API, plus a
@@ -21344,6 +21402,17 @@ def _build_parser():
                     default=None,
                     help="with --explain: focus one character "
                          "(roster lineage + corpus occurrences)")
+    g_learn.add_argument("--corpus-verify-quote",
+                    metavar="FINGERPRINT", default=None,
+                    help="check one candidate quote against one "
+                         "corpus work's text, read-only (full "
+                         "fingerprint or its printed prefix): "
+                         "prints verified/rejected, exits 0/1, "
+                         "2 when the work or corpus is unknown; "
+                         "records nothing. Needs --quote")
+    g_learn.add_argument("--quote", metavar="TEXT", default=None,
+                    help="with --corpus-verify-quote: the "
+                         "candidate quote text to check")
     g_learn.add_argument("--backup-state", metavar="DIR",
                     default=None,
                     help="back up state.db + corpus.db as one act "
@@ -21554,6 +21623,11 @@ def main():
                     character=args.explain_character or None,
                     learn_dir=args.learn_dir or None)
         return
+    if args.corpus_verify_quote:
+        load_config()
+        sys.exit(cmd_corpus_verify_quote(
+            args.corpus_verify_quote, args.quote,
+            learn_dir=args.learn_dir or None))
     if args.backup_state:
         load_config()
         cmd_backup_state(args.backup_state,

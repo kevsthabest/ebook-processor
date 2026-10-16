@@ -14,7 +14,9 @@ occurrences counted, earliest taken. Sentence-boundary rule:
 signature spans must align with sentence boundaries; fragments
 verify as evidence but are signature-ineligible.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
@@ -475,6 +477,67 @@ class TestSelectAndPayload(_QuoteBase):
             "test withdrawal"))
         self.assertNotIn("quotes",
                          pp.corpus_build_payload(self.db, self.fp_a))
+
+
+class TestVerifyQuoteCommand(_QuoteBase):
+    """--corpus-verify-quote: the §10.1 matcher as an on-demand,
+    read-only command (drill 7 step 3's missing surface). The
+    verdicts are the stage's; the command records nothing."""
+
+    def run_cmd(self, fingerprint, quote):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = pp.cmd_corpus_verify_quote(
+                fingerprint, quote, learn_dir=self.learn)
+        return code, buf.getvalue()
+
+    def test_drifted_variant_verifies(self):
+        # Punctuation drift (comma added, terminal period
+        # dropped) and whitespace drift both snap to the span.
+        for cand in ("He betrayed the watch, and the guard fell "
+                     "silent before dawn",
+                     "He betrayed  the   watch and the guard\n"
+                     "fell silent before dawn."):
+            code, out = self.run_cmd(self.fp_a, cand)
+            self.assertEqual(code, 0, out)
+            self.assertIn("verified — chapter 1 (Chapter 1)", out)
+
+    def test_prefix_fingerprint_resolves(self):
+        code, out = self.run_cmd(self.fp_a[:8], _DAWN)
+        self.assertEqual(code, 0, out)
+        self.assertIn("verified", out)
+
+    def test_word_substitution_rejected(self):
+        code, out = self.run_cmd(
+            self.fp_a,
+            "He betrayed the watch and the guard fell quiet "
+            "before dawn.")
+        self.assertEqual(code, 1, out)
+        self.assertIn("rejected — no matching chapter", out)
+
+    def test_unknown_fingerprint_errors_cleanly(self):
+        code, out = self.run_cmd("f" * 64, _DAWN)
+        self.assertEqual(code, 2, out)
+        self.assertIn("No corpus work with fingerprint", out)
+
+    def test_missing_quote_is_a_usage_error(self):
+        code, out = self.run_cmd(self.fp_a, None)
+        self.assertEqual(code, 2, out)
+        self.assertIn("--quote", out)
+
+    def test_command_writes_nothing(self):
+        # Neither a verified nor a rejected check may leave a
+        # quote row or a stage output behind: the stage settles
+        # verdicts, this command only reports them.
+        self.run_cmd(self.fp_a, _DAWN)
+        self.run_cmd(self.fp_a,
+                     "He betrayed the watch and the guard fell "
+                     "quiet before dawn.")
+        self.assertEqual(
+            self.db.query("SELECT COUNT(*) FROM quotes")[0][0], 0)
+        self.assertEqual(
+            self.db.query(
+                "SELECT COUNT(*) FROM stage_outputs")[0][0], 0)
 
 
 if __name__ == "__main__":
