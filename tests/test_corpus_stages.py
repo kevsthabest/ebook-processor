@@ -493,6 +493,80 @@ class TestJudgeIdentity(_CorpusBook):
         self.assertEqual(judge2.calls, 0)
 
 
+class TestRetrieveGranularity(_CorpusBook):
+    """§13 drill 5 step 8, rebuilt as a construction: the drill's
+    live version compared a fresh extraction against the settle,
+    so its claim population moved and nothing could be isolated.
+    Here the claim set is held constant and the chapter text
+    changes the way re-ingest changes it — a rebuilt EPUB through
+    corpus_ingest_book — so the covering property is measured at
+    both levels: the input hash, and the adoption partition."""
+
+    def run_g(self, claims, ctx, judge=None, embedder=None):
+        return pp._evidence_run(
+            claims, call=judge or FakeJudgeCall(),
+            embedder=embedder or CountingEmbedder(FakeEmbedder()),
+            stage_ctx=ctx)
+
+    def _reingest_with_ch3_moved(self):
+        files = _g_files()
+        files["OEBPS/c3.xhtml"] = files["OEBPS/c3.xhtml"].replace(
+            "betrayed the watch again", "sighted the far watch")
+        book2 = _make_epub(self.dir / "gfixture-moved.epub", files,
+                           title="G Fixture", author="Test Author")
+        pp._close_corpus_dbs()
+        idb = self.make_db(mode="importer")
+        res = pp.corpus_ingest_book(idb, book2)
+        # The edit is mid-book: the fingerprint (first substantial
+        # chapter) is unchanged, so the stage outputs settled
+        # against this work are the ones the partition now faces.
+        self.assertEqual(res["fingerprint"], self.fp)
+        out = pp.corpus_embed_work(idb, self.fp, FakeEmbedder(),
+                                   _MODEL)
+        self.assertEqual(out, "complete")
+        pp._close_corpus_dbs()
+        self.db = pp.CorpusDB.open(self.learn, mode="processor")
+        self.chapters = pp.corpus_chapters_for(self.db, self.fp)
+        self.by_index = {c["index"]: c for c in self.chapters}
+
+    def test_chapter_edit_rederives_only_covering_claim(self):
+        floor = pp.CONFIG.get("evidence_retrieval_floor", 0.25)
+        ctx = self.ctx()
+        before = [self.betrayal(), self.storm()]
+        hash_before = {c["key"]: pp._retrieve_claim_input_hash(
+            ctx, c, floor) for c in before}
+        _, rec1, _ = self.run_g(before, ctx)
+
+        self._reingest_with_ch3_moved()
+        self.assertIn("sighted the far watch",
+                      self.by_index[3]["text"])
+        self.assertIn("council debated betrayal",
+                      self.by_index[2]["text"])
+
+        ctx2 = self.ctx()
+        after = [self.betrayal(), self.storm()]
+        hash_after = {c["key"]: pp._retrieve_claim_input_hash(
+            ctx2, c, floor) for c in after}
+        # (a) Hash level: chapter 3 is in Betrayal's support only,
+        # so exactly Betrayal's input hash moves.
+        self.assertNotEqual(hash_after["betrayal"],
+                            hash_before["betrayal"])
+        self.assertEqual(hash_after["storm"], hash_before["storm"])
+
+        # (b) Partition level: exactly the covering claim is
+        # attempted; the other is adopted verbatim.
+        judge2 = FakeJudgeCall()
+        _, rec2, marker2 = self.run_g(after, ctx2, judge=judge2)
+        self.assertEqual(marker2["totals"]["attempted"], 1)
+        self.assertEqual(judge2.calls, 1)
+        self.assertEqual(rec2["storm"], rec1["storm"])
+        # Betrayal re-derived against the moved text: its second
+        # support chapter no longer depicts betrayal, so the
+        # grade drops from strong to single.
+        self.assertEqual(rec2["betrayal"]["outcome"],
+                         "supported-single")
+
+
 class TestWindowCache(_CorpusBook):
     def _drop_chapter_vectors(self, chapter_index):
         with self.db.write_txn("vectors") as conn:
