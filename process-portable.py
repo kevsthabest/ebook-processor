@@ -2977,6 +2977,219 @@ def _substrate_active(learn_dir):
 
 
 # ---------------------------------------------------------------------------
+# Migration: JSON store files -> state.db (spine §3.7 + amendment A1)
+#
+# The build goes into state.db.migrating and is renamed into place
+# ONLY after verification passes (per-store counts equal the file
+# counts, staging's staged_ever identity closes per work, roster
+# accounting closes). A leftover .migrating at startup is an
+# incomplete migration: discard it and retry. On abort the JSON
+# files remain authoritative and untouched — delay-only, exactly
+# the F8 posture. On success the imported originals are renamed
+# <name>.migrated-<date> (never deleted); the printed rollback is:
+# delete state.db, strip the .migrated-<date> suffixes, done.
+# ---------------------------------------------------------------------------
+
+def _migration_sources(d):
+    """The JSON store files a migration would import, as Paths."""
+    out = []
+    for name in ("nicknames.json", "titles.json",
+                 "threshold_stats.json", "rejected_tropes.json",
+                 "staging.json"):
+        p = d / name
+        if p.exists():
+            out.append(p)
+    series = d / "series"
+    if series.is_dir():
+        out.extend(sorted(series.rglob("*.json")))
+    rosters = d / "rosters"
+    if rosters.is_dir():
+        out.extend(sorted(rosters.glob("*.json")))
+    return out
+
+
+def migrate_state_to_substrate(learn_dir):
+    """One-shot JSON -> state.db migration (see the section header).
+    Returns a report dict: {"status": migrated|already|aborted,
+    "counts": {...}, "reason": ...}. Never raises."""
+    d = Path(learn_dir)
+    db_path = d / _STATE_DB_NAME
+    mig_path = d / _STATE_DB_MIGRATING_NAME
+    if db_path.exists():
+        return {"status": "already"}
+    for sidecar in ("", "-wal", "-shm"):
+        try:
+            Path(str(mig_path) + sidecar).unlink(missing_ok=True)
+        except OSError:
+            pass
+    sources = _migration_sources(d)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(mig_path), check_same_thread=False)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
+            tmpdb = StateDB(mig_path, conn)
+            StateDB._create_schema(conn)
+            counts = _migration_import(d, tmpdb)
+            _migration_verify(d, tmpdb, counts)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        for sidecar in ("", "-wal", "-shm"):
+            try:
+                Path(str(mig_path) + sidecar).unlink(missing_ok=True)
+            except OSError:
+                pass
+        print(f"  !! State migration ABORTED ({e}); the JSON store "
+              "files remain authoritative and untouched. The "
+              "migration retries on the next run.")
+        return {"status": "aborted", "reason": str(e)}
+    # Verified: rename into place (A1), then retire the originals.
+    os.replace(mig_path, db_path)
+    for sidecar in ("-wal", "-shm"):
+        s = Path(str(mig_path) + sidecar)
+        if s.exists():
+            os.replace(s, Path(str(db_path) + sidecar))
+    stamp = _staging_today()
+    for p in sources:
+        try:
+            os.replace(p, p.with_name(f"{p.name}.migrated-{stamp}"))
+        except OSError:
+            pass
+    _state_db_for(d)  # register the live handle
+    print(f"  State stores migrated to {db_path} "
+          f"({counts.get('learned', 0)} learned entries, "
+          f"{counts.get('staging_works', 0)} staging works, "
+          f"{counts.get('rosters', 0)} roster stores, "
+          f"{counts.get('series', 0)} series files). The originals "
+          f"were renamed *.migrated-{stamp}, never deleted. "
+          "Rollback: delete state.db and strip the suffixes.")
+    return {"status": "migrated", "counts": counts}
+
+
+def _migration_import(d, tmpdb):
+    """Import every JSON store into the .migrating DB. Corruption in
+    any store raises (the stores degrade-to-empty on their own; here
+    that degradation is detected and treated as fatal)."""
+    jd = lambda o: json.dumps(o, ensure_ascii=False)
+    counts = {}
+    learned = LearnedState(learn_dir=d, enabled=True)
+    if learned._corrupt_seen:
+        raise ValueError(
+            f"learned store file(s) unreadable: "
+            f"{sorted(learned._corrupt_seen)}")
+    learned._db_save_all(tmpdb)
+    counts["learned"] = (len(learned.nicknames) + len(learned.titles)
+                         + len(learned.threshold_stats)
+                         + len(learned.rejected_tropes))
+    series_dir = d / "series"
+    n_series = 0
+    if series_dir.is_dir():
+        with tmpdb.write_txn() as conn:
+            for p in sorted(series_dir.rglob("*.json")):
+                raw = p.read_text(encoding="utf-8")
+                json.loads(raw)  # validate; a bad file aborts
+                rel = p.relative_to(series_dir)
+                key = str(rel)[:-len(".json")].replace(os.sep, "/")
+                conn.execute(
+                    "INSERT OR REPLACE INTO series_state VALUES (?,?)",
+                    (key, raw))
+                n_series += 1
+    counts["series"] = n_series
+    staging = StagingState(learn_dir=d, enabled=True)
+    if staging.corrupt_at_load:
+        raise ValueError("staging.json is unreadable")
+    rep = staging_report_data(staging)
+    if rep["unaccounted"] != 0:
+        raise ValueError(
+            f"staging identity does not close (unaccounted="
+            f"{rep['unaccounted']})")
+    staging._db_save(tmpdb)
+    counts["staging_works"] = len(staging.data["works"])
+    counts["staging_claims"] = sum(
+        len(w["claims"]) for w in staging.data["works"].values())
+    n_rosters = 0
+    rosters_dir = d / "rosters"
+    if rosters_dir.is_dir():
+        for p in sorted(rosters_dir.glob("*.json")):
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            wk = raw.get("work_key") if isinstance(raw, dict) else None
+            if not wk:
+                raise ValueError(f"roster store {p.name} has no "
+                                 "work_key")
+            store = RosterStore(learn_dir=d, work_key=wk)
+            if store.corrupt_at_load:
+                raise ValueError(f"roster store {p.name} is "
+                                 "unreadable")
+            if store.accounting()["unaccounted"] != 0:
+                raise ValueError(
+                    f"roster store {p.name} accounting does not "
+                    "close")
+            store._db_save(tmpdb)
+            n_rosters += 1
+    counts["rosters"] = n_rosters
+    with tmpdb.write_txn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta VALUES (?,?)",
+            ("migrated_from", jd({
+                "date": _staging_today(),
+                "sources": [p.name for p in _migration_sources(d)],
+                "counts": counts})))
+    return counts
+
+
+def _migration_verify(d, tmpdb, counts):
+    """Re-read the built DB and compare against the imported counts
+    and the source stores (the rename into place happens only when
+    this passes)."""
+    q = lambda sql, args=(): tmpdb.query(sql, args)[0][0]
+    n_learned = sum(q(f"SELECT COUNT(*) FROM {t}") for t in
+                    ("learned_nicknames", "learned_titles",
+                     "learned_threshold_stats",
+                     "learned_rejected_tropes"))
+    if n_learned != counts["learned"]:
+        raise ValueError("learned counts differ after import")
+    if q("SELECT COUNT(*) FROM staging_works") \
+            != counts["staging_works"]:
+        raise ValueError("staging work counts differ after import")
+    if q("SELECT COUNT(*) FROM staging_claims") \
+            != counts["staging_claims"]:
+        raise ValueError("staging claim counts differ after import")
+    if q("SELECT COUNT(*) FROM roster_works") != counts["rosters"]:
+        raise ValueError("roster counts differ after import")
+    if q("SELECT COUNT(*) FROM series_state") != counts["series"]:
+        raise ValueError("series counts differ after import")
+    staging_back = StagingState._db_load(tmpdb)
+    staging_src = StagingState(learn_dir=d, enabled=True)
+    if staging_back != staging_src.data:
+        raise ValueError("staging read-back differs from the JSON "
+                         "store")
+    learned_back = LearnedState._db_load_all(tmpdb)
+    src = LearnedState(learn_dir=d, enabled=True)
+    if learned_back != (src.nicknames, src.titles,
+                        src.threshold_stats, src.rejected_tropes):
+        raise ValueError("learned read-back differs from the JSON "
+                         "store")
+
+
+def ensure_state_migrated(learn_dir):
+    """OC-7: migration runs automatically on the first run that
+    touches state. No state at all -> an empty substrate is created
+    (fresh installs start on the substrate)."""
+    if not learn_dir:
+        return None
+    d = Path(learn_dir)
+    if (d / _STATE_DB_NAME).exists():
+        return {"status": "already"}
+    if not _migration_sources(d):
+        StateDB.create(d)
+        return {"status": "created-empty"}
+    return migrate_state_to_substrate(d)
+
+
+# ---------------------------------------------------------------------------
 # Cross-run learning: the pipeline gets smarter with every book processed.
 #
 # LearnedState persists four kinds of knowledge under <learn_dir>/:
@@ -3924,6 +4137,14 @@ class StagingState:
                   f"{path} ({e}); it will still be overwritten")
 
     def _load(self):
+        db = _state_db_for(self.dir)
+        if db is not None:
+            try:
+                self.data = self._db_load(db)
+            except Exception as e:
+                self._note_corrupt(self.dir / _STATE_DB_NAME, e)
+                self.data = {"version": 1, "works": {}}
+            return
         p = self._path()
         if not p.exists():
             return
@@ -3938,6 +4159,59 @@ class StagingState:
             self._note_corrupt(p, e)
             self.data = {"version": 1, "works": {}}
 
+    # -- substrate seam (spine §3.2) ------------------------------------
+    @staticmethod
+    def _db_load(db):
+        works = {}
+        for work_key, payload in db.query(
+                "SELECT work_key, payload FROM staging_works "
+                "ORDER BY rowid"):
+            w = json.loads(payload)
+            w["claims"] = {}
+            w["expired_recent"] = []
+            works[work_key] = w
+        for work_key, claim_key, payload in db.query(
+                "SELECT work_key, claim_key, payload FROM "
+                "staging_claims ORDER BY rowid"):
+            works[work_key]["claims"][claim_key] = json.loads(payload)
+        for work_key, payload in db.query(
+                "SELECT work_key, payload FROM staging_expired "
+                "ORDER BY rowid"):
+            works[work_key]["expired_recent"].append(json.loads(payload))
+        return {"version": 1, "works": works}
+
+    def _db_save(self, db):
+        jd = lambda o: json.dumps(o, ensure_ascii=False)
+        with db.write_txn() as conn:
+            conn.execute("DELETE FROM staging_works")
+            conn.execute("DELETE FROM staging_claims")
+            conn.execute("DELETE FROM staging_expired")
+            for wk, w in self.data["works"].items():
+                payload = {k: v for k, v in w.items()
+                           if k not in ("claims", "expired_recent")}
+                conn.execute(
+                    "INSERT INTO staging_works VALUES (?,?,?,?,?,?,?)",
+                    (wk, w.get("work_id"), w.get("title"),
+                     w.get("author"), int(w.get("runs_completed", 0)),
+                     int(w.get("staged_ever", 0)), jd(payload)))
+                for ck, c in w["claims"].items():
+                    conn.execute(
+                        "INSERT INTO staging_claims VALUES "
+                        "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (wk, ck, c.get("class"), c.get("display"),
+                         c.get("state"), c.get("promoted_run"),
+                         c.get("promoted_via"),
+                         int(c.get("best_chapters", 0)),
+                         1 if c.get("evidence_ever") else 0,
+                         c.get("first_seen"), c.get("last_seen"),
+                         jd(c.get("sightings", [])),
+                         jd(c.get("name_forms", [])), jd(c)))
+                for e in w["expired_recent"]:
+                    conn.execute(
+                        "INSERT INTO staging_expired VALUES (?,?,?,?,?)",
+                        (wk, e.get("key"), e.get("expired_run"),
+                         jd(e.get("sightings", [])), jd(e)))
+
     def save(self):
         """Atomic write: temp file + os.replace. No-op when not
         writable. A size guard warns past 5 MB (the realistic growth
@@ -3945,6 +4219,17 @@ class StagingState:
         if not self._writable or not self.enabled:
             return False
         with self._lock:
+            db = _state_db_for(self.dir)
+            if db is not None:
+                try:
+                    self._db_save(db)
+                    return True
+                except Exception as e:
+                    self._writable = False
+                    self._warn_once(
+                        f"  Staging store write failed ({e}); "
+                        "staging is disabled for the rest of this run.")
+                    return False
             try:
                 p = self._path()
                 self._preserve_corrupt(p)
@@ -4895,6 +5180,20 @@ class RosterStore:
                   f"{path} ({e}); it will still be overwritten")
 
     def _load(self):
+        db = _state_db_for(self.dir.parent)
+        if db is not None:
+            try:
+                data = self._db_load(db)
+            except Exception as e:
+                self._note_corrupt(self.dir.parent / _STATE_DB_NAME, e)
+                self.data = self._empty_data(self.work_key)
+                return
+            if data is not None:
+                empty = self._empty_data(self.work_key)
+                empty.update(data)
+                empty["work_key"] = self.work_key
+                self.data = empty
+            return
         p = self.path
         if not p.exists():
             return
@@ -4913,6 +5212,80 @@ class RosterStore:
             self._note_corrupt(p, e)
             self.data = self._empty_data(self.work_key)
 
+    # -- substrate seam (spine §3.3): one row-set per work ------------
+    def _db_load(self, db):
+        wk = self.work_key
+        rows = db.query("SELECT payload FROM roster_works "
+                        "WHERE work_key=?", (wk,))
+        if not rows:
+            return None
+        data = json.loads(rows[0][0])
+        jd = json.loads
+        data["entities"] = {
+            eid: jd(p) for eid, p in db.query(
+                "SELECT entity_id, payload FROM roster_entities "
+                "WHERE work_key=? ORDER BY rowid", (wk,))}
+        data["retired"] = {
+            rid: jd(p) for rid, p in db.query(
+                "SELECT entity_id, payload FROM roster_retired "
+                "WHERE work_key=? ORDER BY rowid", (wk,))}
+        data["no_pairs"] = [jd(p) for (p,) in db.query(
+            "SELECT payload FROM roster_no_pairs WHERE work_key=? "
+            "ORDER BY rowid", (wk,))]
+        data["adoptions"] = [jd(p) for (p,) in db.query(
+            "SELECT payload FROM roster_adoptions WHERE work_key=? "
+            "ORDER BY seq", (wk,))]
+        data["anchor_retirements"] = [jd(p) for (p,) in db.query(
+            "SELECT payload FROM roster_anchor_retirements "
+            "WHERE work_key=? ORDER BY rowid", (wk,))]
+        return data
+
+    def _db_save(self, db):
+        wk = self.work_key
+        d = self.data
+        jd = lambda o: json.dumps(o, ensure_ascii=False)
+        residual = {k: v for k, v in d.items()
+                    if k not in ("entities", "retired", "no_pairs",
+                                 "adoptions", "anchor_retirements")}
+        with db.write_txn() as conn:
+            for table in ("roster_works", "roster_entities",
+                          "roster_retired", "roster_no_pairs",
+                          "roster_adoptions",
+                          "roster_anchor_retirements"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE work_key=?", (wk,))
+            conn.execute(
+                "INSERT INTO roster_works VALUES (?,?,?,?,?,?,?,?,?)",
+                (wk, d.get("work_id"), d.get("title"), d.get("author"),
+                 int(d.get("runs_completed", 0)),
+                 d.get("last_run_fingerprint"),
+                 int(d.get("next_entity_seq", 1)),
+                 int(d.get("minted_total", 0)), jd(residual)))
+            for eid, e in d["entities"].items():
+                conn.execute(
+                    "INSERT INTO roster_entities VALUES (?,?,?,?,?)",
+                    (wk, eid, e.get("status"), e.get("canonical"),
+                     jd(e)))
+            for rid, r in d["retired"].items():
+                conn.execute(
+                    "INSERT INTO roster_retired VALUES (?,?,?)",
+                    (wk, rid, jd(r)))
+            for pair in d["no_pairs"]:
+                conn.execute(
+                    "INSERT INTO roster_no_pairs VALUES (?,?,?,?,?)",
+                    (wk, pair.get("a"), pair.get("b"),
+                     pair.get("source"), jd(pair)))
+            for i, ad in enumerate(d["adoptions"]):
+                conn.execute(
+                    "INSERT INTO roster_adoptions VALUES (?,?,?)",
+                    (wk, i, jd(ad)))
+            for r in d["anchor_retirements"]:
+                conn.execute(
+                    "INSERT INTO roster_anchor_retirements VALUES "
+                    "(?,?,?,?)",
+                    (wk, r.get("entity_id") or r.get("entity"),
+                     r.get("run"), jd(r)))
+
     def save(self):
         """Atomic write: temp file + os.replace. No-op when not
         writable/enabled."""
@@ -4920,6 +5293,18 @@ class RosterStore:
                 or self.work_key is None:
             return False
         with self._lock:
+            db = _state_db_for(self.dir.parent)
+            if db is not None:
+                try:
+                    self._db_save(db)
+                    return True
+                except Exception as e:
+                    self._writable = False
+                    self._warn_once(
+                        f"  Roster store write failed ({e}); roster "
+                        "persistence is disabled for the rest of this "
+                        "run.")
+                    return False
             try:
                 p = self.path
                 self._preserve_corrupt(p)
@@ -5635,11 +6020,74 @@ def roster_store_paths(learn_dir=None):
     return sorted(rdir.glob("*.json"))
 
 
+def _roster_store_locs(learn_dir):
+    """Every persisted roster store as (label, work_key_or_None,
+    path_or_None): on the substrate the label is a state.db key and
+    the store is constructed by key; in JSON mode the label is the
+    store filename and the store loads via load_path."""
+    base = Path(learn_dir) if learn_dir else _learned_dir()
+    db = _state_db_for(base)
+    if db is not None:
+        return [(f"state.db:{wk}", wk, None) for (wk,) in db.query(
+            "SELECT work_key FROM roster_works ORDER BY rowid")]
+    return [(p.name, None, p) for p in roster_store_paths(base)]
+
+
+def _roster_store_exists(store):
+    """True when the store has a persisted home: a roster_works row
+    on the substrate, else its file."""
+    db = _state_db_for(store.dir.parent)
+    if db is not None:
+        return bool(db.query(
+            "SELECT 1 FROM roster_works WHERE work_key=?",
+            (store.work_key,)))
+    return store.path.exists()
+
+
+def _roster_delete_persisted(learn_dir, work_key):
+    """Remove a store's persisted home (substrate rows, else its
+    file)."""
+    base = Path(learn_dir) if learn_dir else _learned_dir()
+    db = _state_db_for(base)
+    if db is not None:
+        with db.write_txn() as conn:
+            for table in ("roster_works", "roster_entities",
+                          "roster_retired", "roster_no_pairs",
+                          "roster_adoptions",
+                          "roster_anchor_retirements"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE work_key=?",
+                    (work_key,))
+        return
+    p = base / "rosters" / _roster_store_filename(work_key)
+    if p.exists():
+        p.unlink()
+
+
 def find_roster_store(learn_dir, work):
     """Find the store for a <work> argument (exact work_key, else
     work_id, else title — first unambiguous match). Returns
     (RosterStore, None) or (None, error_message)."""
     matches = []
+    db = _state_db_for(Path(learn_dir) if learn_dir
+                       else _learned_dir())
+    if db is not None:
+        for wk, wid, title in db.query(
+                "SELECT work_key, work_id, title FROM roster_works "
+                "ORDER BY rowid"):
+            if work in (wk, wid):
+                return RosterStore(learn_dir=learn_dir,
+                                   work_key=wk), None
+            if work and _tnorm(work) == _tnorm(title or ""):
+                matches.append(RosterStore(learn_dir=learn_dir,
+                                           work_key=wk))
+        if len(matches) == 1:
+            return matches[0], None
+        if len(matches) > 1:
+            return None, (f"work {work!r} matches {len(matches)} "
+                          "roster stores by title; use the work_id "
+                          "or work key")
+        return None, f"no roster store found for work {work!r}"
     for path in roster_store_paths(learn_dir):
         try:
             with open(path, encoding="utf-8") as f:
@@ -5684,13 +6132,13 @@ def adopt_roster_store(learn_dir, work_id, title="", author="",
         if cand == dst_key:
             continue
         src = RosterStore(learn_dir=learn_dir, work_key=cand)
-        if not src.path.exists() or src.corrupt_at_load:
+        if not _roster_store_exists(src) or src.corrupt_at_load:
             continue
         if _tnorm(src.data.get("title")) != _tnorm(title) \
                 or _tnorm(src.data.get("author")) != _tnorm(author):
             continue
         dst = RosterStore(learn_dir=learn_dir, work_key=dst_key)
-        if not dst.path.exists():
+        if not _roster_store_exists(dst):
             # Rename: same store, new key — no reminting needed.
             src.data["work_key"] = dst_key
             src.data["work_id"] = str(work_id)
@@ -5698,13 +6146,17 @@ def adopt_roster_store(learn_dir, work_id, title="", author="",
                 {"from_key": cand, "entities_moved":
                  len(src.data["entities"]) + len(src.data["retired"])})
             old_path = src.path
+            old_key = cand
             src.work_key = dst_key  # .path now resolves to the new key
             src.save()              # writes the store under the new key
-            try:
-                if old_path != src.path and old_path.exists():
-                    old_path.unlink()
-            except OSError:
-                pass
+            if _state_db_for(Path(learn_dir)) is not None:
+                _roster_delete_persisted(learn_dir, old_key)
+            else:
+                try:
+                    if old_path != src.path and old_path.exists():
+                        old_path.unlink()
+                except OSError:
+                    pass
             adopted = True
             continue
         try:
@@ -5716,7 +6168,7 @@ def adopt_roster_store(learn_dir, work_id, title="", author="",
             dst.data["work_id"] = str(work_id)
         dst.save()
         try:
-            src.path.unlink()
+            _roster_delete_persisted(learn_dir, cand)
         except OSError:
             pass
         adopted = True
@@ -5749,16 +6201,19 @@ def cmd_roster_report(learn_dir=None):
     """--roster-report: every roster store, its accounting closed,
     suspects loudest, then entities, links, suspensions,
     suppressions, collisions, splits and canonical changes."""
-    paths = roster_store_paths(_roster_cmd_learn_dir(learn_dir))
-    if not paths:
+    base = _roster_cmd_learn_dir(learn_dir)
+    locs = _roster_store_locs(base)
+    if not locs:
         print("No roster stores found. Roster stores are written by "
               "runs with --persist-roster.")
         return
-    print(f"Roster stores: {len(paths)} work(s)")
-    for path in paths:
-        store = _roster_report_store(path)
+    print(f"Roster stores: {len(locs)} work(s)")
+    for label, wk, path in locs:
+        store = (RosterStore(learn_dir=base, work_key=wk)
+                 if wk is not None else _roster_report_store(path))
         if store is None or store.corrupt_at_load:
-            print(f"\n!! CORRUPT roster store: {path}")
+            print(f"\n!! CORRUPT roster store: "
+                  f"{label if wk is not None else path}")
             print("   Unreadable — preserved on disk. Runs against "
                   "this work degrade to stateless behaviour until "
                   "the file is repaired or removed.")
@@ -5769,7 +6224,7 @@ def cmd_roster_report(learn_dir=None):
               f"{d.get('author') or ''}")
         print(f"    work_id: {d.get('work_id') or '(unresolved)'}   "
               f"runs completed: {d.get('runs_completed', 0)}   "
-              f"store: {path.name}")
+              f"store: {label}")
         if d.get("work_id"):
             try:
                 wid2, how2 = resolve_work(d.get("title") or "",
@@ -6946,6 +7401,16 @@ def cmd_learn_status(learn_dir=None):
     """Print learning system status and exit (for --learn-status)."""
     state = LearnedState(learn_dir=learn_dir, enabled=True)
     print(_learn_status_text(state))
+    db = _state_db_for(state.dir)
+    if db is not None:
+        nbytes = db.size_info()["bytes"]
+        print(f"  State substrate: state.db (SQLite), {nbytes} bytes "
+              "on disk incl. WAL. state.db IS the state, not a "
+              "cache; state.db.bak beside it is the rolling backup "
+              "(refreshed on the first write of each process).")
+        if nbytes > 50 * 1024 * 1024:
+            print("  Note: state.db is large (>50 MB); the staging "
+                  "and roster reports show what is accumulating.")
 
 
 def _effective_titles():
@@ -14722,6 +15187,15 @@ def main():
             sys.exit(f"ERROR: profile '{args.profile}' not found "
                      "(--list-profiles to see available)")
         _apply_profile(args, defaults, profile)
+
+    # Spine OC-7: the state stores migrate to the SQLite substrate
+    # automatically on the first run that touches state. Placed
+    # before every state-reading dispatch below (and before the
+    # _LEARNED construction further down).
+    ensure_state_migrated(
+        Path(args.learn_dir) if getattr(args, "learn_dir", None)
+        else Path(os.path.expanduser("~")) / ".ebook-processor"
+        / "learned")
 
     if args.trope_map:
         load_config()
