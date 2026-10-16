@@ -16640,12 +16640,17 @@ def _dm_budget_claim(n=1):
         else:
             _DM_BUDGET_USED += n
             granted, used = True, _DM_BUDGET_USED
-    # The ticker truth (PORTAL-SPEC GAP-6): every claim, granted or
-    # refused, is one line in the run artifact. Emitted after the lock
-    # is released so the stream can never deadlock against the counter
-    # it reports; a no-op when no flagged run is live.
-    _run_event({"event": "decision", "n": n, "used": used,
-                "cap": _MERGE_TIER3_CAP, "granted": granted})
+        # The ticker truth (PORTAL-SPEC GAP-6): every claim, granted
+        # or refused, is one line in the run artifact. The emit rides
+        # INSIDE the budget lock so a claim and its record are atomic
+        # — emitted after release, parallel books could log their
+        # counts out of order and the stream would misreport the
+        # spend it exists to tell the truth about. This cannot
+        # deadlock: the sink's lock is a leaf (nothing under it ever
+        # claims budget), so the lock order budget -> sink is the
+        # only order ever taken. A no-op when no flagged run is live.
+        _run_event({"event": "decision", "n": n, "used": used,
+                    "cap": _MERGE_TIER3_CAP, "granted": granted})
     return granted
 
 

@@ -175,6 +175,27 @@ class TestBudgetEvents(_SinkCase):
         self.assertTrue(pp._dm_budget_claim(1))
         self.assertEqual(len(self.events()), before)
 
+    def test_parallel_claims_emit_in_count_order(self):
+        # Regression (Advisor F1): the claim and its decision event
+        # must be atomic, or parallel books log used-counts out of
+        # order and the ticker stream misreports the spend. With the
+        # emit inside the budget lock, the file order of `used` is
+        # the claim order: exactly 1..N.
+        import threading
+
+        def worker():
+            for _ in range(10):
+                pp._dm_budget_claim(1)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        evs = self._decision_events()
+        self.assertEqual([e["used"] for e in evs], list(range(1, 41)))
+        self.assertTrue(all(e["granted"] for e in evs))
+
 
 def _chars(*specs):
     return [{"name": n, "description": d, "confidence": 0.9}
@@ -247,6 +268,19 @@ class TestDedupeEvents(_SinkCase):
         self.assertEqual(verdicts[0]["verdict"], "blocked")
         self.assertIsNone(verdicts[0]["score"])
         self.assertTrue(verdicts[0]["reason"])
+
+    def test_adversarial_names_roundtrip(self):
+        # Quotes/newlines in a character name must not tear the
+        # JSONL stream: every line still parses as one object and
+        # the name arrives byte-exact.
+        nasty = 'Jo"n\nSnow'
+        chars = _chars((nasty, "a knight"), (nasty, "a knight"))
+        self._run_dedupe(chars, [[1.0, 0.0], [0.0, 1.0]])
+        verdicts = [e for e in self._of("verdict")
+                    if e["via"] == "signal1"]
+        self.assertEqual(len(verdicts), 1)
+        self.assertEqual(verdicts[0]["a"], nasty)
+        self.assertEqual(verdicts[0]["b"], nasty)
 
     def test_dedupe_output_identical_with_and_without_emission(self):
         chars = _chars(("Jonathan Pryce", "a knight"),
@@ -406,6 +440,31 @@ class TestRunLifecycle(unittest.TestCase):
     def test_unflagged_preview_writes_no_artifact(self):
         self.assertEqual(self._run(False), 0)
         self.assertFalse((self.learn_dir / "run-events").exists())
+
+    def test_interrupt_finalises_artifact_and_clears_sink(self):
+        # Ctrl+C mid-run: the exception still propagates (the CLI's
+        # checkpoint contract), the sink is cleared, and the
+        # artifact's last line is run_end marked interrupted with
+        # failures null, exactly as the §10 addendum specifies.
+        pp.CONFIG["emit_run_events"] = True
+        pp.CONFIG["jobs"] = 1
+
+        def boom(f, dry_run, preview):
+            raise KeyboardInterrupt
+
+        with patch.object(pp, "process_file", side_effect=boom), \
+                mock.patch.object(pp.UI, "start", lambda *a: None), \
+                mock.patch.object(pp.UI, "stop", lambda *a: None), \
+                mock.patch.object(pp.UI, "status", lambda *a: None):
+            with self.assertRaises(KeyboardInterrupt):
+                pp.run_once(False, True, file=str(self.book))
+        self.assertFalse(pp._run_events_active())
+        artifacts = list((self.learn_dir / "run-events").glob("*.jsonl"))
+        self.assertEqual(len(artifacts), 1)
+        evs = _read_events(artifacts[0])
+        self.assertEqual(evs[-1]["event"], "run_end")
+        self.assertTrue(evs[-1]["interrupted"])
+        self.assertIsNone(evs[-1]["failures"])
 
 
 if __name__ == "__main__":
