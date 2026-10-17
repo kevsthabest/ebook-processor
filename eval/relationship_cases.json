@@ -1,1 +1,142 @@
-[{"expect":"keep","from":"Chris Sebeck","note":"Daemon, real quote. The A2 case: a surname-anchored possessive appositive. The pre-tune prompt scored this construction 0.20 in production (run 16) and the true claim dropped.","quote":"Sebeck's son, Chris, stood next to him.","stub_score":0.9,"to":"Peter Sebeck","type":"child"},{"expect":"keep","from":"Fen Riorson","note":"Fourth Wing, real mined sentence (the FW-13 rescue case).","quote":"Fen Riorson was Xaden's father, and the rebellion died with him.","stub_score":0.95,"to":"Xaden Riorson","type":"parent"},{"expect":"keep","from":"Mira Sorrengail","note":"Fourth Wing, real stored evidence; production scored this shape 0.96.","quote":"This is my sister, Violet. She'll be a first-year.","stub_score":0.96,"to":"Violet Sorrengail","type":"sibling"},{"expect":"keep","from":"Brennan Sorrengail","note":"Pronoun apposition: the marker binds Brennan to Violet, the pair claimed. Contrast with the Xaden sibling case on the same quote.","quote":"Violet thought of Brennan, her brother, and of Xaden waiting below.","stub_score":0.9,"to":"Violet Sorrengail","type":"sibling"},{"expect":"keep","from":"Imogen","note":"Fourth Wing, real stored evidence (Xaden speaking).","quote":"Imogen and I are just friends.","stub_score":0.9,"to":"Xaden Riorson","type":"friend"},{"expect":"keep","from":"Jack Barlowe","note":"Fourth Wing, real stored evidence.","quote":"\"You're next, Sorrengail!\" Jack bellows, and I jerk my gaze from the ravine to see him pointing at me, a sinister smile curving his mouth.","stub_score":0.9,"to":"Violet Sorrengail","type":"enemy"},{"expect":"keep","from":"Liam Mairi","note":"Fourth Wing, real stored evidence (Xaden speaking of Liam). Foster-brother supports at least the claimed friend bond; if the judge insists this is sibling-only, that is a finding about type granularity, recorded here deliberately.","quote":"I'd ordered my foster brother to keep her safe, and that order got him killed.","stub_score":0.85,"to":"Xaden Riorson","type":"friend"},{"expect":"drop","from":"Xaden Riorson","note":"Third-party binding: the marker binds Brennan, a third person, not the claimed pair.","quote":"Violet thought of Brennan, her brother, and of Xaden waiting below.","stub_score":0.05,"to":"Violet Sorrengail","type":"sibling"},{"expect":"drop","from":"Anji Anderson","note":"Daemon, real quote: colleague content under a spouse claim.","quote":"Her new boss was an undead automaton from hell, true","stub_score":0.05,"to":"Matthew Sobol","type":"spouse"},{"expect":"drop","from":"Dain Aetos","note":"Fourth Wing, real stored pair: the quote is Dain embracing Violet and does not involve Xaden at all.","quote":"\"Damn it. Violet. Just…damn.\" He squeezes me tight, then pushes me to arm's length.","stub_score":0.05,"to":"Xaden Riorson","type":"friend"},{"expect":"drop","from":"Liam Mairi","note":"Fourth Wing, real stored pair: Liam relays a dragon's words through Violet; nothing makes him the dragon's colleague.","quote":"\"Tell them to change tactics. They don't stand a chance if they can't get close to that venin,\" I tell Tairn.","stub_score":0.1,"to":"Tairneanach","type":"colleague"},{"expect":"drop","from":"Peter Sebeck","note":"The surname construction must not bleed across claims: this quote establishes a child, not the spouse pair it is attached to here.","quote":"Sebeck's son, Chris, stood next to him.","stub_score":0.1,"to":"Laura Sebeck","type":"spouse"},{"expect":"any","from":"Laura Sebeck","note":"REPORT-ONLY. Daemon, real extracted quote (run 16, scored 0.12 and dropped). Unjudgeable from the quote alone — the antecedents live in neighbouring sentences. Recorded to document the context limit; the fix path for this shape is mining (A1), not the judge prompt.","quote":"Within a year they married.","stub_score":0.5,"to":"Peter Sebeck","type":"spouse"},{"expect":"any","from":"Chris Sebeck","note":"REPORT-ONLY. The shared-surname ambiguity A1 accepts at grading time: the construction establishes a Sebeck parent, not which one. The judge's score here shows how it resolves the ambiguity.","quote":"Sebeck's son, Chris, stood next to him.","stub_score":0.5,"to":"Laura Sebeck","type":"child"}]
+[
+ {
+  "expect": "keep",
+  "from": "Chris Sebeck",
+  "note": "Daemon, real quote. The A2 case: a surname-anchored possessive appositive. The pre-tune prompt scored this construction 0.20 in production (run 16) and the true claim dropped.",
+  "quote": "Sebeck's son, Chris, stood next to him.",
+  "stub_score": 0.9,
+  "to": "Peter Sebeck",
+  "type": "child",
+  "work": "Daemon"
+ },
+ {
+  "expect": "keep",
+  "from": "Fen Riorson",
+  "note": "Fourth Wing, real mined sentence (the FW-13 rescue case).",
+  "quote": "Fen Riorson was Xaden's father, and the rebellion died with him.",
+  "stub_score": 0.95,
+  "to": "Xaden Riorson",
+  "type": "parent",
+  "work": "Fourth Wing"
+ },
+ {
+  "expect": "keep",
+  "from": "Mira Sorrengail",
+  "note": "Fourth Wing, real stored evidence; production scored this shape 0.96.",
+  "quote": "This is my sister, Violet. She'll be a first-year.",
+  "stub_score": 0.96,
+  "to": "Violet Sorrengail",
+  "type": "sibling",
+  "work": "Fourth Wing"
+ },
+ {
+  "expect": "keep",
+  "from": "Brennan Sorrengail",
+  "note": "Pronoun apposition: the marker binds Brennan to Violet, the pair claimed. Contrast with the Xaden sibling case on the same quote.",
+  "quote": "Violet thought of Brennan, her brother, and of Xaden waiting below.",
+  "stub_score": 0.9,
+  "to": "Violet Sorrengail",
+  "type": "sibling",
+  "work": "Fourth Wing"
+ },
+ {
+  "expect": "keep",
+  "from": "Imogen",
+  "note": "Fourth Wing, real stored evidence (Xaden speaking).",
+  "quote": "Imogen and I are just friends.",
+  "stub_score": 0.9,
+  "to": "Xaden Riorson",
+  "type": "friend",
+  "work": "Fourth Wing"
+ },
+ {
+  "expect": "keep",
+  "from": "Jack Barlowe",
+  "note": "Fourth Wing, real stored evidence.",
+  "quote": "\"You're next, Sorrengail!\" Jack bellows, and I jerk my gaze from the ravine to see him pointing at me, a sinister smile curving his mouth.",
+  "stub_score": 0.9,
+  "to": "Violet Sorrengail",
+  "type": "enemy",
+  "work": "Fourth Wing"
+ },
+ {
+  "expect": "keep",
+  "from": "Liam Mairi",
+  "note": "Fourth Wing, real stored evidence (Xaden speaking of Liam). Foster-brother supports at least the claimed friend bond; if the judge insists this is sibling-only, that is a finding about type granularity, recorded here deliberately.",
+  "quote": "I'd ordered my foster brother to keep her safe, and that order got him killed.",
+  "stub_score": 0.85,
+  "to": "Xaden Riorson",
+  "type": "friend",
+  "work": "Fourth Wing"
+ },
+ {
+  "expect": "drop",
+  "from": "Xaden Riorson",
+  "note": "Third-party binding: the marker binds Brennan, a third person, not the claimed pair.",
+  "quote": "Violet thought of Brennan, her brother, and of Xaden waiting below.",
+  "stub_score": 0.05,
+  "to": "Violet Sorrengail",
+  "type": "sibling",
+  "work": "Fourth Wing"
+ },
+ {
+  "expect": "drop",
+  "from": "Anji Anderson",
+  "note": "Daemon, real quote: colleague content under a spouse claim.",
+  "quote": "Her new boss was an undead automaton from hell, true",
+  "stub_score": 0.05,
+  "to": "Matthew Sobol",
+  "type": "spouse",
+  "work": "Daemon"
+ },
+ {
+  "expect": "drop",
+  "from": "Dain Aetos",
+  "note": "Fourth Wing, real stored pair: the quote is Dain embracing Violet and does not involve Xaden at all.",
+  "quote": "\"Damn it. Violet. Just…damn.\" He squeezes me tight, then pushes me to arm's length.",
+  "stub_score": 0.05,
+  "to": "Xaden Riorson",
+  "type": "friend",
+  "work": "Fourth Wing"
+ },
+ {
+  "expect": "drop",
+  "from": "Liam Mairi",
+  "note": "Fourth Wing, real stored pair: Liam relays a dragon's words through Violet; nothing makes him the dragon's colleague.",
+  "quote": "\"Tell them to change tactics. They don't stand a chance if they can't get close to that venin,\" I tell Tairn.",
+  "stub_score": 0.1,
+  "to": "Tairneanach",
+  "type": "colleague",
+  "work": "Fourth Wing"
+ },
+ {
+  "expect": "drop",
+  "from": "Peter Sebeck",
+  "note": "The surname construction must not bleed across claims: this quote establishes a child, not the spouse pair it is attached to here.",
+  "quote": "Sebeck's son, Chris, stood next to him.",
+  "stub_score": 0.1,
+  "to": "Laura Sebeck",
+  "type": "spouse",
+  "work": "Daemon"
+ },
+ {
+  "expect": "any",
+  "from": "Laura Sebeck",
+  "note": "REPORT-ONLY. Daemon, real extracted quote (run 16, scored 0.12 and dropped). Unjudgeable from the quote alone — the antecedents live in neighbouring sentences. Recorded to document the context limit; the fix path for this shape is mining (A1), not the judge prompt.",
+  "quote": "Within a year they married.",
+  "stub_score": 0.5,
+  "to": "Peter Sebeck",
+  "type": "spouse",
+  "work": "Daemon"
+ },
+ {
+  "expect": "any",
+  "from": "Chris Sebeck",
+  "note": "REPORT-ONLY. The shared-surname ambiguity A1 accepts at grading time: the construction establishes a Sebeck parent, not which one. The judge's score here shows how it resolves the ambiguity.",
+  "quote": "Sebeck's son, Chris, stood next to him.",
+  "stub_score": 0.5,
+  "to": "Laura Sebeck",
+  "type": "child",
+  "work": "Daemon"
+ }
+]

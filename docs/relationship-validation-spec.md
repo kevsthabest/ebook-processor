@@ -149,3 +149,23 @@ Gate: the same live eval. All 12 gated cases in band before any
 Daemon / Fourth Wing reprocess (reprocessing stays on hold:
 under the 2.13.8 prompt alone, a reprocess would drop true
 speaker-attributed pairs alongside the junk).
+
+## Addendum — 2.13.10: the eval harness measures the production path (2026-10-17)
+
+The first live eval after 2.13.9 returned the 2.13.8 numbers
+(plus visible run-to-run judge variance, e.g. Chris 0.13 ->
+0.25 on an unchanged prompt) because evaluate-relationships.py
+judged bare quotes: it never passed context, so it could not
+see the 2.13.9 change it was meant to gate. Harness flaw, not
+a pipeline result — 2.13.9's effect on the judge is still
+unmeasured, neither proven nor disproven.
+
+Fix: cases carry a "work"; with --corpus the script locates
+each case's quote in that work's corpus chapter texts and
+judges it with the production context window (same helper,
+same framing as v2_reduce). Every run prints its mode —
+"corpus context windows (production path)" vs "prompt-only
+(no context windows)" — and corpus mode marks cases [ctx] or
+[NO WINDOW: quote not in corpus text]. The gate for
+reprocessing is now: py evaluate-relationships.py --config
+config.json --corpus, all 12 gated cases in band.

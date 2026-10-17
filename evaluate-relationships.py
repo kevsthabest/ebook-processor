@@ -20,6 +20,13 @@ Usage:
         config passed with --config)
     python3 evaluate-relationships.py --base-url http://127.0.0.1:8888/v1
     python3 evaluate-relationships.py --dry-run        (no network)
+    python3 evaluate-relationships.py --config config.json --corpus
+        (production path: each case is judged WITH the context
+        window the pipeline computes — the verbatim sentences
+        around the quote, located in the corpus chapter texts of
+        the case's work. Without --corpus the run is prompt-only
+        and says so: it measures the bare validator, NOT what
+        v2_reduce sends since 2.13.9.)
 
 Labels (eval/relationship_cases.json): a list of {from, to, type,
 quote, expect, note, stub_score}. expect is "keep" (P must reach
@@ -43,6 +50,25 @@ _spec = importlib.util.spec_from_file_location("process_portable",
                                                _MOD_PATH)
 pp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(pp)
+
+
+def _context_for_case(pp, chapters, quote):
+    """The production context for one case: locate the quote in
+    the work's chapter texts and frame its neighbouring sentences
+    exactly as v2_reduce does. Returns (context, located) —
+    located False means the quote does not appear verbatim in the
+    corpus text (an edition or normalization difference worth
+    seeing, not papering over)."""
+    for ch in chapters or []:
+        text = ch.get("text", "")
+        if pp._locate_quote_span(quote, text) is None:
+            continue
+        window = pp._evidence_window(quote, text)
+        if not window:
+            return "", True
+        return ("Sentences around the quote, from the same "
+                f"passage: {window}"), True
+    return "", False
 
 
 def _band(p):
@@ -69,9 +95,50 @@ def main():
                          "openrouter_api_key; the key is never printed)")
     ap.add_argument("--dry-run", action="store_true",
                     help="score from each case's stub_score; no network")
+    ap.add_argument("--corpus", action="store_true",
+                    help="judge each case with its production "
+                         "context window, located in the corpus "
+                         "chapter texts (needs corpus.db)")
+    ap.add_argument("--learn-dir", default=str(
+        Path.home() / ".ebook-processor" / "learned"),
+        help="learn dir holding corpus.db (default: the standard "
+             "per-user learn dir)")
     args = ap.parse_args()
 
     cases = json.loads(Path(args.labels).read_text(encoding="utf-8"))
+
+    if args.corpus:
+        db = pp._corpus_db_for(args.learn_dir, mode="report")
+        if db is None:
+            print(f"Error: no corpus.db in learn dir "
+                  f"{args.learn_dir}")
+            return 2
+        rows = db.query("SELECT fingerprint, title "
+                        "FROM corpus_works")
+        chapters_by_work = {}
+        for case in cases:
+            work = (case.get("work") or "").lower()
+            if work not in chapters_by_work:
+                hits = [fp for fp, title in rows
+                        if work and work in (title or "").lower()]
+                if len(hits) != 1:
+                    print(f"Error: work {case.get('work')!r} matched "
+                          f"{len(hits)} corpus works (need exactly 1)")
+                    return 2
+                chapters = pp.corpus_chapters_for(db, hits[0])
+                if not chapters:
+                    print(f"Error: corpus work "
+                          f"{case.get('work')!r} has no readable "
+                          f"chapters (state not text-complete)")
+                    return 2
+                chapters_by_work[work] = chapters
+            ctx, located = _context_for_case(
+                pp, chapters_by_work[work], case["quote"])
+            case["_context"] = ctx
+            case["_located"] = located
+    print("Mode: " + ("corpus context windows (production path)"
+                      if args.corpus else
+                      "prompt-only (no context windows)"))
 
     validator = None
     if not args.dry_run:
@@ -97,7 +164,8 @@ def main():
             p = case.get("stub_score")
         else:
             _verdict, p = validator.validate_relationship(
-                case["from"], case["to"], case["type"], case["quote"])
+                case["from"], case["to"], case["type"], case["quote"],
+                context=case.get("_context", ""))
         band = _band(p)
         expect = case.get("expect", "any")
         if p is not None:
@@ -107,9 +175,16 @@ def main():
         status = "REPORT" if not gated else ("PASS" if ok else "MISS")
         if gated and not ok:
             misses.append(case)
+        ctx_mark = ""
+        if args.corpus:
+            if case.get("_context"):
+                ctx_mark = " [ctx]"
+            elif not case.get("_located", True):
+                ctx_mark = " [NO WINDOW: quote not in corpus text]"
         print(f"[{i:2}] {status:6} expect={expect:4} got={band:10} "
               f"P={p if p is not None else '—'}  "
-              f"{case['from']} -> {case['to']} ({case['type']})")
+              f"{case['from']} -> {case['to']} ({case['type']})"
+              f"{ctx_mark}")
     print()
     print(f"{answered}/{len(cases)} answered; "
           f"{len(misses)} gated miss(es).")
