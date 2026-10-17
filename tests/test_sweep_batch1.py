@@ -461,8 +461,11 @@ class _RetryBackend:
         # pipeline (e.g. the trope confirmation gate, which passes an
         # empty chunk) are NOT Call A and must not be counted.
         _a_head = pp.PROMPT_V2_CHARACTERS.split("{")[0]
+        # 2026-10-17 (registry release): the simple fallback prompt is
+        # sent in its registry-derived rendering, so compare against
+        # _rel_prompt's output rather than the bare constant.
         if prompt.startswith(_a_head) \
-                or prompt == pp.PROMPT_V2_CHARACTERS_SIMPLE:
+                or prompt == pp._rel_prompt(pp.PROMPT_V2_CHARACTERS_SIMPLE):
             self.a_calls.append("BETA" if "BETA" in chunk else "ALPHA")
             return json.dumps({
                 "characters": [{

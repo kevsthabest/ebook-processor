@@ -528,3 +528,34 @@ child.
 Watchlist (demand-driven, NOT seeded): betrothed, in-law,
 roommate, captor, thrall, commanding officer, police partner
 (name collides with the app's romantic "partner").
+
+### Registry: built (2026-10-17, processor v2.13.21)
+
+The registry addendum above is implemented. The
+`relationship_types` table is created and seeded by the app repo's
+migration v614 (current thirteen types with their properties
+derived from the code as it stood, plus the ten prefill rows —
+the nine ruled types with step_parent/step_child as the directed
+pair). The processor loads the registry at run start through its
+existing Supabase read path; on any failure it falls back to a
+built-in vocabulary that mirrors the seed exactly, records the
+fallback and its reason in the run record's thresholds stamp and
+on each reduce result, and never raises — offline runs gain no
+hard dependency. All consumers (extraction prompts, the validator
+prompt with each claimed type's gloss, the reduce precedence
+lattice, family routing, the vocabulary validity check) derive
+from the single vocabulary object the load installs, proven by a
+synthetic-type test: a type present only in a fixture registry
+payload reaches every consumer with no code change. The app loads
+the same rows and derives its graph groups and suggestion
+allowlist from them, with today's hardcoded map kept as the
+fallback. Seed judgment calls made at build time and recorded
+here: ex takes precedence 3 (the addendum places it between
+romantic at 3 and friend at 4; the column is an integer, and ex
+shares romantic's rank as the same bond at a later time);
+step_child's gloss is the reciprocal of the ruled step_parent
+gloss; ally and other seed as suggestible=false (neither is in
+the app's reader-facing allowlist today); graph groups for
+prefill types follow their nearest seeded neighbour (bonded/mate
+→ romance, sire → mentor, handler → friend as colleague's group,
+packmate/crewmate/sworn → friend, step types → family).

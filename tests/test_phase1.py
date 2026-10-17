@@ -205,7 +205,12 @@ class TestPhase1bFixes(unittest.TestCase):
             return orig_task(call, prompt, chunk, i, n, task_name)
 
         def fake_backend(prompt, chunk, i, n):
-            if prompt is pp.PROMPT_IDENTITY_SIMPLE:
+            # 2026-10-17 (registry release): extract_llm now sends the
+            # registry-derived rendering of the simple prompt, not the
+            # bare constant, so identity comparison can never match;
+            # compare against the derived text instead — the property
+            # under test (fallback routed through _run_task) is unchanged.
+            if prompt == pp._rel_prompt(pp.PROMPT_IDENTITY_SIMPLE):
                 return ('{"characters": [{"name": "Laurie", "role": "supporting", '
                         '"description": "a boy"}], "relationships": []}')
             return ""  # rich prompts fail empty

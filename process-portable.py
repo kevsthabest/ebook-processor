@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.20"
+PORTABLE_VERSION = "2.13.21"
 
 
 import argparse
@@ -1920,11 +1920,360 @@ def _drop_ghost_relationships(result):
         dropped.append(entry)
     return len(ghosts)
 
-# Relationship dedupe: exclusive types resolve by precedence (lower wins).
-# Non-exclusive types are kept as extras only with evidence.
-_REL_PRECEDENCE = {"spouse": 0, "parent": 1, "child": 1, "sibling": 2,
-                   "romantic": 3, "friend": 4, "colleague": 4, "enemy": 5}
-_REL_NONEXCLUSIVE = {"mentor", "rival", "ally", "neighbor", "other"}
+# ---------------------------------------------------------------------------
+# Relationship type registry (spec addendum, ruled 2026-10-17).
+#
+# The vocabulary lives in the Supabase `relationship_types` table — the
+# same seeded, curated, DB-held pattern the app uses for its trigger
+# taxonomy — so a type can be added by inserting a row, not by editing
+# this file and the app in lockstep. At run start _load_rel_registry()
+# reads the table through the same sb() path as every other Supabase
+# read; on ANY failure (no config, unreachable, table missing, rows
+# malformed) the run falls back to the built-in vocabulary below and
+# says so in the run record. The fallback mirrors the registry seed
+# exactly, because an offline run must offer the same types a seeded
+# database would — a vocabulary that changes with connectivity would
+# make two runs of the same book disagree for an invisible reason.
+#
+# Everything that enumerates the vocabulary — the extraction prompts,
+# the validator prompt, the reduce precedence lattice, family routing,
+# the validity check in the reduce — derives from ONE vocabulary
+# object produced by _derive_rel_vocab() and installed by
+# _apply_rel_vocab(). There is exactly one seam: consumers keep reading
+# the module-level names they always read (_REL_PRECEDENCE,
+# _REL_NONEXCLUSIVE, _REL_FAMILY_TYPES, _REL_INVERSE, _REL_NO_INVERSE),
+# and _apply_rel_vocab() is the only place those names are (re)built
+# from a vocabulary, so a registry-only type works end to end with no
+# consumer code change.
+# ---------------------------------------------------------------------------
+
+# The built-in fallback vocabulary. This MUST mirror the seed rows of
+# the app migration that creates `relationship_types` (id, label,
+# gloss, direction, family flag, exclusivity, precedence, graph group,
+# suggestible) — the parity test in tests/test_rel_registry.py pins the
+# two together, because a silent drift here is exactly the failure the
+# registry exists to prevent. Glosses for the original thirteen are
+# seed text written for the registry: each states the type's boundary
+# against its nearest neighbour, because the validator judges a claim
+# against the gloss, not against the type's name alone. Prefill
+# glosses are the ruled seed text from the spec addendum, verbatim.
+_BUILTIN_REL_TYPES = [
+    {"id": "spouse", "label": "Spouse",
+     "gloss": "Married partners, or partners the text treats as married: each is the other's husband, wife, or spouse.",
+     "direction": "symmetric", "is_family": True,
+     "exclusivity": "exclusive", "precedence": 0,
+     "graph_group": "romance", "suggestible": True},
+    {"id": "parent", "label": "Parent",
+     "gloss": "The father or mother of the other: a biological or adoptive parent, not a step-parent or a maker.",
+     "direction": "directed", "is_family": True,
+     "exclusivity": "exclusive", "precedence": 1,
+     "graph_group": "family", "suggestible": True},
+    {"id": "child", "label": "Child",
+     "gloss": "The son or daughter of the other: a biological or adoptive child, not a step-child.",
+     "direction": "directed", "is_family": True,
+     "exclusivity": "exclusive", "precedence": 1,
+     "graph_group": "family", "suggestible": True},
+    {"id": "sibling", "label": "Sibling",
+     "gloss": "Brothers or sisters who share at least one parent: half-siblings count, cousins and squadmates do not.",
+     "direction": "symmetric", "is_family": True,
+     "exclusivity": "exclusive", "precedence": 2,
+     "graph_group": "family", "suggestible": True},
+    {"id": "romantic", "label": "Romantic",
+     "gloss": "Partners in a romantic relationship that is not a marriage: dating, courting, or lovers.",
+     "direction": "symmetric", "is_family": False,
+     "exclusivity": "exclusive", "precedence": 3,
+     "graph_group": "friend", "suggestible": True},
+    {"id": "friend", "label": "Friend",
+     "gloss": "A bond of friendship and affection between peers, without romance, kinship, or a formal bond.",
+     "direction": "symmetric", "is_family": False,
+     "exclusivity": "exclusive", "precedence": 4,
+     "graph_group": "friend", "suggestible": True},
+    {"id": "colleague", "label": "Colleague",
+     "gloss": "People who work together in the same organization or profession, without a closer bond being stated.",
+     "direction": "symmetric", "is_family": False,
+     "exclusivity": "exclusive", "precedence": 4,
+     "graph_group": "friend", "suggestible": True},
+    {"id": "enemy", "label": "Enemy",
+     "gloss": "An adversary or opponent: the pair are actively opposed or hostile to each other.",
+     "direction": "symmetric", "is_family": False,
+     "exclusivity": "exclusive", "precedence": 5,
+     "graph_group": "rival", "suggestible": True},
+    {"id": "mentor", "label": "Mentor",
+     "gloss": "A guide or teacher who develops the other over time: more than a colleague, not a commander or a handler.",
+     "direction": "directed", "is_family": False,
+     "exclusivity": "extra", "precedence": None,
+     "graph_group": "mentor", "suggestible": True},
+    {"id": "rival", "label": "Rival",
+     "gloss": "A competitor striving against the other for the same goal or standing, short of outright enmity.",
+     "direction": "symmetric", "is_family": False,
+     "exclusivity": "extra", "precedence": None,
+     "graph_group": "rival", "suggestible": True},
+    {"id": "ally", "label": "Ally",
+     "gloss": "Partners joined for a shared purpose or cause, where the text states the alliance rather than mere companionship.",
+     "direction": "symmetric", "is_family": False,
+     "exclusivity": "extra", "precedence": None,
+     "graph_group": "friend", "suggestible": False},
+    {"id": "neighbor", "label": "Neighbor",
+     "gloss": "People who live near each other, where that proximity itself is the stated connection.",
+     "direction": "symmetric", "is_family": False,
+     "exclusivity": "extra", "precedence": None,
+     "graph_group": "friend", "suggestible": True},
+    {"id": "other", "label": "Other",
+     "gloss": "A stated connection that fits no other type in the vocabulary: use only when the text establishes a bond the other types do not name.",
+     "direction": "symmetric", "is_family": False,
+     "exclusivity": "extra", "precedence": None,
+     "graph_group": "friend", "suggestible": False},
+    {"id": "bonded", "label": "Bonded",
+     "gloss": "A supernatural or formal bond linking the pair (dragon and rider, familiar and keeper, human and AI companion): a persistent, named connection, not mere companionship or affection.",
+     "direction": "symmetric", "is_family": False,
+     "exclusivity": "exclusive", "precedence": 3,
+     "graph_group": "romance", "suggestible": True},
+    {"id": "mate", "label": "Mate",
+     "gloss": "A fated supernatural bond chosen by forces outside the pair (a mating bond): may exist unaccepted, and is distinct from marriage, ordinary romance, and friendship.",
+     "direction": "symmetric", "is_family": False,
+     "exclusivity": "exclusive", "precedence": 3,
+     "graph_group": "romance", "suggestible": True},
+    {"id": "sire", "label": "Sire",
+     "gloss": "The being who turned the other (vampire or similar): a maker-made bond of authority and obligation; not a biological parent.",
+     "direction": "directed", "is_family": False,
+     "exclusivity": "exclusive", "precedence": 1,
+     "graph_group": "mentor", "suggestible": True},
+    {"id": "packmate", "label": "Packmate",
+     "gloss": "Members of the same pack: a group-loyalty bond of mutual obligation and hierarchy, distinct from friendship and family.",
+     "direction": "symmetric", "is_family": False,
+     "exclusivity": "extra", "precedence": None,
+     "graph_group": "friend", "suggestible": True},
+    {"id": "crewmate", "label": "Crewmate",
+     "gloss": "Members of the same ship's crew: a working bond of daily proximity and mutual survival — more than a colleague, not necessarily friendship.",
+     "direction": "symmetric", "is_family": False,
+     "exclusivity": "extra", "precedence": None,
+     "graph_group": "friend", "suggestible": True},
+    {"id": "sworn", "label": "Sworn",
+     "gloss": "Bound by a spoken oath — fealty, a blood oath, sworn brotherhood or service: the oath itself is the bond, distinct from loyalty that was never sworn.",
+     "direction": "either", "is_family": False,
+     "exclusivity": "exclusive", "precedence": 3,
+     "graph_group": "friend", "suggestible": True},
+    {"id": "step_parent", "label": "Step parent",
+     "gloss": "A parent's spouse who is not the biological parent: judge the marriage-created kinship on its own terms; a step-parent claim is not a parent claim.",
+     "direction": "directed", "is_family": True,
+     "exclusivity": "exclusive", "precedence": 1,
+     "graph_group": "family", "suggestible": True},
+    {"id": "step_child", "label": "Step child",
+     "gloss": "The child of one's spouse who is not one's biological child: judge the marriage-created kinship on its own terms; a step-child claim is not a child claim.",
+     "direction": "directed", "is_family": True,
+     "exclusivity": "exclusive", "precedence": 1,
+     "graph_group": "family", "suggestible": True},
+    {"id": "ex", "label": "Ex",
+     "gloss": "A former romantic partner or spouse: the relationship is in the past — judge the history the text establishes, not present-day warmth or hostility, which belong to friend or enemy.",
+     "direction": "symmetric", "is_family": False,
+     "exclusivity": "exclusive", "precedence": 3,
+     "graph_group": "romance", "suggestible": True},
+    {"id": "handler", "label": "Handler",
+     "gloss": "An intelligence handler and their asset: a directed bond of tasking, trust, and control, distinct from a colleague and from a mentor.",
+     "direction": "directed", "is_family": False,
+     "exclusivity": "exclusive", "precedence": 4,
+     "graph_group": "friend", "suggestible": True},
+]
+
+_REL_REGISTRY_SELECT = ("?select=id,label,gloss,direction,is_family,"
+                        "exclusivity,precedence,graph_group,suggestible"
+                        "&order=id")
+
+# Directed types can only flip on canonical reversal when the
+# vocabulary names the inverse type. The registry carries direction
+# but no inverse column, so the one naming convention that can be
+# flipped safely is the parent/child pair and its step- variant; any
+# other directed type keeps its claim direction when stored, which is
+# exactly the long-standing mentor treatment — guessing an inverse the
+# vocabulary never named would rewrite claims into a type nobody
+# proposed.
+_REL_INVERSE_PAIRS = (("parent", "child"), ("step_parent", "step_child"))
+
+
+def _derive_rel_vocab(rows):
+    """Validate registry-shaped rows and derive every consumer view.
+
+    Returns the vocabulary object all consumers read, or None when the
+    rows are malformed (not a non-empty list of dicts, a missing or
+    duplicated id, an unknown direction/exclusivity value, or an
+    exclusive type without an integer precedence). Returning None —
+    rather than repairing a bad row — is deliberate: a half-read
+    registry would silently shrink the vocabulary mid-run, while the
+    caller's fallback keeps the full built-in set in force.
+    """
+    if not isinstance(rows, list) or not rows:
+        return None
+    types, by_id = [], {}
+    for r in rows:
+        if not isinstance(r, dict):
+            return None
+        tid = str(r.get("id") or "").strip().lower()
+        if not tid or tid in by_id:
+            return None
+        direction = str(r.get("direction") or "").strip().lower()
+        if direction not in ("symmetric", "directed", "either"):
+            return None
+        exclusivity = str(r.get("exclusivity") or "").strip().lower()
+        if exclusivity not in ("exclusive", "extra"):
+            return None
+        precedence = r.get("precedence")
+        if exclusivity == "exclusive":
+            if isinstance(precedence, bool) \
+                    or not isinstance(precedence, int):
+                return None
+        else:
+            precedence = None
+        entry = {
+            "id": tid,
+            "label": str(r.get("label") or tid),
+            "gloss": str(r.get("gloss") or ""),
+            "direction": direction,
+            "is_family": bool(r.get("is_family")),
+            "exclusivity": exclusivity,
+            "precedence": precedence,
+            "graph_group": str(r.get("graph_group") or "friend"),
+            "suggestible": bool(r.get("suggestible")),
+        }
+        types.append(entry)
+        by_id[tid] = entry
+    precedence_map = {e["id"]: e["precedence"] for e in types
+                      if e["exclusivity"] == "exclusive"}
+    nonexclusive = {e["id"] for e in types
+                    if e["exclusivity"] == "extra"}
+    family = frozenset(e["id"] for e in types if e["is_family"])
+    inverse = {}
+    for a, b in _REL_INVERSE_PAIRS:
+        if a in by_id and b in by_id:
+            inverse[a] = b
+            inverse[b] = a
+    no_inverse = {e["id"] for e in types
+                  if e["direction"] == "directed"
+                  and e["id"] not in inverse}
+    return {"types": types, "by_id": by_id,
+            "precedence": precedence_map, "nonexclusive": nonexclusive,
+            "family": family, "inverse": inverse,
+            "no_inverse": no_inverse}
+
+
+def _apply_rel_vocab(vocab):
+    """Install a derived vocabulary as the module-level names every
+    consumer reads. This is the single seam the registry hangs off:
+    prompts, the reduce lattice, family routing and the validity check
+    all read these names at call time, so replacing them replaces the
+    vocabulary everywhere at once and nowhere partially."""
+    global _REL_PRECEDENCE, _REL_NONEXCLUSIVE, _REL_FAMILY_TYPES
+    global _REL_SPECIFIC_TYPES, _REL_INVERSE, _REL_NO_INVERSE, _REL_VOCAB
+    _REL_VOCAB = vocab
+    _REL_PRECEDENCE = dict(vocab["precedence"])
+    _REL_NONEXCLUSIVE = set(vocab["nonexclusive"])
+    _REL_FAMILY_TYPES = frozenset(vocab["family"])
+    # The specificity band treats family types as "specific" (see
+    # _rel_type_band): it follows the family set so a registry-added
+    # family type bands correctly without a second list to keep in
+    # sync.
+    _REL_SPECIFIC_TYPES = set(vocab["family"])
+    _REL_INVERSE = dict(vocab["inverse"])
+    _REL_NO_INVERSE = set(vocab["no_inverse"])
+
+
+_REL_VOCAB = _derive_rel_vocab(_BUILTIN_REL_TYPES)
+_apply_rel_vocab(_REL_VOCAB)
+
+# Where the active vocabulary came from, recorded in run history so a
+# comparison across runs can see whether the registry or the fallback
+# produced the results. "not-loaded" until a run start attempts the
+# load; the built-in vocabulary is in force either way until then.
+_REL_REGISTRY_STATUS = {"source": "builtin", "reason": "not-loaded",
+                        "types": len(_REL_VOCAB["types"])}
+_REL_REGISTRY_LOAD_ATTEMPTED = False
+
+
+def _load_rel_registry(force=False):
+    """Attempt to load the relationship registry at run start.
+
+    Never raises: the registry is an enhancement, not a dependency,
+    and an offline run must not gain a hard network requirement for
+    its vocabulary. Any failure leaves the built-in vocabulary in
+    force and records WHY in _REL_REGISTRY_STATUS, which run history
+    carries in its thresholds stamp. Returns the status dict.
+    """
+    global _REL_REGISTRY_STATUS, _REL_REGISTRY_LOAD_ATTEMPTED
+    if _REL_REGISTRY_LOAD_ATTEMPTED and not force:
+        return _REL_REGISTRY_STATUS
+    _REL_REGISTRY_LOAD_ATTEMPTED = True
+
+    def _fallback(reason):
+        # The status is module state the run record reads, so this
+        # assignment must reach the global — without the declaration
+        # it would be a local that dies with the call, and the run
+        # record would forever claim the load was never attempted.
+        global _REL_REGISTRY_STATUS
+        _apply_rel_vocab(_derive_rel_vocab(_BUILTIN_REL_TYPES))
+        _REL_REGISTRY_STATUS = {
+            "source": "builtin", "reason": reason,
+            "types": len(_REL_VOCAB["types"])}
+        print(f"  Relationship registry: built-in vocabulary in force "
+              f"({reason})")
+        return _REL_REGISTRY_STATUS
+
+    try:
+        if not CONFIG.get("supabase_url") or not CONFIG.get("supabase_key"):
+            return _fallback("no-supabase-config")
+        rows = sb("relationship_types", params=_REL_REGISTRY_SELECT)
+        if rows is None:
+            return _fallback("unreachable-or-missing-table")
+        vocab = _derive_rel_vocab(rows)
+        if vocab is None:
+            return _fallback("malformed-rows")
+        _apply_rel_vocab(vocab)
+        _REL_REGISTRY_STATUS = {
+            "source": "registry", "reason": "loaded",
+            "types": len(vocab["types"])}
+        print(f"  Relationship registry: {len(vocab['types'])} types "
+              f"loaded from Supabase")
+        return _REL_REGISTRY_STATUS
+    except Exception:
+        return _fallback("load-error")
+
+
+def _rel_vocab():
+    """The active vocabulary object (registry-derived when a load
+    succeeded, the built-in mirror otherwise)."""
+    return _REL_VOCAB
+
+
+def _rel_gloss(rtype):
+    """The active vocabulary's gloss for one type, or "" when the
+    type is unknown — an unknown type gets no invented definition."""
+    entry = _REL_VOCAB["by_id"].get(str(rtype or "").strip().lower())
+    return entry["gloss"] if entry else ""
+
+
+# The type list exactly as the prompt constants below spell it today.
+# _rel_prompt() swaps this literal for the active vocabulary's list,
+# so the constants stay byte-stable for their other readers (prompt
+# stamps hash the DERIVED text — see _history_prompt_stamps) while the
+# model is always offered the vocabulary actually in force.
+_REL_PROMPT_LIST_BUILTIN = ("spouse|parent|child|sibling|friend|enemy|"
+                            "mentor|colleague|neighbor|other")
+_REL_PROMPT_SENTENCE_BUILTIN = ("spouse, parent, child, sibling, friend, "
+                                "enemy, mentor, colleague, neighbor, other")
+
+
+def _rel_prompt(template):
+    """Render an extraction prompt template against the active
+    vocabulary: the closed type list becomes the active type list, and
+    a definitions section carrying every type's gloss is appended, so
+    a type the model has never seen is proposed on its definition
+    rather than guessed from its name."""
+    ids = [e["id"] for e in _REL_VOCAB["types"]]
+    text = template.replace(_REL_PROMPT_LIST_BUILTIN, "|".join(ids))
+    text = text.replace(_REL_PROMPT_SENTENCE_BUILTIN, ", ".join(ids))
+    lines = ["", "RELATIONSHIP TYPE DEFINITIONS — the only types you "
+             "may use, each with its boundary:"]
+    for e in _REL_VOCAB["types"]:
+        lines.append(f"- {e['id']}: {e['gloss']}")
+    return text + "\n" + "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # Relationship direction convention (AUTHORITATIVE — the app renders to this;
@@ -1940,14 +2289,19 @@ _REL_NONEXCLUSIVE = {"mentor", "rival", "ally", "neighbor", "other"}
 # Canonical form: a pair is stored ONCE, with endpoints in canonical
 # (case-insensitive alphabetical) order. When a claim's direction is
 # reversed to fit canonical order, asymmetric types are flipped via
-# _REL_INVERSE (parent <-> child). Symmetric types (spouse, sibling,
-# friend, enemy, romantic, colleague, neighbor, rival, ally, other) are
-# unaffected by reversal. "mentor" is asymmetric but has NO inverse in the
-# type vocabulary, so mentor pairs are stored in claim direction (mentor
-# first) instead of canonical order — the one documented exception.
+# _REL_INVERSE (parent <-> child, step_parent <-> step_child).
+# Symmetric and "either" types are unaffected by reversal. A directed
+# type with NO inverse in the vocabulary (mentor, sire, handler) is
+# stored in claim direction (directed side first) instead of
+# canonical order — the documented exception, generalized: the
+# registry cannot name an inverse it does not carry, so claim
+# direction is the only honest storage for such a type.
 # ---------------------------------------------------------------------------
-_REL_INVERSE = {"parent": "child", "child": "parent"}
-_REL_NO_INVERSE = {"mentor"}
+# Both names are derived from the active vocabulary (see the registry
+# block above): re-stating them as literals here would silently undo a
+# registry load that happened earlier in the file's execution.
+_REL_INVERSE = dict(_REL_VOCAB["inverse"])
+_REL_NO_INVERSE = set(_REL_VOCAB["no_inverse"])
 
 
 def _canonical_pair(frm, to, rtype):
@@ -2790,8 +3144,17 @@ class DecisionValidator:
         error, in which case the caller keeps the original type
         (fail open: a validator outage shouldn't rewrite data).
         """
+        # The claimed type's gloss rides the prompt when the active
+        # vocabulary carries one, because a type added through the
+        # registry is judged on its definition, not on what the judge
+        # guesses its name means. An unknown type gets no clause — an
+        # invented definition would be worse than none.
+        _gloss = _rel_gloss(rel_type)
+        _gloss_clause = (
+            f"Here, \"{rel_type}\" means: {_gloss} " if _gloss else "")
         _instructions = (
             f"Given the quote, is {from_name} the {rel_type} of {to_name}? "
+            f"{_gloss_clause}"
             f"Answer YES when: the quote directly states or clearly implies "
             f"this {rel_type} relationship (e.g. 'my wife', 'his mother', "
             f"'her brother'). A person may be referred to by full name, "
@@ -13788,7 +14151,7 @@ def _v2_call_a_inner(call, roster, chapter, n_chapters):
         if e["name"].lower() in label_low and len(e["name"]) > 2:
             pov_hint = e["name"]
             break
-    prompt = (PROMPT_V2_CHARACTERS
+    prompt = (_rel_prompt(PROMPT_V2_CHARACTERS)
               .replace("{chapter_label}", chapter["label"])
               .replace("{roster}", roster_text))
     _use_shared = CONFIG.get("v2_shared_system")  # isolation flag only; hurts quality
@@ -13805,7 +14168,8 @@ def _v2_call_a_inner(call, roster, chapter, n_chapters):
         a["pov_character"] = pov_hint
     fell_back = False
     if a is None:
-        a = _run_task(call, PROMPT_V2_CHARACTERS_SIMPLE, chapter["text"], idx,
+        a = _run_task(call, _rel_prompt(PROMPT_V2_CHARACTERS_SIMPLE),
+                      chapter["text"], idx,
                       n_chapters, f"v2-ch{idx}-identity-fallback",
                       sanitize_fn=_sanitize_v2a)
         fell_back = a is not None
@@ -15381,6 +15745,12 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # this book's results to the order and policy that
         # produced them.
         "validation_order": _VALIDATION_ORDER_ID,
+        # Which relationship vocabulary produced this run's results
+        # (registry rows vs the built-in fallback, and why the
+        # fallback when it is) — a run judged against a shrunken or
+        # stale vocabulary must not compare silently against one that
+        # was not.
+        "rel_registry": dict(_REL_REGISTRY_STATUS),
         "validator_circuit_breaker": _validator_breaker,
         "self_pairs_dropped": {"extracted": _self_pairs_extracted,
                                "remapped": _self_pairs_remapped},
@@ -16633,13 +17003,14 @@ def extract_llm(chunk, i, n):
     backends = {"ollama": llm_ollama, "openrouter": llm_openrouter, "openai": llm_openai_compat}
     call = backends.get(CONFIG["llm"], llm_ollama)
     disc = _run_task(call, PROMPT_DISCIPLINE, chunk, i, n, "discipline")
-    ident = _run_task(call, PROMPT_IDENTITY, chunk, i, n, "identity")
+    ident = _run_task(call, _rel_prompt(PROMPT_IDENTITY), chunk, i, n,
+                      "identity")
     ident_simple = False
     if ident is None:
         # Graceful degradation: evidence-free fallback prompt, routed through
         # _run_task for retries, debug dumps and empty-response diagnostics.
-        ident = _run_task(call, PROMPT_IDENTITY_SIMPLE, chunk, i, n,
-                          "identity-fallback")
+        ident = _run_task(call, _rel_prompt(PROMPT_IDENTITY_SIMPLE), chunk,
+                          i, n, "identity-fallback")
         if ident is not None:
             ident_simple = True
             if CONFIG.get("debug"):
@@ -17502,7 +17873,11 @@ _REL_DROP_THRESHOLD = 0.30
 # three-tier outcomes above. High-stakes: being wrong about
 # spouse/parent/child/sibling is worse than being wrong about
 # friend/enemy/colleague.
-_REL_FAMILY_TYPES = frozenset({"spouse", "parent", "child", "sibling"})
+# Derived from the active vocabulary (registry block above): family
+# routing follows the rows' family flags, so a registry-added family
+# type (step_parent/step_child in the seed) routes to family
+# validation without a second list living here.
+_REL_FAMILY_TYPES = frozenset(_REL_VOCAB["family"])
 # Validation priority order (spec §1.2, Decision K1): family claims
 # validate before non-family; within family, by stakes (spouse and
 # parent/child before sibling — their errors cost more — using
@@ -17936,6 +18311,11 @@ def _history_thresholds():
         # checkpoint can attribute outcomes to the scheme, not
         # just to the totals.
         "validation_order": _VALIDATION_ORDER_ID,
+        # Which relationship vocabulary is in force (registry rows
+        # vs the built-in fallback, and why the fallback when it is):
+        # stamped alongside the bars because a run judged against a
+        # different vocabulary is not comparable without it.
+        "rel_registry": dict(_REL_REGISTRY_STATUS),
         "budget_reserves": dict(_DM_BUDGET_RESERVES),
         "validator_error_threshold": _VALIDATOR_ERROR_THRESHOLD,
         "validator_error_min_sample": _VALIDATOR_ERROR_MIN_SAMPLE,
@@ -17974,18 +18354,22 @@ def _history_prompt_stamps():
                 "hash": _hl.sha256(
                     text.encode("utf-8")).hexdigest()[:12]}
 
+    # Relationship-bearing prompts are stamped in their DERIVED form
+    # (see _rel_prompt): a registry change that alters the vocabulary
+    # the model is offered must move the hash, or two runs with
+    # different vocabularies would stamp identically.
     if CONFIG.get("pipeline") == "v2":
-        _add("extractor_characters", PROMPT_V2_CHARACTERS)
+        _add("extractor_characters", _rel_prompt(PROMPT_V2_CHARACTERS))
         _add("extractor_characters_simple",
-             PROMPT_V2_CHARACTERS_SIMPLE)
+             _rel_prompt(PROMPT_V2_CHARACTERS_SIMPLE))
         _add("extractor_content", PROMPT_V2_CONTENT)
         _add("shared_system", V2_SHARED_SYSTEM)
         _add("trope_gate", PROMPT_V2_TROPE_GATE)
         if CONFIG.get("evidence_retrieval"):
             _add("evidence_judge", PROMPT_EVIDENCE_JUDGE)
     else:
-        _add("identity", PROMPT_IDENTITY)
-        _add("identity_simple", PROMPT_IDENTITY_SIMPLE)
+        _add("identity", _rel_prompt(PROMPT_IDENTITY))
+        _add("identity_simple", _rel_prompt(PROMPT_IDENTITY_SIMPLE))
         _add("discipline", PROMPT_DISCIPLINE)
     return stages
 
@@ -18789,6 +19173,12 @@ def _history_begin(mode, preview=False, dry_run=False, learn_dir=None,
     stays a no-op, so a history-off run is byte-identical to today.
     """
     global _HISTORY, _HISTORY_NOSB_WARNED
+    # The registry load rides this seam too, because run_once and the
+    # replay path arm history without passing main()'s hook — and the
+    # recorder's thresholds stamp must record the vocabulary actually
+    # in force, so the attempt happens before the recorder is built.
+    # Idempotent per process; failure leaves the built-in vocabulary.
+    _load_rel_registry()
     if not CONFIG.get("run_history"):
         return
     if _HISTORY is not None:
@@ -22434,6 +22824,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "relationships": red["relationships"],
         "dropped_relationships": red.get("dropped_relationships", []),
         "validation_order": red.get("validation_order"),
+        "rel_registry": red.get("rel_registry"),
         "validator_circuit_breaker": red.get(
             "validator_circuit_breaker"),
         "self_pairs_dropped": red.get("self_pairs_dropped",
@@ -24421,6 +24812,11 @@ def main():
         sys.exit("ERROR: Set supabase_url and supabase_key in config.json")
 
     print(f"Portable v{PORTABLE_VERSION}")
+    # Run start: attempt the relationship registry load before any
+    # book work, so every prompt and judgment in the run derives from
+    # the same vocabulary. Failure is non-fatal by design (the
+    # built-in mirror stays in force) — see _load_rel_registry.
+    _load_rel_registry()
     print(f"LLM: {CONFIG['llm']}")
     if args.preview:
         print("Preview mode: results saved to preview/, nothing written to Supabase, files not moved")
