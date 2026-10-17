@@ -13,7 +13,12 @@
 --
 -- HOME: dedicated schema "processor" (RH-4 ruling). Accepted fallback if
 -- the precondition proof below fails or proves fiddly: the same tables
--- in "public" + explicit REVOKEs from anon/authenticated.
+-- in "public" + explicit REVOKEs from anon/authenticated. WARNING: the
+-- fallback is a RE-DRAFT written for public's default grants, never a
+-- schema-name swap of this file — this file contains no REVOKEs because
+-- a fresh schema needs none, and in public a mechanically swapped copy
+-- would apply WIDE OPEN (Supabase grants anon/authenticated at CREATE
+-- TABLE time there) while looking identical to the reviewed draft.
 --
 -- APPLY-TIME PREREQUISITES (project config, outside this SQL):
 --   1. Add "processor" to PostgREST's exposed schemas
@@ -130,6 +135,13 @@ COMMIT;
 --        FROM information_schema.role_table_grants
 --       WHERE table_schema = 'processor';
 --    Expect: service_role rows only; nothing for anon/authenticated.
+-- 1b. RLS verified from the catalog, not trusted from this file:
+--      SELECT c.relname, c.relrowsecurity FROM pg_class c
+--        JOIN pg_namespace n ON n.oid = c.relnamespace
+--       WHERE n.nspname = 'processor' AND c.relkind = 'r';
+--    Expect relrowsecurity = true for all three tables; and
+--      SELECT count(*) FROM pg_policies WHERE schemaname = 'processor';
+--    Expect 0.
 -- 2. Anon-key PostgREST probe of all three tables returns nothing/error.
 -- 3. RLS-faithful authenticated-role read returns zero rows.
 -- 4. Positive service-key REST round trip (insert marker row -> read
@@ -141,6 +153,9 @@ COMMIT;
 --   DROP TABLE processor.processor_run_books;
 --   DROP TABLE processor.processor_runs;
 --   DROP SCHEMA processor;
+--   ...and remove 'processor' from PostgREST's exposed schemas
+--   (apply-time prerequisite 1, reversed) so no dangling config entry
+--   points at a dropped schema.
 --
 -- RH-1 EXIT (prune instead of drop, if retention is ever revisited;
 -- book rows follow via the internal CASCADE):

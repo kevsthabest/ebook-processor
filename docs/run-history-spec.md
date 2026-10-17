@@ -101,9 +101,9 @@ processor_run_books(run_id).
 | id | uuid PK | |
 | run_book_id | uuid FK → processor_run_books.id ON DELETE CASCADE | internal to the history store, like run_id above |
 | axis | text | tropes / triggers (CHECK) |
-| claim_key | text NOT NULL | hash of the claim's normalized identity (work + axis + catalogue identity) — stable across runs, carries no text; UNIQUE with run_book_id + axis |
-| verdict | text | the run's outcome for this claim (derived / reused / abstained / failed, and the retrieve verdict vocabulary where applicable) |
-| confidence | numeric NULL | as reported by the stage that produced the verdict |
+| claim_key | text NOT NULL | hash of the claim's normalized identity (work + axis + catalogue identity) — stable across runs, carries no text; UNIQUE with run_book_id + axis. INPUT DISCIPLINE (required, Advisor team-review round 2): the identity hashed is catalogue identity plus the book fingerprint ONLY — never a raw free-text or proposed label; a not-yet-catalogued claim is keyed salted with the book fingerprint, so no bare label is ever globally dictionary-matchable. The writer's suite asserts this input rule. |
+| verdict | text | the run's outcome for this claim (derived / reused / abstained / failed, and the retrieve verdict vocabulary where applicable). Deliberately NO database CHECK (Advisor ruling): verdict is an evolving measurement vocabulary, and under best-effort writes a CHECK violation would silently drop rows; the writer's suite pins emitted values against the code-side vocabulary allowlist instead. |
+| confidence | numeric NULL | the stage's RAW numeric score, stored unbucketed — a deliberate change from the original RH-3 sketch (which said "confidence bucket"): raw scores are the processor's own telemetry and are more useful for abstention analysis. |
 | uploaded_at | timestamptz default now() | |
 
 Its acceptance questions (named by Trope Review, team review 2026-10-17):
@@ -187,7 +187,10 @@ before upload. The payload builder is unit-tested against this denylist
 - Suite pins: payload builder emits only allowlisted keys (denylist scan);
   flag-off = zero network calls; POST failure leaves run result and exit
   behaviour unchanged; upsert payloads carry the §4 stamps (version,
-  prompt hashes, judge identity); interrupted run writes status correctly.
+  prompt hashes, judge identity); interrupted run writes status correctly;
+  claim_key inputs never include a raw free-text/proposed label (catalogue
+  identity + book fingerprint only); emitted verdict values are pinned
+  against the processor's code-side verdict vocabulary allowlist.
 - First live enable is verified by the §6 marker + RLS checks and one
   real run whose rows are read back and reconciled against its JSONL.
 
