@@ -12022,6 +12022,428 @@ def cmd_corpus_status(learn_dir=None, as_json=False):
 
 
 # ---------------------------------------------------------------------------
+# --corpus-snapshot (docs/corpus-snapshot-spec.md): a metadata-only,
+# point-in-time observation of the local corpus, uploaded to the
+# processor schema (one header row + one row per corpus work). Not
+# a run and not a sync: nothing flows back, the local corpus is
+# never modified, and no other command takes one implicitly.
+# ---------------------------------------------------------------------------
+
+_SNAPSHOT_SCHEMA = "processor"
+_SNAPSHOT_BOOK_CHUNK = 200
+_SNAPSHOT_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_SNAPSHOT_GENERATION_KEYS = ("model", "format", "dim", "canary",
+                             "born", "checked")
+
+
+def _snapshot_generation_projection(gen):
+    """The ONLY shape a generation record may ship in: the six
+    state fields, named explicitly. The stored record also carries
+    the canary's sentinel vectors and pairwise cosines — embedding
+    material that must never leave the machine — so the projection
+    is a whitelist, never a copy with keys removed afterwards."""
+    if not isinstance(gen, dict):
+        return None
+    return {k: gen.get(k) for k in _SNAPSHOT_GENERATION_KEYS}
+
+
+def _snapshot_isbn(raw_identifiers):
+    """The one identifier a snapshot ships: an ISBN, re-cleaned
+    through _clean_isbn at build time. The stored identifier record
+    also carries the ASIN and the raw identifier list; neither is
+    shipped, and the raw list is consulted only as a source of
+    further ISBN candidates. Re-cleaning (rather than trusting the
+    value ingest stored) keeps the 'cleaned ISBN-13 only' guarantee
+    provable against legacy or hand-edited rows. Malformed records
+    read as no ISBN, never as a crash and never shipped raw."""
+    try:
+        ids = json.loads(raw_identifiers) if isinstance(
+            raw_identifiers, str) else raw_identifiers
+    except (TypeError, ValueError):
+        ids = None
+    candidates = []
+    if isinstance(ids, dict):
+        if ids.get("isbn"):
+            candidates.append(ids["isbn"])
+        raw = ids.get("raw")
+        if isinstance(raw, list):
+            candidates.extend(raw)
+    elif isinstance(ids, list):
+        candidates.extend(ids)
+    elif isinstance(ids, str):
+        candidates.append(ids)
+    for c in candidates:
+        if isinstance(c, (str, int)):
+            cleaned = _clean_isbn(str(c))
+            if cleaned:
+                return cleaned
+    return None
+
+
+def _snapshot_work_id(raw):
+    """corpus_works.work_id is a soft reference with no local
+    constraint on its shape, and no current local writer populates
+    it. A malformed local value shipped raw would make Postgres
+    reject the whole book chunk, so only a UUID-shaped value
+    ships — anything else reads as unknown (NULL)."""
+    if isinstance(raw, str) and _SNAPSHOT_UUID_RE.match(raw.strip()):
+        return raw.strip()
+    return None
+
+
+def _corpus_snapshot_fingerprint(cur_gen, books):
+    """The content identity of the whole corpus (spec §6): sha256
+    of the canonical JSON of the current generation's {model,
+    format} and the per-work identity tuples, sorted by
+    fingerprint. Machine label and capture time are NOT inputs —
+    the same corpus on another machine, observed at another time,
+    fingerprints identically. Quote counts are deliberately
+    excluded: curation churn (verify / select / retract) must not
+    re-identify the corpus; quote changes stay visible by diffing
+    the book rows themselves."""
+    import hashlib as _hl
+    gen_part = None
+    if cur_gen:
+        gen_part = {"model": cur_gen.get("model"),
+                    "format": cur_gen.get("format")}
+    tuples = sorted(
+        ([b["fingerprint"], b["status"], b["parser_version"],
+          b["text_root_hash"], b["source_hash"], b["vectors"]]
+         for b in books),
+        key=lambda t: t[0])
+    canon = json.dumps({"generation": gen_part, "works": tuples},
+                       sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False)
+    return _hl.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def _corpus_snapshot_data(learn_dir):
+    """Build one corpus snapshot's payloads (header + book rows)
+    from the local corpus. Returns {"present": False, "reason":
+    "absent" | "unavailable"} when there is nothing to snapshot,
+    else {"present": True, "header": ..., "books": [...]}.
+
+    Field discipline is whitelist-only (spec §5): every shipped
+    value is projected field by field from a named column or a
+    named payload key — the raw payload, the raw envelope JSON and
+    the raw identifier list are never copied. Per-work fields come
+    from a direct corpus_works query; the aggregate counts come
+    from grouped queries, and the vector count / coverage are
+    computed exactly as _corpus_status_data computes them (a
+    current-generation JOIN count, coverage rounded to 4 places),
+    so a snapshot reconciles against --corpus-status output."""
+    import uuid as _uuid
+    d = _explain_learn_dir(learn_dir)
+    if not (d / _CORPUS_DB_NAME).exists():
+        return {"present": False, "reason": "absent"}
+    # The read opens the corpus DIRECTLY in report mode on a
+    # read-only handle — never via _corpus_db_for, whose ordinary
+    # open path stamps probe results into meta and can rebuild the
+    # FTS index: the snapshot must not mutate the corpus it
+    # observes. No embedder is consulted and no canary runs, so a
+    # generation's canary value is its state as last recorded by
+    # corpus operations, exactly as the spec states.
+    try:
+        db = CorpusDB.open(d, mode="report", readonly=True)
+    except Exception:
+        db = None
+    if db is None:
+        # corpus.db exists but would not open: the open discipline
+        # has already warned and preserved the file as .corrupt.
+        # That is an UNAVAILABLE corpus, not an absent one — the
+        # two must never be reported as each other.
+        return {"present": False, "reason": "unavailable"}
+    try:
+        captured_at = _corpus_now()
+        cur_ptr = None
+        raw_ptr = db.meta_get("generation_current")
+        if raw_ptr:
+            try:
+                cur_ptr = json.loads(raw_ptr)
+            except (TypeError, ValueError):
+                cur_ptr = None
+        cur_gen = None
+        if isinstance(cur_ptr, dict) and cur_ptr.get("model"):
+            cur_gen = _corpus_generation(
+                db, cur_ptr["model"],
+                cur_ptr.get("format") or _CORPUS_VECTOR_FORMAT)
+        generations = []
+        for g in _corpus_generations(db):
+            proj = _snapshot_generation_projection(g)
+            if proj is not None:
+                generations.append(proj)
+        # Aggregate counts via grouped queries — the same measured
+        # values _corpus_status_data reaches per work, without a
+        # query per work.
+        passage_counts = dict(db.query(
+            "SELECT fingerprint, COUNT(*) FROM corpus_passages "
+            "GROUP BY fingerprint"))
+        vector_counts = {}
+        if cur_gen:
+            vector_counts = dict(db.query(
+                "SELECT p.fingerprint, COUNT(*) FROM passage_vectors "
+                "pv JOIN corpus_passages p "
+                "ON p.passage_id = pv.passage_id "
+                "WHERE pv.model=? AND pv.format=? "
+                "GROUP BY p.fingerprint",
+                (cur_gen.get("model"), cur_gen.get("format"))))
+        quote_counts = {}
+        for fp, qstatus, n in db.query(
+                "SELECT fingerprint, status, COUNT(*) FROM quotes "
+                "GROUP BY fingerprint, status"):
+            qc = quote_counts.setdefault(
+                fp, {"total": 0, "by_status": {}, "selected": 0})
+            qc["by_status"][qstatus] = n
+            qc["total"] += n
+        for qc in quote_counts.values():
+            qc["selected"] = qc["by_status"].get("selected", 0)
+        # The envelope contributes its corpus_v and computed_at
+        # COLUMNS only — the envelope JSON itself (stage sections,
+        # retraction reasons, quote text hashes) is never parsed
+        # here, let alone shipped.
+        envelopes = {fp: (cv, ca) for fp, cv, ca in db.query(
+            "SELECT fingerprint, corpus_v, computed_at "
+            "FROM work_envelope")}
+        books = []
+        by_status = {}
+        for row in db.query(
+                "SELECT fingerprint, book_key, work_id, title, "
+                "author, identifiers, series, series_index, "
+                "parser_version, chapter_count, text_root_hash, "
+                "source_hash, status, ingested_at, updated_at, "
+                "payload FROM corpus_works ORDER BY fingerprint"):
+            (fp, book_key, work_id, title, author, identifiers,
+             series, series_index, parser_version, chapter_count,
+             text_root_hash, source_hash, status, ingested_at,
+             updated_at, payload_raw) = row
+            try:
+                payload = json.loads(payload_raw) if isinstance(
+                    payload_raw, str) else {}
+            except (TypeError, ValueError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            # The ingest payload is projected to exactly two keys:
+            # word_count and chapter_detection_fallback. Its
+            # source_name (a filename) and series_source never ship.
+            words = payload.get("word_count")
+            if not isinstance(words, int) or isinstance(words, bool):
+                words = None
+            fallback = payload.get("chapter_detection_fallback")
+            n_pass = passage_counts.get(fp, 0)
+            if cur_gen:
+                n_vec = vector_counts.get(fp, 0)
+                coverage = (round(n_vec / n_pass, 4) if n_pass
+                            else None)
+            else:
+                # No current generation: every work's vector state
+                # is unknown, and unknown ships as NULL — a
+                # measured-looking 0 would claim embedding coverage
+                # that was never assessed.
+                n_vec = None
+                coverage = None
+            env = envelopes.get(fp)
+            books.append({
+                "fingerprint": fp,
+                "book_key": book_key,
+                "work_id": _snapshot_work_id(work_id),
+                "title": title,
+                "author": author,
+                "isbn": _snapshot_isbn(identifiers),
+                "series": series,
+                "series_index": series_index,
+                "status": status,
+                "parser_version": parser_version,
+                "chapters": chapter_count,
+                "words": words,
+                "passages": n_pass,
+                "vectors": n_vec,
+                "vector_coverage": coverage,
+                "chapter_detection_fallback": (
+                    bool(fallback) if fallback is not None else None),
+                "text_root_hash": text_root_hash,
+                "source_hash": source_hash,
+                "quotes": quote_counts.get(
+                    fp, {"total": 0, "by_status": {},
+                         "selected": 0}),
+                "envelope_corpus_v": env[0] if env else None,
+                "envelope_computed_at": env[1] if env else None,
+                "ingested_at": ingested_at,
+                "updated_at": updated_at,
+            })
+            if status is not None:
+                by_status[status] = by_status.get(status, 0) + 1
+        try:
+            breakdown = _corpus_size_breakdown(db)
+        except Exception:
+            breakdown = None
+        quotes_by_status = {}
+        for qc in quote_counts.values():
+            for s, n in qc["by_status"].items():
+                quotes_by_status[s] = (
+                    quotes_by_status.get(s, 0) + n)
+        header = {
+            "snapshot_key": f"snapshot-{_uuid.uuid4().hex}",
+            "captured_at": captured_at,
+            "machine_label": CONFIG.get("machine_label") or None,
+            "processor_version": PORTABLE_VERSION,
+            "corpus_parser_version": CORPUS_PARSER_VERSION,
+            "corpus_v": CORPUS_V,
+            "corpus_fingerprint": _corpus_snapshot_fingerprint(
+                cur_gen, books),
+            "works_count": len(books),
+            "corpus_bytes": (breakdown or {}).get("total"),
+            "size_breakdown": breakdown or {},
+            "fts_available": bool(db.fts_available),
+            "current_generation": _snapshot_generation_projection(
+                cur_gen),
+            "generations": generations,
+            "totals": {
+                "works": len(books),
+                "by_status": by_status,
+                "quotes": sum(q["total"]
+                              for q in quote_counts.values()),
+                "quotes_by_status": quotes_by_status,
+            },
+            "complete": False,
+        }
+        return {"present": True, "header": header, "books": books}
+    finally:
+        db.close()
+
+
+def _snapshot_delete_header(snapshot_id):
+    """Delete a snapshot header (its book rows follow via the
+    internal CASCADE). Confirmed ONLY by a non-None, non-empty
+    response: the REST helper returns the deleted rows under
+    return=representation, so an empty or None response leaves the
+    delete unproven and the caller names the snapshot key for
+    manual cleanup instead of claiming it."""
+    rows = sb("processor_corpus_snapshots", method="DELETE",
+              params=f"?id=eq.{snapshot_id}",
+              schema=_SNAPSHOT_SCHEMA)
+    return bool(rows)
+
+
+def _snapshot_fail_cleanup(header, snapshot_id, reason):
+    """The common upload-failure tail (spec §7): try to leave no
+    partial snapshot behind, and say plainly whether the cleanup
+    is proven. The snapshot key is named either way — it is the
+    handle a manual cleanup needs."""
+    key = header["snapshot_key"]
+    if _snapshot_delete_header(snapshot_id):
+        print(f"  Corpus snapshot: upload failed ({reason}); "
+              f"snapshot {key} was deleted — no partial snapshot "
+              f"remains.")
+    else:
+        print(f"  Corpus snapshot: upload failed ({reason}); "
+              f"cleanup of snapshot {key} could not be confirmed "
+              f"— delete that snapshot_key from "
+              f"processor_corpus_snapshots manually.")
+    return 1
+
+
+def cmd_corpus_snapshot(learn_dir=None, as_json=False):
+    """--corpus-snapshot: upload one metadata-only snapshot of
+    the local corpus (docs/corpus-snapshot-spec.md) and return
+    the exit code: 0 shipped, 1 the upload failed (partial state
+    deleted, or named for manual cleanup), 2 nothing to snapshot
+    / corpus unavailable / Supabase not configured. Invoking the
+    command is itself the named act: it does not consult the
+    run-history setting, never arms the run-history recorder, and
+    never takes a snapshot implicitly on any other path."""
+    data = _corpus_snapshot_data(learn_dir)
+    if not data["present"]:
+        if data["reason"] == "absent":
+            print("  Corpus snapshot: no corpus.db in the learn "
+                  "dir — nothing to snapshot.")
+        else:
+            print("  Corpus snapshot: the corpus is unavailable "
+                  "(see the warning above) — nothing uploaded.")
+        return 2
+    # The config guard stands before ANY sb() call: an unconfigured
+    # install must make zero requests, not one failed one.
+    if not (CONFIG.get("supabase_url") and CONFIG.get("supabase_key")):
+        print("  Corpus snapshot: supabase_url/supabase_key are "
+              "not set in config.json — nothing uploaded.")
+        return 2
+    header = data["header"]
+    books = data["books"]
+    key = header["snapshot_key"]
+    # Upload order (spec §7): the header first, stamped
+    # complete=false, so a snapshot interrupted mid-upload exists
+    # only as a visibly partial row — and the failure paths below
+    # delete it rather than leaving even that behind.
+    rows = sb("processor_corpus_snapshots", method="POST",
+              data=[header], schema=_SNAPSHOT_SCHEMA)
+    if not rows or not rows[0].get("id"):
+        # No usable response: the insert may still have landed (a
+        # response can be lost after the commit), so probe by the
+        # client-generated UNIQUE snapshot_key before declaring
+        # anything, and delete a landed header.
+        probe = sb("processor_corpus_snapshots", method="GET",
+                   params=(f"?snapshot_key=eq.{key}&select=id"),
+                   schema=_SNAPSHOT_SCHEMA)
+        landed_id = probe[0].get("id") if probe else None
+        if landed_id and _snapshot_delete_header(landed_id):
+            print(f"  Corpus snapshot: upload failed "
+                  f"(no-response); the landed header for snapshot "
+                  f"{key} was deleted — no partial snapshot "
+                  f"remains.")
+        elif probe is not None and not probe:
+            print(f"  Corpus snapshot: upload failed "
+                  f"(no-response); no landed header was found "
+                  f"under snapshot {key}.")
+        else:
+            print(f"  Corpus snapshot: upload failed "
+                  f"(no-response); cleanup of snapshot {key} "
+                  f"could not be confirmed — delete that "
+                  f"snapshot_key from processor_corpus_snapshots "
+                  f"manually.")
+        return 1
+    snapshot_id = rows[0]["id"]
+    for start in range(0, len(books), _SNAPSHOT_BOOK_CHUNK):
+        chunk = books[start:start + _SNAPSHOT_BOOK_CHUNK]
+        for b in chunk:
+            b["snapshot_id"] = snapshot_id
+        sent = sb("processor_corpus_snapshot_books", method="POST",
+                  data=chunk, schema=_SNAPSHOT_SCHEMA)
+        # A chunk counts as landed only when the response carries
+        # exactly the rows sent: a short response means rows the
+        # finalize step would otherwise have blessed are missing.
+        if sent is None or len(sent) != len(chunk):
+            return _snapshot_fail_cleanup(
+                header, snapshot_id,
+                "book-chunk" if sent is None else "book-count")
+    fin = sb("processor_corpus_snapshots", method="PATCH",
+             data={"complete": True},
+             params=f"?id=eq.{snapshot_id}", schema=_SNAPSHOT_SCHEMA)
+    if not fin:
+        return _snapshot_fail_cleanup(header, snapshot_id,
+                                      "finalize")
+    if as_json:
+        # The receipt names the snapshot and nothing more — never
+        # the full payload.
+        print(json.dumps(
+            {"snapshot_key": key,
+             "captured_at": header["captured_at"],
+             "works": header["works_count"],
+             "corpus_fingerprint": header["corpus_fingerprint"]},
+            separators=(",", ":")))
+    else:
+        size = header["corpus_bytes"]
+        size_txt = (f"{size:,} bytes" if size is not None
+                    else "size unmeasured")
+        print(f"  Corpus snapshot {key}: "
+              f"{header['works_count']} works · corpus "
+              f"fingerprint {header['corpus_fingerprint'][:12]} "
+              f"· {size_txt}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # --explain (§7.1): the forensics join over both stores. Read-only:
 # the corpus side is a report-mode handle, the state side a mode=ro
 # SQLite connection; the command writes nothing, and says plainly
@@ -22674,6 +23096,14 @@ def _build_parser():
                          "vector coverage vs the current generation, "
                          "quotes, sizes; corpus design §7.4) and exit "
                          "(no books processed)")
+    g_learn.add_argument("--corpus-snapshot", action="store_true",
+                    help="upload a metadata-only snapshot of the "
+                         "local corpus (works, completeness, vector "
+                         "coverage, sizes — never text) to the "
+                         "processor schema in Supabase and exit; "
+                         "exits 2 when there is nothing to snapshot "
+                         "or Supabase is not configured, 1 when the "
+                         "upload fails (docs/corpus-snapshot-spec.md)")
     g_learn.add_argument("--explain", metavar="WORK", default=None,
                     help="forensics report for one work, joining "
                          "state.db and corpus.db read-only: staging "
@@ -22934,6 +23364,10 @@ def main():
         load_config()
         cmd_corpus_status(args.learn_dir or None, as_json=args.json)
         return
+    if args.corpus_snapshot:
+        load_config()
+        sys.exit(cmd_corpus_snapshot(args.learn_dir or None,
+                                     as_json=args.json))
     if args.explain:
         load_config()
         cmd_explain(args.explain,
