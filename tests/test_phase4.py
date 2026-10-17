@@ -2688,7 +2688,9 @@ class TestManualAlias(unittest.TestCase):
 
 
 class TestRelationshipValidation(unittest.TestCase):
-    """Jev validation for family-type relationships (spouse/parent/child/sibling)."""
+    """Jev validation for relationship claims: family types
+    (spouse/parent/child/sibling) first with three-tier outcomes,
+    then non-family types with drop-tier-only outcomes."""
 
     def _make_chapter_a(self, relationships):
         return {"characters": [], "relationships": relationships,
@@ -2780,7 +2782,16 @@ class TestRelationshipValidation(unittest.TestCase):
         self.assertEqual(dropped[0]["type"], "spouse")
         self.assertEqual(dropped[0]["validation_note"], "no_evidence")
 
-    def test_non_family_not_validated(self):
+    def test_non_family_validated_and_dropped(self):
+        # BAR-MOVE (non-family validation, 2026-10-17): this test used
+        # to pin friend claims never being validated. The stored
+        # Fourth Wing data showed what the exemption admits — pairs
+        # typed on quotes that do not involve the pair at all — so
+        # evidenced non-family claims are judged too, after the
+        # family pass. Two-tier outcome: below the drop threshold
+        # the claim drops; at or above it the type stands (the keep
+        # side is pinned in test_pair_evidence.py's
+        # TestNonFamilyValidation).
         calls = []
         class FakeValidator:
             model = "fake"
@@ -2792,9 +2803,13 @@ class TestRelationshipValidation(unittest.TestCase):
         chapter_as = {1: self._make_chapter_a(
             [self._rel("Alice", "Bob", "friend", "good friends")])}
         red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
-        self.assertEqual(len(calls), 0)  # friend is not validated
-        self.assertEqual(red["relationships"][0]["type"], "friend")
-        self.assertNotIn("validation_p", red["relationships"][0])
+        self.assertEqual(len(calls), 1)  # friend IS validated now
+        self.assertEqual(red["relationships"], [])
+        dropped = red["dropped_relationships"]
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(dropped[0]["type"], "friend")
+        self.assertEqual(dropped[0]["validation_p"], 0.1)
+        self.assertEqual(dropped[0]["validation_note"], "dropped")
 
     def test_validator_error_keeps_type(self):
         class FakeValidator:

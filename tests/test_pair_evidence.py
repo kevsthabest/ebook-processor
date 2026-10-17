@@ -466,5 +466,298 @@ class TestWritePayloadOrientation(unittest.TestCase):
         self.assertEqual(by_name["Alice"]["relationships"], [])
 
 
+_SEBECK_ROSTER = _roster(
+    ("Peter Sebeck", []),
+    ("Laura Sebeck", []),
+    ("Chris Sebeck", []),
+    ("Jon Ross", []),
+)
+
+
+class TestMinerSurnameForms(unittest.TestCase):
+    """Surname name forms: kinship stated through the bare surname.
+
+    Daemon run 16 regression set: the validator dropped a spouse
+    claim and a child claim whose evidence the grader could only
+    call co-occurrence, because the possessive in "Sebeck's son,
+    Chris" anchors on a surname the miner did not treat as a name
+    form."""
+
+    def test_surname_possessive_apposition_binds(self):
+        chs = _chs("Sebeck's son, Chris, stood next to him in the "
+                   "hospital corridor.")
+        hit = pp._mine_pair_evidence("Chris Sebeck", "Peter Sebeck",
+                                     chs, _SEBECK_ROSTER)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["grade"], "binding")
+
+    def test_surname_of_construction_binds(self):
+        chs = _chs("The son of Sebeck, Chris, had his father's hands.")
+        hit = pp._mine_pair_evidence("Chris Sebeck", "Peter Sebeck",
+                                     chs, _SEBECK_ROSTER)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["grade"], "binding")
+
+    def test_surname_anchor_does_not_bind_unrelated_pair(self):
+        # The same sentence mined for (Chris Sebeck, Jon Ross): the
+        # construction belongs to the Sebeck pair; Ross is never
+        # equated with the relative.
+        chs = _chs("Sebeck's son, Chris, stood next to him while Jon "
+                   "Ross waited outside.")
+        hit = pp._mine_pair_evidence("Chris Sebeck", "Jon Ross",
+                                     chs, _SEBECK_ROSTER)
+        self.assertIsNotNone(hit)
+        self.assertNotEqual(hit["grade"], "binding")
+        self.assertEqual(hit["grade"], "co-occurrence")
+
+    def test_shared_family_surname_still_binds(self):
+        # Design trade-off, pinned deliberately: for the pair
+        # (Laura Sebeck, Chris Sebeck) the same sentence grades
+        # binding — it equates Chris with a Sebeck child, and Laura
+        # is the pair's other endpoint. Which Sebeck the sentence
+        # means is the validator's question, not the grader's; the
+        # grader's job is that the sentence is establishing-shaped.
+        chs = _chs("Sebeck's son, Chris, stood next to him in the "
+                   "hospital corridor.")
+        hit = pp._mine_pair_evidence("Laura Sebeck", "Chris Sebeck",
+                                     chs, _SEBECK_ROSTER)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["grade"], "binding")
+
+    def test_surname_disabled_when_it_is_a_first_name_elsewhere(self):
+        # A roster character whose FIRST name is "Sebeck" makes the
+        # bare word more likely that person than the family name, so
+        # the surname form is withheld — the sentence then cannot
+        # even place Peter, and mining finds no candidate.
+        roster = _roster(("Peter Sebeck", []), ("Chris Sebeck", []),
+                         ("Sebeck Jones", []))
+        chs = _chs("Sebeck's son, Chris, stood next to him in the "
+                   "hospital corridor.")
+        self.assertIsNone(pp._mine_pair_evidence(
+            "Chris Sebeck", "Peter Sebeck", chs, roster))
+
+    def test_surname_presence_alone_is_plain(self):
+        chs = _chs("Sebeck met Chris at the precinct house.")
+        hit = pp._mine_pair_evidence("Chris Sebeck", "Peter Sebeck",
+                                     chs, _SEBECK_ROSTER)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["grade"], "plain")
+
+
+class _ScriptedValidator:
+    """Validator stub whose P is scripted per (from, to) pair."""
+
+    model = "stub"
+
+    def __init__(self, p_by_pair=None, default=0.95):
+        self.p_by_pair = p_by_pair or {}
+        self.default = default
+        self.calls = []
+
+    def validate_relationship(self, frm, to, rtype, quote, context=""):
+        self.calls.append((frm, to, rtype, quote))
+        return True, self.p_by_pair.get((frm, to), self.default)
+
+
+class TestNonFamilyValidation(unittest.TestCase):
+    """Non-family validation: friend/enemy/colleague claims are
+    judged too, on their extracted quote or a mined sentence.
+
+    Motivation (relationships audit, 2026-10-17): non-family claims
+    were never validated, and the stored Fourth Wing data carries
+    pairs typed on quotes that do not involve the pair at all.
+    Two-tier outcomes: at or above the drop threshold the type
+    stands; below it the claim drops. There is no downgrade tier —
+    a doubtful friend claim has no meaningful "other" to become."""
+
+    def setUp(self):
+        self._old_validator = pp._DECISION_VALIDATOR
+        pp._dm_budget_reset()
+        self.validator = _ScriptedValidator()
+        pp._DECISION_VALIDATOR = self.validator
+
+    def tearDown(self):
+        pp._DECISION_VALIDATOR = self._old_validator
+        pp._dm_budget_reset()
+
+    def _reduce(self, rels, chs=None, roster=None, preview=False):
+        chapter_as = {1: {"relationships": rels,
+                          "pov_character": None}}
+        return pp.v2_reduce(chapter_as, {}, roster or {},
+                            chs or _chs("x " * 200), preview=preview)
+
+    def test_junk_nonfamily_drops_in_write_mode(self):
+        self.validator.p_by_pair[("Alice", "Bob")] = 0.10
+        red = self._reduce([{
+            "from": "Alice", "to": "Bob", "type": "friend",
+            "evidence": "a quote about somebody else entirely"}])
+        self.assertEqual(red["relationships"], [])
+        dropped = red["dropped_relationships"]
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(dropped[0]["validation_note"], "dropped")
+        self.assertEqual(dropped[0]["validation_p"], 0.10)
+
+    def test_supported_nonfamily_kept(self):
+        self.validator.p_by_pair[("Alice", "Bob")] = 0.90
+        red = self._reduce([{
+            "from": "Alice", "to": "Bob", "type": "friend",
+            "evidence": "they were inseparable since childhood"}])
+        rel = red["relationships"][0]
+        self.assertEqual(rel["type"], "friend")
+        self.assertEqual(rel["validation_note"], "kept")
+        self.assertEqual(rel["validation_p"], 0.90)
+
+    def test_middle_band_nonfamily_keeps_its_type(self):
+        # 0.30 <= P < 0.70 would downgrade a FAMILY claim to
+        # "other"; a non-family claim keeps its type instead.
+        self.validator.p_by_pair[("Alice", "Bob")] = 0.50
+        red = self._reduce([{
+            "from": "Alice", "to": "Bob", "type": "enemy",
+            "evidence": "they glared at each other across the hall"}])
+        rel = red["relationships"][0]
+        self.assertEqual(rel["type"], "enemy")
+        self.assertEqual(rel["validation_note"], "kept")
+        self.assertEqual(red["dropped_relationships"], [])
+
+    def test_nonfamily_preview_records_would_drop(self):
+        self.validator.p_by_pair[("Alice", "Bob")] = 0.10
+        red = self._reduce([{
+            "from": "Alice", "to": "Bob", "type": "friend",
+            "evidence": "a quote about somebody else entirely"}],
+            preview=True)
+        rel = red["relationships"][0]
+        self.assertEqual(rel["validation_note"], "would_drop")
+        self.assertEqual(red["dropped_relationships"], [])
+
+    def test_evidenceless_nonfamily_judged_on_mined_sentence(self):
+        # No extracted quote: the judge weighs the mined both-names
+        # sentence — the interaction test a bare co-occurrence
+        # cannot pass on its own.
+        self.validator.p_by_pair[("Alice", "Bob")] = 0.10
+        chs = _chs("Alice met Bob at the market square.")
+        red = self._reduce([{
+            "from": "Alice", "to": "Bob", "type": "friend",
+            "evidence": ""}], chs=chs)
+        self.assertEqual(len(self.validator.calls), 1)
+        self.assertEqual(self.validator.calls[0][3],
+                         "Alice met Bob at the market square.")
+        self.assertEqual(red["relationships"], [])
+
+    def test_validated_evidenceless_nonfamily_still_written(self):
+        # A kept evidence-less claim must still receive its mined
+        # write evidence. Its "kept" note must not impose the
+        # family bar on the write pass (that bar is traced by the
+        # "downgraded" note, not by having been judged at all).
+        self.validator.p_by_pair[("Alice", "Bob")] = 0.95
+        chs = _chs("Alice met Bob at the market square.")
+        red = self._reduce([{
+            "from": "Alice", "to": "Bob", "type": "friend",
+            "evidence": ""}], chs=chs)
+        rel = red["relationships"][0]
+        self.assertEqual(rel["validation_note"], "kept")
+        self.assertEqual(rel["evidence"],
+                         "Alice met Bob at the market square.")
+        self.assertEqual(rel["evidence_source"], "mined")
+
+    def test_family_claims_claim_budget_first(self):
+        # One budget unit left, a friend claim listed BEFORE a
+        # parent claim: the family pass runs first, so the parent
+        # claim is judged and the friend claim is the one that
+        # reports budget_exhausted.
+        for _ in range(pp._MERGE_TIER3_CAP - 1):
+            self.assertTrue(pp._dm_budget_claim(1))
+        red = self._reduce([
+            {"from": "Alice", "to": "Bob", "type": "friend",
+             "evidence": "an evidenced friend claim"},
+            {"from": "Fen Riorson", "to": "Xaden Riorson",
+             "type": "parent", "evidence": "an evidenced parent claim"}],
+            roster=_FW_ROSTER)
+        self.assertEqual(len(self.validator.calls), 1)
+        self.assertEqual(self.validator.calls[0][2], "parent")
+        by_type = {r["type"]: r for r in red["relationships"]}
+        self.assertEqual(by_type["parent"]["validation_note"], "kept")
+        self.assertEqual(by_type["friend"]["validation_note"],
+                         "budget_exhausted")
+
+    def test_other_type_is_not_judged(self):
+        red = self._reduce([{
+            "from": "Alice", "to": "Bob", "type": "other",
+            "evidence": "some quote"}])
+        self.assertEqual(self.validator.calls, [])
+        self.assertNotIn("validation_note", red["relationships"][0])
+
+
+class TestValidatorPromptConstructions(unittest.TestCase):
+    """The validator prompt must teach the surname constructions.
+
+    Motivation: the pre-tune prompt scored "Sebeck's son, Chris"
+    at 0.20 in production while scoring "my sister" constructions
+    at 0.96 — the judge had never been told a surname alone names
+    a person, or that a possessive appositive states a relation.
+    These tests pin the guidance so a future prompt edit cannot
+    silently drop it (the live scores are gated by
+    evaluate-relationships.py against eval/relationship_cases.json).
+    """
+
+    def _instructions_for(self, frm, to, rtype, quote):
+        captured = {}
+        validator = pp.DecisionValidator.__new__(pp.DecisionValidator)
+
+        def _ask(kind, instructions, state, label=""):
+            captured["instructions"] = instructions
+            return 0.9
+
+        validator._ask_noul = _ask
+        validator.validate_relationship(frm, to, rtype, quote)
+        return captured["instructions"]
+
+    def test_prompt_teaches_surname_constructions(self):
+        text = self._instructions_for(
+            "Chris Sebeck", "Peter Sebeck", "child",
+            "Sebeck's son, Chris, stood next to him.")
+        self.assertIn("surname alone", text)
+        self.assertIn("Sebeck's son, Chris", text)
+        self.assertIn("judge the construction", text)
+
+    def test_prompt_rejects_third_person_binding(self):
+        text = self._instructions_for(
+            "Xaden Riorson", "Violet Sorrengail", "sibling",
+            "Violet thought of Brennan, her brother.")
+        self.assertIn("third person", text)
+
+
+class TestSurnameValidationIntegration(unittest.TestCase):
+    def setUp(self):
+        self._old_validator = pp._DECISION_VALIDATOR
+        pp._dm_budget_reset()
+        self.validator = _CapturingValidator()
+        pp._DECISION_VALIDATOR = self.validator
+
+    def tearDown(self):
+        pp._DECISION_VALIDATOR = self._old_validator
+        pp._dm_budget_reset()
+
+    def test_surname_binding_sentence_replaces_validator_quote(self):
+        # The Daemon run-16 child claim end to end: a topical
+        # original quote, a surname-anchored establishing sentence
+        # in the text — the validator must judge the mined sentence.
+        text = ("The hospital corridor was quiet. Sebeck's son, "
+                "Chris, stood next to him.")
+        chs = _chs(text)
+        chapter_as = {1: {"relationships": [{
+            "from": "Chris Sebeck", "to": "Peter Sebeck",
+            "type": "child", "evidence": "they were at the hospital"}],
+            "pov_character": None}}
+        red = pp.v2_reduce(chapter_as, {}, _SEBECK_ROSTER, chs,
+                           preview=False)
+        self.assertEqual(len(self.validator.calls), 1)
+        self.assertEqual(self.validator.calls[0][3],
+                         "Sebeck's son, Chris, stood next to him.")
+        rel = red["relationships"][0]
+        self.assertEqual(rel["evidence_grade"], "binding")
+        self.assertEqual(rel["validation_note"], "kept")
+        self.assertEqual(rel["type"], "child")
+
+
 if __name__ == "__main__":
     unittest.main()

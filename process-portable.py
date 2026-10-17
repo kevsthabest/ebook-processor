@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.7"
+PORTABLE_VERSION = "2.13.8"
 
 
 import argparse
@@ -1971,7 +1971,9 @@ def _pair_name_forms(name, roster):
     roster entry's canonical name and aliases, plus the first name —
     but only when that first name is unique across the roster (a
     shared first name could denote the other character and is never
-    used). Without a roster entry, only the full name is trusted."""
+    used). The surname rides separately (see _pair_surname_form):
+    it needs its own guards and its own match rule in the miner.
+    Without a roster entry, only the full name is trusted."""
     forms = {name} if name else set()
     if not roster or not name:
         return forms
@@ -2006,6 +2008,54 @@ def _pair_name_forms(name, roster):
         if not shared:
             forms.add(first)
     return forms
+
+
+def _pair_surname_form(name, roster):
+    """The endpoint's surname as a mining form, or None.
+
+    English states kinship through the bare surname constantly —
+    "Sebeck's son, Chris" anchors the possessive on the surname
+    alone. Without it that construction can never grade binding,
+    so true family claims reach the validator looking unproven and
+    die there (Daemon run 16: a spouse and a child claim dropped
+    on exactly this). Unlike the first name, the surname is NOT
+    required to be roster-unique: sharing it is what family means,
+    and grading is per pair, so a shared surname can only ever
+    bind the pair actually being mined. It is withheld when
+    another roster character's first name is that word — then the
+    bare word more likely names that person than this one's
+    family — or when the word is itself a kinship marker or an
+    initial. The miner additionally refuses a surname occurrence
+    that is merely the tail of the OTHER endpoint's full name
+    ("Fen Riorson" does not place Xaden Riorson in a sentence)."""
+    if not roster or not name:
+        return None
+    entry = None
+    for e in roster.values():
+        if norm_name(e.get("name", "")) == norm_name(name):
+            entry = e
+            break
+    if entry is None:
+        return None
+    parts = entry["name"].split()
+    if len(parts) < 2:
+        return None
+    first, surname = parts[0], parts[-1]
+    if (surname == first or len(surname) < 2
+            or not surname[-1].isalpha()
+            or surname.lower() in _PAIR_MARKERS):
+        return None
+    for e in roster.values():
+        if e is entry:
+            continue
+        eparts = e.get("name", "").split()
+        if eparts and eparts[0] == surname:
+            return None
+        for a in e.get("aliases", []):
+            aparts = a.split()
+            if a == surname or (aparts and aparts[0] == surname):
+                return None
+    return surname
 
 
 def _forms_re(forms):
@@ -2097,10 +2147,39 @@ def _mine_pair_evidence(from_name, to_name, chapters, roster=None):
     Deterministic ranking: grade first (binding > co-occurrence >
     plain), then earliest chapter, then shortest sentence, then
     earliest position in the chapter."""
-    re_a = _forms_re(_pair_name_forms(from_name, roster))
-    re_b = _forms_re(_pair_name_forms(to_name, roster))
+    forms_a = _pair_name_forms(from_name, roster)
+    forms_b = _pair_name_forms(to_name, roster)
+    re_a = _forms_re(forms_a)
+    re_b = _forms_re(forms_b)
     if re_a is None or re_b is None:
         return None
+    # Surname-augmented patterns: grading uses them so a possessive
+    # anchored on the bare surname ("Sebeck's son, Chris") can bind.
+    _sn_a = _pair_surname_form(from_name, roster)
+    _sn_b = _pair_surname_form(to_name, roster)
+    aug_a = _forms_re(forms_a | {_sn_a}) if _sn_a else re_a
+    aug_b = _forms_re(forms_b | {_sn_b}) if _sn_b else re_b
+
+    def _appears(text, strict, aug, other_strict):
+        """True when an endpoint is placed in the text. A strict
+        form anywhere suffices. A surname-only match counts only
+        when it is not the tail of the other endpoint's full name —
+        "Fen Riorson" in a sentence does not place Xaden Riorson
+        there, but the standalone "Sebeck" in "Sebeck's son,
+        Chris" places Peter Sebeck."""
+        if strict.search(text):
+            return True
+        if aug is strict:
+            return False
+        other_spans = ([m.span() for m in other_strict.finditer(text)]
+                       if other_strict is not None else [])
+        for m in aug.finditer(text):
+            s, e = m.span()
+            if any(s >= os_ and e <= oe for os_, oe in other_spans):
+                continue
+            return True
+        return False
+
     _rank = {"binding": 0, "co-occurrence": 1, "plain": 2}
     best = None  # (key, hit)
     for c in chapters or []:
@@ -2108,15 +2187,17 @@ def _mine_pair_evidence(from_name, to_name, chapters, roster=None):
         if not text:
             continue
         # Cheap pre-filter: both endpoints must appear in the chapter.
-        if not (re_a.search(text) and re_b.search(text)):
+        if not (_appears(text, re_a, aug_a, re_b)
+                and _appears(text, re_b, aug_b, re_a)):
             continue
         idx = c.get("index", 0)
         for pos, sentence in enumerate(_split_sentences(text)):
             if len(sentence) > _PAIR_MAX_SENTENCE:
                 continue
-            if not (re_a.search(sentence) and re_b.search(sentence)):
+            if not (_appears(sentence, re_a, aug_a, re_b)
+                    and _appears(sentence, re_b, aug_b, re_a)):
                 continue
-            grade = _pair_sentence_grade(sentence, re_a, re_b)
+            grade = _pair_sentence_grade(sentence, aug_a, aug_b)
             key = (_rank[grade], idx, len(sentence), pos)
             if best is None or key < best[0]:
                 best = (key, {"sentence": sentence, "grade": grade,
@@ -2576,21 +2657,32 @@ class DecisionValidator:
 
     def validate_relationship(self, from_name, to_name, rel_type, quote,
                               context=""):
-        """Judge whether a quote supports a family relationship claim.
+        """Judge whether a quote supports a relationship claim.
 
-        Used for high-stakes types (spouse/parent/child/sibling) where a
-        wrong label is embarrassing. Returns (verdict_bool, p_yes).
-        (None, None) on any error, in which case the caller keeps the
-        original type (fail open: a validator outage shouldn't rewrite data).
+        Built for the high-stakes family types (spouse/parent/
+        child/sibling) where a wrong label is embarrassing; it also
+        judges non-family claims, whose stored data showed the same
+        failure — pairs typed on quotes that do not involve the
+        pair. Returns (verdict_bool, p_yes). (None, None) on any
+        error, in which case the caller keeps the original type
+        (fail open: a validator outage shouldn't rewrite data).
         """
         _instructions = (
             f"Given the quote, is {from_name} the {rel_type} of {to_name}? "
             f"Answer YES when: the quote directly states or clearly implies "
             f"this {rel_type} relationship (e.g. 'my wife', 'his mother', "
-            f"'her brother'). "
-            f"Answer NO when: the quote is ambiguous, describes a different "
-            f"relationship (friend, lover, mistress, colleague, enemy), or "
-            f"does not support the claimed {rel_type} relationship."
+            f"'her brother'). A person may be referred to by full name, "
+            f"first name, surname alone, or a pronoun the quote makes "
+            f"clear. A possessive construction that names one person's "
+            f"relative with the relative alongside — 'Sebeck's son, "
+            f"Chris', 'the son of Sebeck, Chris' — states the "
+            f"relationship just as directly; judge the construction, "
+            f"not which name form is used. "
+            f"Answer NO when: the quote is ambiguous, describes a "
+            f"different relationship than the one claimed, or does not "
+            f"support the claimed {rel_type} relationship. A quote that "
+            f"binds a relative to a third person does not support a "
+            f"claim about this pair."
         )
         _state = f"Quote:\n{quote}"
         if context:
@@ -2602,7 +2694,12 @@ class DecisionValidator:
         if p_yes >= _REL_VALIDATION_THRESHOLD:
             _action = "keep"
         elif p_yes >= _REL_DROP_THRESHOLD:
-            _action = "downgrade to other"
+            # Family claims downgrade to "other" in this band;
+            # non-family claims simply keep their type — the caller
+            # applies the band by type, and the printed action must
+            # not claim a downgrade that will not happen.
+            _action = ("downgrade to other"
+                       if rel_type in _REL_FAMILY_TYPES else "keep")
         else:
             _action = "drop"
         print(f"  Relationship validation: {from_name[:30]} -> "
@@ -14494,6 +14591,57 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             rel["validation_note"] = "dropped" if not preview else "would_drop"
             if not preview:
                 _dropped_relationships.append(rel)
+    # --- Non-family validation ---
+    # Family claims are not the only ones that can be invented.
+    # Friend/enemy/colleague claims were never judged at all, and
+    # the stored Fourth Wing data shows what that admits: pairs
+    # typed on quotes that do not involve the pair, and pairs whose
+    # only support is a mined sentence where the two names merely
+    # co-occur. So every non-family claim that HAS evidence to
+    # judge — its extracted quote, or a mined both-names sentence
+    # when it has no quote — is judged here, after the family pass
+    # so family claims claim budget first. The outcome is
+    # deliberately two-tier: a claim the judge firmly rejects
+    # (below the drop threshold) drops like a family hallucination;
+    # anything above it keeps its type, because for non-family
+    # types there is no "other" worth downgrading into — a doubtful
+    # friend claim is either still a friend claim or it is nothing.
+    # "other" claims are skipped: the judge cannot weigh a claim
+    # with no type to weigh (downgraded family claims land there
+    # too, already judged). Evidence-less, unmineable claims are
+    # left untouched: with nothing to judge, the write pass's
+    # mined-evidence rules decide them, as before.
+    if _DECISION_VALIDATOR is not None:
+        for rel in relationships:
+            _rt = rel.get("type", "")
+            if _rt in _REL_FAMILY_TYPES or _rt == "other":
+                continue
+            _ev = (rel.get("evidence") or "").strip()
+            if not _ev:
+                _mined = _mine(rel["from"], rel["to"])
+                if _mined:
+                    _ev = _mined["sentence"]
+                    rel["evidence_grade"] = _mined["grade"]
+            if not _ev:
+                continue
+            if not _dm_budget_claim(1):
+                rel["validation_note"] = "budget_exhausted"
+                continue
+            _v, _p = _DECISION_VALIDATOR.validate_relationship(
+                rel["from"], rel["to"], _rt, _ev)
+            if _p is None:
+                # Validator error: fail open, as for family claims.
+                rel["validation_note"] = "validator_error"
+                continue
+            rel["validation_p"] = round(_p, 4)
+            rel["validation_model"] = _DECISION_VALIDATOR.model
+            if _p >= _REL_DROP_THRESHOLD:
+                rel["validation_note"] = "kept"
+            else:
+                rel["validation_note"] = ("dropped" if not preview
+                                          else "would_drop")
+                if not preview:
+                    _dropped_relationships.append(rel)
     if _dropped_relationships:
         _drop_ids = {id(r) for r in _dropped_relationships}
         relationships = [r for r in relationships if id(r) not in _drop_ids]
@@ -14512,8 +14660,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     # sentence (the same bar as validation); non-family claims accept
     # any both-names sentence (it evidences the interaction itself).
     # Claims that went through family validation keep the family bar
-    # even after a downgrade changed their type to "other" (their
-    # validation_note is the trace). Mined evidence is marked
+    # even after a downgrade changed their type to "other" — the
+    # trace is specifically the "downgraded" note, not any note: a
+    # claim judged by the non-family pass carries notes too, and
+    # merely having been judged must not impose a bar it was never
+    # under. Mined evidence is marked
     # evidence_source="mined" so provenance survives into the preview
     # and the write payload; claims with original evidence are
     # untouched.
@@ -14524,7 +14675,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         if not _mined:
             continue
         _family_bar = (rel.get("type") in _REL_FAMILY_TYPES
-                       or "validation_note" in rel)
+                       or rel.get("validation_note") == "downgraded")
         if _family_bar and _mined["grade"] != "binding":
             continue
         rel["evidence"] = _mined["sentence"]
@@ -16997,18 +17148,22 @@ _COMMON_NICKNAMES = {
 _MERGE_P_YES_THRESHOLD = 0.85
 # Safety cap on Tier 3 decision-model calls per book.
 _MERGE_TIER3_CAP = 50
-# Decision-model relationship validation threshold (family types only).
-# Lower than the merge threshold: a wrong relationship type is embarrassing
-# but doesn't corrupt the roster permanently.
+# Decision-model relationship validation threshold. Lower than the
+# merge threshold: a wrong relationship type is embarrassing but
+# doesn't corrupt the roster permanently.
 _REL_VALIDATION_THRESHOLD = 0.70
-# Decision-model relationship DROP threshold (family types only).
-# Three-tier logic: P >= 0.70 keeps the type; 0.30 <= P < 0.70 downgrades
-# to "other" (relationship exists, type uncertain); P < 0.30 drops the
-# relationship entirely (likely hallucinated, not just mistyped).
+# Decision-model relationship DROP threshold. Family claims use
+# three-tier logic: P >= 0.70 keeps the type; 0.30 <= P < 0.70
+# downgrades to "other" (relationship exists, type uncertain);
+# P < 0.30 drops the claim entirely (likely hallucinated, not just
+# mistyped). Non-family claims use only the drop tier: at or above
+# it the type stands, below it the claim drops — there is no
+# meaningful "other" to downgrade a doubtful friend claim into.
 _REL_DROP_THRESHOLD = 0.30
-# Family relationship types validated by the decision model. High-stakes:
-# being wrong about spouse/parent/child/sibling is worse than being wrong
-# about friend/enemy/colleague.
+# Family relationship types: validated first and held to the
+# three-tier outcomes above. High-stakes: being wrong about
+# spouse/parent/child/sibling is worse than being wrong about
+# friend/enemy/colleague.
 _REL_FAMILY_TYPES = frozenset({"spouse", "parent", "child", "sibling"})
 
 # ---------------------------------------------------------------------------
