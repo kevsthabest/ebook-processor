@@ -330,7 +330,13 @@ class TestDedupePreservesRelationships(_WriteBase):
         self.assertEqual(hero[0]["relationships"], [{
             "to": "Mentor", "type": "mentor",
             "evidence": "Hero trained under Mentor for a decade.",
-            "evidence_source": "extracted"}])
+            "evidence_source": "extracted",
+            # Added 2026-10-17 (2.13.20, spec §1.5): stored rows
+            # carry curation state + provenance. This hand-built
+            # claim was never judged, so review_required is the
+            # honest state.
+            "validation_state": "review_required",
+            "source": "extracted"}])
 
     def test_merging_cluster_unions_member_fields(self):
         canon = _char(

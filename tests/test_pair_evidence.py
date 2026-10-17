@@ -347,7 +347,13 @@ class TestWriteEvidenceIntegration(unittest.TestCase):
         self.assertEqual(rel_map["alice"], [{
             "to": "Bob", "type": "friend",
             "evidence": "Alice met Bob at the market square.",
-            "evidence_source": "mined"}])
+            "evidence_source": "mined",
+            # Added 2026-10-17 (2.13.20, spec §1.5): the stored row
+            # now carries the claim's curation state and provenance
+            # too. No validator ran in this test, so the claim was
+            # never judged — review_required is the honest state.
+            "validation_state": "review_required",
+            "source": "extracted"}])
 
     def test_evidenceless_family_cooccurrence_drops(self):
         # BAR-MOVE (family fail-closed, 2026-10-14): this test used to
@@ -443,7 +449,13 @@ class TestWritePayloadOrientation(unittest.TestCase):
         by_name = {r["name"]: r for r in rows}
         self.assertEqual(by_name["Alice"]["relationships"],
                          [{"to": "Bob", "type": "child",
-                           "evidence": "ev1"}])
+                           "evidence": "ev1",
+                           # Added 2026-10-17 (2.13.20, spec §1.5):
+                           # stored rows carry curation state +
+                           # provenance; no validator ran here, so
+                           # the claim is honestly review_required.
+                           "validation_state": "review_required",
+                           "source": "extracted"}])
         self.assertEqual(by_name["Bob"]["relationships"], [])
         total = sum(len(r["relationships"]) for r in rows)
         self.assertEqual(total, 1)
@@ -462,7 +474,12 @@ class TestWritePayloadOrientation(unittest.TestCase):
         by_name = {r["name"]: r for r in rows}
         self.assertEqual(by_name["Bob"]["relationships"],
                          [{"to": "Alice", "type": "mentor",
-                           "evidence": "ev"}])
+                           "evidence": "ev",
+                           # Added 2026-10-17 (2.13.20, spec §1.5):
+                           # as in the parent case above — state +
+                           # provenance ride the stored row.
+                           "validation_state": "review_required",
+                           "source": "extracted"}])
         self.assertEqual(by_name["Alice"]["relationships"], [])
 
 
@@ -670,7 +687,16 @@ class TestNonFamilyValidation(unittest.TestCase):
         # claim is now measured against the general pool
         # (cap - floor), not the whole cap. The property under
         # test — family claims before non-family — is unchanged.
-        for _ in range(pp._MERGE_TIER3_CAP - pp._TRIGGER_GATE_FLOOR - 1):
+        # Amended again 2026-10-17 (2.13.20): hard reserves (spec
+        # §1.3) replaced the single floor, and an untagged drain
+        # now stops at the general pool — so "one unit left" is
+        # set up by releasing every reserve (all stages finished)
+        # and draining the pool itself to one unit. The property
+        # under test and the assertions below are unchanged;
+        # reserve discipline is pinned in test_budget_reserves.py.
+        for _c in pp._DM_BUDGET_ORDER:
+            pp._dm_budget_finish(_c)
+        for _ in range(pp._MERGE_TIER3_CAP - 1):
             self.assertTrue(pp._dm_budget_claim(1))
         red = self._reduce([
             {"from": "Alice", "to": "Bob", "type": "friend",

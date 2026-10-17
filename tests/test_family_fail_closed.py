@@ -126,6 +126,12 @@ class TestFamilyFailClosed(unittest.TestCase):
         # side — quoted claim + exhausted budget survives with
         # "budget_exhausted" — is pinned in test_budget.py's
         # TestBudgetExhaustionNote.)
+        # Amended 2026-10-17 (2.13.20): hard reserves (spec §1.3)
+        # cap an untagged drain at the general pool, so draining
+        # the whole pool first releases every reserve. Assertions
+        # unchanged.
+        for _c in pp._DM_BUDGET_ORDER:
+            pp._dm_budget_finish(_c)
         for _ in range(pp._MERGE_TIER3_CAP):
             self.assertTrue(pp._dm_budget_claim(1))
         self.assertFalse(pp._dm_budget_claim(1))

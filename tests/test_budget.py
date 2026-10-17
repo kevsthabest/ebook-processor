@@ -18,9 +18,22 @@ pp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(pp)
 
 
+def _finish_all_consumers():
+    # Amended 2026-10-17 (2.13.20): hard reserves (spec §1.3) mean a
+    # claim on a fresh budget can only spend the general pool plus
+    # its own reserve until the other consumers finish. The classes
+    # below pin the per-book CEILING, so their setup declares every
+    # pipeline stage finished — reserves released — and their
+    # assertions are unchanged. Reserve discipline itself is
+    # pinned in test_budget_consumers.py / test_budget_reserves.py.
+    for _c in pp._DM_BUDGET_ORDER:
+        pp._dm_budget_finish(_c)
+
+
 class TestBudgetBasics(unittest.TestCase):
     def setUp(self):
         pp._dm_budget_reset()
+        _finish_all_consumers()
 
     def test_cap_is_50(self):
         self.assertEqual(pp._MERGE_TIER3_CAP, 50)
@@ -58,6 +71,7 @@ class TestBudgetPriority(unittest.TestCase):
 
     def setUp(self):
         pp._dm_budget_reset()
+        _finish_all_consumers()  # see _finish_all_consumers (2.13.20)
 
     def test_merges_exhaust_starves_validation(self):
         # Simulate 50 merge decisions consuming the entire budget
@@ -102,6 +116,7 @@ class TestBudgetExhaustionNote(unittest.TestCase):
     def setUp(self):
         self._old_validator = pp._DECISION_VALIDATOR
         pp._dm_budget_reset()
+        _finish_all_consumers()  # see _finish_all_consumers (2.13.20)
         self.calls = []
 
         outer = self

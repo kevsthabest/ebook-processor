@@ -521,8 +521,16 @@ class TestTier3BudgetClaims(unittest.TestCase):
         # cap. The property under test — one claim per real call,
         # exhaustion after exactly the remaining units — is
         # unchanged, measured against the consumer's ceiling.
+        # Amended again 2026-10-17 (2.13.20): hard reserves (spec
+        # §1.3) — the drain now runs as merge_tier3 claims with the
+        # other validation reserves released (they are not what
+        # this test measures), leaving the trigger reserve as the
+        # merge ceiling, exactly the quantity the assertions use.
+        for _c in ("rel_family", "rel_nonfamily", "quote_poll"):
+            pp._dm_budget_finish(_c)
         self.assertTrue(pp._dm_budget_claim(
-            pp._MERGE_TIER3_CAP - pp._TRIGGER_GATE_FLOOR - 1))
+            pp._MERGE_TIER3_CAP - pp._TRIGGER_GATE_FLOOR - 1,
+            consumer="merge_tier3"))
         stub = _StubSamePerson([(False, 0.2)] * 3)
         n, possible = pp.post_pass_merge(_jon_roster(), validator=stub)
         self.assertEqual(len(stub.calls), 1)
@@ -587,6 +595,12 @@ class TestTriggerGateBudget(unittest.TestCase):
     def test_budget_out_mid_gate_falls_back_to_regex(self):
         # One claim left: exactly one quote is judged; the category
         # then falls back to the regex gates (not silently trusted).
+        # Amended 2026-10-17 (2.13.20): hard reserves (spec §1.3)
+        # cap an untagged drain at the general pool, so leaving
+        # exactly one claim first releases every reserve.
+        # Assertions unchanged.
+        for _c in pp._DM_BUDGET_ORDER:
+            pp._dm_budget_finish(_c)
         self.assertTrue(pp._dm_budget_claim(pp._MERGE_TIER3_CAP - 1))
         red = self._reduce_two_quote_category()
         self.assertEqual(len(self.calls), 1)

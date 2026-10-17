@@ -163,6 +163,13 @@ class TestBudgetEvents(_SinkCase):
         self.assertTrue(all(e["cap"] == pp._MERGE_TIER3_CAP for e in evs))
 
     def test_refused_claim_emits_granted_false(self):
+        # Amended 2026-10-17 (2.13.20): hard reserves (spec §1.3)
+        # cap an untagged claim at the general pool while named
+        # consumers are unfinished, so claiming the whole cap in
+        # one call first releases every reserve. The event
+        # assertions below are unchanged.
+        for _c in pp._DM_BUDGET_ORDER:
+            pp._dm_budget_finish(_c)
         self.assertTrue(pp._dm_budget_claim(pp._MERGE_TIER3_CAP))
         self.assertFalse(pp._dm_budget_claim(1))
         last = self._decision_events()[-1]
@@ -182,6 +189,14 @@ class TestBudgetEvents(_SinkCase):
         # emit inside the budget lock, the file order of `used` is
         # the claim order: exactly 1..N.
         import threading
+
+        # Amended 2026-10-17 (2.13.20): hard reserves (spec §1.3)
+        # cap untagged claims at the general pool (9) while named
+        # consumers are unfinished; this test needs 40 granted
+        # claims, so it releases every reserve first. The atomicity
+        # property under test is unchanged.
+        for _c in pp._DM_BUDGET_ORDER:
+            pp._dm_budget_finish(_c)
 
         def worker():
             for _ in range(10):

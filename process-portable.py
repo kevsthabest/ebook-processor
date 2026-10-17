@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.19"
+PORTABLE_VERSION = "2.13.20"
 
 
 import argparse
@@ -14243,6 +14243,9 @@ def post_pass_merge(roster, validator=None):
                 "name_a": _na, "name_b": _nb,
                 "p_yes": round(_p, 4) if _p is not None else None,
                 "reason": f"below threshold ({_MERGE_P_YES_THRESHOLD})"})
+    # The merge stage is done: its unused budget reserve becomes
+    # borrowable by the validation stages that follow (spec §1.3).
+    _dm_budget_finish("merge_tier3")
     return n_merged, possible_merges
 
 
@@ -14345,6 +14348,60 @@ def _is_minor(role, description):
     """True if role/description indicates a child/teen. Word-boundary match."""
     text = f"{role or ''} {description or ''}"
     return bool(_MINOR_RE.search(text))
+
+
+_REL_CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+
+def _validation_order_key(rel, index, principal_names):
+    """Sort key for one relationship claim under the §1.2 priority
+    order (see _VALIDATION_ORDER_ID). Family claims sort before
+    non-family; within family, stakes rank first (_REL_PRECEDENCE:
+    spouse, then parent/child, then sibling); principal pairs
+    (both endpoints principal) before minor pairs within each
+    group; then extractor confidence ascending, provisionally
+    (Decision K1). The stored index is the final tie-breaker so
+    the order is deterministic. Principal status uses the same
+    principal filter the run applies downstream, so "principal
+    pair" here means the same pairs the coverage metric counts."""
+    _rt = rel.get("type", "")
+    _is_family = 0 if _rt in _REL_FAMILY_TYPES else 1
+    # Stakes rank applies within family only — the spec gives
+    # non-family claims no stakes order, so they all share rank 0
+    # and fall through to the principal/confidence keys.
+    _stakes = _REL_PRECEDENCE.get(_rt, 99) if not _is_family else 0
+    if principal_names is None:
+        _principal = 0
+    else:
+        _principal = 0 if (
+            norm_name(rel.get("from", "")) in principal_names
+            and norm_name(rel.get("to", "")) in principal_names) else 1
+    _conf = _REL_CONFIDENCE_ORDER.get(
+        str(rel.get("confidence") or "").lower(), 1)
+    return (_is_family, _stakes, _principal, _conf, index)
+
+
+def _rel_validation_state(rel):
+    """The claim's curation state under the internal state names
+    (spec §1.5): validated / budget_exhausted / validator_error /
+    review_required / rejected. Derived from the validation note
+    the pipeline recorded: a claim the judge scored and kept (or
+    downgraded) is validated; a claim the judge firmly rejected
+    (dropped / would_drop, or a family claim with no evidence at
+    all — fail-closed is a rejection, not an oversight) is
+    rejected; a claim nobody judged — no validator configured, no
+    evidence to judge, "other" type, or a family-guard disposal —
+    is review_required, because a human must decide it instead."""
+    _note = rel.get("validation_note") or ""
+    if _note in ("kept", "downgraded"):
+        return "validated"
+    if _note == "budget_exhausted":
+        return "budget_exhausted"
+    if _note == "validator_error":
+        return "validator_error"
+    if _note in ("dropped", "would_drop", "no_evidence"):
+        return "rejected"
+    return "review_required"
 
 
 def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
@@ -14537,6 +14594,13 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 "evidence_offered": bool(r.get("evidence")),
                 "chapter": idx_to_label.get(idx, ""),
                 "_idx": idx,
+                # Claim provenance (spec §1.5): every claim this
+                # pipeline creates came from extraction, and the
+                # marker rides the claim through every later stage
+                # (validation, preview, write) so curation can
+                # always tell an extracted claim from a discovered
+                # or human one.
+                "source": r.get("source") or "extracted",
             }
             # Option B: endpoint identity alongside the name strings,
             # only for endpoints the seam assigned (flag on).
@@ -14678,7 +14742,64 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             return ""
         return f"Sentences around the quote, from the same passage: {_w}"
 
-    for rel in relationships:
+    # Validation priority order (spec §1.2, Decision K1): validation
+    # no longer walks the stored list order. Both passes below walk
+    # claims sorted by _validation_order_key — family before
+    # non-family is structural (two passes), and within each pass
+    # stakes, principal-before-minor, and provisional
+    # confidence-ascending decide who reaches the judge first when
+    # the budget runs out. The stored list order itself is not
+    # changed; only the judging order is.
+    try:
+        _principal_chars, _, _ = _filter_principals(
+            characters, relationships,
+            CONFIG.get("min_frequency", 0.20))
+        _principal_names = {norm_name(c.get("name", ""))
+                            for c in _principal_chars}
+        _principal_names.discard("")
+    except Exception:
+        _principal_names = set()
+    _ordered_rels = [rel for _, rel in sorted(
+        enumerate(relationships),
+        key=lambda t: _validation_order_key(
+            t[1], t[0], _principal_names))]
+    # Validator-error accounting for the §1.6 circuit breaker:
+    # attempts counts claims the judge was asked to decide (a
+    # claim denied budget was never attempted; a claim with no
+    # evidence was never attempted); errors counts claims whose
+    # final outcome — after the one allowed retry — is an error.
+    _val_stats = {"attempts": 0, "errors": 0}
+
+    def _judge_relationship(rel, rtype, ev, ctx, consumer):
+        """Judge one relationship claim, claiming budget per call.
+
+        Returns (p, "ok") for a successful judgment. Failures
+        return (None, why): "budget" when the pool denied the
+        claim's call, "error" when a validator error survived
+        its one retry (spec §1.6). A failed judgment is never
+        returned as a successful one.
+        Retries claim budget again — a retry is a real second
+        call, and accounting that hid it would understate spend
+        exactly where the budget is tightest."""
+        if not _dm_budget_claim(1, consumer=consumer):
+            return None, "budget"
+        _val_stats["attempts"] += 1
+        _v, _p = _DECISION_VALIDATOR.validate_relationship(
+            rel["from"], rel["to"], rtype, ev, context=ctx)
+        if _p is not None:
+            return _p, "ok"
+        # One retry per claim (Decision K4). If the retry cannot
+        # claim budget, the claim stands as an error — the retry
+        # was owed a call the pool could not give.
+        if _dm_budget_claim(1, consumer=consumer):
+            _v, _p = _DECISION_VALIDATOR.validate_relationship(
+                rel["from"], rel["to"], rtype, ev, context=ctx)
+            if _p is not None:
+                return _p, "ok"
+        _val_stats["errors"] += 1
+        return None, "error"
+
+    for rel in _ordered_rels:
         _rt = rel.get("type", "")
         if _rt not in _REL_FAMILY_TYPES:
             continue
@@ -14714,17 +14835,19 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             continue
         if _DECISION_VALIDATOR is None:
             continue  # no validator configured; leave as-is
-        if not _dm_budget_claim(1, consumer="rel_family"):
-            rel["validation_note"] = "budget_exhausted"
-            continue
         _ctx = _validation_context(
             _ev, rel,
             _mined["chapter"] if (rel.get("evidence_mined")
                                   and _mined) else None)
-        _v, _p = _DECISION_VALIDATOR.validate_relationship(
-            rel["from"], rel["to"], _rt, _ev, context=_ctx)
+        _p, _outcome = _judge_relationship(
+            rel, _rt, _ev, _ctx, "rel_family")
+        if _outcome == "budget":
+            rel["validation_note"] = "budget_exhausted"
+            continue
         if _p is None:
-            # Validator error: fail open, keep the original type.
+            # Validator error (after its one retry): fail open,
+            # keep the original type, and record the failure as a
+            # failure — never as a successful judgment.
             rel["validation_note"] = "validator_error"
             continue
         rel["validation_p"] = round(_p, 4)
@@ -14740,6 +14863,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             rel["validation_note"] = "dropped" if not preview else "would_drop"
             if not preview:
                 _dropped_relationships.append(rel)
+    # The family stage is done: its unused reserve becomes
+    # borrowable by the non-family pass and everything after it
+    # (spec §1.3).
+    _dm_budget_finish("rel_family")
     # --- Non-family validation ---
     # Family claims are not the only ones that can be invented.
     # Friend/enemy/colleague claims were never judged at all, and
@@ -14761,7 +14888,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     # left untouched: with nothing to judge, the write pass's
     # mined-evidence rules decide them, as before.
     if _DECISION_VALIDATOR is not None:
-        for rel in relationships:
+        for rel in _ordered_rels:
             _rt = rel.get("type", "")
             if _rt in _REL_FAMILY_TYPES or _rt == "other":
                 continue
@@ -14774,15 +14901,16 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                     rel["evidence_grade"] = _mined["grade"]
             if not _ev:
                 continue
-            if not _dm_budget_claim(1, consumer="rel_nonfamily"):
-                rel["validation_note"] = "budget_exhausted"
-                continue
             _ctx = _validation_context(
                 _ev, rel, _mined["chapter"] if _mined else None)
-            _v, _p = _DECISION_VALIDATOR.validate_relationship(
-                rel["from"], rel["to"], _rt, _ev, context=_ctx)
+            _p, _outcome = _judge_relationship(
+                rel, _rt, _ev, _ctx, "rel_nonfamily")
+            if _outcome == "budget":
+                rel["validation_note"] = "budget_exhausted"
+                continue
             if _p is None:
-                # Validator error: fail open, as for family claims.
+                # Validator error (after its one retry): fail
+                # open, as for family claims.
                 rel["validation_note"] = "validator_error"
                 continue
             rel["validation_p"] = round(_p, 4)
@@ -14803,6 +14931,36 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # Audit trail only: these claims lost to a family claim for the
         # same pair (family guard above); they were never emitted.
         _dropped_relationships.extend(_guard_suppressed)
+    # The non-family stage is done: its unused reserve becomes
+    # borrowable by the trigger gate and the quote poll (spec §1.3).
+    _dm_budget_finish("rel_nonfamily")
+    # Validator-error circuit breaker (spec §1.6, Decision K4):
+    # the book's error rate over the claims validation actually
+    # attempted. The breaker trips only at or above the minimum
+    # sample — a rate computed on a handful of claims is noise,
+    # not a verdict on the validator. When it trips, the write
+    # stage skips this book's replace-wholesale write entirely
+    # (enforced in write_claims and at the process_file_v2 write
+    # gate); the record below rides the result into the preview
+    # and the run history so the skip is never silent.
+    _val_attempts = _val_stats["attempts"]
+    _val_errors = _val_stats["errors"]
+    _val_rate = (_val_errors / _val_attempts) if _val_attempts else 0.0
+    _validator_breaker = {
+        "tripped": bool(_val_attempts >= _VALIDATOR_ERROR_MIN_SAMPLE
+                        and _val_rate >= _VALIDATOR_ERROR_THRESHOLD),
+        "attempts": _val_attempts,
+        "errors": _val_errors,
+        "error_rate": round(_val_rate, 4),
+        "threshold": _VALIDATOR_ERROR_THRESHOLD,
+        "min_sample": _VALIDATOR_ERROR_MIN_SAMPLE,
+    }
+    if _validator_breaker["tripped"]:
+        print(f"  Validator circuit breaker TRIPPED: {_val_errors}/"
+              f"{_val_attempts} relationship judgments errored "
+              f"(rate {_val_rate:.2f} >= {_VALIDATOR_ERROR_THRESHOLD}); "
+              f"this book's write will be SKIPPED and its previous "
+              f"rows left untouched")
 
     # --- Mined write evidence for evidence-less survivors ---
     # A surviving claim with no extracted quote would be skipped at
@@ -14835,6 +14993,23 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         rel["evidence_grade"] = _mined["grade"]
         if _mined["grade"] == "binding":
             rel.setdefault("evidence_mined", _mined["sentence"])
+
+    # Curation state + provenance (spec §1.5): every surviving and
+    # dropped claim is stamped with its internal state name, so
+    # the state is visible wherever claims are presented for
+    # curation (preview JSON, preview Markdown, the write payload)
+    # — unverified claims (budget_exhausted / validator_error)
+    # keep their type and ship with their state showing, and
+    # there is NO per-book cap on them. Provenance was stamped at
+    # extraction ("extracted"); the setdefault here preserves any
+    # provenance a claim already carries (discovered / human)
+    # rather than overwriting it.
+    for rel in relationships:
+        rel.setdefault("source", "extracted")
+        rel["validation_state"] = _rel_validation_state(rel)
+    for rel in _dropped_relationships:
+        rel.setdefault("source", "extracted")
+        rel["validation_state"] = _rel_validation_state(rel)
 
     if show_matrices:
         print(_rel_confidence_ascii(relationships))
@@ -14975,6 +15150,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         })
     if _gated_dropped:
         print(f"  Trigger gate: dropped {_gated_dropped} unsupported claim(s)")
+    # The trigger stage is done: its unused reserve becomes
+    # borrowable by the quote poll, the last consumer (spec §1.3).
+    _dm_budget_finish("trigger_gate")
 
     # --- Spice: peak-chapter intensity x fraction-at-that-intensity (matrix) ---
     # Triggers warn that content EXISTS; spice level measures PERVASIVENESS
@@ -15196,6 +15374,14 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         "characters": characters,
         "relationships": relationships,
         "dropped_relationships": _dropped_relationships,
+        # The validation order in effect and the circuit-breaker
+        # outcome (spec §1.2 / §1.6): recorded on the result so
+        # the preview, the write gate, and run history all carry
+        # them, and a later calibration checkpoint can attribute
+        # this book's results to the order and policy that
+        # produced them.
+        "validation_order": _VALIDATION_ORDER_ID,
+        "validator_circuit_breaker": _validator_breaker,
         "self_pairs_dropped": {"extracted": _self_pairs_extracted,
                                "remapped": _self_pairs_remapped},
         "triggers": triggers,
@@ -17317,6 +17503,38 @@ _REL_DROP_THRESHOLD = 0.30
 # spouse/parent/child/sibling is worse than being wrong about
 # friend/enemy/colleague.
 _REL_FAMILY_TYPES = frozenset({"spouse", "parent", "child", "sibling"})
+# Validation priority order (spec §1.2, Decision K1): family claims
+# validate before non-family; within family, by stakes (spouse and
+# parent/child before sibling — their errors cost more — using
+# _REL_PRECEDENCE as the stakes rank); principal pairs before
+# minor pairs within each group; within a group, extractor
+# confidence ASCENDING — provisional, because extractor confidence
+# is a formula, not a calibrated probability, and the direction
+# is re-decided from per-consumer accounting data at the §1.2
+# calibration checkpoint. This identifier is recorded in run
+# history thresholds and on each reduce result so a later
+# checkpoint can attribute results to the order that produced
+# them.
+_VALIDATION_ORDER_ID = ("k1:family>nonfamily;stakes;"
+                        "principal>minor;confidence-asc")
+# Validator-error circuit breaker (spec §1.6, Decision K4): a
+# claim whose judgment errors is retried ONCE; the breaker trips
+# when a book's error rate reaches the threshold below, and then
+# that book's replace-wholesale write is skipped entirely — the
+# same principle as "aborted runs never write". The threshold is
+# a rate of one half with a minimum sample of eight judged
+# claims: below eight claims a rate is mostly noise (one error
+# in two claims reads as 50% without meaning the validator is
+# down), while at eight or more claims a validator failing half
+# its judgments is not judging this book at all — shipping its
+# replace-wholesale write would replace curated rows with a
+# mostly-unjudged result, which is exactly the harm the breaker
+# exists to prevent. The validator's own consecutive-error
+# disable (three in a row) does not catch intermittent failure
+# patterns; this rate-based breaker does. Both numbers are
+# recorded in the run record with every result.
+_VALIDATOR_ERROR_THRESHOLD = 0.5
+_VALIDATOR_ERROR_MIN_SAMPLE = 8
 
 # ---------------------------------------------------------------------------
 # Run-event emission (PORTAL-SPEC §8 GAP-2/GAP-6, §10 S0; funded by Q2)
@@ -17711,6 +17929,16 @@ def _history_thresholds():
         "rel_validation": _REL_VALIDATION_THRESHOLD,
         "rel_drop": _REL_DROP_THRESHOLD,
         "merge_tier3_cap": _MERGE_TIER3_CAP,
+        # The budget-governance scheme in effect (spec §1.2/§1.3/
+        # §1.6): which validation order produced this run's
+        # results, the reserve slices that bounded its budget, and
+        # the circuit-breaker bars — recorded so the calibration
+        # checkpoint can attribute outcomes to the scheme, not
+        # just to the totals.
+        "validation_order": _VALIDATION_ORDER_ID,
+        "budget_reserves": dict(_DM_BUDGET_RESERVES),
+        "validator_error_threshold": _VALIDATOR_ERROR_THRESHOLD,
+        "validator_error_min_sample": _VALIDATOR_ERROR_MIN_SAMPLE,
         "trope_map_threshold": CONFIG.get("trope_map_threshold"),
         "evidence_retrieval_floor":
             CONFIG.get("evidence_retrieval_floor"),
@@ -18685,19 +18913,58 @@ _DM_BUDGET_LOCK = threading.Lock()
 _DM_BUDGET_USED = 0
 _DM_BUDGET_BY_CONSUMER = {}
 
-# The trigger gate's provisional floor: calls held back from the
-# named non-trigger consumers so a relationship-dense book cannot
-# spend the trigger gate into total fallback. Sized from run 17's
-# observed demand — Daemon presented about twenty trigger
-# categories, and a category with zero judged quotes is not
-# judged at all (it takes the regex fallback whole), so the
-# floor's job is to guarantee most categories at least their
-# first, most decisive judgment even when every earlier consumer
-# spends its full share: 15 covers three quarters of a dense
-# book's categories while leaving 35 of the 50 for merges and
-# relationships. Provisional by design — it is re-sized from the
-# per-consumer accounting this module now records (spec §1.3).
-_TRIGGER_GATE_FLOOR = 15
+# Hard reserves (spec §1.3 final form, Decision K2): every budget
+# consumer is guaranteed a minimum slice of the shared per-book
+# pool. A consumer may borrow unused reserve only after every
+# EARLIER consumer in pipeline order has finished — so a later
+# consumer's reserve survives while it is still waiting to run.
+# The old provisional trigger floor is not a second mechanism: it
+# is trigger_gate's reserve slice in this scheme. The single
+# per-book ceiling (_MERGE_TIER3_CAP) still binds the pool.
+#
+# Sizing (first measured data comes from run-17 + this module's
+# per-consumer accounting):
+# - merge_tier3 10: merges run first against mostly-small
+#   candidate lists; the old ceiling gave them up to 35, but the
+#   same budget must now also reserve non-family and quote slices
+#   that had no protection before. 10 covers a heavy merge book
+#   while leaving the shared pool for validation.
+# - rel_family 10 / rel_nonfamily 5: family claims are the
+#   highest-stakes judgments (a wrong parent/spouse is the worst
+#   kind of wrong), and Daemon's dense books present roughly
+#   twice as many family as non-family validation candidates.
+# - trigger_gate 15: carried over from the provisional floor —
+#   Daemon presented about twenty trigger categories, and a
+#   category with zero judged quotes takes the regex fallback
+#   whole, so 15 guarantees most categories at least their first,
+#   most decisive judgment (the live defect that motivated the
+#   programme).
+# - quote_poll 1: it claims exactly one call per book — its
+#   reserve is its exact demand, neither protection nor waste.
+# - discovery 0 / untagged 0: discovery does not exist yet
+#   (§3 is shadow-first, later), and untagged claims are the
+#   pre-accounting path — they get no guaranteed slice, only
+#   what the pool has left over. Borrowing for untagged is last
+#   in pipeline order, so it can never eat a named consumer's
+#   reserve. This closes the phase-1 bypass (untagged claims
+#   used to keep whole-pool semantics and could silently defeat
+#   the floor — recorded as a PASS_WITH_RISK item in 2.13.18).
+_DM_BUDGET_RESERVES = {
+    "merge_tier3": 10,
+    "rel_family": 10,
+    "rel_nonfamily": 5,
+    "trigger_gate": 15,
+    "quote_poll": 1,
+    "discovery": 0,
+    "untagged": 0,
+}
+_DM_BUDGET_ORDER = ("merge_tier3", "rel_family", "rel_nonfamily",
+                    "trigger_gate", "quote_poll", "discovery",
+                    "untagged")
+_DM_BUDGET_FINISHED = set()
+# Kept for the phase-1 tests and code that reference the floor by
+# name: the trigger reserve IS the old provisional floor.
+_TRIGGER_GATE_FLOOR = _DM_BUDGET_RESERVES["trigger_gate"]
 
 
 def _dm_budget_reset():
@@ -18706,6 +18973,18 @@ def _dm_budget_reset():
     with _DM_BUDGET_LOCK:
         _DM_BUDGET_USED = 0
         _DM_BUDGET_BY_CONSUMER.clear()
+        _DM_BUDGET_FINISHED.clear()
+
+
+def _dm_budget_finish(consumer):
+    """Mark a consumer's pipeline stage finished: its unused reserve
+    becomes borrowable by every consumer still running. Call at the
+    stage boundary in pipeline order (merge -> family -> nonfamily ->
+    trigger -> quote poll). Idempotent; unknown tags are accepted
+    without effect."""
+    tag = consumer or "untagged"
+    with _DM_BUDGET_LOCK:
+        _DM_BUDGET_FINISHED.add(tag)
 
 
 def _dm_budget_snapshot():
@@ -18718,25 +18997,48 @@ def _dm_budget_snapshot():
         return {k: dict(v) for k, v in _DM_BUDGET_BY_CONSUMER.items()}
 
 
+def _dm_budget_scheme():
+    """The reserve scheme in force: per-consumer guaranteed slices,
+    pipeline order, and which consumers have finished this book.
+    Recorded on the run record so the §1 calibration checkpoint
+    can attribute results to the scheme that produced them."""
+    with _DM_BUDGET_LOCK:
+        return {"cap": _MERGE_TIER3_CAP,
+                "reserves": dict(_DM_BUDGET_RESERVES),
+                "pipeline_order": list(_DM_BUDGET_ORDER),
+                "finished": sorted(_DM_BUDGET_FINISHED)}
+
+
 def _dm_budget_claim(n=1, consumer=None):
     """Claim n decision-model calls from the shared per-book budget
     on behalf of a named consumer. Returns True if claimed, False
     if refused.
 
-    The trigger gate's floor (see _TRIGGER_GATE_FLOOR) binds the
-    NAMED non-trigger consumers: they may not spend the pool's
-    last _TRIGGER_GATE_FLOOR calls. The trigger gate itself may
-    spend the whole pool. Untagged claims (consumer=None) are the
-    pre-accounting path and keep the old whole-pool semantics —
-    every production caller passes its tag, so untagged spend in
-    a real run stands out in the accounting under "untagged"
-    instead of hiding."""
+    The claim is denied when it would spend into any OTHER
+    consumer's still-protected reserve. Borrowing is unlocked
+    only when EVERY consumer earlier than the claimant in
+    pipeline order has finished (_dm_budget_finish): until then,
+    even a finished consumer's unused reserve stays protected,
+    because an earlier stage still running may yet be joined by
+    work that belongs ahead of the borrower. A consumer may
+    always spend the general pool and its own reserve slice.
+    Untagged claims (consumer=None) are accounted under
+    "untagged" with zero reserve — the same discipline as every
+    named consumer, so they can no longer silently defeat the
+    reserves."""
     global _DM_BUDGET_USED
     tag = consumer or "untagged"
     with _DM_BUDGET_LOCK:
-        limit = _MERGE_TIER3_CAP
-        if consumer is not None and consumer != "trigger_gate":
-            limit = _MERGE_TIER3_CAP - _TRIGGER_GATE_FLOOR
+        _idx = _DM_BUDGET_ORDER.index(tag)
+        _unlocked = all(c in _DM_BUDGET_FINISHED
+                        for c in _DM_BUDGET_ORDER[:_idx])
+        _protected = 0
+        for _c in _DM_BUDGET_ORDER:
+            if _c == tag:
+                continue
+            if _c not in _DM_BUDGET_FINISHED or not _unlocked:
+                _protected += _DM_BUDGET_RESERVES.get(_c, 0)
+        limit = _MERGE_TIER3_CAP - _protected
         if _DM_BUDGET_USED + n > limit:
             granted, used = False, _DM_BUDGET_USED
         else:
@@ -19701,6 +20003,17 @@ def _build_rel_map(result):
                   "evidence": r.get("evidence", "")}
         if r.get("evidence_source"):
             _entry["evidence_source"] = r["evidence_source"]
+        # Curation state + provenance ride into the stored row
+        # (spec §1.5): the app presents these embedded claims for
+        # curation, so a claim that shipped unverified must show
+        # its state there too, not only in the preview. Claims
+        # built outside v2_reduce (legacy results, hand-built
+        # fixtures) may carry neither key; the state is derived
+        # from the note in that case and provenance defaults to
+        # the pipeline's own origin.
+        _entry["validation_state"] = (
+            r.get("validation_state") or _rel_validation_state(r))
+        _entry["source"] = r.get("source") or "extracted"
         rel_map.setdefault(_from.lower(), []).append(_entry)
     return rel_map, evidenceless
 
@@ -19845,6 +20158,21 @@ def write_claims(work_id, result, trope_mappings=None):
     is a shared merge store with no source marker and is NOT replaced.
     Returns the number of failed operations.
     """
+    # Circuit breaker (spec §1.6, Decision K4): a result whose
+    # validator-error breaker tripped must not replace anything —
+    # the book's previous rows stay exactly as they are and none
+    # of its new or changed claims write. Guarded here, at the
+    # one seam every write path funnels through, so a tripped
+    # book cannot be written by a manual preview push either.
+    # Counted as one failed operation: callers already treat a
+    # nonzero return as "the write did not happen".
+    _breaker = (result or {}).get("validator_circuit_breaker") or {}
+    if _breaker.get("tripped"):
+        print(f"  write_claims refused: validator circuit breaker "
+              f"tripped ({_breaker.get('errors')}/"
+              f"{_breaker.get('attempts')} judgments errored, rate "
+              f"{_breaker.get('error_rate')}); previous rows untouched")
+        return 1
     errors = 0
     _models = {"ollama": CONFIG["ollama_model"], "openrouter": CONFIG["openrouter_model"],
                "openai": CONFIG.get("openai_model", "")}
@@ -22077,6 +22405,9 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                 # now they existed only as printed lines. A shed
                 # selected nothing — 0 is a measurement there, not
                 # an unknown.
+                # The quote-poll stage is done: its unused reserve
+                # is borrowable by anything still running (§1.3).
+                _dm_budget_finish("quote_poll")
                 _cq_stats = {
                     "verified": _qv["verified"] if _qv else None,
                     "rejected": _qv["rejected"] if _qv else None,
@@ -22102,6 +22433,9 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "triggers": red["triggers"], "characters": red["characters"],
         "relationships": red["relationships"],
         "dropped_relationships": red.get("dropped_relationships", []),
+        "validation_order": red.get("validation_order"),
+        "validator_circuit_breaker": red.get(
+            "validator_circuit_breaker"),
         "self_pairs_dropped": red.get("self_pairs_dropped",
                                       {"extracted": 0, "remapped": 0}),
         "spice_level": red["spice_level"],
@@ -22401,6 +22735,21 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         print(f"  Could not find or create work ({how})")
         return False
     print(f"  Work ID: {wid}")
+    _breaker = result.get("validator_circuit_breaker") or {}
+    if _breaker.get("tripped"):
+        # Circuit breaker (spec §1.6, Decision K4): this book's
+        # validator-error rate crossed the threshold, so its
+        # replace-wholesale write is SKIPPED — previous rows stay
+        # untouched and no new or changed claim from this book
+        # writes. The skip and the error rate are on the result
+        # (and therefore the preview audit trail and run history).
+        result["write_skipped"] = "validator_circuit_breaker"
+        print(f"  WRITE SKIPPED (validator circuit breaker): "
+              f"{_breaker.get('errors')}/{_breaker.get('attempts')} "
+              f"relationship judgments errored (rate "
+              f"{_breaker.get('error_rate')}); previous rows untouched")
+        save_preview(fpath, result)
+        return False
     errors = write_claims(wid, result)
     if errors:
         print(f"  {errors} database operation(s) failed")
@@ -22939,6 +23288,12 @@ def save_preview(fpath, result):
                 _conf_str += " [would drop: very low validation]"
             elif _vn == "no_evidence":
                 _conf_str += " [would drop: no evidence]"
+            elif _vn == "budget_exhausted":
+                _conf_str += " [budget_exhausted: not judged]"
+            elif _vn == "validator_error":
+                _conf_str += " [validator_error: judgment failed]"
+            elif r.get("validation_state") == "review_required":
+                _conf_str += " [review_required: not judged]"
             md.append(f"- {r['from']} → {r['to']}: {r['type']}{_conf_str}")
         md.append("")
     _dropped = result.get("dropped_relationships") or []

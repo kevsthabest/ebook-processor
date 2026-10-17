@@ -383,6 +383,12 @@ class TestSelectAndPayload(_QuoteBase):
         self.assertEqual(section["value"]["selected"], 0)
 
     def test_budget_exhaustion_sheds(self):
+        # Amended 2026-10-17 (2.13.20): hard reserves (spec §1.3)
+        # cap an untagged claim at the general pool while named
+        # consumers are unfinished, so exhausting the pool first
+        # releases every reserve. Assertions unchanged.
+        for _c in pp._DM_BUDGET_ORDER:
+            pp._dm_budget_finish(_c)
         self.assertTrue(pp._dm_budget_claim(50))
         ask = _fake_ask({})
         out = pp.corpus_select_quotes(self.db, self.fp_a, ask=ask)
