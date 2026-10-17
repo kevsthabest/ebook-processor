@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.17"
+PORTABLE_VERSION = "2.13.18"
 
 
 import argparse
@@ -1794,6 +1794,39 @@ def _cmd_recalibrate_spice(path):
         lines.append(f"  New spice: {new}")
         lines.append(f"  Status: {detail}")
     return "\n".join(lines)
+
+
+def _principal_rel_coverage(principal_names, relationships, dropped):
+    """Judged coverage of principal relationships: how many of the
+    principal claims validation disposed of were actually scored
+    by the judge. Returns {"judged": j, "total": t}.
+
+    The pool is the principal relationships still standing plus
+    the principal ones validation dropped (a dropped claim was
+    disposed of too — leaving it out would flatter the metric on
+    exactly the dense books it exists to expose). A claim counts
+    as judged only when the judge scored it (validation_p set):
+    budget_exhausted, validator_error and no_evidence claims sit
+    in the total but never in judged, because the judge never saw
+    them. Dropped entries with no validation note (ghost-endpoint
+    and family-guard disposals) never entered validation and are
+    excluded from the pool entirely. principal_names=None means
+    no principal filter ran, so every relationship counts."""
+    names = None
+    if principal_names is not None:
+        names = {norm_name(n) for n in principal_names}
+
+    def _principal(r):
+        if names is None:
+            return True
+        return (norm_name(r.get("from", "")) in names
+                and norm_name(r.get("to", "")) in names)
+
+    pool = [r for r in (relationships or []) if _principal(r)]
+    pool += [r for r in (dropped or [])
+             if _principal(r) and r.get("validation_note")]
+    judged = sum(1 for r in pool if r.get("validation_p") is not None)
+    return {"judged": judged, "total": len(pool)}
 
 
 def _filter_principals(characters, relationships, min_frequency=0.20):
@@ -5918,7 +5951,7 @@ def corpus_select_quotes(db, fingerprint, *, ask=None):
 
         def ask(qs, st, _v=validator):
             return _ask_noul_batch(_v, qs, st)
-    if not _dm_budget_claim(1):
+    if not _dm_budget_claim(1, consumer="quote_poll"):
         # Lowest priority in the shared pool, first shed (§10.5).
         return _quote_select_shed(db, fingerprint, "budget")
     votes = corpus_quote_poll(poll_set, ask)
@@ -14182,7 +14215,7 @@ def post_pass_merge(roster, validator=None):
                 "name_a": _na, "name_b": _nb, "p_yes": None,
                 "reason": "unresolved (decision model disabled)"})
             continue
-        if not _dm_budget_claim(1):
+        if not _dm_budget_claim(1, consumer="merge_tier3"):
             # Pairs beyond the cap are listed for manual review,
             # not silently dropped.
             possible_merges.append({
@@ -14681,7 +14714,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             continue
         if _DECISION_VALIDATOR is None:
             continue  # no validator configured; leave as-is
-        if not _dm_budget_claim(1):
+        if not _dm_budget_claim(1, consumer="rel_family"):
             rel["validation_note"] = "budget_exhausted"
             continue
         _ctx = _validation_context(
@@ -14741,7 +14774,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                     rel["evidence_grade"] = _mined["grade"]
             if not _ev:
                 continue
-            if not _dm_budget_claim(1):
+            if not _dm_budget_claim(1, consumer="rel_nonfamily"):
                 rel["validation_note"] = "budget_exhausted"
                 continue
             _ctx = _validation_context(
@@ -14862,7 +14895,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                     _q = _ev.get("quote", "")
                     _ctx = _extract_quote_context(
                         _label_to_text.get(_ev.get("chapter", ""), ""), _q)
-                    if not _dm_budget_claim(1):
+                    if not _dm_budget_claim(1, consumer="trigger_gate"):
                         # Budget exhausted mid-gate: this category is
                         # NOT judged — take the regex-gate fallback,
                         # exactly as on a validator error. The claim is
@@ -17467,7 +17500,16 @@ class _run_events_book:
     def __exit__(self, *exc):
         if self._sink is not None:
             _run_event({"event": "book_end", "book": self._book,
-                        "decision_calls": _DM_BUDGET_USED})
+                        "decision_calls": _DM_BUDGET_USED,
+                        # Per-consumer split, under the recorder's
+                        # own attribution guard (v2, single-job):
+                        # in parallel mode the shared counters
+                        # cannot be attributed to one book, so the
+                        # field is None rather than a guess.
+                        "decision_budget": _dm_budget_snapshot()
+                        if CONFIG.get("pipeline") == "v2"
+                        and int(CONFIG.get("jobs", 1) or 1) <= 1
+                        else None})
             self._sink.set_book(self._prev)
         _history_book_end(self._fpath, exc[1] if len(exc) > 1 else None)
         return False
@@ -17553,14 +17595,15 @@ _HISTORY_AXIS_KEYS = (
 _HISTORY_CHARACTER_KEYS = (
     "roster_size", "characters", "minor_characters",
     "merges_proposed", "merges_applied", "relationships",
-    "relationships_dropped")
+    "relationships_dropped", "principal_rel_judged",
+    "principal_rel_total")
 _HISTORY_QUOTE_KEYS = ("extracted", "verified", "rejected", "selected")
 _HISTORY_TOTAL_KEYS = (
     "files_seen", "admitted", "skipped_not_in_corpus", "processed",
     "succeeded", "failed", "claims_derived", "claims_reused",
     "claims_abstained", "claims_failed", "claims_supported_strong",
     "claims_supported_single", "claims_adjacent_only",
-    "quotes_verified", "quotes_rejected")
+    "quotes_verified", "quotes_rejected", "decision_budget")
 
 # Marker hashed in place of a catalogue identity for a claim the run
 # could not map. The hash input is this marker plus the book
@@ -17767,7 +17810,8 @@ class _RunHistoryRecorder:
                    "duration_ms": None, "outcome": None,
                    "skip_reason": None, "result": None,
                    "error_class": None, "error_message": None,
-                   "decision_calls": None, "book_key": None,
+                   "decision_calls": None, "decision_budget": None,
+                   "book_key": None,
                    "source": None, "chapters": None,
                    "ingest_title": None, "replace_result": None}
             self.books[key] = rec
@@ -17862,6 +17906,13 @@ class _RunHistoryRecorder:
                 # there, and for the legacy pipeline (which never
                 # resets it per book).
                 rec["decision_calls"] = _DM_BUDGET_USED
+                # The per-consumer split of those calls (spec §1.1),
+                # captured under the same attribution guard: an
+                # empty snapshot means no consumer claimed anything
+                # this book, and the record stays None rather than
+                # claiming a measured zero breakdown.
+                _snap = _dm_budget_snapshot()
+                rec["decision_budget"] = _snap or None
             wrote = getattr(_DIAG, "wrote_stats", None)
             replace = getattr(_DIAG, "replace_stats", None)
             if wrote is not None or replace is not None:
@@ -18144,6 +18195,15 @@ def _history_characters(result):
     _count("minor_characters", "minor_characters")
     _count("relationships", "relationships")
     _count("relationships_dropped", "dropped_relationships")
+    # Judged coverage of principal relationships (spec §1.5's
+    # headline metric), computed by process_file_v2 where the
+    # principal set and the validation outcomes are both final.
+    _cov = result.get("principal_rel_coverage")
+    if isinstance(_cov, dict):
+        if isinstance(_cov.get("judged"), int):
+            out["principal_rel_judged"] = _cov["judged"]
+        if isinstance(_cov.get("total"), int):
+            out["principal_rel_total"] = _cov["total"]
     _count("merges_proposed", "possible_merges")
     # Merge counts arrive in two shapes: the v2 post-pass stores
     # its count directly as an int (post_pass_merge returns a
@@ -18282,6 +18342,27 @@ def _history_totals(rec, book_rows, claim_rows_by_book):
                 if isinstance(b["quotes"].get(key), int)]
         if vals:
             totals[total_key] = sum(vals)
+    # Per-consumer decision-budget breakdown (spec §1.1), pooled
+    # from the per-book recorder snapshots of the books actually
+    # being shipped (book_rows) — a book whose identity never
+    # resolved ships no row, so its spend must not leak into the
+    # totals either; the run row never disagrees with its own
+    # book rows. No shipped book carrying a snapshot means the
+    # run measured no consumer split, and the total stays None —
+    # never a fabricated all-zero breakdown.
+    _shipped = {b["book_key"] for b in book_rows}
+    _snaps = [r.get("decision_budget") for r in rec.books.values()
+              if r.get("book_key") in _shipped]
+    _snaps = [s for s in _snaps if isinstance(s, dict) and s]
+    if _snaps:
+        _pooled = {}
+        for _s in _snaps:
+            for _consumer, _acct in _s.items():
+                _p = _pooled.setdefault(
+                    _consumer, {"granted": 0, "denied": 0, "spent": 0})
+                for _k in _p:
+                    _p[_k] += int(_acct.get(_k) or 0)
+        totals["decision_budget"] = _pooled
     return totals
 
 
@@ -18590,10 +18671,33 @@ def _history_scan_mode():
     return "watch_cycle" if _HISTORY_WATCH is not None else "scan"
 
 
-# Shared decision-model call budget per book (merges + relationship
-# validation draw from the same pool; merges run first so they get priority).
+# Shared decision-model call budget per book. Five consumers draw
+# on the one pool, in pipeline order: roster-merge Tier 3
+# judgments, family relationship validation, non-family
+# relationship validation, the trigger-evidence gate, and the
+# corpus quote-selection poll. Every claim carries its consumer
+# tag so the run record can say who spent what — until it did,
+# the pool's exhaustion was visible only as a single total, and
+# Daemon run 17 spent the whole pool inside relationship
+# validation and left every trigger judgment to the regex
+# fallback without the record showing why (spec §1.1).
 _DM_BUDGET_LOCK = threading.Lock()
 _DM_BUDGET_USED = 0
+_DM_BUDGET_BY_CONSUMER = {}
+
+# The trigger gate's provisional floor: calls held back from the
+# named non-trigger consumers so a relationship-dense book cannot
+# spend the trigger gate into total fallback. Sized from run 17's
+# observed demand — Daemon presented about twenty trigger
+# categories, and a category with zero judged quotes is not
+# judged at all (it takes the regex fallback whole), so the
+# floor's job is to guarantee most categories at least their
+# first, most decisive judgment even when every earlier consumer
+# spends its full share: 15 covers three quarters of a dense
+# book's categories while leaving 35 of the 50 for merges and
+# relationships. Provisional by design — it is re-sized from the
+# per-consumer accounting this module now records (spec §1.3).
+_TRIGGER_GATE_FLOOR = 15
 
 
 def _dm_budget_reset():
@@ -18601,18 +18705,50 @@ def _dm_budget_reset():
     global _DM_BUDGET_USED
     with _DM_BUDGET_LOCK:
         _DM_BUDGET_USED = 0
+        _DM_BUDGET_BY_CONSUMER.clear()
 
 
-def _dm_budget_claim(n=1):
-    """Claim n decision-model calls from the shared per-book budget.
-    Returns True if claimed, False if the budget is exhausted."""
-    global _DM_BUDGET_USED
+def _dm_budget_snapshot():
+    """A copy of the per-consumer accounting for this book:
+    {consumer: {"granted": claim requests granted, "denied":
+    requests refused, "spent": calls actually consumed}}. Read by
+    the run-history recorder at book end; a copy, so callers can
+    never mutate the live counters."""
     with _DM_BUDGET_LOCK:
-        if _DM_BUDGET_USED + n > _MERGE_TIER3_CAP:
+        return {k: dict(v) for k, v in _DM_BUDGET_BY_CONSUMER.items()}
+
+
+def _dm_budget_claim(n=1, consumer=None):
+    """Claim n decision-model calls from the shared per-book budget
+    on behalf of a named consumer. Returns True if claimed, False
+    if refused.
+
+    The trigger gate's floor (see _TRIGGER_GATE_FLOOR) binds the
+    NAMED non-trigger consumers: they may not spend the pool's
+    last _TRIGGER_GATE_FLOOR calls. The trigger gate itself may
+    spend the whole pool. Untagged claims (consumer=None) are the
+    pre-accounting path and keep the old whole-pool semantics —
+    every production caller passes its tag, so untagged spend in
+    a real run stands out in the accounting under "untagged"
+    instead of hiding."""
+    global _DM_BUDGET_USED
+    tag = consumer or "untagged"
+    with _DM_BUDGET_LOCK:
+        limit = _MERGE_TIER3_CAP
+        if consumer is not None and consumer != "trigger_gate":
+            limit = _MERGE_TIER3_CAP - _TRIGGER_GATE_FLOOR
+        if _DM_BUDGET_USED + n > limit:
             granted, used = False, _DM_BUDGET_USED
         else:
             _DM_BUDGET_USED += n
             granted, used = True, _DM_BUDGET_USED
+        acct = _DM_BUDGET_BY_CONSUMER.setdefault(
+            tag, {"granted": 0, "denied": 0, "spent": 0})
+        if granted:
+            acct["granted"] += 1
+            acct["spent"] += n
+        else:
+            acct["denied"] += 1
         # The ticker truth (PORTAL-SPEC GAP-6): every claim, granted
         # or refused, is one line in the run artifact. The emit rides
         # INSIDE the budget lock so a claim and its record are atomic
@@ -18623,7 +18759,8 @@ def _dm_budget_claim(n=1):
         # claims budget), so the lock order budget -> sink is the
         # only order ever taken. A no-op when no flagged run is live.
         _run_event({"event": "decision", "n": n, "used": used,
-                    "cap": _MERGE_TIER3_CAP, "granted": granted})
+                    "cap": _MERGE_TIER3_CAP, "granted": granted,
+                    "consumer": tag})
     return granted
 
 
@@ -22192,6 +22329,18 @@ def process_file_v2(fpath, dry_run=False, preview=False):
               f"(min_frequency={_min_freq})")
         if CONFIG.get("show_matrices"):
             print(_char_importance_ascii(_princs, _minors))
+
+    # Judged coverage of principal relationships (spec §1.5's
+    # headline metric): computed here, where the principal set is
+    # final and the validation outcomes are already recorded on
+    # the claims. With the principal filter off, every character
+    # ships, so coverage runs over all relationships.
+    _cov_names = None
+    if CONFIG.get("principals_only", True):
+        _cov_names = [c.get("name", "") for c in result["characters"]]
+    result["principal_rel_coverage"] = _principal_rel_coverage(
+        _cov_names, result["relationships"],
+        result.get("dropped_relationships"))
 
     # Ghost-endpoint relationships: a claim can name a person who has
     # no character row in the final set (with the principals filter

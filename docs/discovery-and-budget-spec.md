@@ -435,3 +435,41 @@ app reads relationships from character JSON today). A
 relationship table existed once and was archived 2026-10-09;
 its history should shape any revival. Revisit only at the
 user's initiative.
+
+## Addendum — relationship type registry (ruled 2026-10-17)
+
+The user ruled: add the missing types, AND make types addable
+without a code change — the Fourth Wing preview (run 23) showed
+why: dragon-rider bonds were typed spouse/sibling/friend and
+all dropped, because the vocabulary has no bond type and the
+judge correctly rejected the force-fits.
+
+Design: a `relationship_types` registry table in Supabase —
+the same pattern the app already uses for `trigger_taxonomy`
+(seeded, curated, DB-held) — read by BOTH the processor and
+the app, so the vocabulary has one source of truth. Each type
+carries: id, label, a one-sentence gloss (injected into the
+extraction and validator prompts, so a new type is judged on
+its definition, not its name), direction (symmetric or
+directed), family flag (routes validation), exclusivity
+(exclusive with a precedence rank, or a non-exclusive extra),
+app graph group, and whether readers may suggest it (flywheel
+allowlist derives from the same rows). Extraction prompts,
+the validator prompt, the reduce lattice, the app graph map,
+and the suggestion allowlist all derive from the registry —
+adding a type becomes inserting a row, not editing four
+places in two repos.
+
+First entry: **bonded** — "a supernatural or formal bond
+linking the pair (dragon and rider, familiar and keeper): a
+persistent, named connection, not mere companionship."
+Symmetric; not family; exclusive, precedence alongside
+romantic (above friend/colleague). Validated as a non-family
+claim at the standard bar.
+
+Build position: after steps 1–3, alongside steps 4–6, and in
+any case BEFORE any Fourth Wing write reprocess — the book
+cannot be written well until the type exists and extraction
+proposes it. The processor falls back to its built-in type set
+when the registry is unreachable (offline runs must not gain
+a hard network dependency for vocabulary).

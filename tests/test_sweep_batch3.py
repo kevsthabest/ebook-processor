@@ -514,11 +514,20 @@ class TestTier3BudgetClaims(unittest.TestCase):
         self.assertEqual(pp._DM_BUDGET_USED, 2)
 
     def test_exhaustion_after_exactly_n_real_calls(self):
-        self.assertTrue(pp._dm_budget_claim(pp._MERGE_TIER3_CAP - 1))
+        # Amended 2026-10-17 (2.13.18): merge claims are a named
+        # budget consumer now and the trigger gate's floor
+        # reserves the pool's last _TRIGGER_GATE_FLOOR calls from
+        # them, so the merge ceiling is cap - floor, not the whole
+        # cap. The property under test — one claim per real call,
+        # exhaustion after exactly the remaining units — is
+        # unchanged, measured against the consumer's ceiling.
+        self.assertTrue(pp._dm_budget_claim(
+            pp._MERGE_TIER3_CAP - pp._TRIGGER_GATE_FLOOR - 1))
         stub = _StubSamePerson([(False, 0.2)] * 3)
         n, possible = pp.post_pass_merge(_jon_roster(), validator=stub)
         self.assertEqual(len(stub.calls), 1)
-        self.assertEqual(pp._DM_BUDGET_USED, pp._MERGE_TIER3_CAP)
+        self.assertEqual(pp._DM_BUDGET_USED,
+                         pp._MERGE_TIER3_CAP - pp._TRIGGER_GATE_FLOOR)
         capped = [p for p in possible
                   if p["reason"] == "unresolved (Tier 3 cap reached)"]
         self.assertEqual(len(capped), 2)

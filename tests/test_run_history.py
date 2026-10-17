@@ -383,6 +383,47 @@ class PayloadTests(_Base):
         self.assertIsNone(self.book_payload()["decision_calls"])
 
 
+class BudgetAccountingHistoryTests(_Base):
+    """Spec §1.1/§1.5: per-consumer budget accounting and the
+    principal-coverage metric land in the run-history upload —
+    the breakdown pooled into the run totals, the coverage counts
+    on the book row's characters record. Unmeasured stays None."""
+
+    def tearDown(self):
+        pp._dm_budget_reset()
+        super().tearDown()
+
+    def test_totals_carry_pooled_decision_budget(self):
+        pp._dm_budget_reset()
+        pp._dm_budget_claim(2, consumer="rel_family")
+        pp._dm_budget_claim(1, consumer="trigger_gate")
+        pp._dm_budget_claim(1, consumer="rel_family")
+        self.drive_one_book(result=v2_result())
+        totals = self.run_payload()["totals"]
+        self.assertEqual(totals["decision_budget"], {
+            "rel_family": {"granted": 2, "denied": 0, "spent": 3},
+            "trigger_gate": {"granted": 1, "denied": 0, "spent": 1}})
+
+    def test_totals_decision_budget_null_when_nothing_claimed(self):
+        pp._dm_budget_reset()
+        self.drive_one_book(result=v2_result())
+        self.assertIsNone(self.run_payload()["totals"]["decision_budget"])
+
+    def test_book_characters_carry_principal_coverage(self):
+        result = v2_result()
+        result["principal_rel_coverage"] = {"judged": 3, "total": 4}
+        self.drive_one_book(result=result)
+        chars = self.book_payload()["characters"]
+        self.assertEqual(chars["principal_rel_judged"], 3)
+        self.assertEqual(chars["principal_rel_total"], 4)
+
+    def test_principal_coverage_null_when_result_lacks_it(self):
+        self.drive_one_book(result=v2_result())
+        chars = self.book_payload()["characters"]
+        self.assertIsNone(chars["principal_rel_judged"])
+        self.assertIsNone(chars["principal_rel_total"])
+
+
 class CollisionTests(_Base):
     def test_collision_suffixes_and_warns(self):
         foreign = [{"id": "zzzz", "started_at":

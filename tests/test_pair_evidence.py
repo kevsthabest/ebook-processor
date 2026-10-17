@@ -664,7 +664,13 @@ class TestNonFamilyValidation(unittest.TestCase):
         # parent claim: the family pass runs first, so the parent
         # claim is judged and the friend claim is the one that
         # reports budget_exhausted.
-        for _ in range(pp._MERGE_TIER3_CAP - 1):
+        # Amended 2026-10-17 (2.13.18): the trigger gate's floor
+        # reserves the pool's last _TRIGGER_GATE_FLOOR calls from
+        # relationship consumers, so "one unit left" for a family
+        # claim is now measured against the general pool
+        # (cap - floor), not the whole cap. The property under
+        # test — family claims before non-family — is unchanged.
+        for _ in range(pp._MERGE_TIER3_CAP - pp._TRIGGER_GATE_FLOOR - 1):
             self.assertTrue(pp._dm_budget_claim(1))
         red = self._reduce([
             {"from": "Alice", "to": "Bob", "type": "friend",
