@@ -88,14 +88,24 @@ def _resolve_case_context(pp, chapter_sets, quote):
     return "", False, ambiguous
 
 
-def _band(p):
+def _band(p, rel_type=""):
+    """The production outcome for a score, by claim family.
+    Family claims are three-tier (keep at the validation
+    threshold, downgrade in the middle, drop below the drop
+    threshold); non-family claims are two-tier — at or above the
+    drop threshold the claim keeps its type, below it drops.
+    (An earlier version of this harness banded every case with
+    the family thresholds, which misreported non-family keeps:
+    Imogen->Xaden friend at P=0.43 is a production keep.)"""
     if p is None:
         return "unanswered"
-    if p >= pp._REL_VALIDATION_THRESHOLD:
-        return "keep"
-    if p < pp._REL_DROP_THRESHOLD:
-        return "drop"
-    return "middle"
+    if rel_type in pp._REL_FAMILY_TYPES:
+        if p >= pp._REL_VALIDATION_THRESHOLD:
+            return "keep"
+        if p < pp._REL_DROP_THRESHOLD:
+            return "drop"
+        return "middle"
+    return "keep" if p >= pp._REL_DROP_THRESHOLD else "drop"
 
 
 def main():
@@ -191,7 +201,7 @@ def main():
             _verdict, p = validator.validate_relationship(
                 case["from"], case["to"], case["type"], case["quote"],
                 context=case.get("_context", ""))
-        band = _band(p)
+        band = _band(p, case["type"])
         expect = case.get("expect", "any")
         if p is not None:
             answered += 1

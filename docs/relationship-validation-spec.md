@@ -181,3 +181,29 @@ accepted. Resolution now follows the text: among the readable
 copies matching a case's work, the copy the case's quote
 locates in judges it; ambiguity is reported on the run header,
 and a quote locating in no copy stays an honest [NO WINDOW].
+
+## Addendum — 2.13.12: punctuation folding + production banding (2026-10-17)
+
+First corpus-mode live run: only 3 of 14 cases attached a
+window. Two harness/production gaps and one real signal:
+
+  Signal: where a window attached, scores moved the right way
+  (Imogen friend 0.27 -> 0.43, a production keep; the Laura
+  report-only spouse 0.06 -> 0.21; the Anji drop case stayed
+  dropped at 0.02). Windows help; they were mostly absent.
+
+  Gap 1 — location: the case quotes (hand-transcribed from
+  stored evidence) use straight apostrophes/quotes where the
+  books use curly glyphs, so verbatim location failed. The
+  locator now folds punctuation variants (curly quotes,
+  apostrophes, dashes, ellipses) on both sides of the match;
+  returned windows remain verbatim book text. This also serves
+  production, where extraction/storage normalize glyphs
+  independently. Quotes that are fragment-joined by the
+  extractor stay unlocatable and judge bare, as before.
+
+  Gap 2 — banding: the harness banded every case at the family
+  keep threshold (0.70). Non-family production outcomes are
+  two-tier (keep at >= 0.30). _band is now type-aware; the
+  Imogen case at 0.43 was a production keep misreported as a
+  miss.

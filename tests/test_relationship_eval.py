@@ -97,5 +97,26 @@ class TestResolveCaseContext(unittest.TestCase):
         self.assertTrue(ambiguous)
 
 
+class TestBand(unittest.TestCase):
+    """Banding mirrors production tiers: family three-tier,
+    non-family two-tier. (The harness originally banded every
+    case at the family keep threshold and misreported
+    non-family keeps — Imogen->Xaden friend at 0.43 keeps its
+    type in production.)"""
+
+    def test_family_bands(self):
+        self.assertEqual(er._band(0.9, "sibling"), "keep")
+        self.assertEqual(er._band(0.5, "sibling"), "middle")
+        self.assertEqual(er._band(0.2, "parent"), "drop")
+
+    def test_nonfamily_bands(self):
+        self.assertEqual(er._band(0.43, "friend"), "keep")
+        self.assertEqual(er._band(0.3, "enemy"), "keep")
+        self.assertEqual(er._band(0.29, "colleague"), "drop")
+
+    def test_unanswered(self):
+        self.assertEqual(er._band(None, "sibling"), "unanswered")
+
+
 if __name__ == "__main__":
     unittest.main()

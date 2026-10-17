@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.11"
+PORTABLE_VERSION = "2.13.12"
 
 
 import argparse
@@ -2138,7 +2138,22 @@ def _pair_sentence_grade(sentence, re_a, re_b):
 
 
 def _collapse_ws(s):
-    return re.sub(r"\s+", " ", s or "").strip()
+    """Normalize a string for quote matching: collapse whitespace
+    and fold punctuation variants (curly quotes and apostrophes,
+    em/en dashes, ellipses) to their plain forms. Extraction,
+    storage, and transcription each normalize glyphs their own
+    way, so the same sentence routinely differs from the chapter
+    text in punctuation only; folding equates those variants for
+    the search. The fold is applied to both sides inside
+    _locate_quote_span, so offsets stay consistent even where a
+    fold changes length (an ellipsis becomes three dots)."""
+    s = s or ""
+    for curly, plain in (("‘", "'"), ("’", "'"),
+                         ("“", '"'), ("”", '"'),
+                         ("—", "-"), ("–", "-"),
+                         ("…", "...")):
+        s = s.replace(curly, plain)
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def _locate_quote_span(quote, text):

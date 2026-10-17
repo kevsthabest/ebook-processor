@@ -789,6 +789,29 @@ class TestEvidenceWindow(unittest.TestCase):
         self.assertIn("This is my sister", w)
         self.assertNotIn("wrote it down", w)
 
+    def test_punctuation_variants_still_locate(self):
+        # Books carry curly glyphs; stored and transcribed quotes
+        # often carry straight ones. Folding equates them for the
+        # search; the window stays verbatim book text.
+        text = ("Sebeck’s son, Chris, stood next to him. "
+                "The ward was quiet — too quiet.")
+        w = pp._evidence_window(
+            "Sebeck's son, Chris, stood next to him.", text)
+        self.assertIn("The ward was quiet — too quiet.", w)
+        # and the other direction
+        text2 = ("Sebeck's son, Chris, stood next to him. "
+                 "The ward was quiet.")
+        w2 = pp._evidence_window(
+            "Sebeck’s son, Chris, stood next to him.", text2)
+        self.assertIn("The ward was quiet.", w2)
+
+    def test_ellipsis_fold_keeps_span_alignment(self):
+        # The ellipsis fold changes string length (1 char -> 3);
+        # the span must still bracket the right sentence.
+        text = "He paused… then spoke. Nothing followed after that."
+        w = pp._evidence_window("He paused... then spoke.", text)
+        self.assertEqual(w, "Nothing followed after that.")
+
     def test_unlocatable_quote_returns_empty(self):
         self.assertEqual(pp._evidence_window(
             "A quote that appears nowhere in this text.", self.TEXT), "")
