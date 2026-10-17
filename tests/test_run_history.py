@@ -18,6 +18,7 @@ import sys
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import unquote
 from unittest import mock
 import unittest
 
@@ -695,6 +696,241 @@ class CorpusQuotesAttachTests(_Base):
         self.assertEqual(quotes["verified"], 2)
         self.assertEqual(quotes["rejected"], 1)
         self.assertEqual(quotes["selected"], 1)
+
+
+class _ClaimTables:
+    """Stateful stand-in for the public claim tables, patterned on
+    tests/test_replace_wholesale.py's _StatefulSB: GET/POST/PATCH/
+    DELETE with eq/neq/ilike matching and PostgREST NULL semantics
+    (a comparison against NULL never matches, not even neq)."""
+
+    def __init__(self, tables=None):
+        self.tables = {t: [dict(r) for r in rows]
+                       for t, rows in (tables or {}).items()}
+        self.calls = []
+        self._next_id = 1000
+
+    def _match(self, row, params):
+        for part in (params or "").lstrip("?").split("&"):
+            if not part or "=" not in part:
+                continue
+            key, val = part.split("=", 1)
+            if key in ("select", "limit", "on_conflict", "order"):
+                continue
+            if key == "or":
+                inner = val.strip()
+                if inner.startswith("(") and inner.endswith(")"):
+                    inner = inner[1:-1]
+                conds = [c for c in inner.split(",") if c]
+                if not any(self._match_cond(row, c) for c in conds):
+                    return False
+                continue
+            op, _, v = val.partition(".")
+            if not self._match_val(row.get(key), op, unquote(v)):
+                return False
+        return True
+
+    def _match_cond(self, row, cond):
+        col, _, rest = cond.partition(".")
+        op, _, v = rest.partition(".")
+        return self._match_val(row.get(col), op, unquote(v))
+
+    @staticmethod
+    def _match_val(cell, op, v):
+        if op == "is":
+            if v == "null":
+                return cell is None
+            return cell is not None and str(cell).lower() == v
+        if cell is None:
+            return False
+        if op == "eq":
+            return str(cell) == v
+        if op == "neq":
+            return str(cell) != v
+        if op == "ilike":
+            return str(cell).lower() == v.lower()
+        return False
+
+    def __call__(self, table, method="GET", data=None, params="",
+                 prefer=None, schema=None):
+        self.calls.append((table, method))
+        rows = self.tables.setdefault(table, [])
+        if method == "GET":
+            return [dict(r) for r in rows if self._match(r, params)]
+        if method == "POST":
+            out = []
+            items = data if isinstance(data, list) else [data]
+            for d in items:
+                r = dict(d)
+                r.setdefault("id", self._next_id)
+                self._next_id += 1
+                rows.append(r)
+                out.append(dict(r))
+            return out
+        if method == "PATCH":
+            out = []
+            for r in rows:
+                if self._match(r, params):
+                    r.update(data or {})
+                    out.append(dict(r))
+            return out
+        if method == "DELETE":
+            gone = [r for r in rows if self._match(r, params)]
+            self.tables[table] = [r for r in rows
+                                  if not self._match(r, params)]
+            return [dict(r) for r in gone]
+        return []
+
+    def mutating_calls(self):
+        return [c for c in self.calls
+                if c[1] in ("POST", "PATCH", "DELETE")]
+
+
+class _WriteSB:
+    """One sb for both worlds: processor-schema calls delegate to
+    the recording FakeSB, everything else to the stateful claim
+    tables — the same split the real sb makes by schema."""
+
+    def __init__(self, tables):
+        self.history = FakeSB()
+        self.claims = _ClaimTables(tables)
+
+    def __call__(self, table, method="GET", data=None, params="",
+                 prefer=None, schema=None):
+        if schema == "processor":
+            return self.history(table, method=method, data=data,
+                                params=params, prefer=prefer,
+                                schema=schema)
+        return self.claims(table, method=method, data=data,
+                           params=params, prefer=prefer)
+
+    def posts(self, table):
+        return self.history.posts(table)
+
+    def sequence(self):
+        return self.history.sequence()
+
+
+def _seed_claim_tables():
+    """Existing claims for WORK_ID: deletable processor rows, one
+    rejected trope, one confirmed trope, one confirmed trigger, one
+    rejected character, one stale pipeline quote."""
+    return {
+        "book_trope_claims": [
+            {"id": 1, "work_id": WORK_ID, "trope_id": "cat-old-a",
+             "status": "candidate", "source_type": "ai"},
+            {"id": 2, "work_id": WORK_ID, "trope_id": "cat-old-b",
+             "status": "candidate", "source_type": "ai"},
+            {"id": 3, "work_id": WORK_ID, "trope_id": "cat-rej",
+             "status": "rejected", "source_type": "ai"},
+            {"id": 4, "work_id": WORK_ID, "trope_id": "cat-conf",
+             "status": "confirmed", "source_type": "ai"},
+        ],
+        "book_trigger_claims": [
+            {"id": 5, "work_id": WORK_ID, "warning": "old warning",
+             "status": "candidate", "source_type": "ai"},
+            {"id": 6, "work_id": WORK_ID, "warning": "kept warning",
+             "status": "confirmed", "source_type": "ai"},
+        ],
+        "book_characters": [
+            {"id": 7, "work_id": WORK_ID, "name": "Old Char",
+             "status": "candidate", "source_type": "ai"},
+            {"id": 8, "work_id": WORK_ID, "name": "Rejected Char",
+             "status": "rejected", "source_type": "ai"},
+        ],
+        "book_quotes": [
+            {"id": 9, "work_id": WORK_ID,
+             "quote": "old pipeline quote", "source_type": "pipeline"},
+        ],
+    }
+
+
+def _write_result():
+    """A write-shaped result, mirroring test_replace_wholesale's:
+    one mapped trope, one trigger, one character, one quote."""
+    return {
+        "title": "Test Book", "isbn": "9780000000001",
+        "tropes": ["Mind Game"], "trope_confidence": {},
+        "trope_catalog_map": {},
+        "trope_chapters": {pp._tnorm("Mind Game"): ["Ch 1"]},
+        "triggers": [{"warning": "murder", "severity": "mentioned",
+                      "severity_claimed": "mentioned",
+                      "chapters": ["A"], "chapter_count": 1,
+                      "frequency": 0.5, "prominence": "low",
+                      "evidence": [{"quote": "q", "chapter": "A"}],
+                      "confidence": 0.8}],
+        "characters": [{"name": "Hero", "role": "protagonist"}],
+        "relationships": [],
+        "quotes": [{"text": "a brand new quote", "chapter": "Ch 1"}],
+    }
+
+
+class ReplaceResultTests(_Base):
+    """replace_result stops carrying NULLs: write_claims and
+    plan_replace stash the replace accounting they already compute,
+    and book_outcome reads it into the book payload."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = _WriteSB(_seed_claim_tables())
+        pp.sb = self.fake
+
+    def test_write_run_replace_result_carries_real_counts(self):
+        pp._history_begin("scan", preview=False,
+                          learn_dir=str(self.tmp), files_seen=1)
+        pp._history_book_start(self.book)
+        errors = pp.write_claims(
+            WORK_ID, _write_result(),
+            trope_mappings={"Mind Game": "cat-a"})
+        self.assertEqual(errors, 0)
+        pp._history_note_result(self.book, v2_result())
+        pp._history_book_outcome(self.book, True)
+        pp._history_finish(failures=0)
+        # Deleted 5 (2 tropes, 1 trigger, 1 character, 1 quote),
+        # inserted 4 (one per section), preserved 2 rejected
+        # (trope + character) and 2 confirmed (trope + trigger).
+        self.assertEqual(self.book_payload()["replace_result"], {
+            "inserted": 4, "deleted": 5, "would_delete": None,
+            "preserved_rejected": 2, "preserved_confirmed": 2})
+        # The write itself behaved exactly as before: stale
+        # processor rows replaced, curated rows untouched.
+        tables = self.fake.claims.tables
+        self.assertEqual(
+            sorted(r["trope_id"] for r in tables["book_trope_claims"]),
+            ["cat-a", "cat-conf", "cat-rej"])
+        self.assertEqual(
+            sorted(r["warning"]
+                   for r in tables["book_trigger_claims"]),
+            ["kept warning", "murder"])
+        self.assertEqual(
+            sorted(r["name"] for r in tables["book_characters"]),
+            ["Hero", "Rejected Char"])
+        self.assertEqual(
+            [r["quote"] for r in tables["book_quotes"]],
+            ["a brand new quote"])
+
+    def test_preview_replace_result_carries_the_plan(self):
+        pp._history_begin("scan", preview=True,
+                          learn_dir=str(self.tmp), files_seen=1)
+        pp._history_book_start(self.book)
+        plan = pp.plan_replace(
+            WORK_ID, _write_result(),
+            trope_mappings={"Mind Game": "cat-a"})
+        pp._history_note_result(self.book, v2_result())
+        pp._history_book_outcome(self.book, True)
+        pp._history_finish(failures=0)
+        # The payload's numbers ARE the plan's (plan ≡ write): the
+        # stash came from plan_replace's own partitions, and the
+        # plan was read-only — no mutating claim calls, tables
+        # byte-identical to the seed.
+        self.assertEqual(sum(plan["would_delete"].values()), 5)
+        self.assertEqual(plan["rejections_preserved"], 2)
+        self.assertEqual(self.fake.claims.mutating_calls(), [])
+        self.assertEqual(self.book_payload()["replace_result"], {
+            "inserted": None, "deleted": None, "would_delete": 5,
+            "preserved_rejected": 2, "preserved_confirmed": 2})
+        self.assertEqual(len(self.fake.claims.tables[
+            "book_trope_claims"]), 4)
 
 
 if __name__ == "__main__":

@@ -17131,8 +17131,11 @@ class _RunHistoryRecorder:
         # A fresh book must not inherit the previous book's write
         # stats on this thread: wrote_stats is only meaningful for
         # the book whose write_claims set it during this processing.
+        # replace_stats rides the same lifecycle for the same reason.
         if getattr(_DIAG, "wrote_stats", None) is not None:
             _DIAG.wrote_stats = None
+        if getattr(_DIAG, "replace_stats", None) is not None:
+            _DIAG.replace_stats = None
         self._resolve_book_identity(rec)
 
     def book_end(self, fpath, exc):
@@ -17164,19 +17167,35 @@ class _RunHistoryRecorder:
                 # resets it per book).
                 rec["decision_calls"] = _DM_BUDGET_USED
             wrote = getattr(_DIAG, "wrote_stats", None)
-            if wrote is not None:
-                # write_claims' own accounting: new rows inserted,
-                # summed across sections. Its deleted / preserved
-                # counts are printed but never stashed, so they stay
-                # None here rather than being reconstructed.
+            replace = getattr(_DIAG, "replace_stats", None)
+            if wrote is not None or replace is not None:
+                # The write path's own accounting, read from the
+                # stashes it leaves on this thread — never
+                # reconstructed here, because a count this record
+                # cannot source must stay None. wrote_stats carries
+                # new rows inserted, summed across sections;
+                # replace_stats carries the replace totals the same
+                # code computed: deleted + preserved counts from a
+                # write run, would_delete + preserved counts from
+                # plan_replace in preview (the plan's numbers, which
+                # are the write numbers by the plan ≡ write design).
                 rec["replace_result"] = {
                     "inserted": sum(
                         int(v) for v in wrote.values()
-                        if isinstance(v, int)),
-                    "deleted": None, "would_delete": None,
-                    "preserved_rejected": None,
-                    "preserved_confirmed": None}
+                        if isinstance(v, int)) if wrote is not None
+                    else None,
+                    "deleted": replace.get("deleted")
+                    if replace is not None else None,
+                    "would_delete": replace.get("would_delete")
+                    if replace is not None else None,
+                    "preserved_rejected":
+                    replace.get("preserved_rejected")
+                    if replace is not None else None,
+                    "preserved_confirmed":
+                    replace.get("preserved_confirmed")
+                    if replace is not None else None}
                 _DIAG.wrote_stats = None
+                _DIAG.replace_stats = None
 
     def note_result(self, fpath, result):
         """Keep the book's own result record (the dict save_preview
@@ -18968,6 +18987,7 @@ def write_claims(work_id, result, trope_mappings=None):
     wrote = {"tropes": 0, "triggers": 0, "characters": 0, "proposals": 0, "quotes": 0}
     deleted = {"tropes": 0, "triggers": 0, "characters": 0, "proposals": 0, "quotes": 0}
     preserved_rej = 0
+    preserved_conf = 0
     # Merge explicit mappings with the in-pipeline catalog map.
     _cat = dict(result.get("trope_catalog_map", {}) or {})
     if trope_mappings:
@@ -18981,6 +19001,8 @@ def write_claims(work_id, result, trope_mappings=None):
     else:
         _preserved, _rejected, _ndel = _partition_claims("book_trope_claims", _tstate)
         preserved_rej += len(_rejected)
+        preserved_conf += sum(1 for r in _tstate
+                              if (r.get("status") or "") == "confirmed")
         rows, unmatched, _lookup_failed = _build_trope_rows(
             work_id, result, _cat, trope_mappings, model, _preserved)
         if _lookup_failed:
@@ -19045,6 +19067,8 @@ def write_claims(work_id, result, trope_mappings=None):
     else:
         _preserved, _rejected, _ndel = _partition_claims("book_trigger_claims", _gstate)
         preserved_rej += len(_rejected)
+        preserved_conf += sum(1 for r in _gstate
+                              if (r.get("status") or "") == "confirmed")
         rows = _build_trigger_rows(work_id, result, model, _preserved)
         _ok = True
         if _ndel:
@@ -19070,6 +19094,8 @@ def write_claims(work_id, result, trope_mappings=None):
     else:
         _preserved, _rejected, _ndel = _partition_claims("book_characters", _cstate)
         preserved_rej += len(_rejected)
+        preserved_conf += sum(1 for r in _cstate
+                              if (r.get("status") or "") == "confirmed")
         pre_existing = set(_preserved)  # surviving rows: backfill targets
         rows = _build_character_rows(work_id, result, rel_map, _preserved)
         _ok = True
@@ -19214,6 +19240,16 @@ def write_claims(work_id, result, trope_mappings=None):
               f"{wrote.get('quotes', 0)} quotes (new rows only)")
     # P7: stash for the end-of-run summary panel.
     _DIAG.wrote_stats = dict(wrote)
+    # The run-history writer reads the same totals from here: the
+    # replace accounting above exists only as local variables and a
+    # print, so without this stash replace_result would carry the
+    # deleted / preserved counts as NULL on every write run. The
+    # confirmed tally counts the state rows this run's partitions
+    # preserved via the confirmed branch — tallied from rows already
+    # fetched, no extra reads.
+    _DIAG.replace_stats = {"deleted": _tot_del,
+                           "preserved_rejected": preserved_rej,
+                           "preserved_confirmed": preserved_conf}
     return errors
 
 
@@ -19233,6 +19269,7 @@ def plan_replace(work_id, result, trope_mappings=None):
         _cat.update({_tnorm(k): v for k, v in trope_mappings.items()})
     plan = {"would_delete": {}, "would_insert": {},
             "rejections_preserved": 0, "existing": 0}
+    preserved_conf = 0
     unmatched = []
 
     _tstate = _claim_rows("book_trope_claims", work_id)
@@ -19242,6 +19279,8 @@ def plan_replace(work_id, result, trope_mappings=None):
     plan["would_delete"]["book_trope_claims"] = _ndel
     plan["existing"] += len(_tstate)
     plan["rejections_preserved"] += len(_rejected)
+    preserved_conf += sum(1 for r in _tstate
+                          if (r.get("status") or "") == "confirmed")
     _rows, unmatched, _lookup_failed = _build_trope_rows(
         work_id, result, _cat, trope_mappings, model, _preserved)
     if _lookup_failed:
@@ -19273,6 +19312,8 @@ def plan_replace(work_id, result, trope_mappings=None):
     plan["would_delete"]["book_trigger_claims"] = _ndel
     plan["existing"] += len(_gstate)
     plan["rejections_preserved"] += len(_rejected)
+    preserved_conf += sum(1 for r in _gstate
+                          if (r.get("status") or "") == "confirmed")
     plan["would_insert"]["triggers"] = len(
         _build_trigger_rows(work_id, result, model, _preserved))
 
@@ -19283,6 +19324,8 @@ def plan_replace(work_id, result, trope_mappings=None):
     plan["would_delete"]["book_characters"] = _ndel
     plan["existing"] += len(_cstate)
     plan["rejections_preserved"] += len(_rejected)
+    preserved_conf += sum(1 for r in _cstate
+                          if (r.get("status") or "") == "confirmed")
     _rel_map, _nev = _build_rel_map(result)
     plan["would_insert"]["characters"] = len(
         _build_character_rows(work_id, result, _rel_map, _preserved))
@@ -19309,6 +19352,16 @@ def plan_replace(work_id, result, trope_mappings=None):
                           if s.get("class") == "trope"),
             "triggers": sum(1 for s in _staged
                             if s.get("class") == "trigger")}
+    # The run-history writer reads the plan through the same stash
+    # write_claims fills, so a preview's replace_result carries the
+    # plan's would-* totals — the write totals, by the plan ≡ write
+    # design. Only this completed-plan return stashes: the {} early
+    # returns above are failed lookups, and a failed lookup must
+    # leave replace_result NULL rather than invent numbers.
+    _DIAG.replace_stats = {
+        "would_delete": sum(plan["would_delete"].values()),
+        "preserved_rejected": plan["rejections_preserved"],
+        "preserved_confirmed": preserved_conf}
     return plan
 
 
