@@ -105,3 +105,47 @@ run. Once this ships, reprocess Fourth Wing from the corpus
 refresh the ai rows under the fixed behaviour. The live eval
 above should be run first; if gated cases miss, the prompt —
 not the thresholds — is the tuning surface.
+
+## Addendum — 2.13.9: validation context window (2026-10-17)
+
+The live eval on the 2.13.8 prompt produced the measurement this
+addendum answers (results:
+~/workspace/ebook-processor-sweep/reviews/relationship-eval-live-2026-10-17.md).
+All drop cases passed (0.01–0.04); five keep cases missed, and
+they share one shape:
+
+  The judge credits a quote only when BOTH endpoints are
+  identifiable by name inside the quote itself. Quotes spoken by
+  one of the pair (speaker unnamed in the quote: Mira's "This is
+  my sister, Violet" 0.26, Imogen's "Imogen and I are just
+  friends" 0.27, Jack's "You're next, Sorrengail!" with Violet
+  as unnamed narrator 0.21) and surname-only constructions
+  (Chris->Peter child, 0.13) score in the drop band. Prompt
+  teaching did not move the surname case even with the exact
+  construction present as an example in the prompt — the
+  fine-tune dominates the instruction.
+
+The context the attribution lives in is the sentences around the
+quote: dialogue tags and narration name the speaker. Fix:
+`_evidence_window(quote, chapter_text)` locates the quote in its
+chapter (whitespace-collapsed match) and returns the verbatim
+sentences immediately before and after it; `v2_reduce` passes
+that window through the validator's existing `context` parameter
+(framed as "Sentences around the quote, from the same passage:")
+in both the family and non-family passes. A mined sentence's
+window comes from the mined chapter; an extracted quote's from
+the claim's chapter. An unlocatable quote yields empty context —
+validation then behaves exactly as before this change.
+
+Deliberately NOT done: POV context (a chapter's narrator is not
+the speaker of its dialogue — Fourth Wing's failing quotes are
+dialogue inside Violet's narration, and the surrounding
+sentences carry the true attribution); evidence substitution
+beyond the existing binding-grade rule (the measured judge is
+stingy, not gullible — it does not need protecting from
+co-occurrence text, but claim semantics stay as pinned).
+
+Gate: the same live eval. All 12 gated cases in band before any
+Daemon / Fourth Wing reprocess (reprocessing stays on hold:
+under the 2.13.8 prompt alone, a reprocess would drop true
+speaker-attributed pairs alongside the junk).

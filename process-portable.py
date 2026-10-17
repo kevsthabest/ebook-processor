@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.8"
+PORTABLE_VERSION = "2.13.9"
 
 
 import argparse
@@ -2135,6 +2135,73 @@ def _pair_sentence_grade(sentence, re_a, re_b):
             or _pair_binding(sentence, re_b, re_a)):
         return "binding"
     return "co-occurrence"
+
+
+def _collapse_ws(s):
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def _locate_quote_span(quote, text):
+    """Locate a quote in chapter text as a sentence range.
+
+    Returns (first, last) indices into _split_sentences(text), or
+    None. Extraction and chapter text rarely share exact
+    whitespace, so both sides are whitespace-collapsed before the
+    search; the indices always refer to the chapter's own verbatim
+    sentences."""
+    pieces = _split_sentences(text)
+    if not pieces or not quote:
+        return None
+    collapsed = [_collapse_ws(p) for p in pieces]
+    joined = " ".join(collapsed)
+    needle = _collapse_ws(quote)
+    if not needle:
+        return None
+    start = joined.find(needle)
+    if start < 0:
+        return None
+    end = start + len(needle)
+    first = last = None
+    pos = 0
+    for i, piece in enumerate(collapsed):
+        nxt = pos + len(piece)
+        if first is None and nxt >= start:
+            first = i
+        if nxt >= end - 1:
+            last = i
+            break
+        pos = nxt + 1
+    if first is None or last is None:
+        return None
+    return first, last
+
+
+def _evidence_window(quote, chapter_text):
+    """The verbatim sentences immediately around a quote in its
+    chapter, for the relationship validator's context slot.
+
+    The judge credits what it can resolve, and a quote spoken by
+    one of the pair ("This is my sister, Violet") names only the
+    other party in the quote itself — the speaker lives in the
+    dialogue tags and narration around it (measured live,
+    2026-10-17: speaker-attributed and surname-only quotes scored
+    0.13–0.27 while both-names quotes scored 0.97–0.99). The
+    window is the quote's own neighbouring sentences, never
+    rewritten or joined with it. Returns "" when the quote cannot
+    be located, which leaves validation exactly as it was."""
+    if not quote or not chapter_text:
+        return ""
+    span = _locate_quote_span(quote, chapter_text)
+    if span is None:
+        return ""
+    pieces = _split_sentences(chapter_text)
+    first, last = span
+    around = []
+    if first > 0:
+        around.append(pieces[first - 1])
+    if last + 1 < len(pieces):
+        around.append(pieces[last + 1])
+    return " ".join(around)[:700]
 
 
 def _mine_pair_evidence(from_name, to_name, chapters, roster=None):
@@ -14533,6 +14600,28 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 frm, to, _mine_chapters, roster)
         return _mine_cache[_k]
 
+    _chapters_by_label = {c.get("label"): c for c in chapters}
+    _chapters_by_index = {c.get("index"): c for c in chapters}
+
+    def _validation_context(ev_quote, rel, mined_idx=None):
+        """Context for the validator: the sentences around the
+        evidence quote in its own chapter (see _evidence_window).
+        A mined sentence's chapter wins over the claim's chapter —
+        the judged text lives there, not where the claim was
+        extracted. Empty when the quote cannot be located, which
+        leaves the validation call exactly as it was."""
+        _ch = None
+        if mined_idx is not None:
+            _ch = _chapters_by_index.get(mined_idx)
+        if _ch is None:
+            _ch = _chapters_by_label.get(rel.get("chapter") or "")
+        if _ch is None:
+            return ""
+        _w = _evidence_window(ev_quote, _ch.get("text", ""))
+        if not _w:
+            return ""
+        return f"Sentences around the quote, from the same passage: {_w}"
+
     for rel in relationships:
         _rt = rel.get("type", "")
         if _rt not in _REL_FAMILY_TYPES:
@@ -14572,8 +14661,12 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         if not _dm_budget_claim(1):
             rel["validation_note"] = "budget_exhausted"
             continue
+        _ctx = _validation_context(
+            _ev, rel,
+            _mined["chapter"] if (rel.get("evidence_mined")
+                                  and _mined) else None)
         _v, _p = _DECISION_VALIDATOR.validate_relationship(
-            rel["from"], rel["to"], _rt, _ev)
+            rel["from"], rel["to"], _rt, _ev, context=_ctx)
         if _p is None:
             # Validator error: fail open, keep the original type.
             rel["validation_note"] = "validator_error"
@@ -14617,6 +14710,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             if _rt in _REL_FAMILY_TYPES or _rt == "other":
                 continue
             _ev = (rel.get("evidence") or "").strip()
+            _mined = None
             if not _ev:
                 _mined = _mine(rel["from"], rel["to"])
                 if _mined:
@@ -14627,8 +14721,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             if not _dm_budget_claim(1):
                 rel["validation_note"] = "budget_exhausted"
                 continue
+            _ctx = _validation_context(
+                _ev, rel, _mined["chapter"] if _mined else None)
             _v, _p = _DECISION_VALIDATOR.validate_relationship(
-                rel["from"], rel["to"], _rt, _ev)
+                rel["from"], rel["to"], _rt, _ev, context=_ctx)
             if _p is None:
                 # Validator error: fail open, as for family claims.
                 rel["validation_note"] = "validator_error"

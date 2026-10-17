@@ -759,5 +759,145 @@ class TestSurnameValidationIntegration(unittest.TestCase):
         self.assertEqual(rel["type"], "child")
 
 
+class TestEvidenceWindow(unittest.TestCase):
+    """The validator's context window: the sentences around a
+    quote in its own chapter (2.13.9, from the live eval: the judge
+    credits only what it can resolve, and speaker-attributed
+    quotes carry their speaker in the surrounding sentences)."""
+
+    TEXT = ("Mira faced the scribe with a steady look. "
+            "This is my sister, Violet. She'll be a first-year. "
+            "The scribe wrote it down without a word.")
+
+    def test_window_is_the_neighbouring_sentences(self):
+        w = pp._evidence_window(
+            "This is my sister, Violet. She'll be a first-year.",
+            self.TEXT)
+        self.assertIn("Mira faced the scribe", w)
+        self.assertIn("The scribe wrote it down", w)
+        self.assertNotIn("first-year", w)  # the quote itself is not context
+
+    def test_whitespace_variant_quote_still_locates(self):
+        w = pp._evidence_window(
+            "This is my sister,\n  Violet.   She'll be a first-year.",
+            self.TEXT)
+        self.assertIn("Mira faced the scribe", w)
+
+    def test_quote_at_chapter_start_has_no_before_sentence(self):
+        w = pp._evidence_window(
+            "Mira faced the scribe with a steady look.", self.TEXT)
+        self.assertIn("This is my sister", w)
+        self.assertNotIn("wrote it down", w)
+
+    def test_unlocatable_quote_returns_empty(self):
+        self.assertEqual(pp._evidence_window(
+            "A quote that appears nowhere in this text.", self.TEXT), "")
+        self.assertEqual(pp._evidence_window("", self.TEXT), "")
+        self.assertEqual(pp._evidence_window("anything", ""), "")
+
+
+class _ContextValidator:
+    model = "stub"
+
+    def __init__(self, p=0.95):
+        self.p = p
+        self.calls = []  # dicts with quote + context
+
+    def validate_relationship(self, frm, to, rtype, quote, context=""):
+        self.calls.append({"from": frm, "to": to, "type": rtype,
+                           "quote": quote, "context": context})
+        return True, self.p
+
+
+class TestValidationContext(unittest.TestCase):
+    def setUp(self):
+        self._old_validator = pp._DECISION_VALIDATOR
+        pp._dm_budget_reset()
+        self.validator = _ContextValidator()
+        pp._DECISION_VALIDATOR = self.validator
+
+    def tearDown(self):
+        pp._DECISION_VALIDATOR = self._old_validator
+        pp._dm_budget_reset()
+
+    def test_extracted_quote_gets_neighbour_context(self):
+        # The Mira eval case shape: the quote names only Violet;
+        # the sentence before it names the speaker.
+        text = ("Mira faced the scribe with a steady look. "
+                "This is my sister, Violet. She'll be a first-year. "
+                "The scribe wrote it down without a word.")
+        chapter_as = {1: {"relationships": [{
+            "from": "Mira Sorrengail", "to": "Violet Sorrengail",
+            "type": "sibling",
+            "evidence": "This is my sister, Violet. "
+                        "She'll be a first-year."}],
+            "pov_character": None}}
+        red = pp.v2_reduce(chapter_as, {}, _FW_ROSTER, _chs(text),
+                           preview=False)
+        self.assertEqual(len(self.validator.calls), 1)
+        ctx = self.validator.calls[0]["context"]
+        self.assertIn("Mira faced the scribe", ctx)
+        self.assertIn("The scribe wrote it down", ctx)
+        self.assertEqual(red["relationships"][0]["validation_note"],
+                         "kept")
+
+    def test_mined_evidence_context_comes_from_the_mined_chapter(self):
+        # Evidence-less claim; the binding mined sentence sits in
+        # chapter 2 while the claim was extracted in chapter 1 —
+        # the window must come from chapter 2.
+        chs = [
+            {"index": 1, "label": "Ch1", "title": "",
+             "text": "A claim was extracted here."},
+            {"index": 2, "label": "Ch2", "title": "",
+             "text": ("The hall was loud that morning. "
+                      "\"You are my sister, Violet,\" Mira said. "
+                      "Everyone in the hall heard it.")},
+        ]
+        chapter_as = {1: {"relationships": [{
+            "from": "Mira Sorrengail", "to": "Violet Sorrengail",
+            "type": "sibling", "evidence": None}],
+            "pov_character": None}}
+        pp.v2_reduce(chapter_as, {}, _FW_ROSTER, chs, preview=False)
+        self.assertEqual(len(self.validator.calls), 1)
+        call = self.validator.calls[0]
+        self.assertIn("my sister, Violet", call["quote"])
+        self.assertIn("Everyone in the hall heard it", call["context"])
+        self.assertIn("The hall was loud", call["context"])
+
+    def test_nonfamily_quote_gets_neighbour_context(self):
+        # The non-family pass routes context too (this is the Jack
+        # eval shape: the quote names the narrator only by
+        # surname; the neighbours name everyone).
+        text = ("Jack Barlowe cornered Violet Sorrengail in the "
+                "hall. \"You're next, Sorrengail!\" he said. "
+                "Violet did not answer him.")
+        chapter_as = {1: {"relationships": [{
+            "from": "Jack Barlowe", "to": "Violet Sorrengail",
+            "type": "enemy",
+            "evidence": "\"You're next, Sorrengail!\" he said."}],
+            "pov_character": None}}
+        roster = _roster(("Jack Barlowe", []),
+                         ("Violet Sorrengail", []))
+        pp.v2_reduce(chapter_as, {}, roster, _chs(text),
+                     preview=False)
+        self.assertEqual(len(self.validator.calls), 1)
+        call = self.validator.calls[0]
+        self.assertEqual(call["type"], "enemy")
+        self.assertIn("Jack Barlowe cornered Violet", call["context"])
+        self.assertIn("Violet did not answer", call["context"])
+
+    def test_unlocatable_quote_validates_with_empty_context(self):
+        chapter_as = {1: {"relationships": [{
+            "from": "Mira Sorrengail", "to": "Violet Sorrengail",
+            "type": "sibling",
+            "evidence": "A quote that appears nowhere in the text."}],
+            "pov_character": None}}
+        pp.v2_reduce(chapter_as, {}, _FW_ROSTER,
+                     _chs("An unrelated chapter about other people."),
+                     preview=False)
+        self.assertEqual(len(self.validator.calls), 1)
+        self.assertEqual(self.validator.calls[0]["context"], "")
+
+
 if __name__ == "__main__":
     unittest.main()
