@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.15"
+PORTABLE_VERSION = "2.13.16"
 
 
 import argparse
@@ -17957,6 +17957,26 @@ def _history_claim_key(axis, book_key, identity):
         f"{axis}|{book_key}|{identity}".encode("utf-8")).hexdigest()
 
 
+def _history_unique_identity(seen, identity):
+    """Per-axis identity disambiguation for claim rows. Several
+    claims in one axis can share an identity — every unmapped
+    trope carries the same pending marker — and identical
+    (axis, identity) pairs hash to identical claim_keys, which
+    Postgres refuses inside a single upsert (error 21000: ON
+    CONFLICT DO UPDATE cannot affect the same row twice; first
+    seen live on Daemon run 17, whose final list held two
+    unmapped tropes). The first claim keeps the bare identity;
+    later ones take an ordinal suffix (#2, #3, ...) in row order.
+    The suffix is not name material and feeds only the hash, so
+    §4's non-reversibility is untouched; unmapped claims were
+    never individually trackable across runs under the marker
+    design — this only keeps them individually recorded within
+    the run that evaluated them."""
+    n = seen.get(identity, 0) + 1
+    seen[identity] = n
+    return identity if n == 1 else f"{identity}#{n}"
+
+
 def _history_axis(retrieval, final_keys, confidence_by_key,
                   promoted_count, retrieval_ran):
     """One axis' counts plus its claim rows, from the run's own
@@ -18045,13 +18065,23 @@ def _history_book_claims(result):
         len(persist) if isinstance(persist, dict) else None,
         retrieval_ran)
     claims["tropes"] = counts
+    _seen_t = {}
     for key, row in trows.items():
+        # Identity resolution consults the catalogue map for every
+        # row key, not just final-listed names: a claim the
+        # retrieve stage evaluated but the book dropped still has
+        # a catalogue id when one exists, and keying it as pending
+        # would both misrecord it and pile it onto the shared
+        # pending key.
+        _ident = trope_rows.get(key, {}).get("identity")
+        if _ident is None:
+            _ident = (str(catmap[key]) if key in catmap
+                      else _HISTORY_UNMAPPED)
         rows.append({
             "axis": "tropes",
             "claim_key": _history_claim_key(
                 "tropes", book_key,
-                trope_rows.get(key, {}).get(
-                    "identity", _HISTORY_UNMAPPED)),
+                _history_unique_identity(_seen_t, _ident)),
             "verdict": row["verdict"],
             "confidence": row["confidence"]})
 
@@ -18072,6 +18102,7 @@ def _history_book_claims(result):
         len(tpersist) if isinstance(tpersist, dict) else None,
         retrieval_ran)
     claims["triggers"] = counts
+    _seen_g = {}
     for key, row in grows.items():
         ident = trig_final.get(key, {}).get("identity")
         if ident is None:
@@ -18082,7 +18113,8 @@ def _history_book_claims(result):
         rows.append({
             "axis": "triggers",
             "claim_key": _history_claim_key(
-                "triggers", book_key, ident),
+                "triggers", book_key,
+                _history_unique_identity(_seen_g, ident)),
             "verdict": row["verdict"],
             "confidence": row["confidence"]})
     return claims, rows

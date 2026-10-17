@@ -293,6 +293,60 @@ class PayloadTests(_Base):
         self.assertIn(mapped, keys)
         self.assertIn(pending, keys)
 
+    def test_two_unmapped_tropes_get_distinct_claim_keys(self):
+        # RH-F1 regression: Daemon run 17's upload died with
+        # Postgres 21000 because two unmapped tropes hashed to the
+        # same pending key inside one upsert batch. The first
+        # keeps the bare pending key; the second is suffixed.
+        result = v2_result()
+        result["tropes"] = ["Found Family", "Secret Baby"]
+        result["trope_confidence"] = {"found family": 0.7,
+                                      "secret baby": 0.6}
+        result["trope_catalog_map"] = {}
+        result["trope_retrieval"] = {}
+        result["trope_persistence"] = {}
+        self.drive_one_book(result=result)
+        rows = self.fake.posts("processor_run_claim_outcomes")[0]["data"]
+        trope_rows = [r for r in rows if r["axis"] == "tropes"]
+        self.assertEqual(len(trope_rows), 2)
+        bare = hashlib.sha256(
+            f"tropes|{self.book_key}|catalogue-pending"
+            .encode()).hexdigest()
+        suffixed = hashlib.sha256(
+            f"tropes|{self.book_key}|catalogue-pending#2"
+            .encode()).hexdigest()
+        self.assertEqual({r["claim_key"] for r in trope_rows},
+                         {bare, suffixed})
+
+    def test_evaluated_dropped_claims_keep_their_own_keys(self):
+        # Claims the retrieve stage evaluated but the book dropped
+        # still earn rows: a mapped one keys by its catalogue id
+        # (not the shared pending marker), and an unmapped one
+        # does not collide with anything.
+        result = v2_result()
+        result["tropes"] = ["Enemies To Lovers"]
+        result["trope_confidence"] = {"enemies to lovers": 0.8}
+        result["trope_catalog_map"] = {
+            "enemies to lovers": "trope-123",
+            "found family": "trope-456"}
+        result["trope_retrieval"] = {
+            "enemies to lovers": {"outcome": "supported-single"},
+            "found family": {"outcome": "abstained"},
+            "secret baby": {"outcome": "adjacent-only"}}
+        result["trope_persistence"] = {}
+        self.drive_one_book(result=result)
+        rows = self.fake.posts("processor_run_claim_outcomes")[0]["data"]
+        trope_keys = {r["claim_key"] for r in rows
+                      if r["axis"] == "tropes"}
+        expect = {
+            hashlib.sha256(f"tropes|{self.book_key}|trope-123"
+                           .encode()).hexdigest(),
+            hashlib.sha256(f"tropes|{self.book_key}|trope-456"
+                           .encode()).hexdigest(),
+            hashlib.sha256(f"tropes|{self.book_key}|catalogue-pending"
+                           .encode()).hexdigest()}
+        self.assertEqual(trope_keys, expect)
+
     def test_explicit_null_inner_keys_for_failed_book(self):
         pp._history_begin("scan", preview=True,
                           learn_dir=str(self.tmp), files_seen=1)
@@ -423,22 +477,37 @@ class DisciplineTests(_Base):
         pp._history_finish()
 
     def test_claim_key_never_uses_free_text_label(self):
-        result = v2_result()
-        result["tropes"] = ["Alpha Name", "Beta Name"]
-        result["trope_catalog_map"] = {}
-        result["trope_retrieval"] = {}
-        result["trope_confidence"] = {"alpha name": 0.5,
-                                      "beta name": 0.6}
-        claims, rows = pp._history_book_claims(
-            {**result, "_history_book_key": self.book_key})
-        trope_rows = [r for r in rows if r["axis"] == "tropes"]
-        self.assertEqual(len(trope_rows), 2)
-        expected = hashlib.sha256(
+        # Amended 2026-10-17 (RH-F1): the original form asserted
+        # two unmapped labels hash to the IDENTICAL key. Postgres
+        # forbids identical keys in one upsert batch (21000, live
+        # on Daemon run 17), so repeated identities now take an
+        # ordinal suffix. The property this test exists to guard
+        # is unchanged and is asserted in its stronger form: the
+        # SET of keys is invariant under relabelling — rename both
+        # claims and the same keys come out — so no label material
+        # can be entering any key.
+        def keys_for(names):
+            result = v2_result()
+            result["tropes"] = names
+            result["trope_catalog_map"] = {}
+            result["trope_retrieval"] = {}
+            result["trope_confidence"] = {
+                n.lower(): 0.5 for n in names}
+            claims, rows = pp._history_book_claims(
+                {**result, "_history_book_key": self.book_key})
+            return {r["claim_key"] for r in rows
+                    if r["axis"] == "tropes"}
+
+        bare = hashlib.sha256(
             f"tropes|{self.book_key}|catalogue-pending"
             .encode()).hexdigest()
-        for r in trope_rows:
-            self.assertEqual(r["claim_key"], expected)
-            self.assertNotIn("alpha", r["claim_key"])
+        suffixed = hashlib.sha256(
+            f"tropes|{self.book_key}|catalogue-pending#2"
+            .encode()).hexdigest()
+        self.assertEqual(keys_for(["Alpha Name", "Beta Name"]),
+                         {bare, suffixed})
+        self.assertEqual(keys_for(["Gamma Tag", "Delta Tag"]),
+                         {bare, suffixed})
 
     def test_verdict_allowlist_blocks_offlist_outcomes(self):
         result = v2_result()

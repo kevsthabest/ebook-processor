@@ -317,3 +317,25 @@ The arguments that were put to the user:
   both homes — service-role-only access, verified from the database's own
   grant tables plus a PostgREST probe and a positive round trip, never
   trusted from migration text.
+
+## Addendum — 2.13.16: claim-key disambiguation (RH-F1, 2026-10-17)
+
+The first live run-history upload (Daemon run 17) failed on
+processor_run_claim_outcomes: Postgres 21000 — two claim rows in
+one upsert batch carried the same (run_book_id, axis, claim_key).
+Cause: §4 keys every unmapped claim in an axis to the single
+pending marker, and Daemon's final list held two unmapped tropes.
+
+Ruling implemented: identity resolution now consults the catalogue
+map for EVERY row key (a claim the retrieve stage evaluated but
+the book dropped keys by its catalogue id when one exists, rather
+than piling onto the pending marker), and a repeated identity
+within an axis takes an ordinal suffix (catalogue-pending#2, ...)
+in row order before hashing. §4's guarantee survives in its
+operative form — no label material enters any key, and the key SET
+for a book is invariant under relabelling (asserted by the amended
+discipline test, which previously pinned identical keys for two
+unmapped labels — the mechanism Postgres forbids). Unmapped claims
+remain individually untrackable ACROSS runs, as the marker design
+always accepted; within a run each evaluated claim now keeps its
+own row, so axis counts and claim rows reconcile.
