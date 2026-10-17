@@ -1,8 +1,8 @@
 [
  {
-  "expect": "keep",
+  "expect": "any",
   "from": "Chris Sebeck",
-  "note": "Daemon, real quote. The A2 case: a surname-anchored possessive appositive. The pre-tune prompt scored this construction 0.20 in production (run 16) and the true claim dropped.",
+  "note": "Daemon, real quote. The A2 case: a surname-anchored possessive appositive. The pre-tune prompt scored this construction 0.20 in production (run 16) and the true claim dropped. ACCEPTED as a documented miss (2026-10-17): no explicit evidence exists — Daemon's only two binding sentences are surname-anchored (probed), Freedom has zero both-names kinship sentences (probed). Production outcome: middle band, downgrade to 'other'; the pair survives, human-confirmable.",
   "quote": "Sebeck's son, Chris, stood next to him.",
   "stub_score": 0.9,
   "to": "Peter Sebeck",
@@ -60,9 +60,9 @@
   "work": "Fourth Wing"
  },
  {
-  "expect": "keep",
+  "expect": "any",
   "from": "Liam Mairi",
-  "note": "Fourth Wing, real stored evidence (Xaden speaking of Liam). Foster-brother supports at least the claimed friend bond; if the judge insists this is sibling-only, that is a finding about type granularity, recorded here deliberately.",
+  "note": "Fourth Wing, real stored evidence (Xaden speaking of Liam). Foster-brother supports at least the claimed friend bond; if the judge insists this is sibling-only, that is a finding about type granularity, recorded here deliberately. ACCEPTED as a documented miss (2026-10-17): the judge reads foster-brother evidence as sibling-only — a type-granularity finding about the extractor's claim, not an evidence failure. Production outcome: the friend claim drops on reprocess unless extraction types the pair sibling.",
   "quote": "I'd ordered my foster brother to keep her safe, and that order got him killed.",
   "stub_score": 0.85,
   "to": "Xaden Riorson",

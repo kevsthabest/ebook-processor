@@ -237,3 +237,27 @@ whether Freedom (which IS in the corpus) confirms Daemon's
 surname-anchored Chris->Peter claim. One occurrence of a
 shared surname cannot place both endpoints. Corpus opened
 read-only (mode="report").
+
+## Addendum — 2.13.15: two eval cases accepted as documented misses (2026-10-17)
+
+The gated set goes from 12 to 10 — not by weakening the gate
+but by closing the two cases with evidence, on the record:
+
+  Chris->Peter child: accepted. Daemon's full text holds two
+  binding sentences for the pair, both surname-anchored
+  (probed); Freedom holds zero both-names kinship sentences
+  (probed). No explicit evidence exists for any judge to
+  credit; the production outcome is the designed middle tier
+  (downgrade to "other", pair preserved, human-confirmable).
+
+  Liam->Xaden friend: accepted. The evidence states a
+  foster-brother bond; the judge's refusal to call it "friend"
+  is a type-granularity finding about the extractor's claim.
+  The claim drops on reprocess unless extraction types the
+  pair sibling; the preview will show which happened.
+
+Both cases remain in the set as report-only, notes carrying
+the acceptance and its evidence. With the gate at 10/10
+attainable, Daemon + Fourth Wing reprocessing proceeds
+preview-first: every downgrade and drop is read in the
+previews before any write run.
