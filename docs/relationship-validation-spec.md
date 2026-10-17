@@ -207,3 +207,20 @@ window. Two harness/production gaps and one real signal:
   two-tier (keep at >= 0.30). _band is now type-aware; the
   Imogen case at 0.43 was a production keep misreported as a
   miss.
+
+## Addendum — 2.13.13: window widened to two sentences each side (2026-10-17)
+
+One-variable experiment on the 2.13.12 eval: windows attached
+on 11/14 cases and every speaker-attributed case flipped to
+keep (Mira 0.71, Jack 0.57, Imogen 0.50); the surname case
+(Chris->Peter child) climbed 0.13 -> 0.33 but stopped in the
+middle band. Its window named the scene but not the scene's
+subject; the wider passage frame is the next place that
+attribution can live. _evidence_window now returns the two
+sentences on each side (cap 700 -> 1200 chars so long
+neighbours are not clipped). The Liam friend case (0.02,
+foster-brother evidence) is NOT a target of this change: the
+judge reads that evidence as sibling-only, a type-granularity
+finding about the extractor's claim, recorded in the eval
+notes. Gate: the same live corpus eval; Chris in the keep band
+closes the surname thread.

@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.12"
+PORTABLE_VERSION = "2.13.13"
 
 
 import argparse
@@ -2211,12 +2211,15 @@ def _evidence_window(quote, chapter_text):
         return ""
     pieces = _split_sentences(chapter_text)
     first, last = span
-    around = []
-    if first > 0:
-        around.append(pieces[first - 1])
-    if last + 1 < len(pieces):
-        around.append(pieces[last + 1])
-    return " ".join(around)[:700]
+    # Two sentences each side (widened from one in 2.13.13): the
+    # live eval's surname case (Chris->Peter child) reached only
+    # the middle band with a one-sentence window — the passage's
+    # wider frame, not its immediate neighbours, is what names
+    # the scene's subject. The cap grows with the window so a
+    # long neighbour is not clipped mid-sentence at the old size.
+    around = (pieces[max(0, first - 2):first]
+              + pieces[last + 1:last + 3])
+    return " ".join(around)[:1200]
 
 
 def _mine_pair_evidence(from_name, to_name, chapters, roster=None):

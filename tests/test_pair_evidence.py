@@ -787,7 +787,26 @@ class TestEvidenceWindow(unittest.TestCase):
         w = pp._evidence_window(
             "Mira faced the scribe with a steady look.", self.TEXT)
         self.assertIn("This is my sister", w)
+        # BAR-MOVE (2.13.13): the window widened from +/-1 to +/-2
+        # sentences (the surname eval case needed the wider frame),
+        # so the second following sentence ("She'll be a
+        # first-year.") is now in the window; the third is not.
+        self.assertIn("first-year", w)
         self.assertNotIn("wrote it down", w)
+
+    def test_window_is_two_sentences_each_side(self):
+        text = ("Sentence one here. Sentence two here. "
+                "The quoted sentence sits here. "
+                "Sentence four here. Sentence five here. "
+                "Sentence six here.")
+        w = pp._evidence_window("The quoted sentence sits here.",
+                                text)
+        self.assertIn("Sentence one here", w)
+        self.assertIn("Sentence two here", w)
+        self.assertIn("Sentence four here", w)
+        self.assertIn("Sentence five here", w)
+        self.assertNotIn("Sentence six here", w)
+        self.assertNotIn("quoted sentence", w)
 
     def test_punctuation_variants_still_locate(self):
         # Books carry curly glyphs; stored and transcribed quotes
