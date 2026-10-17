@@ -7,7 +7,7 @@ whatever ebook files you hand it. **Preview first, write later** — every run
 can save a full Markdown/JSON report for human review before anything
 touches the database.
 
-**Current version: 2.13.24** (`PORTABLE_VERSION` in `process-portable.py`).
+**Current version: 2.13.25** (`PORTABLE_VERSION` in `process-portable.py`).
 
 ## How it works
 
@@ -174,7 +174,10 @@ second pipeline path.
 - **Live Run page** — streamed log, stage progress, results feed,
   and the Matrices panel (merge/trope decision grids computed
   from the run's event artifact; pipeline launches add
-  `--emit-run-events`). Stop signals the run (`CTRL_BREAK_EVENT`
+  `--emit-run-events`). A run started in a terminal instead
+  also shows live — on Home and on its own Run page, labelled
+  external and read-only — when launched with
+  `--emit-run-events`. Stop signals the run (`CTRL_BREAK_EVENT`
   on Windows), then terminates after a short grace, then kills;
   Resume re-runs the argv with `--resume` when checkpoints exist.
 - **The Desk** — the human-ruling surface: staged claims in

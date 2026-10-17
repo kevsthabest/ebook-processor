@@ -624,10 +624,11 @@ def home_data(learn_dir, script_dir, backup_dir=None):
     strip = {
         "jobs": [],
         "decision_cap": cap if isinstance(cap, int) else 50,
-        "note": ("Only runs launched from this portal appear "
-                 "here. A run started in a terminal does not "
-                 "appear; its effects show as ordinary state "
-                 "changes on refresh."),
+        "note": ("Runs launched from this portal appear here. "
+                 "A run started in a terminal also appears — "
+                 "labelled external — while it runs, when it "
+                 "was launched with --emit-run-events; its "
+                 "finished preview appears under Recent runs."),
     }
     return {
         "present": corpus is not None, "dir": str(learn_dir),
@@ -1418,9 +1419,18 @@ class EventsTailer:
                         for line in chunk.decode(
                                 "utf-8", "replace").splitlines():
                             try:
-                                self._events.append(json.loads(line))
+                                ev = json.loads(line)
                             except ValueError:
                                 continue
+                            # Every consumer of this stream
+                            # calls .get on its events, so a line
+                            # that is valid JSON but not an object
+                            # (a stray "42" in a hand-mangled
+                            # artifact) is skipped here, at the
+                            # one reader, rather than wedging
+                            # each consumer downstream.
+                            if isinstance(ev, dict):
+                                self._events.append(ev)
             return self._aggregates()
 
     def _aggregates(self):
@@ -2088,6 +2098,366 @@ class Job:
         }
 
 
+# ---------------------------------------------------------------------------
+# External runs: standalone processor runs observed live (§5.1)
+# ---------------------------------------------------------------------------
+
+# A standalone run is discoverable while it could still be news:
+# its artifact changed within this window, or its writer is
+# provably alive. Anything older and silent is history — Recent
+# runs and the retained-artifact pages already cover it, and
+# adopting every artifact ever written would bury the strip.
+_EXTERNAL_DISCOVERY_SECONDS = 900
+
+# Extraction can sit silent inside one book for many minutes —
+# the artifact only speaks at book boundaries and during the
+# reduce — so a live run is not declared dead on a short quiet
+# spell. The writer's pid (below) is the stronger signal; this
+# window is the fallback for when the pid cannot be checked.
+_EXTERNAL_SILENCE_SECONDS = 1800
+
+
+def _path_key(path):
+    """The comparison key for artifact paths: two spellings of
+    one file (the child's announced path, the portal's glob of
+    the same folder) must claim once, never twice."""
+    try:
+        return str(Path(path).resolve())
+    except OSError:
+        return str(path)
+
+
+def _artifact_pid(path):
+    """The writer's pid, from the artifact's pinned name
+    (run-<YYYYMMDD-HHMMSS>-<pid>.jsonl, plus an optional numeric
+    collision suffix). None when the name does not carry one —
+    the name is the processor's own pin, so a foreign file in
+    the folder simply has no writer to check."""
+    parts = Path(path).stem.split("-")
+    # isdigit() alone would wave through Unicode digits (a
+    # superscript two in a crafted filename) that int() then
+    # rejects — the pid is an ASCII field or it is not a pid.
+    if len(parts) >= 4 and parts[3].isascii() \
+            and parts[3].isdigit():
+        return int(parts[3])
+    return None
+
+
+def _pid_alive(pid):
+    """True/False when the platform can answer, None when it
+    cannot — a watcher must never declare a run dead on a
+    failed guess, so 'cannot tell' falls back to the file's
+    mtime rather than to a verdict."""
+    if not pid or pid <= 0:
+        return None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            # PROCESS_QUERY_LIMITED_INFORMATION: enough to ask
+            # whether the process exists, never to touch it.
+            handle = ctypes.windll.kernel32.OpenProcess(
+                0x1000, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            # ERROR_INVALID_PARAMETER is OpenProcess's answer
+            # for a pid that does not exist; anything else
+            # (notably access denied) means it does.
+            err = ctypes.get_last_error()
+            if err == 87:
+                return False
+            if err == 5:
+                return True
+            return None
+        except Exception:
+            return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+class ExternalRun:
+    """A processor run the portal did not launch — started in a
+    terminal with --emit-run-events — observed through its
+    run-events artifact. Duck-typed to the Job surface the
+    handlers and the run page consume (snapshot / brief /
+    matrix / stop / claim_resume), because the page must not
+    care which side of the glass started the run.
+
+    The differences are stated, not hidden: there is no argv
+    (the portal never saw the command), no captured terminal
+    output (the log says so), and the run cannot be stopped or
+    resumed from here — those verbs belong to the terminal
+    that owns the process."""
+
+    def __init__(self, ctx, path):
+        self.ctx = ctx
+        self.id = None  # the registry assigns it on adoption
+        self.action = "external"
+        self.argv = []
+        self.path = Path(path)
+        self.run_id = self.path.stem
+        self.tailer = EventsTailer()
+        self.tailer.attach(self.path)
+        self.state = "running"
+        self.exit_code = None
+        self.started = None
+        self.finished = None
+        self.label = f"External run — {self.run_id}"
+        self._preview = False
+        self._dry_run = False
+        self._failures = 0
+        self._ended = False
+        self._stages = []
+        self._book_stage = None
+        self._feed = []
+        self._seq = 0
+        self._now = ""
+        self._books_done = 0
+        self._books_total = None
+        self._preview_before = _preview_artifacts(ctx)
+        self._lock = threading.Lock()
+
+    # -- evidence -------------------------------------------------
+
+    def _settle_book_stage(self, state="done"):
+        if self._book_stage is not None:
+            self._book_stage["state"] = state
+            self._book_stage = None
+
+    def _close_stages(self, state):
+        self._settle_book_stage(state)
+        for stage in self._stages:
+            if stage["state"] in ("active", "pending"):
+                stage["state"] = state
+
+    def _absorb(self, ev):
+        """Fold one artifact event into stages, feed, and the
+        label — the same reductions the launched-job path makes
+        from the same stream (bookends open and close stages;
+        every event's feed text comes from _event_feed_text,
+        so the two paths cannot drift in wording)."""
+        kind = ev.get("event")
+        ts = ev.get("ts")
+        if isinstance(ts, (int, float)):
+            if self.started is None:
+                self.started = ts
+        text = _event_feed_text(ev)
+        if text:
+            self._seq += 1
+            self._feed.append({"seq": self._seq, "text": text,
+                               "source": "events"})
+            del self._feed[:-400]
+            self._now = text
+        if kind == "run_start":
+            self._preview = bool(ev.get("preview"))
+            self._dry_run = bool(ev.get("dry_run"))
+        elif kind == "book_start":
+            self._settle_book_stage()
+            stage = {"name": f"Book — {ev.get('book')}",
+                     "state": "active"}
+            self._stages.append(stage)
+            self._book_stage = stage
+            book = ev.get("book") or self.run_id
+            label = f"External run — {book}"
+            if self._preview:
+                label += " (preview)"
+            elif self._dry_run:
+                label += " (dry run)"
+            self.label = label
+        elif kind == "book_end":
+            self._settle_book_stage()
+            self._books_done += 1
+        elif kind == "run_end":
+            self._ended = True
+            self._failures = ev.get("failures") or 0
+            if isinstance(ts, (int, float)):
+                self.finished = ts
+            total = ev.get("books")
+            if isinstance(total, int) and total:
+                self._books_total = total
+
+    def _writer_live(self):
+        """Whether the run is still producing: its writer's
+        process exists, or the artifact moved within the
+        silence window. A book mid-extraction is quiet, not
+        dead — the pid is consulted first for exactly that
+        reason."""
+        if _pid_alive(_artifact_pid(self.path)):
+            return True
+        try:
+            mtime = self.path.stat().st_mtime
+        except OSError:
+            return False
+        return (time.time() - mtime) <= _EXTERNAL_SILENCE_SECONDS
+
+    def refresh(self):
+        """Read whatever the writer has appended since the last
+        look and settle the run's state from the evidence:
+        run_end is terminal (done / failed / interrupted by its
+        own flags); no run_end and a live writer is running;
+        no run_end and silence is a run the portal can no
+        longer vouch for — interrupted, never tailed as running
+        forever. The stale call is recomputed each refresh, so
+        a run that speaks again after a long quiet book returns
+        to running on its own evidence."""
+        agg = self.tailer.poll()
+        with self._lock:
+            for ev in self.tailer.new_events():
+                self._absorb(ev)
+            if self._ended:
+                if agg["interrupted"]:
+                    self.state = "interrupted"
+                    self._close_stages("stopped")
+                elif self._failures:
+                    self.state = "failed"
+                    self._close_stages("failed")
+                else:
+                    self.state = "done"
+                    self._close_stages("done")
+            elif self._writer_live():
+                self.state = "running"
+            else:
+                self.state = "interrupted"
+                self._close_stages("stopped")
+                if self.finished is None:
+                    self.finished = self._last_event_ts()
+        return agg
+
+    def _last_event_ts(self):
+        events = self.tailer.events()
+        for ev in reversed(events):
+            ts = ev.get("ts")
+            if isinstance(ts, (int, float)):
+                return ts
+        return self.started
+
+    # -- the Job-shaped surface -----------------------------------
+
+    def snapshot(self):
+        agg = self.refresh()
+        with self._lock:
+            state, started = self.state, self.started
+            finished = self.finished
+            stages = [dict(s) for s in self._stages]
+            feed = list(reversed(self._feed))
+            now = self._now
+            books_done, books_total = (self._books_done,
+                                       self._books_total)
+        return {
+            "id": self.id, "action": self.action,
+            "label": self.label, "argv": list(self.argv),
+            "state": state, "exit_code": None,
+            "started": started, "finished": finished,
+            "elapsed": ((finished or time.time()) - started
+                        if started else 0),
+            "stages": stages, "now": now, "feed": feed,
+            "books_done": books_done, "books_total": books_total,
+            "checkpointed": False,
+            "log": ["portal: standalone run — its terminal "
+                    "output belongs to the terminal that "
+                    "launched it; this page is reduced from "
+                    "its run-events artifact."],
+            "events": agg,
+            "can_stop": False, "can_resume": False,
+            "artifacts": sorted(
+                _preview_artifacts(self.ctx) - self._preview_before),
+            "backup": None, "queued_behind": None,
+        }
+
+    def matrix(self):
+        """The Matrices panel payload, same shape and same
+        single-reader discipline as a launched job's: the
+        reduction runs over this run's own tailer stream."""
+        agg = self.refresh()
+        return {"aggregates": agg,
+                "matrix": reduce_matrix(self.tailer.events()),
+                "run_id": self.path.stem}
+
+    def brief(self):
+        agg = self.refresh()
+        return {
+            "id": self.id, "label": self.label,
+            "state": self.state, "now": self._now,
+            "decision": agg.get("decision"),
+        }
+
+    def stop(self):
+        """Not ours to stop: the verb belongs to the terminal
+        that owns the process. Returning False leaves the
+        caller's state report truthful — nothing happened."""
+        return False
+
+    def claim_resume(self):
+        """Resume re-runs a launched argv with checkpoints the
+        portal can point at; a standalone run offers neither."""
+        return False
+
+
+class ExternalRunWatcher:
+    """Adopts standalone runs' artifacts for the portal.
+
+    Association is by claim, in one direction only: an artifact
+    a portal job's tailer has attached to belongs to that job
+    (its announcement line is authoritative, its fallback scan
+    next), and is never adopted — and if a job attaches to an
+    artifact already adopted here, the adoption is handed over,
+    so a run is never presented twice. Everything unclaimed is
+    a candidate: adopted while it is fresh or its writer lives,
+    so a portal that starts mid-run still picks the run up."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self._runs = {}  # path key -> ExternalRun
+        self._lock = threading.Lock()
+
+    def poll(self):
+        registry = self.ctx.registry
+        claimed = registry.claimed_artifacts()
+        folder = Path(self.ctx.learn_dir) / "run-events"
+        with self._lock:
+            for key, run in list(self._runs.items()):
+                if key in claimed:
+                    # The job's claim wins, retroactively: its
+                    # fallback scan can attach after we adopted,
+                    # and the run must live in exactly one place.
+                    registry.unregister_external(run)
+                    del self._runs[key]
+            try:
+                paths = sorted(folder.glob("run-*.jsonl"))
+            except OSError:
+                paths = []
+            now = time.time()
+            for path in paths:
+                key = _path_key(path)
+                if key in claimed or key in self._runs:
+                    continue
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                fresh = (now - st.st_mtime) \
+                    <= _EXTERNAL_DISCOVERY_SECONDS
+                if not fresh and not _pid_alive(_artifact_pid(path)):
+                    # Old and silent: a finished run's preview
+                    # and matrix already present it; an
+                    # interrupted one is aged out, not adopted
+                    # as a permanent ghost.
+                    continue
+                run = ExternalRun(self.ctx, path)
+                run.refresh()
+                registry.register_external(run)
+                self._runs[key] = run
+            for run in list(self._runs.values()):
+                run.refresh()
+
+
 class JobRegistry:
     """Every job the portal has launched, and the one-writer
     slot (§7): writer-class jobs run one at a time, in launch
@@ -2102,6 +2472,7 @@ class JobRegistry:
         self.stop_grace = stop_grace
         self._lock = threading.Lock()
         self._jobs = {}
+        self._external = {}
         self._queue = []
         self._next_id = 1
         self._running_id = None
@@ -2140,11 +2511,16 @@ class JobRegistry:
 
     def get(self, job_id):
         with self._lock:
-            return self._jobs.get(job_id)
+            job = self._jobs.get(job_id)
+            if job is None:
+                job = self._external.get(job_id)
+            return job
 
     def jobs(self):
         with self._lock:
-            return [self._jobs[i] for i in sorted(self._jobs)]
+            all_jobs = list(self._jobs.values()) \
+                + list(self._external.values())
+        return sorted(all_jobs, key=lambda j: j.id)
 
     def running_job(self):
         with self._lock:
@@ -2153,10 +2529,42 @@ class JobRegistry:
             return self._jobs.get(self._running_id)
 
     def briefs(self):
-        with self._lock:
-            jobs = [self._jobs[i] for i in sorted(self._jobs)]
-        return [job.brief() for job in jobs
+        return [job.brief() for job in self.jobs()
                 if job.state in ("queued", "running")]
+
+    # -- external runs (standalone, observed — never queued) ----
+
+    def register_external(self, run):
+        """Adopt a standalone run into the id space. Ids come
+        from the same counter as launched jobs so every surface
+        that resolves an id (/run/<id>, /api/jobs/<id>) finds
+        exactly one run per id, whichever side started it.
+        Adopted runs never enter the launch queue: the
+        one-writer slot governs children the portal spawns,
+        not processes it merely observes."""
+        with self._lock:
+            run.id = self._next_id
+            self._next_id += 1
+            self._external[run.id] = run
+        return run
+
+    def unregister_external(self, run):
+        with self._lock:
+            self._external.pop(run.id, None)
+
+    def claimed_artifacts(self):
+        """The artifact paths this portal's own jobs own, as
+        comparison keys. A job's tailer path is set by its
+        child's announcement (authoritative) or its fallback
+        scan; either way the artifact is spoken for, and the
+        external watcher must not adopt it."""
+        with self._lock:
+            jobs = list(self._jobs.values())
+        keys = set()
+        for job in jobs:
+            if job.tailer.path is not None:
+                keys.add(_path_key(job.tailer.path))
+        return keys
 
 
 # ---------------------------------------------------------------------------
@@ -3704,6 +4112,10 @@ class PortalContext:
         self.registry = JobRegistry(
             self, popen_factory=popen_factory,
             stop_grace=stop_grace)
+        # Standalone runs the portal observes but did not
+        # launch (see ExternalRunWatcher): adopted from their
+        # run-events artifacts, never queued, never signalled.
+        self.external = ExternalRunWatcher(self)
         # Rulings in flight, queue_id -> job (or the _RULING_SENTINEL
         # while the launch is being built). A queue row stays
         # 'pending' in the store until its apply job actually
@@ -3721,12 +4133,25 @@ class PortalContext:
         # beside portal.py, never in the learned dir or stores.
         return self.script_dir / "portal-cache" / "covers"
 
+    def poll_external(self):
+        """Let the external watcher look at the run-events
+        folder once. A watcher fault must never take a page
+        down — the surfaces degrade to launched jobs only, and
+        the reason goes to the operator's terminal."""
+        try:
+            self.external.poll()
+        except Exception as e:
+            print(f"portal: external run scan failed: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+
     def home(self):
+        self.poll_external()
         data = home_data(self.learn_dir, self.script_dir,
                          self.backup_dir)
-        # The strip stops being a placeholder: it reports this
-        # portal's own jobs, the only runs it can truthfully
-        # know about (§5.1's honesty rule is unchanged).
+        # The strip reports this portal's own jobs plus the
+        # standalone runs the watcher is observing live — each
+        # labelled external, so the strip never lets a terminal
+        # run borrow a launched job's authority (§5.1).
         data["strip"]["jobs"] = self.registry.briefs()
         return data
 
@@ -3998,6 +4423,11 @@ def make_server(host, port, ctx):
             return False
 
         def _job_or_404(self, job_id):
+            # Adopt/refresh standalone runs first: an id the
+            # strip just linked to must resolve here, and a run
+            # page's polls are what keep an external run's
+            # state honest between Home refreshes.
+            ctx.poll_external()
             try:
                 job = ctx.registry.get(int(job_id))
             except (TypeError, ValueError):
@@ -4301,6 +4731,7 @@ def make_server(host, port, ctx):
                         extra_script=script),
                         "text/html; charset=utf-8")
                 elif parsed.path == "/api/jobs":
+                    ctx.poll_external()
                     self._json(200, {"jobs": [
                         job.brief() for job in
                         ctx.registry.jobs()]})
