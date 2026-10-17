@@ -224,3 +224,16 @@ judge reads that evidence as sibling-only, a type-granularity
 finding about the extractor's claim, recorded in the eval
 notes. Gate: the same live corpus eval; Chris in the keep band
 closes the surname thread.
+
+## Addendum — 2.13.14: kinship-evidence probe (2026-10-17)
+
+New standalone tool, find-kinship-evidence.py: scans a corpus
+work's chapter texts for kinship sentences naming both
+endpoints of a pair and reports the form each endpoint was
+matched by (full / first / nickname / surname), strongest
+placements first. It answers "does this book state the bond,
+and how explicitly" without a model call — built to check
+whether Freedom (which IS in the corpus) confirms Daemon's
+surname-anchored Chris->Peter claim. One occurrence of a
+shared surname cannot place both endpoints. Corpus opened
+read-only (mode="report").
