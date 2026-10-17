@@ -228,5 +228,35 @@
   "to": "Peter Sebeck",
   "type": "child",
   "work": "Daemon"
+ },
+ {
+  "expect": "drop",
+  "from": "Fen Riorson",
+  "note": "Fourth Wing, generation-inversion shape (run-23 failure): the father typed as his son's child. The quote establishes the OPPOSITE direction — it is the gated keep case for Fen -> Xaden parent above — so a judge that keeps this claim is reading the names, not the direction. Gated, not report-only: the evidence is unambiguous, the same standard the companion keep case is held to.",
+  "quote": "Fen Riorson was Xaden's father, and the rebellion died with him.",
+  "stub_score": 0.05,
+  "to": "Xaden Riorson",
+  "type": "child",
+  "work": "Fourth Wing"
+ },
+ {
+  "expect": "drop",
+  "from": "Lilith Sorrengail",
+  "note": "Fourth Wing, generation-inversion shape (run-23 failure): the mother typed as her daughter's child. Book-shaped quote stating the true direction; the claim inverts it. Gated for the same reason as the Fen inversion: the quote leaves no honest middle reading. The reduce-level direction guard (v2.13.23) also flags this pair shape for review from the claim data alone; this case pins the JUDGE side of the same failure.",
+  "quote": "Lilith Sorrengail, Violet's mother, commanded the quadrant from the dais.",
+  "stub_score": 0.05,
+  "to": "Violet Sorrengail",
+  "type": "child",
+  "work": "Fourth Wing"
+ },
+ {
+  "expect": "keep",
+  "from": "Lilith Sorrengail",
+  "note": "Fourth Wing, companion to the Lilith inversion case: the SAME quote under the correct direction must keep, so the pair of cases separates a direction failure from an evidence failure.",
+  "quote": "Lilith Sorrengail, Violet's mother, commanded the quadrant from the dais.",
+  "stub_score": 0.95,
+  "to": "Violet Sorrengail",
+  "type": "parent",
+  "work": "Fourth Wing"
  }
 ]

@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.22"
+PORTABLE_VERSION = "2.13.23"
 
 
 import argparse
@@ -141,14 +141,39 @@ DEFAULT_CONFIG = {
     "pipeline": "v2",
     "v2_max_chapter_chars": 16000,  # ~4k tokens; keep well under your
     # server's context window minus prompt (~1k) minus output (~3k)
+    # Relationship discovery, shadow mode (spec §3, Decision K5/K6):
+    # when on, a post-reduce pass looks for bonds extraction never
+    # proposed and records what it WOULD propose in the preview's
+    # discovery section — it writes nothing, ever. Default off, and
+    # with it off processing is byte-identical to before: no result
+    # key, no calls, no budget movement.
+    "discovery_shadow": False,
+    # Pair cap for shadow discovery: candidate pairs per book,
+    # strongest bucket first (spec §3.1).
+    "discovery_max_pairs": 20,
+    # Shadow discovery's separate experimental allowance (spec
+    # §3.6): decision-model calls discovery may spend without
+    # touching the shared per-book pool, so shadow measurements can
+    # never starve validation or the trigger gate. Sized at twice
+    # the pair cap because an advancing pair costs at most two
+    # calls (one closed-set discovery call, one validator call).
+    # The spend is reported in the discovery section, never hidden.
+    "discovery_allowance": 40,
+    # §3.3 experimental arm: rank a pair's binding sentences by
+    # embedding similarity to relationship-dynamic queries instead
+    # of the miner's order. Default off (the miner-order arm);
+    # ranking only — embeddings never become a confidence score.
+    "discovery_embedding_rank": False,
 }
 
 
 # Config keys that must be int (env overrides arrive as strings).
-_INT_CONFIG_KEYS = {"sample_rate", "sample_edges", "batch_size", "llm_max_tokens"}
+_INT_CONFIG_KEYS = {"sample_rate", "sample_edges", "batch_size", "llm_max_tokens",
+                    "discovery_max_pairs", "discovery_allowance"}
 # Config keys that are bools (EBOOK_DEDUPE=false must not be truthy).
 _BOOL_CONFIG_KEYS = {"debug", "dedupe", "llm_enable_thinking", "llm_json_schema",
-                     "v2_prompt_cache", "run_history"}
+                     "v2_prompt_cache", "run_history",
+                     "discovery_shadow", "discovery_embedding_rank"}
 
 
 def load_config():
@@ -2476,22 +2501,19 @@ def _split_sentences(text):
     return out
 
 
-def _pair_binding(sentence, re_anchor, re_other):
-    """True when a kinship-marker construction anchored at one endpoint
-    equates the pair's OTHER endpoint with the relative it defines:
-      possessive ("Xaden's father") or of-construction ("son of Fen
-      Riorson"), equated by apposition ("Xaden's father, Fen Riorson,
-      ...", "Fen Riorson, Xaden's father, ...") or copula ("Fen was
-      Xaden's father", "Xaden's father is Fen"); or a pronoun
-      possessive equating an adjacent endpoint ("her brother Brennan",
-      "Brennan, her brother") — the pronoun's referent is taken to be
-      the pair's other endpoint, which the caller has established is
-      also present in the sentence.
-    A marker bound to a third party, or defining a relative who is
-    not the other endpoint, does NOT count: mere presence of both
-    names near a marker is co-occurrence, not binding."""
-    poss = re_anchor.pattern + r"['’]s\s+" + _PAIR_MARKER_ALT + r"\b"
-    ofph = (_PAIR_MARKER_ALT + r"\s+of\s+(?:the\s+)?"
+def _pair_binding_with(sentence, re_anchor, re_other, marker_alt):
+    """The binding constructions of _pair_binding, parameterised on
+    the marker vocabulary so a caller with a wider bond vocabulary
+    (shadow discovery, spec §3.2) can grade with the SAME syntax —
+    possessive / of-construction / pronoun possessive, equated by
+    apposition or copula — without widening the production miner's
+    kinship-only grading. The constructions are the precision: a
+    marker word alone, however bond-flavoured, never binds; it must
+    syntactically equate the pair's other endpoint with the bond it
+    names, which is what keeps this grading on the binding side of
+    the K6 line (co-presence never counts as a bond)."""
+    poss = re_anchor.pattern + r"['’]s\s+" + marker_alt + r"\b"
+    ofph = (marker_alt + r"\s+of\s+(?:the\s+)?"
             + re_anchor.pattern)
     for phrase in (poss, ofph):
         for m in re.finditer(phrase, sentence):
@@ -2507,7 +2529,7 @@ def _pair_binding(sentence, re_anchor, re_other):
                          + r"\s+(?i:is|was|became)\s+(?:the\s+)?$",
                          before):
                 return True  # "Fen was Xaden's father"
-    pron = _PAIR_PRONOUN_ALT + r"\s+" + _PAIR_MARKER_ALT + r"\b"
+    pron = _PAIR_PRONOUN_ALT + r"\s+" + marker_alt + r"\b"
     either = r"(?:" + re_anchor.pattern + r"|" + re_other.pattern + r")"
     for m in re.finditer(pron, sentence):
         before, after = sentence[:m.start()], sentence[m.end():]
@@ -2516,6 +2538,24 @@ def _pair_binding(sentence, re_anchor, re_other):
         if re.search(either + r"[\s,]+$", before):
             return True  # "Brennan, her brother"
     return False
+
+
+def _pair_binding(sentence, re_anchor, re_other):
+    """True when a kinship-marker construction anchored at one endpoint
+    equates the pair's OTHER endpoint with the relative it defines:
+      possessive ("Xaden's father") or of-construction ("son of Fen
+      Riorson"), equated by apposition ("Xaden's father, Fen Riorson,
+      ...", "Fen Riorson, Xaden's father, ...") or copula ("Fen was
+      Xaden's father", "Xaden's father is Fen"); or a pronoun
+      possessive equating an adjacent endpoint ("her brother Brennan",
+      "Brennan, her brother") — the pronoun's referent is taken to be
+      the pair's other endpoint, which the caller has established is
+      also present in the sentence.
+    A marker bound to a third party, or defining a relative who is
+    not the other endpoint, does NOT count: mere presence of both
+    names near a marker is co-occurrence, not binding."""
+    return _pair_binding_with(sentence, re_anchor, re_other,
+                              _PAIR_MARKER_ALT)
 
 
 def _pair_sentence_grade(sentence, re_a, re_b):
@@ -2680,6 +2720,550 @@ def _mine_pair_evidence(from_name, to_name, chapters, roster=None):
                 best = (key, {"sentence": sentence, "grade": grade,
                               "chapter": idx})
     return best[1] if best else None
+
+
+# --- Relationship discovery, shadow mode (spec §3) -------------------------
+# Validation can only judge pairs extraction proposed, so a bond the
+# extractor never typed is invisible no matter how clearly the text
+# states it (spec Motivation 3). Discovery looks for those bonds —
+# in shadow mode only (Decision K5): it emits a report section in
+# the preview output and writes NOTHING. No book_characters change,
+# no claim write, and a discovered pair never enters the write path;
+# promotion to writable is a separate, later decision on shadow
+# evidence, and its machinery is deliberately not built here.
+#
+# The evidence bar is the programme's standing doctrine (K6): only
+# syntactically binding evidence may advance a pair. Co-presence in
+# a sentence makes a bucket, never a candidate that costs a judge
+# call — Daemon's Jon Ross / Peter Sebeck pair shares 64 sentences
+# and not one states a bond, so that pair is a recorded unreachable
+# for this programme, not a discovery target.
+#
+# Marker coverage (spec §3.2, first build task): the production
+# miner's markers are kinship-only, and the audit in
+# docs/discovery-marker-audit.md measures what that means per
+# relationship category — kinship constructions grade binding,
+# ally / rival / mentor / friend / romantic / enemy constructions
+# grade nothing at all under the kinship vocabulary. The gap is
+# real, so discovery grades with an EXTENDED marker vocabulary —
+# but through the same binding constructions (_pair_binding_with),
+# never through marker presence alone, and scoped to discovery:
+# widening the production miner's markers would re-grade the
+# evidence of claims extraction already made, a blast radius this
+# shadow step has no reason to take. Kinship precision is pinned
+# by the audit tests: a marker bound to a third party still grades
+# co-occurrence, not binding, under the extended vocabulary too.
+_DISCOVERY_EXTRA_MARKERS = (
+    "ally", "allies", "rival", "rivals", "mentor", "mentors",
+    "friend", "friends", "enemy", "enemies", "lover", "lovers",
+    "beloved", "sweetheart", "sweethearts", "girlfriend",
+    "girlfriends", "boyfriend", "boyfriends", "nemesis",
+    "companion", "companions", "partner", "partners",
+)
+_DISCOVERY_MARKER_ALT = (r"(?i:\b(?:"
+                         + "|".join(_PAIR_MARKERS
+                                    + _DISCOVERY_EXTRA_MARKERS)
+                         + r"))")
+_DISCOVERY_MARKER_RE = re.compile(_DISCOVERY_MARKER_ALT + r"\b",
+                                  re.IGNORECASE)
+# A discovered type must be the closed-set winner at or above this
+# score, or the verdict is "none": the discovery call proposes, and
+# a coin-flip proposal would spend the standard validator's time —
+# and later a curator's — on noise. The bar sits between the
+# validator's drop threshold (0.30, "a bond plausibly exists") and
+# its keep threshold (0.70, "this type is right"), because the
+# validator gate that follows applies those production bands to
+# whatever discovery proposes.
+_DISCOVERY_THRESHOLD = 0.5
+
+
+def _pair_aug_res(name, roster):
+    """(strict, surname-augmented) name regexes for one endpoint —
+    exactly the pair _mine_pair_evidence grades with, factored out
+    so discovery's index places endpoints under the miner's own
+    rules rather than a second, drifting definition of a mention."""
+    forms = _pair_name_forms(name, roster)
+    strict = _forms_re(forms)
+    sn = _pair_surname_form(name, roster)
+    aug = _forms_re(forms | {sn}) if sn else strict
+    return strict, aug
+
+
+def _pair_places(text, strict, aug, other_strict):
+    """True when an endpoint is placed in the text — the miner's
+    _appears rule: a strict form anywhere suffices; a surname-only
+    match counts only when it is not the tail of the OTHER
+    endpoint's full name."""
+    if strict is None:
+        return False
+    if strict.search(text):
+        return True
+    if aug is strict or aug is None:
+        return False
+    other_spans = ([m.span() for m in other_strict.finditer(text)]
+                   if other_strict is not None else [])
+    for m in aug.finditer(text):
+        s, e = m.span()
+        if any(s >= os_ and e <= oe for os_, oe in other_spans):
+            continue
+        return True
+    return False
+
+
+def _discovery_sentence_grade(sentence, re_a, re_b):
+    """Grade one both-endpoints sentence under discovery's extended
+    marker vocabulary: binding when an extended-marker construction
+    equates the other endpoint with the bond it names, co-occurrence
+    when a marker is present but bound to no one (or to a third
+    party), plain otherwise. The kinship grading of the same
+    sentence is always available separately (_pair_sentence_grade);
+    the extended grade never lowers it, because the kinship markers
+    are a subset of the extended set."""
+    if (_pair_binding_with(sentence, re_a, re_b,
+                           _DISCOVERY_MARKER_ALT)
+            or _pair_binding_with(sentence, re_b, re_a,
+                                  _DISCOVERY_MARKER_ALT)):
+        return "binding"
+    if _DISCOVERY_MARKER_RE.search(sentence):
+        return "co-occurrence"
+    return "plain"
+
+
+def _discovery_sentence_index(roster, chapters):
+    """One-pass sentence index (spec §3.1): every sentence is scanned
+    ONCE for roster mentions and bucketed under each character pair
+    it mentions (sentence-level co-presence). Per-pair rescans of
+    the book do not scale to the minor tier; this index is the one
+    scan both tiers are built from. A surname-only mention counts
+    only when it is not the tail of another character's full name
+    in the same sentence — the miner's placement rule, applied
+    index-wide. Returns (buckets, display) where buckets maps
+    (norm_a, norm_b) sorted name keys to [{sentence, chapter,
+    position}] in scan order and display maps a key to its roster
+    display name."""
+    entries = []
+    for e in (roster or {}).values():
+        if not isinstance(e, dict):
+            continue
+        name = e.get("name", "") or ""
+        if not name:
+            continue
+        strict, aug = _pair_aug_res(name, roster)
+        if strict is None:
+            continue
+        entries.append({"norm": norm_name(name), "name": name,
+                        "strict": strict, "aug": aug})
+    display = {ent["norm"]: ent["name"] for ent in entries}
+    buckets = {}
+    for c in chapters or []:
+        text = c.get("text", "") or ""
+        if not text:
+            continue
+        idx = c.get("index", 0)
+        for pos, sentence in enumerate(_split_sentences(text)):
+            if len(sentence) > _PAIR_MAX_SENTENCE:
+                continue
+            strict_spans = []
+            present = set()
+            for i, ent in enumerate(entries):
+                for m in ent["strict"].finditer(sentence):
+                    strict_spans.append((i, m.span()))
+                    present.add(i)
+            for i, ent in enumerate(entries):
+                if i in present or ent["aug"] is ent["strict"]:
+                    continue
+                for m in ent["aug"].finditer(sentence):
+                    s, e = m.span()
+                    if any(j != i and s >= a and e <= b
+                           for j, (a, b) in strict_spans):
+                        continue  # tail of another's full name
+                    present.add(i)
+                    break
+            if len(present) < 2:
+                continue
+            ordered = sorted(present,
+                             key=lambda i: entries[i]["norm"])
+            for x in range(len(ordered)):
+                for y in range(x + 1, len(ordered)):
+                    key = (entries[ordered[x]]["norm"],
+                           entries[ordered[y]]["norm"])
+                    buckets.setdefault(key, []).append(
+                        {"sentence": sentence, "chapter": idx,
+                         "position": pos})
+    return buckets, display
+
+
+def _discovery_principal_names(characters, relationships):
+    """Principal name keys for the §3.1 tiers, computed with the
+    same principal filter validation uses, so "principal pair"
+    means the same pairs here as in the coverage metric. Any
+    failure degrades to no principals (every pair T2) rather than
+    failing the shadow pass — a report with wrong tiers is worse
+    than one that says so by lumping, and the filter is a pure
+    function of data the caller already holds."""
+    try:
+        pcs, _, _ = _filter_principals(
+            characters or [], relationships or [],
+            CONFIG.get("min_frequency", 0.20))
+        return {norm_name(c.get("name", "")) for c in pcs} - {""}
+    except Exception:
+        return set()
+
+
+def _discovery_candidates(roster, chapters, surviving_pairs,
+                          principal_names):
+    """Candidate pairs for discovery: index buckets with NO
+    surviving claim between the two characters (a pair validation
+    already disposed of is extraction's story, not discovery's),
+    tiered T1 (any pair involving a principal) / T2 (minor ↔ minor,
+    in scope by design — side characters' bonds are the point)."""
+    buckets, display = _discovery_sentence_index(roster, chapters)
+    out = []
+    for (na, nb), bucket in buckets.items():
+        if (na, nb) in surviving_pairs:
+            continue
+        tier = ("T1" if (na in principal_names
+                         or nb in principal_names) else "T2")
+        out.append({"name_a": display[na], "name_b": display[nb],
+                    "norm_a": na, "norm_b": nb, "tier": tier,
+                    "bucket": bucket})
+    return out
+
+
+def _discovery_grade_bucket(name_a, name_b, bucket, roster):
+    """The miner pre-filter (spec §3.2), at zero judge calls: grade
+    the pair's bucket sentences and keep the grades on each item.
+    A pair advances only on at least one binding-grade sentence —
+    grading is deterministic text work, so the entire minor tier
+    costs nothing until the text actually states a bond."""
+    strict_a, aug_a = _pair_aug_res(name_a, roster)
+    strict_b, aug_b = _pair_aug_res(name_b, roster)
+    graded = []
+    for item in bucket:
+        s = item["sentence"]
+        if not (_pair_places(s, strict_a, aug_a, strict_b)
+                and _pair_places(s, strict_b, aug_b, strict_a)):
+            continue
+        graded.append({**item,
+                       "grade": _discovery_sentence_grade(
+                           s, aug_a, aug_b),
+                       "kinship_grade": _pair_sentence_grade(
+                           s, aug_a, aug_b)})
+    return graded
+
+
+def _discovery_embedding_rank(items, name_a, name_b, embedder):
+    """The §3.3 experimental arm: order binding sentences by
+    embedding similarity to relationship-dynamic queries. Ranking
+    only — a cosine never becomes a score on the record. Returns
+    (ordered, ok); ok False means the embedder failed or answered
+    nonsense, and the caller falls back to the miner's order,
+    because a shadow comparison measured on a silently degraded
+    arm would misreport both arms."""
+    queries = [
+        f"{name_a} and {name_b} are family, bound by kinship",
+        f"{name_a} and {name_b} are close friends or allies",
+        f"{name_a} is a mentor or guide to {name_b}",
+        f"{name_a} and {name_b} share a romantic or formal bond",
+        f"{name_a} and {name_b} are enemies or rivals",
+    ]
+    try:
+        vecs = embedder([it["sentence"] for it in items] + queries)
+        if not vecs or len(vecs) != len(items) + len(queries):
+            return items, False
+        svecs, qvecs = vecs[:len(items)], vecs[len(items):]
+        scored = []
+        for it, v in zip(items, svecs):
+            best = max((_corpus_cosine(v, q) for q in qvecs),
+                       default=0.0)
+            scored.append((best, it))
+        # Ties fall back to the miner's order (chapter, length,
+        # position), so the arm differs from the baseline only
+        # where the embeddings actually discriminate.
+        scored.sort(key=lambda t: (
+            -t[0], t[1]["chapter"], len(t[1]["sentence"]),
+            t[1]["position"]))
+        return [it for _, it in scored], True
+    except Exception:
+        return items, False
+
+
+def _discovery_evidence(binding, name_a, name_b, use_embedding,
+                        embedder):
+    """Choose the sentences the discovery call sees: the miner's
+    order (earliest chapter, then shortest, then earliest
+    position — bucket order is scan order, so a stable sort by
+    chapter/length/position reproduces it), or the §3.3 embedding
+    arm when enabled. Up to two sentences, from DIFFERENT chapters
+    when the pair has them (spec §3.4): a judgment hostage to one
+    sentence's phrasing is how stated bonds get missed. Returns
+    (picks, arm_label) where picks[0] is the best sentence — the
+    one the standard validator later judges."""
+    ordered = sorted(binding, key=lambda it: (
+        it["chapter"], len(it["sentence"]), it["position"]))
+    arm = "miner"
+    if use_embedding and embedder is not None and len(ordered) > 1:
+        ranked, ok = _discovery_embedding_rank(
+            ordered, name_a, name_b, embedder)
+        if ok:
+            ordered, arm = ranked, "embedding"
+        else:
+            arm = "miner (embedding unavailable)"
+    picks = [ordered[0]]
+    for it in ordered[1:]:
+        if it["chapter"] != ordered[0]["chapter"]:
+            picks.append(it)
+            break
+    return picks, arm
+
+
+def _discovery_validator_outcome(rtype, p):
+    """Band a validator score for a discovered claim exactly as
+    production bands an extracted one: family claims keep at the
+    validation threshold, downgrade in the middle, drop below the
+    drop threshold; non-family claims keep at or above the drop
+    threshold. Shadow mode changes what happens to the claim
+    (nothing), never what the score means."""
+    if rtype in _REL_FAMILY_TYPES:
+        if p >= _REL_VALIDATION_THRESHOLD:
+            return "keep"
+        if p >= _REL_DROP_THRESHOLD:
+            return "middle"
+        return "drop"
+    return "keep" if p >= _REL_DROP_THRESHOLD else "drop"
+
+
+def _discovery_shadow_run(roster, chapters, relationships,
+                          characters=None, validator=None,
+                          embedder=None, max_pairs=None,
+                          allowance_limit=None, use_embedding=None):
+    """Run shadow discovery for one book and return its report.
+
+    Pure shadow: reads the roster, the chapter texts, and the
+    surviving claims; spends only its own experimental allowance;
+    mutates nothing it was given and writes nothing anywhere. The
+    report is the whole product — candidate pairs considered,
+    advanced, capped; per-pair verdicts; per-tier counts; the
+    allowance spent (spec §3.5/§3.6).
+
+    Budget choice (spec §3.6): shadow mode spends a SEPARATE
+    experimental allowance, reported here, and never claims the
+    shared per-book pool — so a shadow run cannot starve the
+    production consumers it exists to be measured against, at any
+    pipeline position. Discovery still runs LAST (its caller
+    places it after the quote poll, the previous last consumer),
+    and the report records which consumers had finished when it
+    started, so its pipeline position is on the record rather than
+    implied. Its claim sites are accounted under the existing
+    "discovery" consumer tag inside this allowance's ledger.
+    """
+    chapters = [c for c in (chapters or [])
+                if not c.get("is_toc")
+                and not c.get("is_frontmatter")]
+    if validator is None:
+        validator = _DECISION_VALIDATOR
+    if max_pairs is None:
+        max_pairs = CONFIG.get("discovery_max_pairs", 20)
+    if allowance_limit is None:
+        allowance_limit = CONFIG.get("discovery_allowance", 40)
+    if use_embedding is None:
+        use_embedding = bool(CONFIG.get("discovery_embedding_rank"))
+    surviving = set()
+    for r in relationships or []:
+        a, b = norm_name(r.get("from", "")), norm_name(r.get("to", ""))
+        if a and b and a != b:
+            surviving.add(tuple(sorted((a, b))))
+    principals = _discovery_principal_names(characters, relationships)
+    finished_at_start = sorted(_DM_BUDGET_FINISHED)
+    candidates = _discovery_candidates(roster, chapters, surviving,
+                                       principals)
+    advancing = []
+    for cand in candidates:
+        graded = _discovery_grade_bucket(
+            cand["name_a"], cand["name_b"], cand["bucket"], roster)
+        binding = [g for g in graded if g["grade"] == "binding"]
+        if binding:
+            advancing.append({**cand, "graded": graded,
+                              "binding": binding,
+                              "binding_count": len(binding)})
+    # Cap by bucket strength, strongest first (spec §3.1): binding
+    # sentences are the strength that matters — they are the only
+    # sentences that can carry a judgment — with raw bucket size as
+    # the tie-breaker and names last so the order is deterministic.
+    advancing.sort(key=lambda c: (-c["binding_count"],
+                                  -len(c["bucket"]),
+                                  c["norm_a"], c["norm_b"]))
+    capped = advancing[:max_pairs]
+    capped_out = len(advancing) - len(capped)
+    allowance = {"allowance": allowance_limit, "spent": 0,
+                 "denied": 0}
+
+    def _claim():
+        if allowance["spent"] >= allowance_limit:
+            allowance["denied"] += 1
+            return False
+        allowance["spent"] += 1
+        return True
+
+    records = []
+    arm_used = "miner"
+    for cand in capped:
+        picks, arm = _discovery_evidence(
+            cand["binding"], cand["name_a"], cand["name_b"],
+            use_embedding, embedder)
+        if arm != "miner":
+            arm_used = arm
+        rec = {"from": cand["name_a"], "to": cand["name_b"],
+               "tier": cand["tier"],
+               "bucket_size": len(cand["bucket"]),
+               "binding_count": cand["binding_count"],
+               "evidence": [{"sentence": p["sentence"],
+                             "chapter": p["chapter"]}
+                            for p in picks],
+               "discovery_type": None, "discovery_p": None,
+               "verdict": None, "validator_p": None,
+               "validator_outcome": None}
+        if validator is None or not hasattr(validator,
+                                            "ask_discovery"):
+            rec["verdict"] = "no_validator"
+        elif not _claim():
+            rec["verdict"] = "budget_exhausted"
+        else:
+            dtype, detail = validator.ask_discovery(
+                cand["name_a"], cand["name_b"],
+                [p["sentence"] for p in picks])
+            if detail is None:
+                rec["verdict"] = "validator_error"
+            elif dtype is None:
+                rec["verdict"] = "none"
+            else:
+                rec["discovery_type"] = dtype
+                rec["discovery_p"] = detail.get("p")
+                # A directed winner carries its direction: the
+                # claim the validator gates is the claim the
+                # discovery call actually proposed.
+                if detail.get("direction") == "ba":
+                    rec["from"], rec["to"] = (cand["name_b"],
+                                              cand["name_a"])
+                if not _claim():
+                    rec["verdict"] = "budget_exhausted"
+                else:
+                    _v, _p = validator.validate_relationship(
+                        rec["from"], rec["to"], dtype,
+                        picks[0]["sentence"], context="")
+                    if _p is None:
+                        rec["verdict"] = "validator_error"
+                    else:
+                        rec["validator_p"] = round(_p, 4)
+                        rec["validator_outcome"] = \
+                            _discovery_validator_outcome(dtype, _p)
+                        rec["verdict"] = {
+                            "keep": "shadow_keep",
+                            "middle": "shadow_middle",
+                            "drop": "shadow_drop",
+                        }[rec["validator_outcome"]]
+        records.append(rec)
+    per_tier = {}
+    for tier in ("T1", "T2"):
+        per_tier[tier] = {
+            "considered": sum(1 for c in candidates
+                              if c["tier"] == tier),
+            "advanced": sum(1 for c in advancing
+                            if c["tier"] == tier),
+            "judged": sum(1 for r in records if r["tier"] == tier),
+            "shadow_keeps": sum(
+                1 for r in records
+                if r["tier"] == tier
+                and r["verdict"] == "shadow_keep"),
+        }
+    # Discovery is the last pipeline consumer: marking it finished
+    # releases its (zero) shared-pool reserve to anything still
+    # accounting after it, and puts the stage boundary on the same
+    # record every other consumer leaves.
+    _dm_budget_finish("discovery")
+    return {
+        "mode": "shadow",
+        "writes": 0,
+        "ranking_arm": arm_used,
+        "pairs_considered": len(candidates),
+        "pairs_with_binding": len(advancing),
+        "pairs_judged": len(records),
+        "pairs_capped_out": capped_out,
+        "cap": max_pairs,
+        "per_tier": per_tier,
+        "budget": {"consumer": "discovery",
+                   "mode": "experimental_allowance",
+                   "allowance": allowance_limit,
+                   "spent": allowance["spent"],
+                   "denied": allowance["denied"],
+                   "shared_pool_spent": 0,
+                   "pipeline_finished_at_start": finished_at_start},
+        "records": records,
+    }
+
+
+def _maybe_run_discovery(roster, chapters, relationships, characters):
+    """The flag gate between process_file_v2 and shadow discovery.
+
+    With the flag off this returns None without touching the
+    validator, the budget, or any input — the caller attaches the
+    report only when one exists, so a flag-off run's result is
+    byte-identical to a run on code that never heard of discovery.
+    """
+    if not CONFIG.get("discovery_shadow"):
+        return None
+    embedder = None
+    if CONFIG.get("discovery_embedding_rank") \
+            and CONFIG.get("embed_url"):
+        embedder = lambda texts: embed_vectors(  # noqa: E731
+            CONFIG.get("embed_url", ""),
+            CONFIG.get("embed_model", ""), texts)
+    return _discovery_shadow_run(
+        roster, chapters, relationships, characters=characters,
+        embedder=embedder,
+        use_embedding=bool(CONFIG.get("discovery_embedding_rank")))
+
+
+def _discovery_markdown(report):
+    """Render a discovery report as preview-Markdown lines (pure:
+    report dict in, lines out). The section declares its shadow
+    nature on its face — a reader must never mistake a shadow keep
+    for a written relationship."""
+    if not report:
+        return []
+    b = report.get("budget") or {}
+    lines = [
+        f"## Relationship discovery — SHADOW "
+        f"({report.get('pairs_judged', 0)} judged, nothing written)",
+        f"Candidate pairs considered: "
+        f"{report.get('pairs_considered', 0)}; with binding-grade "
+        f"evidence: {report.get('pairs_with_binding', 0)}; capped "
+        f"out: {report.get('pairs_capped_out', 0)} "
+        f"(cap {report.get('cap', 0)}, strongest first). "
+        f"Ranking arm: {report.get('ranking_arm', 'miner')}.",
+        f"Budget: experimental allowance "
+        f"{b.get('spent', 0)}/{b.get('allowance', 0)} spent "
+        f"({b.get('denied', 0)} denied); shared pool untouched.",
+    ]
+    for tier in ("T1", "T2"):
+        t = (report.get("per_tier") or {}).get(tier) or {}
+        lines.append(
+            f"- {tier}: {t.get('considered', 0)} considered, "
+            f"{t.get('advanced', 0)} advanced, "
+            f"{t.get('shadow_keeps', 0)} shadow keeps")
+    for r in report.get("records") or []:
+        _line = (f"- {r.get('from')} → {r.get('to')} "
+                 f"[{r.get('tier')}]: {r.get('verdict')}")
+        if r.get("discovery_type"):
+            _line += f" — proposed {r['discovery_type']}"
+            if r.get("discovery_p") is not None:
+                _line += f" (discovery P={r['discovery_p']:.2f})"
+        if r.get("validator_p") is not None:
+            _line += f"; validator P={r['validator_p']:.2f} " \
+                     f"({r.get('validator_outcome')})"
+        lines.append(_line)
+    lines.append("")
+    return lines
 
 
 # --- Referent resolution as provenance (spec §2) ---------------------------
@@ -3631,6 +4215,69 @@ class DecisionValidator:
         print(f"  Relationship validation: {from_name[:30]} -> "
               f"{to_name[:30]} ({rel_type}): P(yes)={p_yes:.2f} → {_action}")
         return p_yes >= _REL_VALIDATION_THRESHOLD, p_yes
+
+    def ask_discovery(self, name_a, name_b, sentences):
+        """One closed-set discovery call (spec §3.4): "which of these
+        types, if any, do these sentences establish between the two
+        characters?" — the full registry-derived vocabulary is
+        offered, each type with its gloss, plus the explicit "none"
+        outcome (no type reaching the discovery threshold).
+
+        The whole vocabulary rides ONE decision-model request (the
+        batched-noul protocol the quote poll uses): one call, one
+        budget unit, however wide the vocabulary is — asking per
+        type instead would make discovery's cost grow with the
+        registry it is supposed to derive from. Directed types are
+        asked in both directions inside the same request, because a
+        directed bond proposed backwards is a wrong claim, not a
+        cheaper one; the winner's direction rides the result.
+
+        Returns (type, detail) for a proposal, (None, detail) for
+        "none", and (None, None) on any error — an error is never
+        dressed up as a "none" verdict. detail carries the winning
+        score, its direction ("ab" / "ba" / "sym"), and the top
+        scores, so the shadow record shows what the call saw."""
+        questions = {}
+        for e in _REL_VOCAB["types"]:
+            tid = e["id"]
+            _gloss = (f" Here, \"{tid}\" means: {e['gloss']}"
+                      if e["gloss"] else "")
+            if e["direction"] == "directed":
+                questions[f"{tid}::ab"] = (
+                    f"Do these sentences establish that {name_a} is "
+                    f"the {tid} of {name_b}?{_gloss} Answer YES only "
+                    f"when the sentences state or clearly imply "
+                    f"exactly this relationship in this direction.")
+                questions[f"{tid}::ba"] = (
+                    f"Do these sentences establish that {name_b} is "
+                    f"the {tid} of {name_a}?{_gloss} Answer YES only "
+                    f"when the sentences state or clearly imply "
+                    f"exactly this relationship in this direction.")
+            else:
+                questions[f"{tid}::sym"] = (
+                    f"Do these sentences establish a {tid} "
+                    f"relationship between {name_a} and {name_b}?"
+                    f"{_gloss} Answer YES only when the sentences "
+                    f"state or clearly imply that bond between these "
+                    f"two characters.")
+        _state = "\n".join(f"- {s}" for s in sentences)
+        raw = _ask_noul_batch(self, questions, _state,
+                              label="discovery")
+        if raw is None:
+            return None, None
+        scored = sorted(
+            ((p, key) for key, p in raw.items()),
+            key=lambda t: (-t[0], t[1]))
+        _top = [(key, round(p, 4)) for p, key in scored[:3]]
+        _best_p, _best_key = scored[0]
+        _tid, _dir = _best_key.split("::")
+        detail = {"p": round(_best_p, 4), "direction": _dir,
+                  "top": _top}
+        if _best_p < _DISCOVERY_THRESHOLD:
+            return None, detail
+        print(f"  Discovery: {name_a[:30]} / {name_b[:30]}: "
+              f"proposes {_tid} ({_dir}) P={_best_p:.2f}")
+        return _tid, detail
 
 
 # ---------------------------------------------------------------------------
@@ -14928,6 +15575,78 @@ def _merge_pair_signal(ka, kb):
     return 0
 
 
+def _merge_name_candidates(roster):
+    """Name-structure merge candidates: (ka, kb, sources) pairs,
+    sorted, whose only link is the SHAPE of their names.
+
+    Why this exists (Fourth Wing run 23): every pre-existing
+    candidate source is claim-driven — _roster_reconcile merges
+    only on mutual alias claims or learned links, and
+    post_pass_merge's Tier 3 list is built from _merge_pair_signal
+    over pairs _merge_tier already called ambiguous. A title-form
+    entry ("General Sorrengail") sitting split from its full-name
+    entry ("Lilith Sorrengail") with no alias claim recorded
+    between them therefore generates NO candidate anywhere: the
+    reconcile reports zero merges and the pair is invisible, not
+    rejected. These sources read the names themselves:
+
+      shared_surname — both entries carry the same surname token;
+      title_form     — one entry is title + surname only (General
+                       Sorrengail, Captain X, Dr. Y) and the other
+                       is a full name carrying that surname;
+      containment    — one entry's stripped tokens are a strict
+                       contiguous subsequence of the other's.
+
+    A candidate is a PROPOSAL to the existing tiers, never a
+    merge: post_pass_merge runs each one through _merge_tier like
+    any other pair, and the deterministic and judge tiers behave
+    exactly as before. Pairs identical after stripping are Tier
+    2's business and are not re-proposed here."""
+    keys = sorted(roster)
+    _titles = {t for t in (_effective_titles()
+                           | _PROFESSIONAL_TITLES) if " " not in t}
+
+    def _tokens(key):
+        # The generator's own token view: the tiers' stripped
+        # tokens, dot-normalized, with any leading title removed
+        # even in its dotted form ("Dr. Reyes" — the tiers' exact
+        # token match never strips "dr.", so without this pass a
+        # dotted title form is invisible here too). This view only
+        # PROPOSES pairs; _merge_tier judges them with its own
+        # unchanged view.
+        toks = [t.rstrip(".") for t in _strip_merge_noise(key)]
+        while toks and toks[0] in _titles:
+            toks = toks[1:]
+        return toks
+
+    stripped = {k: _tokens(k) for k in keys}
+    out = []
+    for i, ka in enumerate(keys):
+        for kb in keys[i + 1:]:
+            sa, sb = stripped[ka], stripped[kb]
+            if not sa or not sb or sa == sb:
+                continue
+            sources = set()
+            for raw, s_self, s_other in ((ka, sa, sb), (kb, sb, sa)):
+                raw_toks = raw.split()
+                if (len(s_self) == 1 and len(raw_toks) >= 2
+                        and raw_toks[0].rstrip(".") in _titles
+                        and len(s_other) >= 2
+                        and s_other[-1] == s_self[0]):
+                    sources.add("title_form")
+            if (sa[-1] == sb[-1] and len(sa[-1]) >= 3
+                    and sa[-1] not in _NAME_STOPWORDS):
+                sources.add("shared_surname")
+            short, long_ = (sa, sb) if len(sa) <= len(sb) \
+                else (sb, sa)
+            if len(short) < len(long_) \
+                    and _is_contig_subseq(short, long_):
+                sources.add("containment")
+            if sources:
+                out.append((ka, kb, tuple(sorted(sources))))
+    return out
+
+
 def post_pass_merge(roster, validator=None):
     """Post-chapter merge pass over the roster. Tier 1/2 deterministic first
     (converging loop), then Tier 3 via the decision model for ambiguous pairs
@@ -14999,6 +15718,40 @@ def post_pass_merge(roster, validator=None):
             _sig = _merge_pair_signal(ka, kb)
             if _sig:
                 _cands.append((_sig, ka, kb))
+    # Name-structure candidates (_merge_name_candidates): pairs
+    # whose names alone propose them, fed through the SAME tier
+    # check. An ambiguous pair joins the Tier 3 list below and is
+    # judged like any other candidate. A pair the tiers hard-NO —
+    # Tier 1 cannot-link (co-listed in a chapter) or the surname
+    # trap — is never judged and never merged: the vetoes are
+    # unchanged, and a judge that could override them would
+    # force-merge siblings. But a title-form or containment pair
+    # blocked that way is collected as a blocked proposal and
+    # surfaced in possible_merges after the Tier 3 loop, because
+    # silence is exactly how the run-23 title-form split shipped
+    # as "zero merges proposed". Plain shared-surname blocks are
+    # NOT surfaced: the surname trap working on siblings is the
+    # designed outcome, and listing every sibling pair would bury
+    # the review list the blocked proposals exist for.
+    # Pair identity is unordered: the signal loop above keys pairs
+    # in roster order, the generator in sorted order, and comparing
+    # the two without normalizing would judge a pair twice.
+    _cand_pairs = {tuple(sorted((ka, kb))) for _, ka, kb in _cands}
+    _blocked_proposals = []
+    for _ka, _kb, _srcs in _merge_name_candidates(roster):
+        if tuple(sorted((_ka, _kb))) in _cand_pairs \
+                or _ka not in roster or _kb not in roster:
+            continue
+        _tier = _merge_tier(
+            _ka, _kb, a_chapters=roster[_ka].get("chapters"),
+            b_chapters=roster[_kb].get("chapters"),
+            roster_keys=set(_keys))
+        if _tier == "ambiguous":
+            _cands.append((1, _ka, _kb))
+            _cand_pairs.add(tuple(sorted((_ka, _kb))))
+        elif _tier == "no" and {"title_form", "containment"} \
+                & set(_srcs):
+            _blocked_proposals.append((_ka, _kb, _srcs))
     # Strongest signals first. The shared per-book budget (relationship
     # validation later draws from the same pool) is claimed per ACTUAL
     # call, immediately before it — never up front for the whole
@@ -15047,6 +15800,21 @@ def post_pass_merge(roster, validator=None):
                 "name_a": _na, "name_b": _nb,
                 "p_yes": round(_p, 4) if _p is not None else None,
                 "reason": f"below threshold ({_MERGE_P_YES_THRESHOLD})"})
+    # Blocked name-candidate proposals (see the candidate block
+    # above): pairs a Tier 1 veto kept from the judge entirely.
+    # Only pairs whose entries both survived Tier 3 are listed —
+    # a proposal naming an entry that no longer exists would send
+    # a reviewer hunting a ghost.
+    for _ka, _kb, _srcs in _blocked_proposals:
+        if _ka not in roster or _kb not in roster:
+            continue
+        possible_merges.append({
+            "name_a": roster[_ka].get("name", _ka),
+            "name_b": roster[_kb].get("name", _kb),
+            "p_yes": None,
+            "reason": (f"name candidate ({', '.join(_srcs)}): "
+                       f"blocked by Tier 1 — not judged, not "
+                       f"merged; manual review")})
     # The merge stage is done: its unused budget reserve becomes
     # borrowable by the validation stages that follow (spec §1.3).
     _dm_budget_finish("merge_tier3")
@@ -15206,6 +15974,56 @@ def _rel_validation_state(rel):
     if _note in ("dropped", "would_drop", "no_evidence"):
         return "rejected"
     return "review_required"
+
+
+# Generational types and which endpoint they make the elder:
+# parent / step_parent describe `from` as the elder; child /
+# step_child describe `to` as the elder. A pair's canonical claims
+# are generationally contradictory when they make EACH endpoint
+# the elder of the other — the Fourth Wing run-23 inversions (a
+# father typed as his son's "child"; a mother typed as her
+# daughter's "child") survived precisely because each inverted
+# claim was scored alone and nothing ever compared the pair's
+# claims against each other. The same fact phrased both ways
+# ("A is B's parent" + "B is A's child") canonicalizes to ONE
+# elder direction and is not a contradiction.
+_GENERATIONAL_ELDER_FROM = frozenset({"parent", "step_parent"})
+_GENERATIONAL_ELDER_TO = frozenset({"child", "step_child"})
+
+
+def _generational_contradiction(cands):
+    """Detect generationally contradictory claims for ONE pair.
+
+    cands: the pair's canonicalized candidate claims (dicts with
+    from / to / type). Returns a record of the contradiction —
+    the elder directions claimed and the types involved — or None.
+
+    Deterministic and claim-data alone: no external knowledge
+    about who is actually older, only the shape of what was
+    claimed. A single-direction claim set, however often repeated
+    or rephrased, returns None, so legitimate parent/child claims
+    are untouched."""
+    elders = {}
+    for c in cands or []:
+        t = (c.get("type") or "").lower()
+        f, to = norm_name(c.get("from", "")), norm_name(c.get("to", ""))
+        if not f or not to or f == to:
+            continue
+        if t in _GENERATIONAL_ELDER_FROM:
+            elder, younger = f, to
+        elif t in _GENERATIONAL_ELDER_TO:
+            elder, younger = to, f
+        else:
+            continue
+        elders.setdefault((elder, younger), set()).add(t)
+    for elder, younger in elders:
+        if (younger, elder) in elders:
+            return {
+                "elders": sorted([list(k) for k in elders]),
+                "types": sorted({t for ts in elders.values()
+                                 for t in ts}),
+            }
+    return None
 
 
 def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
@@ -15424,6 +16242,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
 
     relationships = []
     _guard_suppressed = []  # non-family claims suppressed by the family guard
+    _direction_contradictions = []  # pairs flagged by the direction guard
     _CONF_RANK = {"high": 0, "medium": 1, "low": 2}
     _TYPE_SPEC_RANK = {"specific": 0, "moderate": 1, "vague": 2}
     for _pair_key, cands in _pair_cands.items():
@@ -15447,6 +16266,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # Best: highest confidence, then most specific type, then evidence,
         # then earliest chapter.
         _scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        # Direction guard: computed over ALL the pair's candidates,
+        # before the family guard narrows the pool — a contradiction
+        # is a fact about everything extraction claimed for the
+        # pair, not about whichever subset survives to compete.
+        _contra = _generational_contradiction([s[7] for s in _scored])
         # Family guard: a family claim (spouse/parent/child/sibling) is the
         # canonical winner for its pair. Family types are all "specific"
         # band, so a family claim's matrix confidence is never below medium
@@ -15477,6 +16301,18 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         _rel["confidence"] = _conf
         _rel["evidence_count"] = _nq
         _rel["cooccurrence_count"] = _co
+        if _contra:
+            # The winner carries the contradiction record; the
+            # curation stamp below turns it into a review_required
+            # state when the claim otherwise validates, because
+            # the judge scored ONE direction's evidence and never
+            # saw that the pair was also claimed the other way —
+            # which generation is right is a human call the claim
+            # data alone cannot make.
+            _rel["direction_contradiction"] = _contra
+            _direction_contradictions.append({
+                "from": _rel["from"], "to": _rel["to"],
+                "types": _contra["types"]})
         relationships.append(_rel)
 
     # --- Relationship importance: 1-5 from chapter co-occurrence ---
@@ -15866,6 +16702,17 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     for rel in relationships:
         rel.setdefault("source", "extracted")
         rel["validation_state"] = _rel_validation_state(rel)
+        if rel.get("direction_contradiction") \
+                and rel["validation_state"] == "validated":
+            # Direction guard (see _generational_contradiction):
+            # a claim whose pair ALSO claimed the reverse
+            # generation does not ship as validated on one
+            # direction's evidence alone — it goes to a human with
+            # the contradiction record attached. Claims in any
+            # other state keep it: a rejected claim needs no
+            # review, and an unjudged one is already review-bound
+            # or carries its own state.
+            rel["validation_state"] = "review_required"
     for rel in _dropped_relationships:
         rel.setdefault("source", "extracted")
         rel["validation_state"] = _rel_validation_state(rel)
@@ -16249,6 +17096,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         "validator_circuit_breaker": _validator_breaker,
         "self_pairs_dropped": {"extracted": _self_pairs_extracted,
                                "remapped": _self_pairs_remapped},
+        "direction_contradictions": _direction_contradictions,
         "triggers": triggers,
         "trigger_chapters": _trigger_chapters_map(triggers),
         "spice_level": spice_level,
@@ -23343,6 +24191,31 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         except Exception:
             pass
 
+    # Shadow discovery (spec §3.5): placed LAST in pipeline order,
+    # after the quote-poll block above — the quote poll's
+    # finished-marker fires at the end of that block (Release A
+    # gate note R-A5), so discovery's borrow position is honest:
+    # it starts only once every earlier consumer has either
+    # finished or never run, and the report records which. Shadow
+    # mode spends its own reported experimental allowance rather
+    # than the shared pool (see _discovery_shadow_run), so even
+    # at this last position it cannot take a call a production
+    # consumer was owed. Flag off (or an aborted run — partial
+    # results are not a book to discover from): no report, no
+    # result key, byte-identical output.
+    _discovery_report = None
+    if not aborted:
+        _discovery_report = _maybe_run_discovery(
+            roster, [ch for _, ch in indexed],
+            red["relationships"], red["characters"])
+    if _discovery_report is not None:
+        _keeps = sum(t["shadow_keeps"]
+                     for t in _discovery_report["per_tier"].values())
+        print(f"  Discovery (shadow): "
+              f"{_discovery_report['pairs_considered']} candidate "
+              f"pairs, {_discovery_report['pairs_judged']} judged, "
+              f"{_keeps} shadow keeps — nothing written")
+
     reading_mins = word_count // 250
     result = {
         "file": fpath.name, "title": title or fpath.stem, "author": author,
@@ -23366,6 +24239,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             "validator_circuit_breaker"),
         "self_pairs_dropped": red.get("self_pairs_dropped",
                                       {"extracted": 0, "remapped": 0}),
+        "direction_contradictions": red.get(
+            "direction_contradictions", []),
         "spice_level": red["spice_level"],
         # Reduce-computed fields the consumers read from the RESULT
         # (not from red): --recalibrate-spice needs chapter_spice +
@@ -23407,6 +24282,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     }
     if _recon_stats is not None:
         result["roster_reconcile"] = _recon_stats
+    if _discovery_report is not None:
+        result["discovery"] = _discovery_report
     if _staging_marker is not None:
         result["staging"] = _staging_marker
     if _roster_marker is not None:
@@ -24182,6 +25059,8 @@ def save_preview(fpath, result):
             _p = f" P(yes)={m['p_yes']:.2f}" if m.get("p_yes") is not None else ""
             md.append(f"- {m['name_a']} vs {m['name_b']}{_p} ({m['reason']})")
         md.append("")
+    if result.get("discovery"):
+        md.extend(_discovery_markdown(result["discovery"]))
     md.append(f"## Characters ({len(result['characters'])})")
     for c in result["characters"]:
         md.append(f"### {c['name']} ({c.get('role') or 'unknown'})")
@@ -24714,6 +25593,25 @@ def _build_parser():
                          "curation anchors; cross-run form flips stop "
                          "flickering (default off; see "
                          "eval/b-roster-design.md)")
+
+    g_merge.add_argument("--discovery-shadow", action="store_true",
+                    help="spec §3 (v2): shadow relationship "
+                         "discovery — one-pass sentence index, "
+                         "miner pre-filter, one closed-set "
+                         "discovery call per advancing pair, then "
+                         "the standard validator as a shadow record. "
+                         "Emits a discovery section in the preview "
+                         "output and writes NOTHING (default off; "
+                         "see docs/discovery-and-budget-spec.md §3)")
+
+    g_merge.add_argument("--discovery-embedding-rank",
+                    action="store_true",
+                    help="spec §3.3 experimental arm: with "
+                         "--discovery-shadow, rank a pair's binding "
+                         "sentences by embedding similarity to "
+                         "relationship-dynamic queries instead of "
+                         "the miner's order (ranking only; needs "
+                         "embed_url/embed_model; default off)")
 
     g_learn = ap.add_argument_group("Learning")
     g_learn.add_argument("--learn", dest="learn", action="store_true", default=True,
@@ -25311,6 +26209,10 @@ def main():
 
     if args.persist_roster:
         CONFIG["persist_roster"] = True
+    if getattr(args, "discovery_shadow", False):
+        CONFIG["discovery_shadow"] = True
+    if getattr(args, "discovery_embedding_rank", False):
+        CONFIG["discovery_embedding_rank"] = True
     if args.preview_summary:
         CONFIG["preview_summary"] = True
     if args.resume:
