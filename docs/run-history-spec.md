@@ -1,7 +1,10 @@
 # Processor Run History in Supabase — Spec (DRAFT for approval)
 
-Status: draft, 2026-10-17. Nothing built, nothing migrated. A schema change is a
-gated decision; this spec is the thing being approved, not the build.
+Status: APPROVED and IN IMPLEMENTATION, 2026-10-17. All four RH decisions
+ruled (§12/§14); team review folded in (§13). The migration was APPLIED
+2026-10-17 and the four-part verification passed (see the migration
+file's header). The --run-history writer is being built through the
+standing gated lane; first live enable follows on the user's machine.
 
 ## 1. Purpose
 

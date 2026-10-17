@@ -1,7 +1,15 @@
 -- =====================================================================
--- processor run history — migration DRAFT (NOT APPLIED)
+-- processor run history — migration (APPLIED 2026-10-17)
 -- Drafted 2026-10-17 from run-history-supabase-spec.md (incl. the §13
--- team-review amendments and the §14 RH-4 ruling).
+-- team-review amendments and the §14 RH-4 ruling). Applied via the
+-- Management API SQL path after the Advisor's PASS_WITH_CHANGES (all
+-- required edits folded in first) and the user's implementation go.
+-- PostgREST exposed schemas now include 'processor'. Four-part
+-- verification PASSED: catalog grants (service_role only) + RLS on all
+-- three tables with zero policies; anon PostgREST probe 401;
+-- authenticated role 42501 permission denied for schema; service-key
+-- round trip (insert 201 -> read 200 -> delete) with tables verified
+-- empty afterwards. The --run-history writer ships separately.
 --
 -- CUSTODY: these tables are PROCESSOR-owned. This file lives with the
 -- ebook-processor records and must never be numbered into the Cozy app's
