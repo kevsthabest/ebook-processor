@@ -482,5 +482,104 @@ class TestRunLifecycle(unittest.TestCase):
         self.assertIsNone(evs[-1]["failures"])
 
 
+def _history_rec(result, outcome="failed", skip_reason=None):
+    """A recorder record in the shape _history_book_payload reads:
+    the book's own result plus the recorder's per-book fields."""
+    return {"result": result, "chapters": None, "ingest_title": None,
+            "book_key": "bk-history-breaker", "source": "file",
+            "outcome": outcome, "skip_reason": skip_reason,
+            "duration_ms": None, "decision_calls": None,
+            "replace_result": None, "error_class": None,
+            "error_message": None}
+
+
+# The book payload's top-level keys are the processor_run_books
+# columns (docs/run-history-spec.md §4): the breaker fix must ride
+# existing carriers only, so this set may not grow.
+_HISTORY_BOOK_KEYS = {
+    "run_id", "book_key", "title", "work_id", "source", "outcome",
+    "skip_reason", "chapters", "duration_ms", "decision_calls",
+    "claims", "characters", "quotes", "suppressed_by_verdict",
+    "replace_result", "error_class", "error_message"}
+
+
+class TestHistoryBreakerPayload(unittest.TestCase):
+    """Run history records the validator circuit breaker (spec
+    §1.6, Release A gate risk R1): before this, a tripped book
+    landed in history as outcome "failed" with no marker and no
+    error rate, indistinguishable from any other failure."""
+
+    def test_tripped_book_payload_carries_breaker_marker_and_rate(self):
+        result = {
+            "title": "Tripped Book",
+            "validator_circuit_breaker": {
+                "tripped": True, "attempts": 10, "errors": 6,
+                "error_rate": 0.6, "threshold": 0.5, "min_sample": 8},
+            "write_skipped": "validator_circuit_breaker",
+        }
+        payload, _rows = pp._history_book_payload(
+            _history_rec(result), None)
+        # No new top-level field: the payload still names exactly
+        # the existing table columns.
+        self.assertEqual(set(payload), _HISTORY_BOOK_KEYS)
+        # The outcome itself is unchanged — the marker is what
+        # separates a breaker skip from an ordinary failure.
+        self.assertEqual(payload["outcome"], "failed")
+        self.assertEqual(payload["skip_reason"],
+                         "validator_circuit_breaker")
+        chars = payload["characters"]
+        self.assertEqual(chars["validator_breaker_attempts"], 10)
+        self.assertEqual(chars["validator_breaker_errors"], 6)
+        self.assertEqual(chars["validator_breaker_error_rate"], 0.6)
+
+    def test_untripped_book_payload_has_no_breaker_marker(self):
+        result = {
+            "title": "Normal Book",
+            "validator_circuit_breaker": {
+                "tripped": False, "attempts": 10, "errors": 1,
+                "error_rate": 0.1, "threshold": 0.5, "min_sample": 8},
+        }
+        payload, _rows = pp._history_book_payload(
+            _history_rec(result, outcome="processed"), None)
+        self.assertEqual(set(payload), _HISTORY_BOOK_KEYS)
+        self.assertEqual(payload["outcome"], "processed")
+        self.assertIsNone(payload["skip_reason"])
+        chars = payload["characters"]
+        self.assertIsNone(chars["validator_breaker_attempts"])
+        self.assertIsNone(chars["validator_breaker_errors"])
+        self.assertIsNone(chars["validator_breaker_error_rate"])
+
+    def test_book_without_breaker_record_payload_unaffected(self):
+        # A result with no breaker record at all (a book that
+        # failed before validation, or a legacy result): payload
+        # shape and markers exactly as before the fix.
+        payload, _rows = pp._history_book_payload(
+            _history_rec({"title": "Plain Book"}), None)
+        self.assertEqual(set(payload), _HISTORY_BOOK_KEYS)
+        self.assertIsNone(payload["skip_reason"])
+        chars = payload["characters"]
+        self.assertIsNone(chars["validator_breaker_attempts"])
+        self.assertIsNone(chars["validator_breaker_errors"])
+        self.assertIsNone(chars["validator_breaker_error_rate"])
+
+    def test_tripped_book_keeps_an_existing_skip_reason(self):
+        # A skip reason the recorder already set is the run's own
+        # record of why the book stopped; the breaker marker must
+        # not overwrite it.
+        result = {
+            "title": "Skipped Book",
+            "validator_circuit_breaker": {
+                "tripped": True, "attempts": 8, "errors": 8,
+                "error_rate": 1.0, "threshold": 0.5, "min_sample": 8},
+        }
+        payload, _rows = pp._history_book_payload(
+            _history_rec(result, outcome="skipped",
+                         skip_reason="not_in_corpus"), None)
+        self.assertEqual(payload["skip_reason"], "not_in_corpus")
+        self.assertEqual(
+            payload["characters"]["validator_breaker_error_rate"],
+            1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

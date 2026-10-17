@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.23"
+PORTABLE_VERSION = "2.13.24"
 
 
 import argparse
@@ -19532,7 +19532,8 @@ _HISTORY_CHARACTER_KEYS = (
     "roster_size", "characters", "minor_characters",
     "merges_proposed", "merges_applied", "relationships",
     "relationships_dropped", "principal_rel_judged",
-    "principal_rel_total")
+    "principal_rel_total", "validator_breaker_attempts",
+    "validator_breaker_errors", "validator_breaker_error_rate")
 _HISTORY_QUOTE_KEYS = ("extracted", "verified", "rejected", "selected")
 _HISTORY_TOTAL_KEYS = (
     "files_seen", "admitted", "skipped_not_in_corpus", "processed",
@@ -20194,6 +20195,24 @@ def _history_characters(result):
             out["principal_rel_judged"] = _cov["judged"]
         if isinstance(_cov.get("total"), int):
             out["principal_rel_total"] = _cov["total"]
+    # Validator circuit-breaker outcome (spec §1.6): the attempts
+    # the breaker counts are relationship judgments, so its numbers
+    # ride in this record, alongside the relationship counters and
+    # the judged coverage above. Only a tripped breaker is
+    # recorded — an untripped book's validation ran its course,
+    # and stamping its raw error counts here would dress a routine
+    # run up as a near-miss the run itself never called it. A book
+    # whose breaker never tripped keeps None, like every other
+    # counter this record did not measure for it.
+    _breaker = result.get("validator_circuit_breaker")
+    if isinstance(_breaker, dict) and _breaker.get("tripped"):
+        if isinstance(_breaker.get("attempts"), int):
+            out["validator_breaker_attempts"] = _breaker["attempts"]
+        if isinstance(_breaker.get("errors"), int):
+            out["validator_breaker_errors"] = _breaker["errors"]
+        if isinstance(_breaker.get("error_rate"), (int, float)):
+            out["validator_breaker_error_rate"] = \
+                _breaker["error_rate"]
     _count("merges_proposed", "possible_merges")
     # Merge counts arrive in two shapes: the v2 post-pass stores
     # its count directly as an int (post_pass_merge returns a
@@ -20265,6 +20284,21 @@ def _history_book_payload(rec, run_id):
         {**(result or {}), "_history_book_key": rec["book_key"]}
         if isinstance(result, dict) else result)
     error_message = _history_sanitize(rec["error_message"])
+    skip_reason = rec["skip_reason"]
+    if skip_reason is None and isinstance(result, dict):
+        _breaker = result.get("validator_circuit_breaker")
+        if isinstance(_breaker, dict) and _breaker.get("tripped"):
+            # A tripped book's write gate returns False, so in
+            # history it lands as outcome "failed" — on its own
+            # indistinguishable from any other failure, with the
+            # write refusal invisible. skip_reason is this
+            # payload's existing marker for why a book did not
+            # proceed normally, so the breaker's own name rides
+            # there: the same string the process result carries
+            # in write_skipped, separable by a history query with
+            # no schema change. The breaker's numbers ride in the
+            # characters record (see _history_characters).
+            skip_reason = "validator_circuit_breaker"
     return {
         "run_id": run_id,
         "book_key": rec["book_key"],
@@ -20272,7 +20306,7 @@ def _history_book_payload(rec, run_id):
         "work_id": work_id,
         "source": rec["source"],
         "outcome": rec["outcome"],
-        "skip_reason": rec["skip_reason"],
+        "skip_reason": skip_reason,
         "chapters": chapters,
         "duration_ms": rec["duration_ms"],
         "decision_calls": rec["decision_calls"],
