@@ -14,5 +14,8 @@
   "llm_response_format": "json_object",
   "llm_json_schema": true,
   "_comment_pipeline": "pipeline: 'legacy' (fixed chunks) or 'v2' (chapter-level map/reduce with character roster); also settable via --pipeline",
-  "pipeline": "legacy"
+  "pipeline": "legacy",
+  "_comment_run_history": "run_history: when true (or --run-history is passed), each run mirrors metadata about itself (versions, models, prompt hashes, per-book outcomes and claim counts — never book text) to the processor schema in Supabase; uploads are best-effort and never affect the run. machine_label: an optional label you choose (e.g. your PC's name) stamped on those rows so runs from different machines are distinguishable; it is never read from the machine automatically",
+  "run_history": false,
+  "machine_label": ""
 }

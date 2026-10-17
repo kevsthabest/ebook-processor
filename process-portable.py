@@ -125,6 +125,14 @@ DEFAULT_CONFIG = {
     "trope_map_cache": "trope-vectors.json",  # cached catalog embeddings
     "v2_prompt_cache": False,  # put chapter first for llama.cpp KV cache reuse
     "proposer_user_id": "",  # Supabase users.id for trope_proposals.proposed_by
+    "run_history": False,  # run-history mirror (docs/run-history-spec.md):
+    # when on, each run uploads metadata about itself (versions, models,
+    # prompt hashes, per-book outcomes and claim counts — never book
+    # text) to the processor schema in Supabase; best-effort only, a
+    # failed upload never affects the run
+    "machine_label": "",  # opt-in, user-chosen label stamped on
+    # run-history rows so multi-machine history is distinguishable;
+    # never auto-collected from the machine
     "pipeline": "legacy",  # or "v2": chapter-level map/reduce (--pipeline v2)
     "v2_max_chapter_chars": 16000,  # ~4k tokens; keep well under your
     # server's context window minus prompt (~1k) minus output (~3k)
@@ -135,7 +143,7 @@ DEFAULT_CONFIG = {
 _INT_CONFIG_KEYS = {"sample_rate", "sample_edges", "batch_size", "llm_max_tokens"}
 # Config keys that are bools (EBOOK_DEDUPE=false must not be truthy).
 _BOOL_CONFIG_KEYS = {"debug", "dedupe", "llm_enable_thinking", "llm_json_schema",
-                     "v2_prompt_cache"}
+                     "v2_prompt_cache", "run_history"}
 
 
 def load_config():
@@ -4032,6 +4040,10 @@ def cmd_ingest(paths, learn_dir=None, reason="", force=False):
                     corpus_generate_opening_line(pdb, fp)
                 except Exception:
                     pass
+    # A standalone ingest dispatch arms the run-history capture in
+    # main(); watch-cycle ingests do not (their scan owns the run).
+    if _HISTORY_INGEST_CAPTURE:
+        _history_note_ingest(results, files, db)
     return results
 
 
@@ -16413,8 +16425,17 @@ def cmd_trope_map(preview_path):
     print(f"  {len(mappings)} mapped, {len(proposals)} proposals -> {out_path}")
 
 
-def sb(table, method="GET", data=None, params="", prefer=None):
-    """Returns a list on success (possibly empty) or None on any error."""
+def sb(table, method="GET", data=None, params="", prefer=None,
+       schema=None):
+    """Returns a list on success (possibly empty) or None on any error.
+
+    schema targets a non-public PostgREST schema for this call only
+    (Accept-Profile on reads, Content-Profile on writes — the
+    mechanism PostgREST exposes for schema selection). Callers that
+    pass no schema get exactly the request they have always made:
+    run history is the first tenant of the dedicated processor
+    schema, and claim writes must not grow new headers as a side
+    effect of sharing this helper."""
     url = f"{CONFIG['supabase_url']}/rest/v1/{table}{params}"
     _prefer = "return=representation"
     if prefer:
@@ -16425,6 +16446,11 @@ def sb(table, method="GET", data=None, params="", prefer=None):
         "Content-Type": "application/json",
         "Prefer": _prefer,
     }
+    if schema:
+        if method == "GET":
+            headers["Accept-Profile"] = schema
+        else:
+            headers["Content-Profile"] = schema
     body = json.dumps(data).encode("utf-8") if data is not None else None
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
@@ -16722,10 +16748,16 @@ class _run_events_book:
 
     def __init__(self, fpath):
         self._book = Path(fpath).name
+        self._fpath = fpath
         self._sink = None
         self._prev = None
 
     def __enter__(self):
+        # The run-history recorder brackets the same span (it is
+        # independent of the event sink — history must work with the
+        # sink flag off), so its bookkeeping starts even when no sink
+        # is live.
+        _history_book_start(self._fpath)
         sink = _RUN_SINK
         if sink is None:
             return self
@@ -16741,6 +16773,7 @@ class _run_events_book:
             _run_event({"event": "book_end", "book": self._book,
                         "decision_calls": _DM_BUDGET_USED})
             self._sink.set_book(self._prev)
+        _history_book_end(self._fpath, exc[1] if len(exc) > 1 else None)
         return False
 
 
@@ -16766,6 +16799,1048 @@ def _run_events_impulse(label, vec, catalog, best_id, best_sim, threshold):
         "catalog_id": best_id if mapped else None,
         "score": round(best_sim, 6) if best_sim is not None else None,
     })
+
+
+# ---------------------------------------------------------------------------
+# Run history (docs/run-history-spec.md): a best-effort metadata mirror
+# of every run into the processor schema of the Cozy Supabase project,
+# so questions about runs ("what did the watch do this week", "did the
+# judge change move abstention rates") are answered by query instead
+# of by re-running drills and pasting terminal output.
+#
+# The disciplines that shape everything below:
+# - Metadata only. Payloads are built from allowlisted fields, and
+#   error text — the one free-text field — is sanitized before it
+#   can ride.
+# - The local run-events JSONL stays the ground truth; this is a
+#   mirror. A failed upload warns once and the run is untouched:
+#   observability must never cost a book its run (the same rule the
+#   event sink above lives by).
+# - Unknown is None, never 0 and never a missing key: a counter the
+#   run did not measure must be distinguishable from "measured, and
+#   it was zero" in every later query.
+# ---------------------------------------------------------------------------
+
+_HISTORY_SCHEMA = "processor"
+_HISTORY = None              # _RunHistoryRecorder while a run is armed
+_HISTORY_WATCH = None        # {"watch_ingest": bool} inside a watch cycle
+_HISTORY_INGEST_CAPTURE = False  # main()'s ingest dispatch is running
+_HISTORY_NOSB_WARNED = False     # missing-Supabase warning fires once
+
+# Boolean switches stamped on every run row. Allowlisted on purpose:
+# the flags column and the config fingerprint are built from this
+# list (plus the model/threshold stamps), so nothing else in CONFIG —
+# keys, endpoints, paths — can leak into the mirror by convenience.
+_HISTORY_FLAG_KEYS = (
+    "use_corpus", "corpus_only", "evidence_retrieval",
+    "roster_reconcile", "staging_gate", "persist_roster",
+    "corpus_quotes", "emit_run_events", "rename_no_isbn",
+    "decision_model", "dedupe")
+
+# The claim verdicts the writer may emit: the run-level outcomes plus
+# the retrieve stage's own grades. The claim table deliberately has
+# no database CHECK (spec §4: an evolving measurement vocabulary,
+# and a CHECK violation under best-effort writes would silently drop
+# rows); this list is the writer-side guard instead, pinned by the
+# suite against the strings the pipeline actually produces.
+_HISTORY_CLAIM_VERDICTS = frozenset({
+    "derived", "reused", "abstained", "failed",
+    "supported-strong", "supported-single", "adjacent-only"})
+
+# Counter keys carried by the payloads, in full: every payload
+# carries every key, with None wherever the run did not measure
+# that counter (see the header note on unknown values).
+_HISTORY_AXIS_KEYS = (
+    "derived", "reused", "abstained", "failed", "promoted",
+    "supported_strong", "supported_single", "adjacent_only",
+    "tier1", "tier2", "tier3")
+_HISTORY_CHARACTER_KEYS = (
+    "roster_size", "characters", "minor_characters",
+    "merges_proposed", "merges_applied", "relationships",
+    "relationships_dropped")
+_HISTORY_QUOTE_KEYS = ("extracted", "verified", "rejected", "selected")
+_HISTORY_TOTAL_KEYS = (
+    "files_seen", "admitted", "skipped_not_in_corpus", "processed",
+    "succeeded", "failed", "claims_derived", "claims_reused",
+    "claims_abstained", "claims_failed", "claims_supported_strong",
+    "claims_supported_single", "claims_adjacent_only",
+    "quotes_verified", "quotes_rejected")
+
+# Marker hashed in place of a catalogue identity for a claim the run
+# could not map. The hash input is this marker plus the book
+# fingerprint only (spec §4's input discipline): a raw free-text or
+# proposed label is never hashed, so an unmapped claim's key cannot
+# be dictionary-matched against guessed label text from other books.
+_HISTORY_UNMAPPED = "catalogue-pending"
+
+_HISTORY_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+_HISTORY_URL_RE = re.compile(r"https?://\S+")
+_HISTORY_WINPATH_RE = re.compile(r"[A-Za-z]:\\[^\s]*")
+_HISTORY_UNCPATH_RE = re.compile(r"\\\\[^\s]*")
+_HISTORY_POSIXPATH_RE = re.compile(r"(?<![\w.])/(?:[\w.\-]+/)+[\w.\-]*")
+_HISTORY_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_HISTORY_BARE_FILE_RE = re.compile(
+    r"[A-Za-z0-9_'\-]+(?: [A-Za-z0-9_'\-]+)*\.(?:epub|mobi|azw3)\b",
+    re.IGNORECASE)
+_HISTORY_BEARER_RE = re.compile(r"Bearer\s+\S+", re.IGNORECASE)
+_HISTORY_JWT_RE = re.compile(r"eyJ[\w.\-]{10,}")
+_HISTORY_APIKEY_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}")
+
+
+def _history_sanitize(text, limit=500):
+    """Make one piece of free text (an error message) safe to mirror:
+    strip anything path-shaped, URL-shaped, email-shaped, key-shaped
+    or a bare ebook filename, then truncate. Error text is the one
+    field that can quote the machine back at us — a Windows path
+    carries a username, a bare filename is on the never-transfer
+    list — so it is cleaned BEFORE payload assembly, never after."""
+    if not text:
+        return None
+    s = str(text)
+    s = _HISTORY_URL_RE.sub("[url]", s)
+    s = _HISTORY_WINPATH_RE.sub("[path]", s)
+    s = _HISTORY_UNCPATH_RE.sub("[path]", s)
+    s = _HISTORY_POSIXPATH_RE.sub("[path]", s)
+    s = _HISTORY_EMAIL_RE.sub("[email]", s)
+    s = _HISTORY_BEARER_RE.sub("Bearer [key]", s)
+    s = _HISTORY_JWT_RE.sub("[key]", s)
+    s = _HISTORY_APIKEY_RE.sub("[key]", s)
+    s = _HISTORY_BARE_FILE_RE.sub("[file]", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:limit] if s else None
+
+
+def _history_denylist_scan(payload):
+    """Pattern names matching anywhere in a built payload. The
+    payload builders are allowlist-built; this scan is the tripwire
+    the suite uses to prove the allowlist held (spec §5/§10)."""
+    blob = json.dumps(payload, ensure_ascii=False, default=str)
+    return [name for name, rx in (
+        ("url", _HISTORY_URL_RE), ("windows-path", _HISTORY_WINPATH_RE),
+        ("unc-path", _HISTORY_UNCPATH_RE),
+        ("posix-path", _HISTORY_POSIXPATH_RE),
+        ("email", _HISTORY_EMAIL_RE), ("bearer", _HISTORY_BEARER_RE),
+        ("jwt", _HISTORY_JWT_RE), ("api-key", _HISTORY_APIKEY_RE),
+        ("bare-file", _HISTORY_BARE_FILE_RE)) if rx.search(blob)]
+
+
+def _history_flags(mode):
+    """The allowlisted boolean switches in force, plus the two watch
+    facts only the watch loop knows. Read from CONFIG so a config-
+    file enablement stamps exactly like a CLI one."""
+    flags = {k: bool(CONFIG.get(k)) for k in _HISTORY_FLAG_KEYS}
+    flags["watch"] = mode == "watch_cycle"
+    flags["watch_ingest"] = bool(
+        (_HISTORY_WATCH or {}).get("watch_ingest")) \
+        if mode == "watch_cycle" else False
+    return flags
+
+
+def _history_models():
+    """Model NAMES in force — never endpoints or base URLs (spec
+    §5: a local backend's LAN address is a hostname by another
+    name). Only the *_model config values are read, so there is no
+    field here an endpoint could hide in."""
+    backend = CONFIG.get("llm") or ""
+    per_backend = {"ollama": CONFIG.get("ollama_model"),
+                   "openrouter": CONFIG.get("openrouter_model"),
+                   "openai": CONFIG.get("openai_model")}
+    judge_backend, judge_model = _effective_judge_identity()
+    return {
+        "llm_backend": backend or None,
+        "llm_model": per_backend.get(backend) or None,
+        "judge_backend": judge_backend or None,
+        "judge_model": judge_model or None,
+        "decision_model_enabled": bool(CONFIG.get("decision_model")),
+        "decision_model_provider":
+            CONFIG.get("decision_model_provider") or None,
+        "decision_model_model":
+            CONFIG.get("decision_model_model") or None,
+        "embed_model": CONFIG.get("embed_model") or None,
+    }
+
+
+def _history_thresholds():
+    """The numeric bars in force, from the same constants and config
+    the run itself obeys — a comparison across runs is only honest
+    if the bars ride along with the results."""
+    return {
+        "merge_p_yes": _MERGE_P_YES_THRESHOLD,
+        "rel_validation": _REL_VALIDATION_THRESHOLD,
+        "rel_drop": _REL_DROP_THRESHOLD,
+        "merge_tier3_cap": _MERGE_TIER3_CAP,
+        "trope_map_threshold": CONFIG.get("trope_map_threshold"),
+        "evidence_retrieval_floor":
+            CONFIG.get("evidence_retrieval_floor"),
+        "min_frequency": CONFIG.get("min_frequency", 0.20),
+    }
+
+
+def _history_setup_stamps(mode):
+    """The allowlisted setup one run is stamped with: flags, model
+    names, thresholds, pipeline. This exact dict is what the config
+    fingerprint hashes, so what a later comparison can see is
+    provably all the fingerprint commits to."""
+    return {"flags": _history_flags(mode),
+            "models": _history_models(),
+            "thresholds": _history_thresholds(),
+            "pipeline": CONFIG.get("pipeline") or None}
+
+
+def _history_prompt_stamps():
+    """{stage: {"name", "hash"}} for the prompts actually in force,
+    hashed from the LIVE constants — an unlabelled prompt edit moves
+    the hash even when nobody renamed a variant. The decision-model
+    instructions are assembled inline inside their methods (no
+    constant exists to hash), so that stage is absent rather than
+    faked."""
+    import hashlib as _hl
+    stages = {}
+
+    def _add(stage, text):
+        if text:
+            stages[stage] = {
+                "name": stage,
+                "hash": _hl.sha256(
+                    text.encode("utf-8")).hexdigest()[:12]}
+
+    if CONFIG.get("pipeline") == "v2":
+        _add("extractor_characters", PROMPT_V2_CHARACTERS)
+        _add("extractor_characters_simple",
+             PROMPT_V2_CHARACTERS_SIMPLE)
+        _add("extractor_content", PROMPT_V2_CONTENT)
+        _add("shared_system", V2_SHARED_SYSTEM)
+        _add("trope_gate", PROMPT_V2_TROPE_GATE)
+        if CONFIG.get("evidence_retrieval"):
+            _add("evidence_judge", PROMPT_EVIDENCE_JUDGE)
+    else:
+        _add("identity", PROMPT_IDENTITY)
+        _add("identity_simple", PROMPT_IDENTITY_SIMPLE)
+        _add("discipline", PROMPT_DISCIPLINE)
+    return stages
+
+
+class _RunHistoryRecorder:
+    """Accumulates one run's history records in memory; the flush at
+    run end turns them into payloads. Books are keyed locally by
+    their file path string (ingest books by fingerprint): the path
+    is join material for this process only and is never part of a
+    payload — payloads name books by corpus fingerprint / source
+    hash and title."""
+
+    def __init__(self, mode, preview, dry_run, learn_dir,
+                 files_seen=None):
+        self.mode = mode
+        self.preview = bool(preview)
+        self.dry_run = bool(dry_run)
+        self.learn_dir = learn_dir
+        self.files_seen = files_seen
+        self.admitted = None
+        self.started_wall = time.time()
+        self.started_mono = time.monotonic()
+        # Same identity format as the run-events artifact, so a
+        # history row and its JSONL name the same run (spec §3);
+        # when a sink is live its stem wins at flush time (the sink
+        # may have suffixed its filename).
+        self.run_key = ("run-" + time.strftime("%Y%m%d-%H%M%S")
+                        + f"-{os.getpid()}")
+        self.books = {}
+        self.lock = threading.Lock()
+        self.corpus_filter_ran = bool(CONFIG.get("corpus_only")) \
+            and mode in ("scan", "watch_cycle")
+        setup = _history_setup_stamps(mode)
+        self.flags = setup["flags"]
+        self.models = setup["models"]
+        self.thresholds = setup["thresholds"]
+        import hashlib as _hl
+        self.config_fingerprint = _hl.sha256(json.dumps(
+            setup, sort_keys=True, separators=(",", ":"),
+            default=str).encode("utf-8")).hexdigest()
+        self.prompt_stamps = _history_prompt_stamps()
+        self.machine_label = CONFIG.get("machine_label") or None
+        self._corpus_db = None
+        self._corpus_db_tried = False
+
+    def _book(self, key):
+        rec = self.books.get(key)
+        if rec is None:
+            rec = {"local_key": key, "fpath": None, "started": None,
+                   "duration_ms": None, "outcome": None,
+                   "skip_reason": None, "result": None,
+                   "error_class": None, "error_message": None,
+                   "decision_calls": None, "book_key": None,
+                   "source": None, "chapters": None,
+                   "ingest_title": None, "replace_result": None}
+            self.books[key] = rec
+        return rec
+
+    def _corpus(self):
+        if not self._corpus_db_tried:
+            self._corpus_db_tried = True
+            try:
+                if self.learn_dir:
+                    self._corpus_db = _corpus_db_for(
+                        self.learn_dir, mode="processor")
+            except Exception:
+                self._corpus_db = None
+        return self._corpus_db
+
+    def _resolve_book_identity(self, rec):
+        """Name this book the way the mirror names books: the corpus
+        fingerprint when the corpus knows the file, else the file's
+        source hash — the two keys the corpus itself joins on.
+        Source is "corpus" exactly when acquisition's own servability
+        test passes right now (the shared predicate, so the mirror
+        cannot disagree with the run about where the text came
+        from). A replay never corpus-sources: it re-parses the
+        presented file against its snapshot."""
+        fpath = rec["fpath"]
+        if fpath is None or rec["book_key"] is not None:
+            return
+        try:
+            source_hash = _corpus_sha256(Path(fpath).read_bytes())
+        except Exception:
+            source_hash = None
+        book_key, source = source_hash, "file"
+        db = self._corpus()
+        if db is not None and source_hash:
+            try:
+                rows = db.query(
+                    "SELECT fingerprint FROM corpus_works "
+                    "WHERE source_hash=?", (source_hash,))
+            except Exception:
+                rows = None
+            if rows:
+                book_key = rows[0][0]
+                if self.mode != "replay" \
+                        and CONFIG.get("use_corpus") \
+                        and corpus_servable_fingerprint(db, fpath) \
+                        == book_key:
+                    source = "corpus"
+        rec["book_key"] = book_key
+        rec["source"] = source
+
+    def book_start(self, fpath):
+        with self.lock:
+            rec = self._book(str(fpath))
+            rec["fpath"] = Path(fpath)
+            rec["started"] = time.monotonic()
+        # A fresh book must not inherit the previous book's write
+        # stats on this thread: wrote_stats is only meaningful for
+        # the book whose write_claims set it during this processing.
+        if getattr(_DIAG, "wrote_stats", None) is not None:
+            _DIAG.wrote_stats = None
+        self._resolve_book_identity(rec)
+
+    def book_end(self, fpath, exc):
+        with self.lock:
+            rec = self.books.get(str(fpath))
+            if rec is None:
+                return
+            if rec["started"] is not None:
+                rec["duration_ms"] = int(
+                    (time.monotonic() - rec["started"]) * 1000)
+            if exc is not None:
+                rec["error_class"] = type(exc).__name__
+                rec["error_message"] = str(exc)
+
+    def book_outcome(self, fpath, ok):
+        with self.lock:
+            rec = self.books.get(str(fpath))
+            if rec is None:
+                return
+            rec["outcome"] = "processed" if ok else "failed"
+            if CONFIG.get("pipeline") == "v2" \
+                    and int(CONFIG.get("jobs", 1) or 1) <= 1:
+                # The decision-call counter is reset per book by the
+                # v2 pipeline and is read here on the thread that
+                # processed the book. In parallel mode the counter
+                # is shared across books, so a per-book value would
+                # be an attribution the run cannot support — None
+                # there, and for the legacy pipeline (which never
+                # resets it per book).
+                rec["decision_calls"] = _DM_BUDGET_USED
+            wrote = getattr(_DIAG, "wrote_stats", None)
+            if wrote is not None:
+                # write_claims' own accounting: new rows inserted,
+                # summed across sections. Its deleted / preserved
+                # counts are printed but never stashed, so they stay
+                # None here rather than being reconstructed.
+                rec["replace_result"] = {
+                    "inserted": sum(
+                        int(v) for v in wrote.values()
+                        if isinstance(v, int)),
+                    "deleted": None, "would_delete": None,
+                    "preserved_rejected": None,
+                    "preserved_confirmed": None}
+                _DIAG.wrote_stats = None
+
+    def note_result(self, fpath, result):
+        """Keep the book's own result record (the dict save_preview
+        persists) for the flush. This is the run's record of the
+        book — the payload builder reads nothing else about it."""
+        with self.lock:
+            rec = self._book(str(fpath))
+            rec["result"] = result
+            if rec["fpath"] is None and fpath:
+                rec["fpath"] = Path(fpath)
+
+    def note_skip(self, fpath):
+        with self.lock:
+            rec = self._book(str(fpath))
+            rec["fpath"] = Path(fpath)
+            rec["outcome"] = "skipped"
+            rec["skip_reason"] = "not_in_corpus"
+        self._resolve_book_identity(rec)
+        # A skipped book was never sourced from anywhere: it has a
+        # book_key (so the skip is countable per book) but no source.
+        rec["source"] = None
+
+    def drop_book(self, fpath):
+        with self.lock:
+            self.books.pop(str(fpath), None)
+
+    def note_ingest(self, results, files, db):
+        """Fold one ingest command's per-book results in. Identity
+        is the corpus fingerprint the ingest itself assigned (the
+        file's source hash, resolved at flush, when a book failed
+        before it earned one); the title is read back from the
+        corpus record the ingest just wrote."""
+        self.files_seen = len(files)
+        self.admitted = len(results)
+        for r, f in zip(results, files):
+            fp = r.get("fingerprint")
+            with self.lock:
+                rec = self._book(fp or str(f))
+                rec["fpath"] = Path(f)
+                outcome = r.get("outcome") or ""
+                if outcome in ("complete", "partial"):
+                    rec["outcome"] = "processed"
+                elif outcome == "failed":
+                    rec["outcome"] = "failed"
+                    rec["error_message"] = r.get("detail")
+                else:
+                    rec["outcome"] = "skipped"
+                    rec["skip_reason"] = outcome or None
+                rec["chapters"] = r.get("chapters")
+                rec["source"] = "file"
+                rec["book_key"] = fp
+                if fp:
+                    try:
+                        wrec = corpus_work_record(db, fp) or {}
+                        rec["ingest_title"] = wrec.get("title")
+                    except Exception:
+                        rec["ingest_title"] = None
+
+
+def _history_claim_key(axis, book_key, identity):
+    """sha256 of "axis|book_fingerprint|catalogue_identity". The
+    inputs are pinned by spec §4: identity is a catalogue id or the
+    pending marker — never a claim's label text — so a key cannot
+    be reversed into, or collision-matched against, what anyone
+    proposed calling the claim."""
+    import hashlib as _hl
+    return _hl.sha256(
+        f"{axis}|{book_key}|{identity}".encode("utf-8")).hexdigest()
+
+
+def _history_axis(retrieval, final_keys, confidence_by_key,
+                  promoted_count, retrieval_ran):
+    """One axis' counts plus its claim rows, from the run's own
+    records: the retrieve stage's per-claim records (richer — they
+    carry the evaluated grade) win over the extraction list, and a
+    claim the stage evaluated but the book dropped still earns its
+    row: the run evaluated it, which is what the mirror records.
+
+    Returns (counts, rows); rows carry local keys (name, identity)
+    the payload builder turns into claim_keys. Counts the run did
+    not measure stay None: per-claim REUSE is not recorded by the
+    retrieve stage (its reuse accounting lives in a stage-local
+    marker), and the review desk's tier1/2/3 evidence grades do not
+    exist in run records — the retrieve stage's own support grades
+    are carried under their own names instead of being mapped onto
+    a vocabulary they do not mean."""
+    counts = {k: None for k in _HISTORY_AXIS_KEYS}
+    rows = {}
+    if retrieval:
+        counts["derived"] = 0
+        counts["reused"] = None
+        counts["abstained"] = 0
+        counts["failed"] = 0
+        counts["supported_strong"] = 0
+        counts["supported_single"] = 0
+        counts["adjacent_only"] = 0
+        for key, rec in retrieval.items():
+            outcome = (rec or {}).get("outcome")
+            if outcome == "supported-strong":
+                counts["supported_strong"] += 1
+            elif outcome == "supported-single":
+                counts["supported_single"] += 1
+            elif outcome == "adjacent-only":
+                counts["adjacent_only"] += 1
+            elif outcome == "abstained":
+                counts["abstained"] += 1
+            elif outcome == "failed":
+                counts["failed"] += 1
+            if outcome in _HISTORY_CLAIM_VERDICTS:
+                rows[key] = {"verdict": outcome, "confidence": None}
+    derived = 0
+    for key in final_keys:
+        if key in rows:
+            continue
+        rows[key] = {"verdict": "derived",
+                     "confidence": confidence_by_key.get(key)}
+        derived += 1
+    if counts["derived"] is not None:
+        counts["derived"] += derived
+    elif final_keys or retrieval_ran:
+        counts["derived"] = derived
+        counts["abstained"] = 0
+        counts["failed"] = 0
+    if promoted_count is not None:
+        counts["promoted"] = promoted_count
+    return counts, rows
+
+
+def _history_book_claims(result):
+    """(claims jsonb, claim payload rows) for one book, built from
+    its result record: final claim lists + catalog mapping +
+    retrieve records + persistence stamps. A book with no result
+    record (it failed before producing one) carries no claims:
+    every counter stays None and no rows are emitted — the run
+    evaluated nothing about it that it recorded."""
+    claims = {"tropes": {k: None for k in _HISTORY_AXIS_KEYS},
+              "triggers": {k: None for k in _HISTORY_AXIS_KEYS}}
+    rows = []
+    if not isinstance(result, dict):
+        return claims, rows
+    retrieval_ran = bool(result.get("evidence_retrieval"))
+    book_key = result.get("_history_book_key") or ""
+
+    catmap = result.get("trope_catalog_map") or {}
+    conf = result.get("trope_confidence") or {}
+    trope_rows = {}
+    for name in result.get("tropes") or []:
+        trope_rows[_tnorm(name)] = {
+            "identity": (str(catmap[_tnorm(name)])
+                         if _tnorm(name) in catmap
+                         else _HISTORY_UNMAPPED)}
+    persist = result.get("trope_persistence")
+    counts, trows = _history_axis(
+        result.get("trope_retrieval") or {}, trope_rows.keys(),
+        {k: conf.get(k) for k in trope_rows},
+        len(persist) if isinstance(persist, dict) else None,
+        retrieval_ran)
+    claims["tropes"] = counts
+    for key, row in trows.items():
+        rows.append({
+            "axis": "tropes",
+            "claim_key": _history_claim_key(
+                "tropes", book_key,
+                trope_rows.get(key, {}).get(
+                    "identity", _HISTORY_UNMAPPED)),
+            "verdict": row["verdict"],
+            "confidence": row["confidence"]})
+
+    trig_final = {}
+    trig_conf = {}
+    for t in result.get("triggers") or []:
+        if not isinstance(t, dict):
+            continue
+        warn = (t.get("warning") or "").lower()
+        if not warn:
+            continue
+        trig_final[warn] = {"identity": warn}
+        trig_conf[warn] = t.get("confidence")
+    tpersist = result.get("trigger_persistence")
+    counts, grows = _history_axis(
+        result.get("trigger_retrieval") or {}, trig_final.keys(),
+        trig_conf,
+        len(tpersist) if isinstance(tpersist, dict) else None,
+        retrieval_ran)
+    claims["triggers"] = counts
+    for key, row in grows.items():
+        ident = trig_final.get(key, {}).get("identity")
+        if ident is None:
+            # Trigger retrieval records key themselves
+            # "trigger:<warn>"; the identity is the warning key.
+            ident = key[len("trigger:"):] if key.startswith(
+                "trigger:") else (key or _HISTORY_UNMAPPED)
+        rows.append({
+            "axis": "triggers",
+            "claim_key": _history_claim_key(
+                "triggers", book_key, ident),
+            "verdict": row["verdict"],
+            "confidence": row["confidence"]})
+    return claims, rows
+
+
+def _history_characters(result):
+    """Character counters from the book's result record. Every key
+    is always present; a field the pipeline did not surface for
+    this book stays None (never 0, never reconstructed)."""
+    out = {k: None for k in _HISTORY_CHARACTER_KEYS}
+    if not isinstance(result, dict):
+        return out
+    if isinstance(result.get("roster_size"), int):
+        out["roster_size"] = result["roster_size"]
+
+    def _count(key, field):
+        v = result.get(field)
+        if isinstance(v, (list, dict)):
+            out[key] = len(v)
+
+    _count("characters", "characters")
+    _count("minor_characters", "minor_characters")
+    _count("relationships", "relationships")
+    _count("relationships_dropped", "dropped_relationships")
+    _count("merges_proposed", "possible_merges")
+    # Merge counts arrive in two shapes: the v2 post-pass stores
+    # its count directly as an int (post_pass_merge returns a
+    # number), while roster dedup reports a list of merge records.
+    # Count each in the shape it actually arrives in — treating
+    # the int as a collection would report 0 for a book whose only
+    # merges were post-pass merges, and a wrong measured zero is
+    # worse than the None a book with no merge data at all gets.
+    merges = 0
+    merges_measured = False
+    post_pass = result.get("post_pass_merged")
+    if isinstance(post_pass, int):
+        merges += post_pass
+        merges_measured = True
+    elif isinstance(post_pass, (list, dict)):
+        merges += len(post_pass)
+        merges_measured = True
+    dedup = result.get("dedup_merges")
+    if isinstance(dedup, (list, dict)):
+        merges += len(dedup)
+        merges_measured = True
+    if merges_measured:
+        out["merges_applied"] = merges
+    return out
+
+
+def _history_quotes(result):
+    """Quote counters: extracted from the book's own result; the
+    corpus stage's verified/rejected/selected counts ride on the
+    result as corpus_quotes when that stage ran (None per count
+    when it did not — a book can extract quotes without the corpus
+    stage ever seeing them)."""
+    out = {k: None for k in _HISTORY_QUOTE_KEYS}
+    if not isinstance(result, dict):
+        return out
+    if isinstance(result.get("quotes"), list):
+        out["extracted"] = len(result["quotes"])
+    cq = result.get("corpus_quotes")
+    if isinstance(cq, dict):
+        for key in ("verified", "rejected", "selected"):
+            if isinstance(cq.get(key), int):
+                out[key] = cq[key]
+    return out
+
+
+def _history_book_payload(rec, run_id):
+    """One processor_run_books row from the recorder's record.
+    Fields the run never surfaced for this book are None — the
+    payload states what the run recorded, nothing more."""
+    result = rec["result"]
+    work_id = None
+    if isinstance(result, dict):
+        wid = result.get("work_id")
+        if isinstance(wid, str) and _HISTORY_UUID_RE.match(wid):
+            work_id = wid
+    title = None
+    chapters = rec["chapters"]
+    if isinstance(result, dict):
+        title = result.get("title") or None
+        if chapters is None and isinstance(result.get("chunks"), int):
+            chapters = result["chunks"]
+    if title is None:
+        title = rec["ingest_title"]
+    suppressed = None
+    if isinstance(result, dict) \
+            and isinstance(result.get("suppressed_rejected"), list):
+        suppressed = len(result["suppressed_rejected"])
+    claims, _rows = _history_book_claims(
+        {**(result or {}), "_history_book_key": rec["book_key"]}
+        if isinstance(result, dict) else result)
+    error_message = _history_sanitize(rec["error_message"])
+    return {
+        "run_id": run_id,
+        "book_key": rec["book_key"],
+        "title": title,
+        "work_id": work_id,
+        "source": rec["source"],
+        "outcome": rec["outcome"],
+        "skip_reason": rec["skip_reason"],
+        "chapters": chapters,
+        "duration_ms": rec["duration_ms"],
+        "decision_calls": rec["decision_calls"],
+        "claims": claims,
+        "characters": _history_characters(result),
+        "quotes": _history_quotes(result),
+        "suppressed_by_verdict": suppressed,
+        "replace_result": rec["replace_result"],
+        "error_class": rec["error_class"]
+        if error_message or rec["error_class"] else None,
+        "error_message": error_message,
+    }, _rows
+
+
+def _history_totals(rec, book_rows, claim_rows_by_book):
+    """Run totals from the same per-book payloads being shipped, so
+    the run row can never disagree with its own book rows. A total
+    no book measured stays None (see the header note)."""
+    totals = {k: None for k in _HISTORY_TOTAL_KEYS}
+    totals["files_seen"] = rec.files_seen
+    measured_books = [b for b in book_rows if b["outcome"] is not None]
+    if rec.admitted is not None:
+        totals["admitted"] = rec.admitted
+    elif measured_books:
+        totals["admitted"] = sum(
+            1 for b in measured_books if b["outcome"] != "skipped")
+    if rec.corpus_filter_ran:
+        totals["skipped_not_in_corpus"] = sum(
+            1 for b in book_rows if b["outcome"] == "skipped")
+    succeeded = sum(1 for b in book_rows if b["outcome"] == "processed")
+    failed = sum(1 for b in book_rows if b["outcome"] == "failed")
+    if book_rows or rec.admitted is not None:
+        totals["processed"] = succeeded + failed
+        totals["succeeded"] = succeeded
+        totals["failed"] = failed
+
+    def _sum_axis(key, total_key):
+        vals = []
+        for b in book_rows:
+            for axis in ("tropes", "triggers"):
+                v = (b["claims"].get(axis) or {}).get(key)
+                if isinstance(v, int):
+                    vals.append(v)
+        if vals:
+            totals[total_key] = sum(vals)
+
+    _sum_axis("derived", "claims_derived")
+    _sum_axis("reused", "claims_reused")
+    _sum_axis("abstained", "claims_abstained")
+    _sum_axis("failed", "claims_failed")
+    _sum_axis("supported_strong", "claims_supported_strong")
+    _sum_axis("supported_single", "claims_supported_single")
+    _sum_axis("adjacent_only", "claims_adjacent_only")
+    for key, total_key in (("verified", "quotes_verified"),
+                           ("rejected", "quotes_rejected")):
+        vals = [b["quotes"][key] for b in book_rows
+                if isinstance(b["quotes"].get(key), int)]
+        if vals:
+            totals[total_key] = sum(vals)
+    return totals
+
+
+def _history_corpus_generation(rec, book_rows):
+    """The embedding generation label ("model / format") when this
+    run actually drew on the corpus; read from the corpus' own meta
+    at flush, in the display form the corpus commands print."""
+    touched = rec.mode == "ingest" or any(
+        b["source"] == "corpus" for b in book_rows)
+    if not touched:
+        return None
+    db = rec._corpus()
+    if db is None:
+        return None
+    try:
+        gen = _corpus_generation(
+            db, CONFIG.get("embed_model"), _CORPUS_VECTOR_FORMAT)
+    except Exception:
+        return None
+    if not gen:
+        return None
+    return f"{gen.get('model')} / {gen.get('format')}"
+
+
+def _history_same_run(existing, rec):
+    """Is the row already stored under this run_key THIS run's own
+    row? The key has one-second, per-machine resolution, so the
+    guard compares the stored started_at and machine_label against
+    this run's: a match means a re-send of our own row (safe to
+    upsert); a mismatch means a different run owns the key and it
+    must never be overwritten (spec §13)."""
+    mine_ts = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.gmtime(rec.started_wall))
+    theirs = str(existing.get("started_at") or "")
+    m = re.match(r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})", theirs)
+    if not m or f"{m.group(1)}T{m.group(2)}" != mine_ts:
+        return False
+    return (existing.get("machine_label") or None) \
+        == (rec.machine_label or None)
+
+
+def _history_warn(error_class):
+    print(f" Run history: upload failed ({error_class}); "
+          "run unaffected")
+
+
+def _history_flush(rec, status, failures=None, error=None):
+    """Build this run's payloads and ship them, in dependency
+    order: the run row first (its returned uuid keys the book
+    rows), then the books (their uuids key the claim rows), then
+    the claims. Any failure stops the chain with ONE warning —
+    a half-mirrored run is still queryable, and the JSONL on the
+    machine remains the ground truth either way."""
+    sink = _RUN_SINK
+    if sink is not None and sink.run_id:
+        rec.run_key = Path(sink.path).stem if sink.path \
+            else sink.run_id
+    for r in list(rec.books.values()):
+        if r["book_key"] is None and r["fpath"] is not None:
+            rec._resolve_book_identity(r)
+    entries = [r for r in rec.books.values() if r["book_key"]]
+    finished_wall = time.time()
+    if status is None:
+        status = "completed"
+    run_payload = {
+        "run_key": rec.run_key,
+        "started_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(rec.started_wall)),
+        "finished_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(finished_wall)),
+        "duration_ms": int(
+            (time.monotonic() - rec.started_mono) * 1000),
+        "status": status,
+        "processor_version": PORTABLE_VERSION,
+        "machine_label": rec.machine_label,
+        "mode": rec.mode,
+        "preview": rec.preview,
+        "dry_run": rec.dry_run,
+        "flags": rec.flags,
+        "models": rec.models,
+        "prompt_variants": rec.prompt_stamps,
+        "thresholds": rec.thresholds,
+        "config_fingerprint": rec.config_fingerprint,
+        "corpus_generation": None,  # filled below, needs book rows
+        "totals": None,             # filled below, needs book rows
+        "error_summary": None,      # filled below
+    }
+    # Book payloads are built against a placeholder run_id first:
+    # totals and the corpus-generation stamp are computed from the
+    # same rows that will ship, then the real uuid is stamped in.
+    built = [_history_book_payload(r, None) for r in entries]
+    book_rows = [b for b, _ in built]
+    run_payload["totals"] = _history_totals(
+        rec, book_rows, [rows for _, rows in built])
+    run_payload["corpus_generation"] = _history_corpus_generation(
+        rec, book_rows)
+    if error:
+        run_payload["error_summary"] = _history_sanitize(
+            f"{type(error).__name__}: {error}"
+            if not isinstance(error, str) else error)
+    if run_payload["error_summary"] is None:
+        for b in book_rows:
+            if b["outcome"] == "failed" and b["error_message"]:
+                run_payload["error_summary"] = _history_sanitize(
+                    f"{b['error_class'] or 'Error'}: "
+                    f"{b['error_message']}")
+                break
+
+    # Collision guard: GET the key before upserting. A row from a
+    # DIFFERENT run under this key (same second, reused pid, two
+    # machines) must never be overwritten — take the next suffix
+    # and say so loudly, because a silent overwrite would destroy
+    # exactly the audit trail this mirror exists to keep.
+    existing = sb("processor_runs", method="GET",
+                  params=(f"?run_key=eq.{rec.run_key}"
+                          "&select=id,started_at,machine_label"),
+                  schema=_HISTORY_SCHEMA)
+    if existing is None:
+        _history_warn("no-response")
+        return
+    if existing:
+        row0 = existing[0]
+        if not _history_same_run(row0, rec):
+            base = rec.run_key
+            suffix = 2
+            while True:
+                candidate = f"{base}-{suffix}"
+                probe = sb(
+                    "processor_runs", method="GET",
+                    params=(f"?run_key=eq.{candidate}"
+                            "&select=id,started_at,machine_label"),
+                    schema=_HISTORY_SCHEMA)
+                if probe is None:
+                    _history_warn("no-response")
+                    return
+                if not probe:
+                    rec.run_key = candidate
+                    break
+                suffix += 1
+                if suffix > 99:
+                    _history_warn("run-key-collision")
+                    return
+            run_payload["run_key"] = rec.run_key
+            print(f" Run history: WARNING — run key {base} already "
+                  f"belongs to another run; this run is recorded "
+                  f"as {rec.run_key}.")
+
+    rows = sb("processor_runs", method="POST", data=[run_payload],
+              params="?on_conflict=run_key",
+              prefer="resolution=merge-duplicates",
+              schema=_HISTORY_SCHEMA)
+    if not rows or not rows[0].get("id"):
+        _history_warn("no-response")
+        return
+    run_id = rows[0]["id"]
+    if not book_rows:
+        return
+    for b in book_rows:
+        b["run_id"] = run_id
+    brows = sb("processor_run_books", method="POST", data=book_rows,
+               params="?on_conflict=run_id,book_key",
+               prefer="resolution=merge-duplicates",
+               schema=_HISTORY_SCHEMA)
+    if brows is None:
+        _history_warn("no-response")
+        return
+    id_by_key = {b["book_key"]: b["id"] for b in brows
+                 if b.get("id") and b.get("book_key")}
+    claim_rows = []
+    for (_payload, rows_for_book), entry in zip(built, entries):
+        book_row_id = id_by_key.get(entry["book_key"])
+        if book_row_id is None:
+            continue
+        for cr in rows_for_book:
+            claim_rows.append({
+                "run_book_id": book_row_id,
+                "axis": cr["axis"],
+                "claim_key": cr["claim_key"],
+                "verdict": cr["verdict"],
+                "confidence": cr["confidence"]})
+    if claim_rows:
+        crows = sb("processor_run_claim_outcomes", method="POST",
+                   data=claim_rows,
+                   params="?on_conflict=run_book_id,axis,claim_key",
+                   prefer="resolution=merge-duplicates",
+                   schema=_HISTORY_SCHEMA)
+        if crows is None:
+            _history_warn("no-response")
+
+
+def _history_begin(mode, preview=False, dry_run=False, learn_dir=None,
+                   files_seen=None):
+    """Arm the recorder for this run. Called from main()'s dispatch
+    and run_once — the seams that know what kind of run this is.
+    With the flag off this returns instantly and every hook below
+    stays a no-op, so a history-off run is byte-identical to today.
+    """
+    global _HISTORY, _HISTORY_NOSB_WARNED
+    if not CONFIG.get("run_history"):
+        return
+    if _HISTORY is not None:
+        # A recorder still armed means a previous run never finished
+        # (an unusual exit path): close it as interrupted rather
+        # than losing it, mirroring the event sink's own discipline.
+        _history_finish(interrupted=True)
+    if not (CONFIG.get("supabase_url") and CONFIG.get("supabase_key")):
+        if not _HISTORY_NOSB_WARNED:
+            _HISTORY_NOSB_WARNED = True
+            print(" Run history: supabase_url/supabase_key are not "
+                  "configured; this run is unmirrored")
+        return
+    if learn_dir is None:
+        if mode == "ingest":
+            learn_dir = str(Path.home() / ".ebook-processor"
+                            / "learned")
+        else:
+            try:
+                learn_dir = _learn().dir
+            except Exception:
+                learn_dir = None
+    _HISTORY = _RunHistoryRecorder(
+        mode, preview, dry_run, learn_dir, files_seen=files_seen)
+
+
+def _history_finish(failures=None, interrupted=False, status=None,
+                    error=None):
+    """Close out the armed recorder (if any) and flush. Idempotent:
+    every run-end path may call it; only the first call ships."""
+    global _HISTORY
+    rec, _HISTORY = _HISTORY, None
+    if rec is None:
+        return
+    if status is None and interrupted:
+        status = "interrupted"
+    try:
+        _history_flush(rec, status, failures=failures, error=error)
+    except Exception as e:  # best-effort: never take the run down
+        _history_warn(type(e).__name__)
+
+
+def _history_book_start(fpath):
+    if _HISTORY is not None:
+        try:
+            _HISTORY.book_start(fpath)
+        except Exception:
+            pass
+
+
+def _history_book_end(fpath, exc=None):
+    if _HISTORY is not None:
+        try:
+            _HISTORY.book_end(fpath, exc)
+        except Exception:
+            pass
+
+
+def _history_book_outcome(fpath, ok):
+    if _HISTORY is not None:
+        try:
+            _HISTORY.book_outcome(fpath, ok)
+        except Exception:
+            pass
+
+
+def _history_note_result(fpath, result):
+    if _HISTORY is not None:
+        try:
+            _HISTORY.note_result(fpath, result)
+        except Exception:
+            pass
+
+
+def _history_note_skip(fpath):
+    if _HISTORY is not None:
+        try:
+            _HISTORY.note_skip(fpath)
+        except Exception:
+            pass
+
+
+def _history_book_drop(fpath):
+    if _HISTORY is not None:
+        try:
+            _HISTORY.drop_book(fpath)
+        except Exception:
+            pass
+
+
+def _history_note_admitted(count):
+    if _HISTORY is not None:
+        _HISTORY.admitted = count
+
+
+def _history_note_ingest(results, files, db):
+    if _HISTORY is not None:
+        try:
+            _HISTORY.note_ingest(results, files, db)
+        except Exception:
+            pass
+
+
+def _history_scan_mode():
+    """A run_once invocation is a watch cycle when the watch loop
+    wrapped it, a plain scan otherwise — the loop is the only
+    caller that knows, so it leaves the hint."""
+    return "watch_cycle" if _HISTORY_WATCH is not None else "scan"
 
 
 # Shared decision-model call budget per book (merges + relationship
@@ -20052,6 +21127,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     # list is untouched (publication is slice 7's payload, not the
     # run's face). Corpus trouble degrades to silence — a corpus
     # write never fails a run (§5.2).
+    _cq_stats = None
     if CONFIG.get("corpus_quotes") and not dry_run and not aborted:
         try:
             _qdb = _corpus_db_for(_learn().dir, mode="processor")
@@ -20077,6 +21153,17 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                     print(f"  Corpus quotes: selection shed "
                           f"({_qs.get('reason')}) — no quotes ship "
                           f"from this run")
+                # The stage's counts are kept so they can ride on
+                # the result record for the history mirror (the
+                # attach below, when run history is armed); until
+                # now they existed only as printed lines. A shed
+                # selected nothing — 0 is a measurement there, not
+                # an unknown.
+                _cq_stats = {
+                    "verified": _qv["verified"] if _qv else None,
+                    "rejected": _qv["rejected"] if _qv else None,
+                    "selected": (_qs.get("selected") or 0)
+                    if _qs.get("poll") == "ok" else 0}
         except Exception:
             pass
 
@@ -20205,6 +21292,13 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if _verdict_attempted:
         result["verdicts_note"] = _verdict_note
         result["suppressed_rejected"] = sorted(set(_supp_names))
+    # The corpus-quote counts attach only when run history is
+    # armed (the same CONFIG check _history_begin arms on): their
+    # one reader is the history writer (_history_quotes), and with
+    # the flag off the preview must stay byte-identical to a run
+    # that never heard of the mirror — same discipline as §3.5.
+    if _cq_stats is not None and CONFIG.get("run_history"):
+        result["corpus_quotes"] = _cq_stats
     if CONFIG.get("emit_uncertainty") and not aborted:
         # Amendment A6: during a replay, _learn().dir is the
         # sandbox, so these emissions land in the throwaway
@@ -20754,6 +21848,10 @@ def process_file(fpath, dry_run=False, preview=False):
 
 def save_preview(fpath, result):
     """Save human-readable preview to preview/ folder."""
+    # Every completed book's result passes through here exactly
+    # once (both pipelines, preview and write modes alike), so the
+    # run-history recorder takes its copy at this seam.
+    _history_note_result(fpath, result)
     prev_dir = SCRIPT_DIR / "preview"
     prev_dir.mkdir(exist_ok=True)
     base = fpath.stem + CONFIG.get("preview_name_suffix", "")
@@ -20957,6 +22055,7 @@ def _process_one(args):
             print(f"  Error processing {f.name}: {e}")
             traceback.print_exc()
         ok = False
+    _history_book_outcome(f, ok)
     if not dry_run and not preview and not _is_single_file_run(f):
         try:
             safe_move(f, DONE_DIR if ok else FAILED_DIR)
@@ -21014,33 +22113,53 @@ def run_once(dry_run, preview, max_books=None, file=None):
             return 1
         files = [p]
         _DIAG.single_file = str(p)
+        _history_begin(_history_scan_mode(), preview=preview,
+                       dry_run=dry_run, files_seen=1)
+        _history_note_admitted(1)
     else:
         _DIAG.single_file = None
         files = sorted(p for p in IMPORT_DIR.iterdir()
                        if p.is_file() and p.suffix.lower() in (".epub", ".mobi", ".azw3"))
+        # The run-history recorder arms before the corpus-only
+        # filter on purpose: a cycle where every book is skipped is
+        # exactly the kind of run the mirror exists to make visible.
+        _history_begin(_history_scan_mode(), preview=preview,
+                       dry_run=dry_run, files_seen=len(files))
         if CONFIG.get("corpus_only"):
             # The filter runs before --max-books limiting: the
             # limit counts admitted books, not folder entries.
             # An all-skipped scan ends here — the filter already
             # printed the clear line, and an empty scan exits 0
             # exactly like today's empty-folder case.
+            _before_filter = files
             files = _corpus_only_filter(files)
+            for _p in _before_filter:
+                if _p not in files:
+                    _history_note_skip(_p)
             if not files:
+                _history_finish()
                 return 0
     if max_books and len(files) > max_books:
         print(f"Limiting to {max_books} of {len(files)} books (--max-books)")
         files = files[:max_books]
     if not files:
         print("No ebooks found.")
+        _history_finish()
         return 0
+    _history_note_admitted(len(files))
     if CONFIG.get("emit_run_events"):
         _run_events_begin(_learn().dir, preview=preview, dry_run=dry_run)
     _CANCEL.clear()
     UI.start()
     try:
         failures = _run_once_inner(dry_run, preview, files)
+        # History finishes before the events sink closes so the
+        # recorder can still read the sink's run identity (its file
+        # stem may carry a disambiguating suffix).
+        _history_finish(failures=failures)
         _run_events_finish(failures=failures)
     except KeyboardInterrupt:
+        _history_finish(interrupted=True)
         _run_events_finish(interrupted=True)
         _CANCEL.set()
         UI.status("\nCancelled — stopping after current chapter...")
@@ -21051,6 +22170,10 @@ def run_once(dry_run, preview, max_books=None, file=None):
         # unexpected exception escaped the book loop, so a flagged
         # run never leaves a live sink (or a half-open file) behind.
         _run_events_finish(interrupted=True)
+        # Safety net mirroring the sink's: no-op once finished; on
+        # an unexpected-exception path the sink is already closed,
+        # so the recorder falls back to its own generated run key.
+        _history_finish(interrupted=True)
         UI.stop()
     return failures
 
@@ -21087,6 +22210,7 @@ def _run_once_inner(dry_run, preview, files):
             print(f"  Error: {e}")
             traceback.print_exc()
             ok = False
+        _history_book_outcome(f, ok)
         if not ok:
             failures += 1
         if not dry_run and not preview:
@@ -21362,6 +22486,14 @@ def _build_parser():
                          "behaviour change (default off; see "
                          "PORTAL-SPEC §10 S0)")
 
+    g_merge.add_argument("--run-history", action="store_true",
+                    help="mirror run metadata (version, models, "
+                         "prompt hashes, per-book outcomes and claim "
+                         "counts — never book text) to the processor "
+                         "schema in Supabase at run end; best-effort, "
+                         "a failed upload never affects the run "
+                         "(default off; see docs/run-history-spec.md)")
+
     g_merge.add_argument("--persist-roster", action="store_true",
                     help="option B (v2): persist per-work roster "
                          "identity across runs — stable minted entity "
@@ -21616,15 +22748,24 @@ def _watch_cycle(args):
     corpus-side failure costs one printed warning and the scan still
     runs, and the next cycle retries the ingest on its own.
     """
-    if getattr(args, "watch_ingest", False):
-        try:
-            cmd_ingest([IMPORT_DIR],
-                       learn_dir=args.learn_dir or None,
-                       reason="watch cycle")
-        except Exception as e:
-            print(f"  watch: ingest failed this cycle ({e}); "
-                  "scanning anyway")
-    run_once(args.dry_run, args.preview, args.max_books, args.file)
+    # The history hint: run_once reads it to mode this cycle's run
+    # row "watch_cycle" (each cycle is its own run). The cycle's own
+    # ingest is part of the cycle, not a separate ingest run.
+    global _HISTORY_WATCH
+    _HISTORY_WATCH = {"watch_ingest": bool(
+        getattr(args, "watch_ingest", False))}
+    try:
+        if getattr(args, "watch_ingest", False):
+            try:
+                cmd_ingest([IMPORT_DIR],
+                           learn_dir=args.learn_dir or None,
+                           reason="watch cycle")
+            except Exception as e:
+                print(f"  watch: ingest failed this cycle ({e}); "
+                      "scanning anyway")
+        run_once(args.dry_run, args.preview, args.max_books, args.file)
+    finally:
+        _HISTORY_WATCH = None
 
 
 def main():
@@ -21764,9 +22905,21 @@ def main():
         return
     if args.ingest:
         load_config()
-        cmd_ingest([args.ingest], learn_dir=args.learn_dir or None,
-                   reason=args.ingest_reason or "",
-                   force=args.ingest_force)
+        # A standalone ingest is its own run in the history mirror.
+        # The capture flag scopes the recorder's ingest hook to this
+        # dispatch: watch cycles ingest too, but their books belong
+        # to the cycle's scan run, not an ingest row of their own.
+        global _HISTORY_INGEST_CAPTURE
+        _history_begin("ingest",
+                       learn_dir=args.learn_dir or None)
+        _HISTORY_INGEST_CAPTURE = True
+        try:
+            cmd_ingest([args.ingest], learn_dir=args.learn_dir or None,
+                       reason=args.ingest_reason or "",
+                       force=args.ingest_force)
+        finally:
+            _HISTORY_INGEST_CAPTURE = False
+            _history_finish()
         return
     if args.corpus_remove:
         load_config()
@@ -21820,6 +22973,13 @@ def main():
         print(f"  Decision model trigger validation: "
               f"provider={args.decision_model_provider} "
               f"endpoint={_dm_endpoint} model={_dm_model}")
+        # The run-history stamps read the decision model's identity
+        # from CONFIG: the model NAME only. The endpoint is a URL
+        # and never enters a payload (spec §5).
+        CONFIG["decision_model"] = True
+        CONFIG["decision_model_provider"] = \
+            args.decision_model_provider
+        CONFIG["decision_model_model"] = _dm_model
 
     # Cross-run learning state (shared across --jobs threads).
     global _LEARNED
@@ -21921,6 +23081,9 @@ def main():
     if getattr(args, "emit_run_events", False):
         CONFIG["emit_run_events"] = True
 
+    if getattr(args, "run_history", False):
+        CONFIG["run_history"] = True
+
     if args.persist_roster:
         CONFIG["persist_roster"] = True
     if args.preview_summary:
@@ -21972,7 +23135,20 @@ def main():
             print("  --replay needs --file <book>: the snapshot "
                   "replays against its own book file")
             sys.exit(2)
+        # A replay is its own run in the history mirror (mode
+        # "replay", preview by construction). A refusal happens
+        # before any book work, so the run row is a failed run with
+        # no book row rather than a book that failed.
+        _history_begin("replay", preview=True)
+        _history_book_start(Path(args.file))
         _code, _rep = run_replay(args.replay, args.file, _LEARNED.dir)
+        if isinstance(_rep, dict) and _rep.get("refusal"):
+            _history_book_drop(Path(args.file))
+            _history_finish(status="failed",
+                            error=str(_rep.get("refusal")))
+        else:
+            _history_book_outcome(Path(args.file), _code == 0)
+            _history_finish(failures=0 if _code == 0 else 1)
         sys.exit(_code)
 
     if args.watch:
