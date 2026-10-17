@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.16"
+PORTABLE_VERSION = "2.13.17"
 
 
 import argparse
@@ -133,7 +133,12 @@ DEFAULT_CONFIG = {
     "machine_label": "",  # opt-in, user-chosen label stamped on
     # run-history rows so multi-machine history is distinguishable;
     # never auto-collected from the machine
-    "pipeline": "legacy",  # or "v2": chapter-level map/reduce (--pipeline v2)
+    # v2 (chapter-level map/reduce) is the default because every
+    # quality gate in the repo measures v2 — a run that forgets the
+    # flag must not silently take the legacy path the gates never
+    # measure. "legacy" (fixed-chunk) stays selectable via
+    # --pipeline or this key. (Decision, 2026-10-17: D2.)
+    "pipeline": "v2",
     "v2_max_chapter_chars": 16000,  # ~4k tokens; keep well under your
     # server's context window minus prompt (~1k) minus output (~3k)
 }

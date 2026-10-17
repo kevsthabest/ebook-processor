@@ -7,7 +7,7 @@ whatever ebook files you hand it. **Preview first, write later** — every run
 can save a full Markdown/JSON report for human review before anything
 touches the database.
 
-**Current version: 2.13.5** (`PORTABLE_VERSION` in `process-portable.py`).
+**Current version: 2.13.17** (`PORTABLE_VERSION` in `process-portable.py`).
 
 ## How it works
 
@@ -26,8 +26,11 @@ touches the database.
      `book_trigger_claims` (source `ai`), `book_characters`,
      `works.spice_detected`, `book_meta` (POVs, series, up to 20 notable
      quotes), and `book_quotes` (3–5 memorable quotes per book, source
-     `pipeline`). Relationships are no longer written — the
-     `character_relationships` table was archived (`..._archive_20261009`).
+     `pipeline`). Relationships ARE written — embedded in the
+     `book_characters` rows, each relationship stored on its
+     source character's row. (The standalone
+     `character_relationships` table was archived on 2026-10-09
+     and is no longer used.)
 4. Processed files move to `import/done/`, failures to `import/failed/`
 
 ## Setup
@@ -259,7 +262,8 @@ python process-portable.py --preview --llm openai --pipeline legacy book.epub
 python process-portable.py --preview --llm openai --pipeline v2 book.epub
 ```
 
-Default is `legacy` (also settable via `pipeline` in `config.json`).
+Default is `v2` (also settable via `pipeline` in `config.json`);
+`legacy` remains selectable for comparison runs.
 
 ### Evidence verification (v1.22+, per-chunk since v1.22.1)
 
@@ -384,8 +388,10 @@ One convention everywhere (also stated at `_canonical_pair` in
 
 The decision model handles judgment calls that rules can't:
 
-- `--decision-model` — validate family-type relationships with the decision
-  model (uses the same Unsloth server as `openai_base_url`).
+- `--decision-model` — validate relationships with the decision model:
+  family types first (keep / downgrade to `other` / drop), then
+  non-family types against a probability floor (uses the same Unsloth
+  server as `openai_base_url`).
 - `--decision-model-provider {local,openrouter}` — `local` (default) uses the
   local Unsloth `/v1/systemone` server; `openrouter` uses hosted
   `typesafe/jev-1.13` (needs `openrouter_api_key` in `config.json` — falls
