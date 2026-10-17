@@ -87,7 +87,7 @@ content; any Cozy app/UI surface (the app never reads these tables).
 | chapters | int NULL | |
 | duration_ms | int NULL | |
 | decision_calls | int NULL | decision-model calls used (already counted by run events) |
-| claims | jsonb | per axis (tropes / triggers): derived, reused, abstained, failed |
+| claims | jsonb | per axis (tropes / triggers): derived, reused, abstained, failed, plus support-grade counts (supported_strong, supported_single, adjacent_only) — the run's evidence-quality vocabulary. tier1/tier2/tier3 keys are present but reserved NULL: Tier 1/2/3 is a review-side classification no run computes, and the support grades are never mapped onto tiers (no false equivalence). Amended at the writer gate, 2026-10-17 |
 | characters | jsonb | roster size, merges proposed/applied, drops — counts only |
 | quotes | jsonb | verified, rejected, selected counts |
 | replace_result | jsonb NULL | write runs only: would_delete / deleted, inserted, preserved_rejected, preserved_confirmed |
@@ -234,7 +234,9 @@ below are adopted into the spec unless they conflict with a user ruling.
 - **Trope Review Agent — AGREE WITH CHANGES.** Add to `processor_run_books`:
   `suppressed_by_verdict` (verdict read-back suppression count — the
   regeneration metric); evidence-tier counts (Tier 1/2/3) per axis in
-  `claims`; `promoted` count per axis (persistence promotions vs fresh
+  `claims` — SUPERSEDED at the writer gate (2026-10-17): the writer
+  ships retrieval support-grade counts instead (see §4); the tier keys
+  stay reserved NULL, as Tier 1/2/3 is a review-side classification; `promoted` count per axis (persistence promotions vs fresh
   derivations). `book_key` is the canonical longitudinal join; `work_id`
   is documented as a convenience snapshot of one run's resolution.
   Silent-gap risk: best-effort drops bias before/after analyses — the
