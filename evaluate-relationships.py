@@ -71,6 +71,23 @@ def _context_for_case(pp, chapters, quote):
     return "", False
 
 
+def _resolve_case_context(pp, chapter_sets, quote):
+    """Pick a case's context across candidate chapter sets.
+
+    A corpus can hold the same book twice under different keys
+    (print ISBN vs ASIN editions), so a work name may match
+    several readable copies; the text itself decides which copy
+    a quote came from — the first set where the quote locates
+    wins. Returns (context, located, ambiguous): ambiguous says
+    more than one readable copy matched the work name."""
+    ambiguous = len(chapter_sets) > 1
+    for chapters in chapter_sets:
+        ctx, located = _context_for_case(pp, chapters, quote)
+        if located:
+            return ctx, True, ambiguous
+    return "", False, ambiguous
+
+
 def _band(p):
     if p is None:
         return "unanswered"
@@ -115,27 +132,35 @@ def main():
             return 2
         rows = db.query("SELECT fingerprint, title "
                         "FROM corpus_works")
-        chapters_by_work = {}
+        sets_by_work = {}
+        ambiguous_works = set()
         for case in cases:
             work = (case.get("work") or "").lower()
-            if work not in chapters_by_work:
+            if work not in sets_by_work:
                 hits = [fp for fp, title in rows
                         if work and work in (title or "").lower()]
-                if len(hits) != 1:
+                sets = []
+                for fp in hits:
+                    chapters = pp.corpus_chapters_for(db, fp)
+                    if chapters:
+                        sets.append(chapters)
+                if not sets:
                     print(f"Error: work {case.get('work')!r} matched "
-                          f"{len(hits)} corpus works (need exactly 1)")
+                          f"{len(hits)} corpus works, none with "
+                          f"readable chapters (state not "
+                          f"text-complete)")
                     return 2
-                chapters = pp.corpus_chapters_for(db, hits[0])
-                if not chapters:
-                    print(f"Error: corpus work "
-                          f"{case.get('work')!r} has no readable "
-                          f"chapters (state not text-complete)")
-                    return 2
-                chapters_by_work[work] = chapters
-            ctx, located = _context_for_case(
-                pp, chapters_by_work[work], case["quote"])
+                sets_by_work[work] = sets
+            ctx, located, ambiguous = _resolve_case_context(
+                pp, sets_by_work[work], case["quote"])
+            if ambiguous:
+                ambiguous_works.add(case.get("work"))
             case["_context"] = ctx
             case["_located"] = located
+        for work in sorted(ambiguous_works):
+            print(f"Note: work {work!r} matched several readable "
+                  f"corpus copies; each case used the copy its "
+                  f"quote locates in.")
     print("Mode: " + ("corpus context windows (production path)"
                       if args.corpus else
                       "prompt-only (no context windows)"))

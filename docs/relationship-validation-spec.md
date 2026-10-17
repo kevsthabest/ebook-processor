@@ -169,3 +169,15 @@ same framing as v2_reduce). Every run prints its mode —
 [NO WINDOW: quote not in corpus text]. The gate for
 reprocessing is now: py evaluate-relationships.py --config
 config.json --corpus, all 12 gated cases in band.
+
+## Addendum — 2.13.11: duplicate corpus copies resolve by quote location (2026-10-17)
+
+The first corpus-mode run stopped at "work 'Daemon' matched 2
+corpus works" — the corpus holds Daemon twice, the same
+duplicate-ingest pattern already known for Project Hail Mary
+(print ISBN vs ASIN keys). Requiring exactly one match makes
+the gate fragile against a corpus property that is itself
+accepted. Resolution now follows the text: among the readable
+copies matching a case's work, the copy the case's quote
+locates in judges it; ambiguity is reported on the run header,
+and a quote locating in no copy stays an honest [NO WINDOW].

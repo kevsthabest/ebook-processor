@@ -66,5 +66,36 @@ class TestContextForCase(unittest.TestCase):
         self.assertTrue(located)
 
 
+class TestResolveCaseContext(unittest.TestCase):
+    """Duplicate corpus copies (the same book under a print ISBN
+    and an ASIN key) must not abort the run: the copy a quote
+    locates in is the copy that judges it."""
+
+    def test_quote_locates_in_the_second_copy(self):
+        copy_a = _chs("An edition with different wording entirely.")
+        copy_b = _chs("Before this. The target quote stands here. "
+                      "After this.")
+        ctx, located, ambiguous = er._resolve_case_context(
+            pp, [copy_a, copy_b], "The target quote stands here.")
+        self.assertTrue(located)
+        self.assertTrue(ambiguous)
+        self.assertIn("Before this", ctx)
+
+    def test_single_copy_is_not_ambiguous(self):
+        ctx, located, ambiguous = er._resolve_case_context(
+            pp, [_chs("Before. A quote lives here. After.")],
+            "A quote lives here.")
+        self.assertTrue(located)
+        self.assertFalse(ambiguous)
+
+    def test_quote_in_no_copy_reports_unlocated(self):
+        ctx, located, ambiguous = er._resolve_case_context(
+            pp, [_chs("First copy text."), _chs("Second copy text.")],
+            "A quote in neither copy.")
+        self.assertEqual(ctx, "")
+        self.assertFalse(located)
+        self.assertTrue(ambiguous)
+
+
 if __name__ == "__main__":
     unittest.main()
