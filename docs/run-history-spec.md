@@ -339,3 +339,47 @@ unmapped labels — the mechanism Postgres forbids). Unmapped claims
 remain individually untrackable ACROSS runs, as the marker design
 always accepted; within a run each evaluated claim now keeps its
 own row, so axis counts and claim rows reconcile.
+
+## Addendum — 2026-10-17: relationships axis + endpoint_provenance (schema catch-up for 2.13.22)
+
+Release C (v2.13.22) taught the run-history writer to post
+relationship claim outcomes with axis = 'relationships' and an
+endpoint_provenance payload, but the live table was never given
+the matching schema: processor_run_claim_outcomes had no
+endpoint_provenance column, and its axis CHECK
+(processor_run_claim_outcomes_axis_check) allowed only
+('tropes', 'triggers'). PostgREST therefore rejected every
+upload batch containing a relationship row — the whole batch,
+not just the offending rows — and the writer's warn-only failure
+handling let the run complete with its claim outcomes silently
+dropped.
+
+Fix applied 2026-10-17 (Decision: apply the migration, with this
+record), additive only — no data rewritten, RLS and policies
+untouched, the CHECK keeps its original constraint name:
+
+    alter table processor.processor_run_claim_outcomes
+      add column if not exists endpoint_provenance jsonb;
+    alter table processor.processor_run_claim_outcomes
+      drop constraint processor_run_claim_outcomes_axis_check;
+    alter table processor.processor_run_claim_outcomes
+      add constraint processor_run_claim_outcomes_axis_check
+      check (axis in ('tropes', 'triggers', 'relationships'));
+
+Verification: the column list and constraint definitions were
+read back from information_schema / pg_constraint before and
+after — endpoint_provenance is present (jsonb, nullable, no
+default) and the CHECK now reads axis = ANY (ARRAY['tropes',
+'triggers', 'relationships']) under the same name. A probe row
+(axis 'relationships', a small endpoint_provenance object) was
+inserted inside a BEGIN ... ROLLBACK payload and read back from
+the RETURNING clause, proving the writer's shape is now
+accepted; a follow-up count found zero probe residue, so the
+rollback left nothing behind.
+
+Consequence on the record: claim outcomes from any run-history
+run on v2.13.22 or later, before this fix, were lost — treat
+that window's claim-outcome rows as unreliable (in practice,
+absent). The failure was warn-only by design: processing,
+replace-wholesale writes, and every app surface were never
+affected; only the history mirror lost data.

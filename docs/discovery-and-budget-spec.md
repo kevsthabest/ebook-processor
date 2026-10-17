@@ -559,3 +559,44 @@ the app's reader-facing allowlist today); graph groups for
 prefill types follow their nearest seeded neighbour (bonded/mate
 → romance, sire → mentor, handler → friend as colleague's group,
 packmate/crewmate/sworn → friend, step types → family).
+
+## Errata — 2026-10-17: corrections to the phase-2 interim record
+
+The phase-2 releases (2.13.20–2.13.24) shipped gated and
+remote-verified, but several particulars in the interim reports
+were written from texts delivered while builders were still
+amending. The coordinator's corrective addendum is the source;
+this errata supersedes the interim record in the particulars
+named, and rides with the run-history migration change
+(Decision, 2026-10-17) rather than an ungated docs commit.
+
+- Release B (type registry): the gate on the reviewed tree
+  initially returned FAIL on one blocker — a stale generated
+  module map in the app repo. The final commit regenerated the
+  map (module-map suite 10/10 on the final tree); the
+  final-tree verdict is PASS_WITH_RISK.
+- Release B, app side: derivation in v614 is partial. The Char
+  Lab picker consumes the registry opportunistically; the
+  reader suggestion dialog still hardcodes the previous type
+  list. Both paths fail safe to today's behaviour.
+- Release B, comparability: under 2.13.21 the extraction and
+  validator prompts gain the type-gloss definitions even when
+  the registry read falls back to the built-in vocabulary, so
+  2.13.21 runs are not byte-comparable to 2.13.20. That is the
+  ruled gloss mechanism working, not a defect — but any
+  claim of byte-identity between those versions is wrong.
+- Release C (referent resolution): endpoint provenance is NOT
+  copied into stored book_characters entries. It lives on the
+  in-run claim and in the run-history mirror — a durability
+  gap recorded as gate risk R2, not a compatibility break.
+- Release D (discovery shadow): the allowance is a separate
+  experimental budget of 40; the shared decision pool is never
+  claimed. The shadow section's shared_pool_spent: 0 figure is
+  therefore structural, not instrumented. And §3.3 was not
+  deferred: both ranking arms are built, the embedding arm
+  behind its own default-off flag.
+- Release 2.13.24: the suite is 1841 (four new tests), and the
+  R1 carriers are the skip_reason column plus the
+  validator_breaker_* keys inside the characters jsonb — not
+  thresholds_json, as one interim record sentence said. The
+  gate confirmed the fix end-to-end; R1 stays closed.
