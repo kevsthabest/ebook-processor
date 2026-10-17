@@ -473,3 +473,58 @@ cannot be written well until the type exists and extraction
 proposes it. The processor falls back to its built-in type set
 when the registry is unreachable (offline runs must not gain
 a hard network dependency for vocabulary).
+
+### Registry seed: prefill set (ruled 2026-10-17)
+
+When the registry is built, seed it with the current vocabulary
+plus these nine types (glosses are seed text; each states its
+boundary against its nearest neighbour). step_parent ships
+with its directional pair step_child, as parent does with
+child.
+
+- bonded — symmetric; not family; exclusive, precedence at
+  romantic's rank. "A supernatural or formal bond linking the
+  pair (dragon and rider, familiar and keeper, human and AI
+  companion): a persistent, named connection, not mere
+  companionship or affection."
+- mate — symmetric; not family; exclusive, precedence at
+  bonded's rank. "A fated supernatural bond chosen by forces
+  outside the pair (a mating bond): may exist unaccepted, and
+  is distinct from marriage, ordinary romance, and
+  friendship."
+- sire — directed (sire -> made); not family; exclusive,
+  precedence at parent's rank. "The being who turned the
+  other (vampire or similar): a maker-made bond of authority
+  and obligation; not a biological parent."
+- packmate — symmetric; not family; non-exclusive extra.
+  "Members of the same pack: a group-loyalty bond of mutual
+  obligation and hierarchy, distinct from friendship and
+  family."
+- crewmate — symmetric; not family; non-exclusive extra.
+  "Members of the same ship's crew: a working bond of daily
+  proximity and mutual survival — more than a colleague, not
+  necessarily friendship."
+- sworn — either direction; not family; exclusive,
+  precedence at bonded's rank. "Bound by a spoken oath —
+  fealty, a blood oath, sworn brotherhood or service: the
+  oath itself is the bond, distinct from loyalty that was
+  never sworn."
+- step_parent / step_child — directed; FAMILY (routes to
+  family validation); exclusive, precedence at parent's rank.
+  "A parent's spouse who is not the biological parent: judge
+  the marriage-created kinship on its own terms; a
+  step-parent claim is not a parent claim."
+- ex — symmetric; not family; exclusive, precedence between
+  romantic and friend; app graph group romance. "A former
+  romantic partner or spouse: the relationship is in the
+  past — judge the history the text establishes, not
+  present-day warmth or hostility, which belong to friend or
+  enemy."
+- handler — directed; not family; exclusive, precedence at
+  colleague's rank. "An intelligence handler and their asset:
+  a directed bond of tasking, trust, and control, distinct
+  from a colleague and from a mentor."
+
+Watchlist (demand-driven, NOT seeded): betrothed, in-law,
+roommate, captor, thrall, commanding officer, police partner
+(name collides with the app's romantic "partner").

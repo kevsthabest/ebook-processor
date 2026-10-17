@@ -36,12 +36,25 @@ gated — for shapes whose honest answer is "unjudgeable from the
 quote alone"). --dry-run exercises the plumbing with each case's
 stub_score instead of a model call.
 
-Exit codes: 0 = every gated case in band; 1 = a gated case out of
-band; 2 = configuration error (no endpoint/key).
+Every case is judged repeatedly (spec §4): three draws, five
+when the first draw lands within 0.15 of a band edge, because a
+single draw near an edge is a coin flip and the eval exists to
+measure the judge, not its luck. A case's outcome is the band
+every answered draw agrees on; draws that straddle an edge make
+the case UNSTABLE — reported, and failing the gate when gated —
+rather than letting one draw pick a side. The report's headline
+is four metrics over the gated cases (precision, recall, type
+accuracy, abstention), each with its case counts, per book and
+pooled; the old answered/miss count stays for continuity.
+
+Exit codes: 0 = every gated case in band and stable; 1 = a gated
+case out of band or unstable; 2 = configuration error (no
+endpoint/key).
 """
 import argparse
 import importlib.util
 import json
+import statistics
 import sys
 from pathlib import Path
 
@@ -106,6 +119,94 @@ def _band(p, rel_type=""):
             return "drop"
         return "middle"
     return "keep" if p >= pp._REL_DROP_THRESHOLD else "drop"
+
+
+# Repeated draws (spec §4.1). A judge's single score near a band
+# edge flips sides between calls, so one draw cannot distinguish
+# a real miss from sampling luck; cases whose first draw lands
+# near an edge earn extra draws, where the instability actually
+# lives, instead of spending them everywhere.
+_DRAWS_BASE = 3
+_DRAWS_NEAR_EDGE = 5
+_EDGE_MARGIN = 0.15
+
+
+def _band_edges(rel_type):
+    """The score boundaries a claim of this family can straddle:
+    family claims have two (drop below, keep at), non-family
+    claims only the drop threshold — above it they keep."""
+    if rel_type in pp._REL_FAMILY_TYPES:
+        return (pp._REL_DROP_THRESHOLD, pp._REL_VALIDATION_THRESHOLD)
+    return (pp._REL_DROP_THRESHOLD,)
+
+
+def _draw_count(first_p, rel_type):
+    """How many draws a case gets, decided by its first score.
+
+    The epsilon keeps "within 0.15" honest at decimal boundaries:
+    0.85 - 0.70 is 0.15000000000000008 in binary floating point,
+    and a case exactly at the margin is exactly the case the
+    extra draws exist for."""
+    if first_p is None:
+        return _DRAWS_BASE
+    if any(abs(first_p - edge) <= _EDGE_MARGIN + 1e-9
+           for edge in _band_edges(rel_type)):
+        return _DRAWS_NEAR_EDGE
+    return _DRAWS_BASE
+
+
+def _case_outcome(answers, rel_type):
+    """One case's verdict from its answered draws.
+
+    Returns (outcome, median, spread). The outcome is the band
+    every draw agrees on; disagreement means the draws straddle
+    a band edge, and the honest verdict is "unstable" — bands
+    are intervals, so no single band describes the case. Zero
+    answered draws is "unanswered". Median and spread describe
+    the draws; both are None when nothing answered."""
+    if not answers:
+        return "unanswered", None, None
+    bands = {_band(p, rel_type) for p in answers}
+    median = statistics.median(answers)
+    spread = max(answers) - min(answers)
+    if len(bands) > 1:
+        return "unstable", median, spread
+    return bands.pop(), median, spread
+
+
+def _metrics(rows):
+    """The four headline metrics (spec §4.2) over gated cases.
+
+    Each value is a (numerator, denominator) pair so the report
+    always shows the case counts behind a rate — a precision of
+    1.00 over two cases and over two hundred must not read the
+    same. Unstable, middle, and unanswered cases abstain: they
+    leave the precision/recall/type denominators and count in
+    the abstention rate, so a judge cannot look precise by
+    refusing the hard cases."""
+    pred_keep = sum(1 for r in rows if r["outcome"] == "keep")
+    exp_keep = sum(1 for r in rows if r["expect"] == "keep")
+    true_keep = sum(1 for r in rows if r["expect"] == "keep"
+                    and r["outcome"] == "keep")
+    decided = sum(1 for r in rows if r["outcome"] in ("keep", "drop"))
+    exact = sum(1 for r in rows if r["outcome"] == r["expect"]
+                and r["outcome"] in ("keep", "drop"))
+    abstained = sum(1 for r in rows if r["outcome"] in
+                    ("middle", "unstable", "unanswered"))
+    return {
+        "cases": len(rows),
+        "precision": (true_keep, pred_keep),
+        "recall": (true_keep, exp_keep),
+        "type_accuracy": (exact, decided),
+        "abstention": (abstained, len(rows)),
+    }
+
+
+def _fmt_metric(label, pair):
+    num, den = pair
+    if den == 0:
+        return f"{label} n/a ({num}/{den})"
+    return f"{label} {num / den:.2f} ({num}/{den})"
 
 
 def main():
@@ -193,40 +294,92 @@ def main():
             extra_headers=headers)
 
     misses = []
+    unstables = []
     answered = 0
+    gated_rows = []
     for i, case in enumerate(cases, 1):
-        if args.dry_run:
-            p = case.get("stub_score")
-        else:
-            _verdict, p = validator.validate_relationship(
-                case["from"], case["to"], case["type"], case["quote"],
-                context=case.get("_context", ""))
-        band = _band(p, case["type"])
+        # Draw repeatedly: the first draw decides how many the
+        # case gets (near an edge earns more), and a judge that
+        # stops answering ends the case with what it gave — an
+        # unanswered draw is not retried into a different answer.
+        answers = []
+        n_draws = _DRAWS_BASE
+        while len(answers) < n_draws:
+            if args.dry_run:
+                p = case.get("stub_score")
+            else:
+                _verdict, p = validator.validate_relationship(
+                    case["from"], case["to"], case["type"],
+                    case["quote"], context=case.get("_context", ""))
+            if p is None:
+                break
+            answers.append(p)
+            if len(answers) == 1:
+                n_draws = _draw_count(p, case["type"])
+        outcome, median, spread = _case_outcome(answers, case["type"])
         expect = case.get("expect", "any")
-        if p is not None:
+        if answers:
             answered += 1
         gated = expect in ("keep", "drop")
-        ok = (not gated) or band == expect
-        status = "REPORT" if not gated else ("PASS" if ok else "MISS")
-        if gated and not ok:
-            misses.append(case)
+        if gated:
+            gated_rows.append({"work": case.get("work") or "",
+                               "expect": expect, "outcome": outcome})
+            if outcome == "unstable":
+                unstables.append(case)
+                status = "UNSTABLE"
+            elif outcome == expect:
+                status = "PASS"
+            else:
+                misses.append(case)
+                status = "MISS"
+        else:
+            status = "REPORT"
         ctx_mark = ""
         if args.corpus:
             if case.get("_context"):
                 ctx_mark = " [ctx]"
             elif not case.get("_located", True):
                 ctx_mark = " [NO WINDOW: quote not in corpus text]"
-        print(f"[{i:2}] {status:6} expect={expect:4} got={band:10} "
-              f"P={p if p is not None else '—'}  "
+        draws_s = ",".join(f"{p:.2f}" for p in answers) or "—"
+        print(f"[{i:2}] {status:8} expect={expect:4} got={outcome:10} "
+              f"P={median if median is not None else '—'} "
+              f"draws=[{draws_s}] "
+              f"spread={spread if spread is not None else '—'}  "
               f"{case['from']} -> {case['to']} ({case['type']})"
               f"{ctx_mark}")
     print()
     print(f"{answered}/{len(cases)} answered; "
-          f"{len(misses)} gated miss(es).")
+          f"{len(misses)} gated miss(es); "
+          f"{len(unstables)} gated unstable.")
+    # Headline: the four metrics over gated cases, per book and
+    # pooled — the pass count alone hid WHERE the judge fails
+    # (wrong keeps vs missed keeps vs refusing to answer).
+    scopes = []
+    seen_works = []
+    for row in gated_rows:
+        if row["work"] not in seen_works:
+            seen_works.append(row["work"])
+    for work in seen_works:
+        scopes.append((f"book {work!r}" if work else "book (unnamed)",
+                       [r for r in gated_rows if r["work"] == work]))
+    scopes.append(("all books", gated_rows))
+    for label, rows in scopes:
+        m = _metrics(rows)
+        print(f"  {label} ({m['cases']} gated): "
+              + "; ".join([
+                  _fmt_metric("precision", m["precision"]),
+                  _fmt_metric("recall", m["recall"]),
+                  _fmt_metric("type accuracy", m["type_accuracy"]),
+                  _fmt_metric("abstention", m["abstention"])]))
     if misses:
         for case in misses:
             print(f"  MISS: {case['from']} -> {case['to']} "
                   f"({case['type']}): {case.get('note', '')}")
+    if unstables:
+        for case in unstables:
+            print(f"  UNSTABLE: {case['from']} -> {case['to']} "
+                  f"({case['type']}): {case.get('note', '')}")
+    if misses or unstables:
         return 1
     return 0
 

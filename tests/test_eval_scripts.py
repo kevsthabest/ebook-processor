@@ -30,6 +30,7 @@ def _load(name, filename):
 
 emb = _load("evaluate_merges_batched", "evaluate-merges-batched.py")
 lm = _load("label_merges", "label-merges.py")
+er = _load("evaluate_relationships", "evaluate-relationships.py")
 
 
 # ----------------------------------------------------------------------
@@ -286,6 +287,102 @@ class TestLoadPairs(unittest.TestCase):
 
     def test_no_characters_no_pairs(self):
         self.assertEqual(lm.load_pairs(self._write([])), [])
+
+
+# ----------------------------------------------------------------------
+# evaluate-relationships: repeated draws + the four headline metrics
+# (spec §4.1–4.2). A single judge draw is a coin flip near a band
+# edge; these pin the draw-count rule, the stability verdict, and
+# the metric definitions the report's headline now rests on.
+# ----------------------------------------------------------------------
+
+class TestEvalBand(unittest.TestCase):
+    def test_family_three_tier(self):
+        self.assertEqual(er._band(0.9, "parent"), "keep")
+        self.assertEqual(er._band(0.5, "parent"), "middle")
+        self.assertEqual(er._band(0.1, "parent"), "drop")
+
+    def test_nonfamily_two_tier(self):
+        self.assertEqual(er._band(0.43, "friend"), "keep")
+        self.assertEqual(er._band(0.1, "friend"), "drop")
+
+    def test_none_unanswered(self):
+        self.assertEqual(er._band(None, "parent"), "unanswered")
+
+
+class TestDrawCount(unittest.TestCase):
+    def test_far_from_edges_three_draws(self):
+        self.assertEqual(er._draw_count(0.95, "parent"), 3)
+        self.assertEqual(er._draw_count(0.05, "parent"), 3)
+        self.assertEqual(er._draw_count(0.5, "friend"), 3)
+
+    def test_near_keep_edge_five_draws(self):
+        self.assertEqual(er._draw_count(0.62, "parent"), 5)
+        # Exactly the margin counts as near: decimal 0.15 must not
+        # fall foul of binary float representation.
+        self.assertEqual(er._draw_count(0.85, "parent"), 5)
+
+    def test_near_drop_edge_five_draws(self):
+        self.assertEqual(er._draw_count(0.44, "parent"), 5)
+        self.assertEqual(er._draw_count(0.2, "friend"), 5)
+
+    def test_unanswered_first_draw_stays_base(self):
+        self.assertEqual(er._draw_count(None, "parent"), 3)
+
+
+class TestCaseOutcome(unittest.TestCase):
+    def test_unanimous_band_is_the_outcome(self):
+        outcome, median, spread = er._case_outcome(
+            [0.9, 0.92, 0.88], "parent")
+        self.assertEqual(outcome, "keep")
+        self.assertAlmostEqual(median, 0.9)
+        self.assertAlmostEqual(spread, 0.04)
+
+    def test_draws_straddling_an_edge_are_unstable(self):
+        # 0.68 bands middle, 0.72 bands keep: the draws disagree,
+        # so no band may be reported for the case.
+        outcome, median, spread = er._case_outcome(
+            [0.68, 0.72, 0.71, 0.69, 0.70], "parent")
+        self.assertEqual(outcome, "unstable")
+
+    def test_no_answers_unanswered(self):
+        self.assertEqual(er._case_outcome([], "parent"),
+                         ("unanswered", None, None))
+
+    def test_nonfamily_unanimous(self):
+        self.assertEqual(
+            er._case_outcome([0.1, 0.12, 0.11], "friend")[0], "drop")
+
+
+class TestEvalMetrics(unittest.TestCase):
+    ROWS = [
+        {"expect": "keep", "outcome": "keep"},
+        {"expect": "keep", "outcome": "keep"},
+        {"expect": "keep", "outcome": "drop"},
+        {"expect": "drop", "outcome": "keep"},
+        {"expect": "drop", "outcome": "drop"},
+        {"expect": "keep", "outcome": "unstable"},
+        {"expect": "drop", "outcome": "middle"},
+        {"expect": "keep", "outcome": "unanswered"},
+    ]
+
+    def test_four_metrics_with_counts(self):
+        m = er._metrics(self.ROWS)
+        self.assertEqual(m["cases"], 8)
+        # Predicted keeps: 3 (two right, one wrong) -> precision 2/3.
+        self.assertEqual(m["precision"], (2, 3))
+        # Expected keeps: 5 (incl. unstable + unanswered) -> 2/5.
+        self.assertEqual(m["recall"], (2, 5))
+        # Decided cases (unanimous keep/drop): 5, exact matches 3.
+        self.assertEqual(m["type_accuracy"], (3, 5))
+        # Abstained: unstable + middle + unanswered = 3 of 8.
+        self.assertEqual(m["abstention"], (3, 8))
+
+    def test_empty_rows_zero_denominators(self):
+        m = er._metrics([])
+        self.assertEqual(m["cases"], 0)
+        self.assertEqual(m["precision"], (0, 0))
+        self.assertEqual(m["abstention"], (0, 0))
 
 
 if __name__ == "__main__":
