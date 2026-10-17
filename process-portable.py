@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.21"
+PORTABLE_VERSION = "2.13.22"
 
 
 import argparse
@@ -2680,6 +2680,446 @@ def _mine_pair_evidence(from_name, to_name, chapters, roster=None):
                 best = (key, {"sentence": sentence, "grade": grade,
                               "chapter": idx})
     return best[1] if best else None
+
+
+# --- Referent resolution as provenance (spec §2) ---------------------------
+# Extraction reads a whole chapter and anchors a bare surname to the
+# character the scene follows; validation later re-judges from one
+# mined sentence plus a window, and the anchoring is gone — the
+# surname could mean anyone who shares it. This layer gives the
+# validator the chapter's own anchoring back, as a fact about the
+# text and never as the conclusion: a deterministic antecedent pass
+# over the chapter, a provenance record on the claim, and one
+# context line when — and only when — the resolution is unique.
+# The miner's grading above does NOT change: a surname sentence
+# still grades binding for the pair at grading time, without
+# identifying which member anchors it. Resolution runs after
+# mining, is same-chapter only, and never creates claims.
+#
+# The provenance values are a fixed vocabulary, held in module
+# constants so no call site can invent a free-form string (the
+# R-A1 gate risk: free-form provenance strings cannot be queried,
+# grouped, or trusted downstream).
+MATCH_FORM_FULL = "full"
+MATCH_FORM_FIRST = "first"
+MATCH_FORM_SURNAME = "surname"
+MATCH_FORM_RESOLVED_SURNAME = "resolved-surname"
+# An endpoint the evidence does not textually place — absent, or
+# present only as a pronoun, or present in a partial form the
+# chapter does not uniquely resolve. Pronouns never resolve in v1,
+# so a pronoun-only endpoint keeps exactly this treatment.
+MATCH_FORM_UNRESOLVED = "unresolved"
+ENDPOINT_MATCH_FORMS = frozenset({
+    MATCH_FORM_FULL, MATCH_FORM_FIRST, MATCH_FORM_SURNAME,
+    MATCH_FORM_RESOLVED_SURNAME, MATCH_FORM_UNRESOLVED})
+# The two ways a partial mention can be supported. A basis record
+# carries the subset that actually supported its resolution.
+BASIS_NEAREST_PRECEDING_FULL = "nearest_preceding_full"
+BASIS_FOCAL_CHARACTER = "focal_character"
+RESOLUTION_BASIS_KINDS = frozenset({
+    BASIS_NEAREST_PRECEDING_FULL, BASIS_FOCAL_CHARACTER})
+
+
+def _referent_entries(roster):
+    """The roster in antecedent-pass shape: canonical name, first
+    name, surname (under the miner's surname guards, so a word the
+    miner would not trust as a surname is not tracked here either),
+    and the multi-word forms that count as a full mention (the
+    canonical name plus multi-word aliases). Single-word aliases
+    are not full forms: a lone word cannot anchor a chapter the
+    way a full name can."""
+    entries = []
+    for e in (roster or {}).values():
+        if not isinstance(e, dict):
+            continue
+        name = e.get("name", "") or ""
+        if not name:
+            continue
+        parts = name.split()
+        full_forms = {name}
+        full_forms.update(
+            a for a in e.get("aliases", []) if a and " " in a)
+        entries.append({
+            "name": name,
+            "first": parts[0] if parts else "",
+            "surname": _pair_surname_form(name, roster),
+            "full_forms": full_forms,
+        })
+    return entries
+
+
+def _chapter_sentences(text):
+    """(sentence, char offset) pairs for one chapter text. The
+    sentences are _split_sentences' verbatim slices; the offset is
+    found by scanning forward, because the slices are contiguous
+    and in order, so each sentence's true position in the chapter
+    is recoverable without re-splitting anything."""
+    out = []
+    cursor = 0
+    for s in _split_sentences(text or ""):
+        pos = text.find(s, cursor)
+        if pos < 0:
+            pos = cursor
+        out.append((s, pos))
+        cursor = pos + len(s)
+    return out
+
+
+def _chapter_mentions(text, entries):
+    """Every name mention in one chapter, in text order.
+
+    Full-form mentions know their character. Partial mentions
+    (first-name-only, surname-only) are recorded once per distinct
+    word, without a character: which roster members share the word
+    is a resolution question, not a mention question, and recording
+    the mention once per sharer would manufacture candidates the
+    text never offered. Overlaps resolve to the longest match at a
+    position, so the surname inside a full name ("Sebeck" inside
+    "Peter Sebeck") is not a second, partial mention. Pronouns are
+    never mentions here — that absence is what "pronouns never
+    resolve in v1" means mechanically."""
+    sentences = _chapter_sentences(text)
+    raw = []
+    for ent in entries:
+        rx = _forms_re(ent["full_forms"])
+        if rx is not None:
+            for si, (sentence, offset) in enumerate(sentences):
+                for m in rx.finditer(sentence):
+                    raw.append({
+                        "text": m.group(0), "form": MATCH_FORM_FULL,
+                        "character": ent["name"],
+                        "sentence_index": si, "sentence": sentence,
+                        "position": offset + m.start()})
+    partial_words = {}
+    for ent in entries:
+        if ent["first"] and ent["first"] != ent["name"]:
+            partial_words.setdefault(ent["first"], MATCH_FORM_FIRST)
+        if ent["surname"]:
+            # A word that is both someone's first name and someone
+            # else's surname stays a first-name mention: the miner
+            # withholds such surnames for the same reason (the word
+            # more likely names the person it is a first name of).
+            partial_words.setdefault(ent["surname"],
+                                     MATCH_FORM_SURNAME)
+    for word, form in partial_words.items():
+        rx = _forms_re({word})
+        if rx is None:
+            continue
+        for si, (sentence, offset) in enumerate(sentences):
+            for m in rx.finditer(sentence):
+                raw.append({
+                    "text": m.group(0), "form": form,
+                    "character": None,
+                    "sentence_index": si, "sentence": sentence,
+                    "position": offset + m.start()})
+    raw.sort(key=lambda m: (m["position"],
+                            -(len(m["text"]))))
+    mentions = []
+    occupied_until = -1
+    for m in raw:
+        if m["position"] < occupied_until:
+            continue  # inside a longer match already kept
+        mentions.append(m)
+        occupied_until = m["position"] + len(m["text"])
+    mentions.sort(key=lambda m: m["position"])
+    return mentions
+
+
+def _resolution_basis(kinds, mention, chapter_index, focal_name):
+    """The basis record for one resolved mention: what supported
+    the resolution, with the resolving mention stored VERBATIM
+    (its sentence, exactly as the chapter carries it) together
+    with its chapter and position, so a false resolution can be
+    diagnosed later from the record alone. A focal-only resolution
+    may have no verbatim mention to store — the focal character
+    was identified by extraction, not by a sentence in the text —
+    and then the record says so with a None mention instead of
+    paraphrasing an inference into a quote."""
+    return {
+        "kinds": list(kinds),
+        "mention": mention["sentence"] if mention else None,
+        "mention_text": (mention["text"] if mention
+                         else focal_name),
+        "chapter": chapter_index,
+        "position": mention["position"] if mention else None,
+        "sentence_index": (mention["sentence_index"]
+                           if mention else None),
+    }
+
+
+def _resolve_chapter_mentions(chapter_text, chapter_index, roster,
+                              focal_name=None,
+                              exclude_sentence_indexes=frozenset()):
+    """The antecedent pass for one chapter (spec §2.1).
+
+    Tracks surname-only and first-name-only mentions of roster
+    characters and resolves each one only when exactly one roster
+    candidate is supported — by the nearest preceding full-form
+    mention in the same chapter, by the chapter's focal character
+    (where extraction identified one), or by both agreeing. Two
+    sources naming different candidates, one source naming a
+    candidate while another candidate is equally supported, or no
+    source at all: the mention stays unresolved and nothing is
+    asserted. Uniqueness or silence governs all of it, because a
+    wrong resolution is false evidence, which is worse than none.
+
+    Anti-circularity (spec §2.5) is structural here, not a check
+    bolted on afterwards: a mention inside an excluded sentence
+    (the caller excludes the evidence sentence) can be resolved,
+    but no mention inside an excluded sentence can ever serve as
+    another mention's antecedent, and no mention inside a
+    kinship/binding sentence can serve either — an antecedent
+    that itself states a bond would smuggle the conclusion into
+    the provenance. Removing the evidence sentence from the text
+    therefore cannot change any resolution this pass produces.
+
+    Returns the mention records in text order; each carries
+    "resolved_to" (a canonical name or None) and, for resolved
+    partial mentions, a "basis" record (see _resolution_basis).
+    Full-form and roster-unique partial mentions resolve to their
+    character directly, with basis None: no inference was needed,
+    so no inference is recorded."""
+    entries = _referent_entries(roster)
+    mentions = _chapter_mentions(chapter_text or "", entries)
+    focal = None
+    if focal_name:
+        focal = _roster_canonical(roster, focal_name) \
+            if roster else focal_name
+        if not any(e["name"] == focal for e in entries):
+            focal = None
+    excluded = set(exclude_sentence_indexes or ())
+
+    def _source_ok(m):
+        return (m["sentence_index"] not in excluded
+                and not _PAIR_MARKER_RE.search(m["sentence"]))
+
+    focal_full = None
+    if focal:
+        for m in mentions:
+            if (m["form"] == MATCH_FORM_FULL
+                    and m["character"] == focal and _source_ok(m)):
+                focal_full = m
+                break
+    last_full = {}  # canonical name -> its latest source-ok full mention
+    for m in mentions:
+        if m["form"] == MATCH_FORM_FULL:
+            m["resolved_to"] = m["character"]
+            m["basis"] = None
+            if _source_ok(m):
+                last_full[m["character"]] = m
+            continue
+        if m["form"] == MATCH_FORM_FIRST:
+            sharers = [e["name"] for e in entries
+                       if e["first"] == m["text"]]
+        else:
+            sharers = [e["name"] for e in entries
+                       if e["surname"] == m["text"]]
+        m["sharers"] = sharers
+        if len(sharers) == 1:
+            m["resolved_to"] = sharers[0]
+            m["basis"] = None
+            continue
+        if not sharers:
+            m["resolved_to"] = None
+            m["basis"] = None
+            continue
+        supported = {}  # canonical name -> (kinds, mention record)
+        preceding = [last_full[n] for n in sharers if n in last_full]
+        if preceding:
+            nearest = max(preceding,
+                          key=lambda mm: (mm["sentence_index"],
+                                          mm["position"]))
+            supported[nearest["character"]] = (
+                [BASIS_NEAREST_PRECEDING_FULL], nearest)
+        if focal and focal in sharers:
+            if focal in supported:
+                kinds, rec = supported[focal]
+                supported[focal] = (
+                    kinds + [BASIS_FOCAL_CHARACTER], rec)
+            else:
+                supported[focal] = ([BASIS_FOCAL_CHARACTER],
+                                    focal_full)
+        if len(supported) == 1:
+            _name, (_kinds, _rec) = next(iter(supported.items()))
+            m["resolved_to"] = _name
+            m["basis"] = _resolution_basis(
+                _kinds, _rec, chapter_index, focal)
+        else:
+            m["resolved_to"] = None
+            m["basis"] = None
+    return mentions
+
+
+def _provenance_for_endpoint(entry, evidence, ev_sentences, mentions):
+    """One endpoint's match record against the judged evidence.
+
+    entry: the endpoint's _referent_entries record, or None when
+    the endpoint has no roster entry (then only a literal full
+    name in the evidence can place it). ev_sentences: the evidence
+    quote's sentence indexes in its chapter, or None when the
+    quote could not be located there — in that case the record is
+    the textual form alone, with no resolution, because resolution
+    without the chapter around the quote would be a guess.
+    The record's basis is present only on a unique resolution."""
+    name = entry["name"] if entry else None
+    record = {"endpoint": name,
+              "matched_form": MATCH_FORM_UNRESOLVED,
+              "mention_text": None, "basis": None}
+    if not evidence:
+        return record
+    if ev_sentences is None or mentions is None:
+        if name and name in evidence:
+            record["matched_form"] = MATCH_FORM_FULL
+            record["mention_text"] = name
+            return record
+        if entry is not None:
+            if entry["first"] and entry["first"] != name \
+                    and re.search(r"(?<!\w)" + re.escape(entry["first"])
+                                  + r"(?!\w)", evidence):
+                record["matched_form"] = MATCH_FORM_FIRST
+                record["mention_text"] = entry["first"]
+                return record
+            if entry["surname"] and re.search(
+                    r"(?<!\w)" + re.escape(entry["surname"])
+                    + r"(?!\w)", evidence):
+                record["matched_form"] = MATCH_FORM_SURNAME
+                record["mention_text"] = entry["surname"]
+                return record
+        return record
+    in_evidence = [m for m in mentions
+                   if m["sentence_index"] in ev_sentences]
+    for m in in_evidence:
+        if m["form"] == MATCH_FORM_FULL and m["character"] == name:
+            record["matched_form"] = MATCH_FORM_FULL
+            record["mention_text"] = m["text"]
+            return record
+    if entry is None:
+        return record
+    # Partial mentions are considered in a fixed order — first
+    # name before surname — because a sentence can carry both
+    # ("Sebeck's son, Chris"): the surname may resolve to a
+    # different family member, and that must not shadow the
+    # endpoint's own direct first-name mention later in the same
+    # sentence.
+    for m in in_evidence:
+        if m["form"] == MATCH_FORM_FIRST \
+                and entry["first"] == m["text"]:
+            if len(m.get("sharers", [])) == 1:
+                record["matched_form"] = MATCH_FORM_FIRST
+                record["mention_text"] = m["text"]
+                return record
+            if m.get("resolved_to") == name:
+                # A shared first name the chapter uniquely
+                # resolves: the form stays "first" (spec §2.2's
+                # distinct resolved form is the surname's), and
+                # the basis record is what marks it resolved.
+                record["matched_form"] = MATCH_FORM_FIRST
+                record["mention_text"] = m["text"]
+                record["basis"] = m.get("basis")
+                return record
+            return record  # ambiguous: asserted as nothing
+    for m in in_evidence:
+        if m["form"] == MATCH_FORM_SURNAME \
+                and entry["surname"] == m["text"]:
+            if len(m.get("sharers", [])) == 1:
+                record["matched_form"] = MATCH_FORM_SURNAME
+                record["mention_text"] = m["text"]
+                return record
+            if m.get("resolved_to") == name and m.get("basis"):
+                record["matched_form"] = \
+                    MATCH_FORM_RESOLVED_SURNAME
+                record["mention_text"] = m["text"]
+                record["basis"] = m["basis"]
+                return record
+            # A shared surname the chapter resolves to someone
+            # else, or to no one: this endpoint is not placed by
+            # it, and the record stays unresolved rather than
+            # borrowing another character's antecedent.
+            return record
+    return record
+
+
+def _claim_endpoint_provenance(rel, evidence, chapter_text,
+                               chapter_index, roster, focal_name=None):
+    """Endpoint-match provenance for one claim (spec §2.2): for
+    each endpoint, the form that matched in the evidence sentence
+    and — for resolved forms — the basis that resolved it. This
+    record is the evidence ledger's seed record class: it is
+    persisted on the claim itself, where the claim's evidence
+    already lives, and mirrored into run history; no ledger
+    machinery beyond the record is built here."""
+    entries = _referent_entries(roster)
+    by_name = {e["name"]: e for e in entries}
+    span = _locate_quote_span(evidence, chapter_text) \
+        if evidence and chapter_text else None
+    ev_sentences = (set(range(span[0], span[1] + 1))
+                    if span is not None else None)
+    mentions = None
+    if chapter_text and ev_sentences is not None:
+        mentions = _resolve_chapter_mentions(
+            chapter_text, chapter_index, roster,
+            focal_name=focal_name,
+            exclude_sentence_indexes=ev_sentences)
+    out = {}
+    for key in ("from", "to"):
+        nm = rel.get(key, "") or ""
+        entry = by_name.get(_roster_canonical(roster, nm)
+                            if roster else nm)
+        if entry is None and nm:
+            entry = {"name": nm, "first": "", "surname": None,
+                     "full_forms": {nm}}
+        out[key] = _provenance_for_endpoint(
+            entry, evidence, ev_sentences, mentions)
+    return out
+
+
+def _resolution_context_lines(provenance):
+    """The validator-context lines for a claim's provenance
+    (spec §2.3): one line per endpoint whose surname the chapter
+    uniquely resolved, and nothing at all otherwise. Ambiguity
+    stays silent — no hint is better than a guessed hint — so a
+    claim with no unique resolution yields no lines and its
+    validation context is exactly what it was before this layer
+    existed."""
+    lines = []
+    for key in ("from", "to"):
+        ep = (provenance or {}).get(key) or {}
+        if ep.get("matched_form") != MATCH_FORM_RESOLVED_SURNAME:
+            continue
+        basis = ep.get("basis") or {}
+        kinds = basis.get("kinds") or []
+        if BASIS_FOCAL_CHARACTER in kinds:
+            _note = "the scene follows them"
+        else:
+            _note = "named in full earlier in the chapter"
+        lines.append(
+            f"In this chapter, '{ep.get('mention_text')}' refers "
+            f"to {ep.get('endpoint')} ({_note}).")
+    return lines
+
+
+def _history_provenance_mirror(provenance):
+    """The run-history mirror of a claim's provenance record: the
+    structured facts only — each endpoint's matched form (the
+    fixed enum), the basis kinds, and the resolving mention's
+    chapter and position. The verbatim basis text itself is NOT
+    mirrored: run history is metadata-only by its own spec (book
+    text and evidence strings are on its never-transfer list),
+    so the verbatim record lives on the claim, and the mirror
+    carries enough to count, group, and locate resolutions
+    without carrying the text."""
+    out = {}
+    for key in ("from", "to"):
+        ep = (provenance or {}).get(key) or {}
+        basis = ep.get("basis") or {}
+        out[key] = {
+            "matched_form": ep.get("matched_form"),
+            "basis_kinds": list(basis.get("kinds") or []),
+            "basis_chapter": basis.get("chapter"),
+            "basis_position": basis.get("position"),
+        }
+    return out
+
 
 # Regex evidence gates for high-severity trigger claims. The evidence quote
 # must contain supporting language, not just mention the topic. Catches
@@ -15102,9 +15542,55 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         if _ch is None:
             return ""
         _w = _evidence_window(ev_quote, _ch.get("text", ""))
-        if not _w:
-            return ""
-        return f"Sentences around the quote, from the same passage: {_w}"
+        _ctx = (f"Sentences around the quote, from the same passage: {_w}"
+                if _w else "")
+        # Referent resolution (spec §2.3): the context gains a
+        # line only when the claim's provenance holds a unique
+        # resolution, and gains nothing otherwise — so a claim
+        # with no unique resolution is validated with exactly the
+        # context it would have had before this layer existed.
+        _lines = _resolution_context_lines(
+            rel.get("endpoint_provenance") or {})
+        if _lines:
+            _ctx = (_ctx + "\n" if _ctx else "") + "\n".join(_lines)
+        return _ctx
+
+    # The chapter's focal character, where extraction identified
+    # one: Call A's per-chapter pov_character, canonicalized
+    # against the roster. This is the antecedent pass's second
+    # resolution source (spec §2.1) — the character the narration
+    # follows in that chapter.
+    _focal_by_index = {}
+    for _fidx, _fa in chapter_as.items():
+        if _fa and _fa.get("pov_character"):
+            _focal_by_index[_fidx] = _roster_canonical(
+                roster, _fa["pov_character"])
+
+    def _stamp_provenance(rel, ev_quote, chapter_index=None):
+        """Stamp endpoint-match provenance (spec §2.2) on a claim
+        for the evidence it is about to be judged on, in that
+        evidence's chapter. Re-stamping is deliberate: when mining
+        replaces the judged quote, the provenance must describe
+        the quote the validator actually sees, not the one
+        extraction happened to offer."""
+        _ch = None
+        if chapter_index is not None:
+            _ch = _chapters_by_index.get(chapter_index)
+        if _ch is None:
+            _ch = _chapters_by_label.get(rel.get("chapter") or "")
+        if _ch is None or not (ev_quote or "").strip():
+            return
+        _ci = _ch.get("index")
+        rel["endpoint_provenance"] = _claim_endpoint_provenance(
+            rel, ev_quote, _ch.get("text", ""), _ci, roster,
+            _focal_by_index.get(_ci))
+
+    # Every claim is stamped from its own evidence before judging
+    # begins, so provenance exists even for claims validation
+    # never reaches (no validator configured, "other" type) — the
+    # record annotates existing claims only and creates none.
+    for _rel in relationships:
+        _stamp_provenance(_rel, (_rel.get("evidence") or "").strip())
 
     # Validation priority order (spec §1.2, Decision K1): validation
     # no longer walks the stored list order. Both passes below walk
@@ -15199,6 +15685,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             continue
         if _DECISION_VALIDATOR is None:
             continue  # no validator configured; leave as-is
+        _stamp_provenance(
+            rel, _ev,
+            _mined["chapter"] if (rel.get("evidence_mined")
+                                  and _mined) else None)
         _ctx = _validation_context(
             _ev, rel,
             _mined["chapter"] if (rel.get("evidence_mined")
@@ -15265,6 +15755,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                     rel["evidence_grade"] = _mined["grade"]
             if not _ev:
                 continue
+            if _mined:
+                _stamp_provenance(rel, _ev, _mined["chapter"])
             _ctx = _validation_context(
                 _ev, rel, _mined["chapter"] if _mined else None)
             _p, _outcome = _judge_relationship(
@@ -15357,6 +15849,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         rel["evidence_grade"] = _mined["grade"]
         if _mined["grade"] == "binding":
             rel.setdefault("evidence_mined", _mined["sentence"])
+        # The claim's evidence just changed hands, so its
+        # provenance record follows it (see _stamp_provenance).
+        _stamp_provenance(rel, _mined["sentence"], _mined["chapter"])
 
     # Curation state + provenance (spec §1.5): every surviving and
     # dropped claim is stamped with its internal state name, so
@@ -18785,6 +19280,41 @@ def _history_book_claims(result):
                 _history_unique_identity(_seen_g, ident)),
             "verdict": row["verdict"],
             "confidence": row["confidence"]})
+
+    # Relationship claims (spec §2.2): a claim carrying endpoint
+    # provenance earns an outcomes row, so a later run can be
+    # compared against this one on the claims whose judging the
+    # provenance could actually move. The row's verdict is the
+    # claim's §1.5 curation state and its confidence the
+    # validator's score, under the same keys every other axis
+    # uses. The identity hashed is the claim's canonical pair and
+    # type — relationships have no catalogue identity to hash
+    # (that absence is the §9 limitation recorded in the spec),
+    # and the hash, never the names, is what ships. The mirrored
+    # provenance itself is the structured record only (see
+    # _history_provenance_mirror): no verbatim text crosses.
+    _seen_r = {}
+    for rel in list(result.get("relationships") or []) \
+            + list(result.get("dropped_relationships") or []):
+        if not isinstance(rel, dict):
+            continue
+        _prov = rel.get("endpoint_provenance")
+        if not _prov:
+            continue
+        _frm, _to, _typ = (rel.get("from"), rel.get("to"),
+                          rel.get("type"))
+        if not (_frm and _to and _typ):
+            continue
+        rows.append({
+            "axis": "relationships",
+            "claim_key": _history_claim_key(
+                "relationships", book_key,
+                _history_unique_identity(
+                    _seen_r, f"{_frm}\x1f{_to}\x1f{_typ}")),
+            "verdict": (rel.get("validation_state")
+                        or _rel_validation_state(rel)),
+            "confidence": rel.get("validation_p"),
+            "endpoint_provenance": _history_provenance_mirror(_prov)})
     return claims, rows
 
 
@@ -19149,12 +19679,19 @@ def _history_flush(rec, status, failures=None, error=None):
         if book_row_id is None:
             continue
         for cr in rows_for_book:
-            claim_rows.append({
+            _row = {
                 "run_book_id": book_row_id,
                 "axis": cr["axis"],
                 "claim_key": cr["claim_key"],
                 "verdict": cr["verdict"],
-                "confidence": cr["confidence"]})
+                "confidence": cr["confidence"]}
+            # Relationship rows carry their endpoint provenance
+            # mirror (spec §2.2) under its own key; the other axes
+            # never set it, so their rows are exactly as before.
+            if cr.get("endpoint_provenance") is not None:
+                _row["endpoint_provenance"] = \
+                    cr["endpoint_provenance"]
+            claim_rows.append(_row)
     if claim_rows:
         crows = sb("processor_run_claim_outcomes", method="POST",
                    data=claim_rows,

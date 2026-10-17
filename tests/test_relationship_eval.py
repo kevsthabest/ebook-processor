@@ -97,6 +97,45 @@ class TestResolveCaseContext(unittest.TestCase):
         self.assertTrue(ambiguous)
 
 
+class TestResolutionForCase(unittest.TestCase):
+    """Referent-resolution plumbing (spec §2.4/§2.5): the harness
+    reports what production's resolution layer does on a case's
+    fixture chapter — report-only, never a verdict on the case."""
+
+    def _case(self, name):
+        import json
+        cases = json.loads(
+            (Path(__file__).resolve().parent.parent / "eval"
+             / "relationship_cases.json").read_text(encoding="utf-8"))
+        for c in cases:
+            if c.get("resolution") and name in c["note"]:
+                return c
+        raise AssertionError(name)
+
+    def test_chris_peter_resolution_fires(self):
+        case = self._case("Referent test pair")
+        self.assertEqual((case["from"], case["to"]),
+                         ("Chris Sebeck", "Peter Sebeck"))
+        self.assertEqual(er._resolution_for_case(pp, case),
+                         "resolved-surname -> Peter Sebeck")
+
+    def test_chris_laura_resolution_stays_silent(self):
+        import json
+        cases = json.loads(
+            (Path(__file__).resolve().parent.parent / "eval"
+             / "relationship_cases.json").read_text(encoding="utf-8"))
+        case = next(c for c in cases
+                    if c.get("resolution")
+                    and c["to"] == "Laura Sebeck")
+        self.assertEqual(er._resolution_for_case(pp, case), "silent")
+
+    def test_case_without_fixture_reports_none(self):
+        case = {"from": "Fen Riorson", "to": "Xaden Riorson",
+                "type": "parent", "quote": "Fen Riorson was "
+                "Xaden's father, and the rebellion died with him."}
+        self.assertIsNone(er._resolution_for_case(pp, case))
+
+
 class TestBand(unittest.TestCase):
     """Banding mirrors production tiers: family three-tier,
     non-family two-tier. (The harness originally banded every

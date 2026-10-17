@@ -84,6 +84,43 @@ def _context_for_case(pp, chapters, quote):
     return "", False
 
 
+def _resolution_for_case(pp, case):
+    """The referent-resolution measurement for one case (spec
+    §2.4/§2.5): report-only plumbing, never a verdict.
+
+    A case carrying a "resolution" fixture — a self-contained
+    chapter text, a roster of names, the chapter's focal character
+    where extraction would have identified one, and the endpoint
+    to test — is run through production's provenance builder for
+    that endpoint. Returns "resolved-surname -> <name>" when the
+    resolution fires for the tested endpoint, "silent" when it
+    does not (ambiguity, or a resolution to someone else: neither
+    manufactures an antecedent for this claim), and None when the
+    case carries no fixture. Whether a fired resolution moves the
+    case's score is measured by the draws, not promised here."""
+    fixture = case.get("resolution")
+    if not fixture:
+        return None
+    roster = {}
+    for name in fixture.get("roster") or []:
+        pp._roster_update(
+            roster,
+            [{"name": name, "aliases": [], "role": "supporting",
+              "description": "", "evidence": ""}],
+            1)
+    endpoint = fixture.get("endpoint") or ""
+    rel = {"from": case["from"], "to": case["to"]}
+    key = "from" if endpoint == case["from"] else "to"
+    prov = pp._claim_endpoint_provenance(
+        rel, case["quote"], fixture.get("chapter_text", ""),
+        fixture.get("chapter_index", 0), roster,
+        fixture.get("focal"))
+    ep = prov.get(key) or {}
+    if ep.get("matched_form") == pp.MATCH_FORM_RESOLVED_SURNAME:
+        return f"resolved-surname -> {ep.get('endpoint')}"
+    return "silent"
+
+
 def _resolve_case_context(pp, chapter_sets, quote):
     """Pick a case's context across candidate chapter sets.
 
@@ -340,6 +377,9 @@ def main():
                 ctx_mark = " [ctx]"
             elif not case.get("_located", True):
                 ctx_mark = " [NO WINDOW: quote not in corpus text]"
+        _res = _resolution_for_case(pp, case)
+        if _res is not None:
+            ctx_mark += f" [resolution: {_res}]"
         draws_s = ",".join(f"{p:.2f}" for p in answers) or "—"
         print(f"[{i:2}] {status:8} expect={expect:4} got={outcome:10} "
               f"P={median if median is not None else '—'} "

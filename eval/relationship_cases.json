@@ -2,8 +2,20 @@
  {
   "expect": "any",
   "from": "Chris Sebeck",
-  "note": "Daemon, real quote. The A2 case: a surname-anchored possessive appositive. The pre-tune prompt scored this construction 0.20 in production (run 16) and the true claim dropped. ACCEPTED as a documented miss (2026-10-17): no explicit evidence exists — Daemon's only two binding sentences are surname-anchored (probed), Freedom has zero both-names kinship sentences (probed). Production outcome: middle band, downgrade to 'other'; the pair survives, human-confirmable.",
+  "note": "Daemon, real quote. The A2 case: a surname-anchored possessive appositive. The pre-tune prompt scored this construction 0.20 in production (run 16) and the true claim dropped. ACCEPTED as a documented miss (2026-10-17): no explicit evidence exists — Daemon's only two binding sentences are surname-anchored (probed), Freedom has zero both-names kinship sentences (probed). Production outcome: middle band, downgrade to 'other'; the pair survives, human-confirmable. Referent test pair (spec 2.4, report-only): on the fixture chapter, resolution MUST fire for Peter — he is the scene's antecedent and its focal character.",
   "quote": "Sebeck's son, Chris, stood next to him.",
+  "resolution": {
+   "chapter_index": 22,
+   "chapter_text": "Peter Sebeck arrived at the farmhouse before dawn and checked the locks twice. The road beyond the fence was empty. Sebeck's son, Chris, stood next to him.",
+   "endpoint": "Peter Sebeck",
+   "expect_resolution": "resolved",
+   "focal": "Peter Sebeck",
+   "roster": [
+    "Chris Sebeck",
+    "Laura Sebeck",
+    "Peter Sebeck"
+   ]
+  },
   "stub_score": 0.9,
   "to": "Peter Sebeck",
   "type": "child",
@@ -132,10 +144,88 @@
  {
   "expect": "any",
   "from": "Chris Sebeck",
-  "note": "REPORT-ONLY. The shared-surname ambiguity A1 accepts at grading time: the construction establishes a Sebeck parent, not which one. The judge's score here shows how it resolves the ambiguity.",
+  "note": "REPORT-ONLY. The shared-surname ambiguity A1 accepts at grading time: the construction establishes a Sebeck parent, not which one. The judge's score here shows how it resolves the ambiguity. Referent test pair (spec 2.4, report-only): on the same quote and fixture chapter, resolution must NOT manufacture a Laura antecedent — the chapter's antecedent is Peter, so Laura stays silent.",
   "quote": "Sebeck's son, Chris, stood next to him.",
+  "resolution": {
+   "chapter_index": 22,
+   "chapter_text": "Peter Sebeck arrived at the farmhouse before dawn and checked the locks twice. The road beyond the fence was empty. Sebeck's son, Chris, stood next to him.",
+   "endpoint": "Laura Sebeck",
+   "expect_resolution": "silent",
+   "focal": "Peter Sebeck",
+   "roster": [
+    "Chris Sebeck",
+    "Laura Sebeck",
+    "Peter Sebeck"
+   ]
+  },
   "stub_score": 0.5,
   "to": "Laura Sebeck",
+  "type": "child",
+  "work": "Daemon"
+ },
+ {
+  "expect": "any",
+  "from": "Chris Sebeck",
+  "note": "REPORT-ONLY adversarial (spec 2.5): a scene transition within the chapter. The second scene's antecedent is Laura; the surname in the evidence sentence must not be carried back across the transition to Peter, so resolution stays silent for the Peter endpoint.",
+  "quote": "Sebeck's son, Chris, stood next to him.",
+  "resolution": {
+   "chapter_index": 22,
+   "chapter_text": "Peter Sebeck worked the north field until the light failed. Laura Sebeck set the table in the quiet kitchen and waited for the others. Sebeck's son, Chris, stood next to him.",
+   "endpoint": "Peter Sebeck",
+   "expect_resolution": "silent",
+   "focal": "Laura Sebeck",
+   "roster": [
+    "Chris Sebeck",
+    "Laura Sebeck",
+    "Peter Sebeck"
+   ]
+  },
+  "stub_score": 0.5,
+  "to": "Peter Sebeck",
+  "type": "child",
+  "work": "Daemon"
+ },
+ {
+  "expect": "any",
+  "from": "Chris Sebeck",
+  "note": "REPORT-ONLY adversarial (spec 2.5): a point-of-view change. The nearest preceding full-form mention is Peter, but the chapter's focal character is Laura; the two sources disagree, and uniqueness-or-silence governs — resolution stays silent rather than picking a side.",
+  "quote": "Sebeck's son, Chris, stood next to him.",
+  "resolution": {
+   "chapter_index": 22,
+   "chapter_text": "Laura Sebeck narrated the drive south in a low, even voice. Peter Sebeck had taken the first watch and said almost nothing. Sebeck's son, Chris, stood next to him.",
+   "endpoint": "Peter Sebeck",
+   "expect_resolution": "silent",
+   "focal": "Laura Sebeck",
+   "roster": [
+    "Chris Sebeck",
+    "Laura Sebeck",
+    "Peter Sebeck"
+   ]
+  },
+  "stub_score": 0.5,
+  "to": "Peter Sebeck",
+  "type": "child",
+  "work": "Daemon"
+ },
+ {
+  "expect": "any",
+  "from": "Chris Sebeck",
+  "note": "REPORT-ONLY adversarial (spec 2.5): the nearest preceding full-form mention is the WRONG same-surname character. In a Laura-focal scene, 'Sebeck' in dialogue means Peter, but every antecedent the chapter offers points at Laura — resolution must not manufacture a Peter antecedent from it, so the Peter endpoint stays silent.",
+  "quote": "\"Ask Sebeck,\" Laura said. \"He will know what to do.\"",
+  "resolution": {
+   "chapter_index": 22,
+   "chapter_text": "Laura Sebeck poured the coffee and kept her eyes on the window. \"Ask Sebeck,\" Laura said. \"He will know what to do.\"",
+   "endpoint": "Peter Sebeck",
+   "expect_resolution": "silent",
+   "focal": "Laura Sebeck",
+   "roster": [
+    "Chris Sebeck",
+    "Laura Sebeck",
+    "Peter Sebeck"
+   ]
+  },
+  "stub_score": 0.5,
+  "to": "Peter Sebeck",
   "type": "child",
   "work": "Daemon"
  }
