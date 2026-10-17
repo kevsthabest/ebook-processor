@@ -4866,6 +4866,42 @@ class _CorpusWindowCache(dict):
 
 # -- retrieve adoption (§4.2, wave 1) ---------------------------------
 
+def corpus_servable_fingerprint(db, fpath):
+    """The fingerprint of the corpus work this file's bytes name,
+    when the corpus can serve that work to a run — or None.
+
+    This is the membership test corpus-sourced acquisition applies,
+    factored into one place so every caller asks the same question
+    and gets the same answer: the file's bytes must hash to a
+    stored source_hash, the work's composed state must be
+    servable (§3.3: text_complete / vectors_partial / complete
+    under the current parser generation), and chapter rows must
+    exist. The --corpus-only folder filter admits exactly the
+    files this returns a fingerprint for, so the filter can never
+    admit a book acquisition would refuse, nor skip one it would
+    source. Never raises: corpus trouble reads as absence, and
+    the caller falls back to the file — or, for the filter, to
+    skipping the book for this scan."""
+    try:
+        source_hash = _corpus_sha256(Path(fpath).read_bytes())
+        rows = db.query(
+            "SELECT fingerprint FROM corpus_works "
+            "WHERE source_hash=?", (source_hash,))
+        if not rows:
+            return None
+        fingerprint = rows[0][0]
+        if corpus_work_state(db, fingerprint) not in (
+                "text_complete", "vectors_partial", "complete"):
+            return None
+        if not db.query(
+                "SELECT 1 FROM corpus_chapters "
+                "WHERE fingerprint=? LIMIT 1", (fingerprint,)):
+            return None
+        return fingerprint
+    except Exception:
+        return None
+
+
 def corpus_acquire_for_run(learn_dir, fpath):
     """Corpus-sourced acquisition (§11 slice 5): when the corpus
     holds this exact file's text — the presented file's bytes hash
@@ -4883,15 +4919,8 @@ def corpus_acquire_for_run(learn_dir, fpath):
         db = _corpus_db_for(learn_dir, mode="processor")
         if db is None:
             return None
-        source_hash = _corpus_sha256(Path(fpath).read_bytes())
-        rows = db.query(
-            "SELECT fingerprint FROM corpus_works "
-            "WHERE source_hash=?", (source_hash,))
-        if not rows:
-            return None
-        fingerprint = rows[0][0]
-        if corpus_work_state(db, fingerprint) not in (
-                "text_complete", "vectors_partial", "complete"):
+        fingerprint = corpus_servable_fingerprint(db, fpath)
+        if fingerprint is None:
             return None
         chapters = corpus_chapters_for(db, fingerprint)
         if not chapters:
@@ -20942,6 +20971,38 @@ def _is_single_file_run(f):
     return getattr(_DIAG, "single_file", None) is not None and Path(f) == Path(_DIAG.single_file)
 
 
+def _corpus_only_filter(files):
+    """--corpus-only folder filter: keep only the books the corpus
+    can serve, and print the fate of the rest.
+
+    Admission is corpus_servable_fingerprint — the same membership
+    test corpus-sourced acquisition applies — so the filter and
+    acquisition cannot disagree about which folder books are "in
+    the corpus". A skipped file is left exactly where it sits: the
+    filter runs before any processing, and processing (in
+    _run_once_inner / _process_one) is the only code that ever
+    moves a folder file into done/ or failed/. Each skip is
+    printed: a book that silently vanished from the scan would
+    look identical to a book that was never dropped in the
+    folder, and the counts line keeps the admitted/skipped split
+    visible even when nothing was skipped."""
+    db = _corpus_db_for(_learn().dir, mode="processor")
+    kept, skipped = [], []
+    for p in files:
+        fp = (corpus_servable_fingerprint(db, p)
+              if db is not None else None)
+        (kept if fp is not None else skipped).append(p)
+    for p in skipped:
+        print(f"  Skipped (not in the corpus): {p.name}")
+    if kept:
+        print(f"Corpus-only scan: {len(kept)} of {len(files)} "
+              f"books are in the corpus ({len(skipped)} skipped)")
+    else:
+        print(f"Corpus-only scan: none of the {len(files)} books "
+              "in the import folder are in the corpus")
+    return kept
+
+
 def run_once(dry_run, preview, max_books=None, file=None):
     if file:
         p = Path(file)
@@ -20957,6 +21018,15 @@ def run_once(dry_run, preview, max_books=None, file=None):
         _DIAG.single_file = None
         files = sorted(p for p in IMPORT_DIR.iterdir()
                        if p.is_file() and p.suffix.lower() in (".epub", ".mobi", ".azw3"))
+        if CONFIG.get("corpus_only"):
+            # The filter runs before --max-books limiting: the
+            # limit counts admitted books, not folder entries.
+            # An all-skipped scan ends here — the filter already
+            # printed the clear line, and an empty scan exits 0
+            # exactly like today's empty-folder case.
+            files = _corpus_only_filter(files)
+            if not files:
+                return 0
     if max_books and len(files) > max_books:
         print(f"Limiting to {max_books} of {len(files)} books (--max-books)")
         files = files[:max_books]
@@ -21175,6 +21245,12 @@ def _build_parser():
                          "corpus before each rescan")
     g_in.add_argument("--max-books", type=int, default=None,
                         help="process at most N books from the import folder (e.g. --max-books 3)")
+    g_in.add_argument("--corpus-only", action="store_true",
+                        help="folder scans only: process only books already "
+                             "in the corpus; other folder books are skipped "
+                             "and left in place. Admitted books are "
+                             "corpus-sourced, as with --use-corpus. An "
+                             "explicit --file is never filtered")
     g_in.add_argument("--isbn", metavar="ISBN", default="",
                     help="override ISBN for work resolution (e.g. when the EPUB "
                          "has no ISBN in its metadata); takes priority over EPUB "
@@ -21826,6 +21902,14 @@ def main():
         CONFIG["evidence_retrieval"] = True
 
     if getattr(args, "use_corpus", False):
+        CONFIG["use_corpus"] = True
+
+    if getattr(args, "corpus_only", False):
+        # --corpus-only admits only corpus books to a folder scan,
+        # and admitted books are corpus-sourced — so it switches
+        # on the same acquisition path --use-corpus does, plus its
+        # own switch for run_once's folder filter.
+        CONFIG["corpus_only"] = True
         CONFIG["use_corpus"] = True
 
     if getattr(args, "corpus_quotes", False):
