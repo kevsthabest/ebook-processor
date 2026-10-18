@@ -255,8 +255,13 @@ class TestContributorRowsSurvive(_ReplaceBase):
             triggers=[_trig("murder")],
             characters=[{"name": "Hero", "role": "protagonist",
                          "appearance": "tall", "status": "alive"}],
+            # 2026-10-18 (issue #41): the fresh quote's text is 3 words
+            # because quotes under 3 words are unverifiable and no
+            # longer ship; the property under test (a genuinely new
+            # quote is added beside the surviving contributor one) is
+            # unchanged.
             quotes=[{"text": "a human-added quote", "chapter": "Ch 1"},
-                    {"text": "fresh quote", "chapter": "Ch 2"}],
+                    {"text": "a fresh quote", "chapter": "Ch 2"}],
         )
         errors = pp.write_claims(
             1, res, trope_mappings={"Human Trope": "cat-h", "Mind Game": "cat-a"})
@@ -283,7 +288,7 @@ class TestContributorRowsSurvive(_ReplaceBase):
         # Contributor quote survives; only the fresh quote was added.
         self.assertEqual(
             sorted(r["quote"] for r in fake.tables["book_quotes"]),
-            ["a human-added quote", "fresh quote"])
+            ["a fresh quote", "a human-added quote"])
 
 
 class TestRejectionPreservation(_ReplaceBase):
@@ -402,7 +407,10 @@ class TestPreviewPlanReadOnly(_ReplaceBase):
             triggers=[_trig("murder"), _trig("violence")],
             characters=[{"name": "Hero", "role": "protagonist"},
                         {"name": "Rejected Char", "role": "minor"}],
-            quotes=[{"text": "new quote", "chapter": "Ch 1"}],
+            # 2026-10-18 (issue #41): quote text is 3 words because
+            # quotes under 3 words no longer ship (unverifiable); the
+            # plan counts asserted below are unchanged.
+            quotes=[{"text": "a new quote", "chapter": "Ch 1"}],
         )
 
     _MAP = {"Mind Game": "cat-a", "Dark Secret": "cat-r",
@@ -456,7 +464,10 @@ class TestFreshWorkInsertOnly(_ReplaceBase):
             trope_chapters={pp._tnorm("Mind Game"): ["Ch 1"]},
             triggers=[_trig("murder")],
             characters=[{"name": "Hero", "role": "protagonist"}],
-            quotes=[{"text": "a quote", "chapter": "Ch 1"}],
+            # 2026-10-18 (issue #41): quote text is 3 words because
+            # quotes under 3 words no longer ship (unverifiable); the
+            # fresh-work insert behaviour asserted below is unchanged.
+            quotes=[{"text": "a longer quote", "chapter": "Ch 1"}],
         )
         errors = pp.write_claims(1, res, trope_mappings={"Mind Game": "cat-a"})
         self.assertEqual(errors, 0)

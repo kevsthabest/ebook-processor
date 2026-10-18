@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.44"
+PORTABLE_VERSION = "2.13.45"
 
 
 import argparse
@@ -18600,7 +18600,16 @@ def verify_all_evidence(characters, relationships, quotes, source_text):
     for q in quotes:
         qtext = q.get("text", "") if isinstance(q, dict) else ""
         ev, ok, failed, offered = check(qtext)
-        if failed:
+        if not ok:
+            # A quote ships only when its text verified. check()
+            # separates "checked and failed" from "too short to check"
+            # because character and relationship claims survive both —
+            # their claim is the assertion, the evidence is support.
+            # A quote's text IS its claim, and this family's rule is
+            # fail-closed (see the docstring above): a quote that
+            # cannot be verified, short ones included, is dropped
+            # rather than shipped. check()'s own semantics stay as
+            # they are for the evidence families above.
             stats["quotes_dropped"] += 1
             continue
         if isinstance(q, dict):
@@ -22801,11 +22810,39 @@ def _build_character_rows(work_id, result, rel_map, skip_names):
     return rows
 
 
+def _shippable_quotes(quotes):
+    """The result quotes that may ship to book_quotes / book_meta.
+
+    The write boundary's own fail-closed filter, because a result can
+    reach it without passing through verify_all_evidence in this
+    process (an aggregated or restored result), and a fabricated
+    notable quote is worse than none:
+    * a quote shorter than 3 normalized words cannot be verified —
+      the evidence check excludes strings that short by design — so
+      it is unverifiable by construction, whichever path made it;
+    * a quote stamped evidence_verified=False was checked and did
+      not verify; the stamp is honoured here instead of assumed away.
+    A 3+-word quote carrying no stamp still ships: that is the shape
+    results carried before the stamp existed, and this boundary has
+    no source text to check it against."""
+    out = []
+    for q in quotes or []:
+        qtext = q.get("text", "") if isinstance(q, dict) else str(q)
+        if not qtext:
+            continue
+        if isinstance(q, dict) and q.get("evidence_verified") is False:
+            continue
+        if len(_norm_quote(qtext).split()) < 3:
+            continue
+        out.append(q)
+    return out
+
+
 def _build_quote_rows(work_id, result, skip_prefixes):
     """Build book_quotes rows (cap 5), skipping quote prefixes that survive
     in the DB (contributor rows)."""
     qrows, seen_q = [], set(skip_prefixes)
-    for q in result.get("quotes", [])[:5]:  # cap at 5
+    for q in _shippable_quotes(result.get("quotes", []))[:5]:  # cap at 5
         qtext = q.get("text", "") if isinstance(q, dict) else str(q)
         if not qtext or qtext[:100] in seen_q:
             continue
@@ -23165,7 +23202,8 @@ def write_claims(work_id, result, trope_mappings=None):
     if result.get("series_source"):
         meta_updates["series_source"] = result["series_source"]
     quotes = [{"text": q["text"], "chapter": q.get("chapter", "")}
-              for q in result.get("quotes", []) if q.get("text")]
+              for q in _shippable_quotes(result.get("quotes", []))
+              if q.get("text")]
     if quotes:
         meta_updates["notable_quotes"] = quotes[:20]  # cap at 20
     if meta_updates:

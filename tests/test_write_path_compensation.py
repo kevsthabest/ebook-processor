@@ -351,7 +351,11 @@ class TestBookMetaNonDictBlobContained(_CompBase):
                 {"id": 1, "work_id": 1, "quote": "old pipeline quote",
                  "source_type": "pipeline"}],
         }))
-        res = _result(quotes=[{"text": "fresh quote", "chapter": "Ch 1"}])
+        # 2026-10-18 (issue #41): quote text is 3 words because quotes
+        # under 3 words no longer ship (unverifiable); the property
+        # under test (the quotes section still runs after a contained
+        # book_meta failure) is unchanged.
+        res = _result(quotes=[{"text": "a fresh quote", "chapter": "Ch 1"}])
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             errors = pp.write_claims(1, res)
@@ -366,7 +370,7 @@ class TestBookMetaNonDictBlobContained(_CompBase):
         # the book is not left mixed-generation by an escape.
         self.assertEqual(
             [r["quote"] for r in fake.tables["book_quotes"]],
-            ["fresh quote"])
+            ["a fresh quote"])
 
 
 if __name__ == "__main__":
