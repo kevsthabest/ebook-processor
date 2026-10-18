@@ -600,3 +600,35 @@ named, and rides with the run-history migration change
   validator_breaker_* keys inside the characters jsonb — not
   thresholds_json, as one interim record sentence said. The
   gate confirmed the fix end-to-end; R1 stays closed.
+
+## Addendum — the pool scales with the book (2026-10-18, v2.13.33)
+
+Decision (2026-10-18): the per-book decision pool is no longer
+a flat 50 calls. Fourth Wing run 24 (115 chapters, 70
+characters) had roughly 130 draws of real demand, got 49, and
+shipped 56 of 68 relationship claims unjudged (audit F-24-2 /
+F-24-3) — a flat pool does not scale with cast or chapters.
+
+The pool is now computed per book when its budget is armed:
+pool = min(250, max(50, chapter_count)) — a floor of 50, one
+call per chapter, a ceiling of 250. The chapter count is the
+book's parsed chapter list as the pipeline knows it at arming
+time, in `process_file_v2`, before any consumer draws.
+
+The §1.3 hard reserves (merge 10, rel_family 10,
+rel_nonfamily 5, trigger 15, quote_poll 1) are unchanged and
+stay ABSOLUTE: they are floors carved from whatever pool the
+book gets, not proportions of it. The scaled increment lands
+in the shared remainder and flows through the existing §1.3
+borrowing rules unchanged.
+
+No operator config key sets the pool: none existed before this
+ruling, and none was created — the formula is the default and
+the only source. The book's computed pool is stamped where
+the budget scheme is already recorded (the budget scheme
+dict, the run-history thresholds stamp, and the reduce
+artefact's `decision_pool`), so the calibration checkpoint
+can attribute judged coverage to pool size. That checkpoint
+also revisits the reserve proportions against the scaled
+pools it now observes; until it does, the reserves above
+stand as ruled.

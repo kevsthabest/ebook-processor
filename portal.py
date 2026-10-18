@@ -2834,8 +2834,9 @@ def _render_home(home):
                    "portal.</p>")
         out.append(
             f"<p class='muted'>Decision-call budget: "
-            f"{strip['decision_cap']} per book — live spend "
-            f"shows here while a portal-launched run is active."
+            f"{strip['decision_cap']}–250 per book, scaled by "
+            f"chapter count — live spend shows here while a "
+            f"portal-launched run is active."
             f"</p>")
     out.append(f"<p class='note'>{_esc(strip['note'])}</p>")
     out.append("</section>")

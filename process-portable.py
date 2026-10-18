@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.32"
+PORTABLE_VERSION = "2.13.33"
 
 
 import argparse
@@ -17316,6 +17316,13 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # and a registry that changed between runs shows the
         # difference on the face of the two artefacts.
         "relationship_type_vocabulary": _rel_vocabulary_ids(),
+        # The decision pool this book was armed with (v2.13.33):
+        # stamped beside the scheme stamps above so the artefact
+        # records the pool size its judged coverage was produced
+        # under — the calibration checkpoint attributes coverage
+        # to pool size from this number, not from a rerun of the
+        # formula against a chapter count it would have to trust.
+        "decision_pool": _dm_budget_pool(),
         "validator_circuit_breaker": _validator_breaker,
         "self_pairs_dropped": {"extracted": _self_pairs_extracted,
                                "remapped": _self_pairs_remapped},
@@ -19437,8 +19444,18 @@ _COMMON_NICKNAMES = {
 # Decision-model merge threshold (Tier 3). Deliberately high: a false merge
 # corrupts the roster permanently, a missed merge just leaves a duplicate.
 _MERGE_P_YES_THRESHOLD = 0.85
-# Safety cap on Tier 3 decision-model calls per book.
+# Floor of the per-book decision-model pool (v2.13.33): the pool
+# scales with the book — one call per chapter, never below this
+# floor and never above _DECISION_POOL_CEILING — because a flat
+# pool starved long books (Fourth Wing run 24: 115 chapters,
+# ~130 draws of demand, 49 served). The constant keeps its old
+# name because the portal reads it as the pool's floor and older
+# stamps record it; the armed per-book pool itself lives in
+# _DM_BUDGET_POOL, computed by _decision_pool_for_chapters at
+# budget-arming time. There is deliberately no config override:
+# none existed before, and the formula is the ruled default.
 _MERGE_TIER3_CAP = 50
+_DECISION_POOL_CEILING = 250
 # Decision-model relationship validation threshold. Lower than the
 # merge threshold: a wrong relationship type is embarrassing but
 # doesn't corrupt the roster permanently.
@@ -19668,6 +19685,11 @@ class _run_events_book:
         self._sink = sink
         self._prev = sink.set_book(self._book)
         sink.note_book()
+        # This wrapper knows only the file path — the book has not
+        # been parsed yet, so its scaled pool is not armed and
+        # cannot be stamped here. The stamp carries the pool floor;
+        # the per-claim decision events that follow carry the armed
+        # pool as their cap, and the book's stamps record it exactly.
         _run_event({"event": "book_start", "book": self._book,
                     "decision_cap": _MERGE_TIER3_CAP})
         return self
@@ -19902,6 +19924,14 @@ def _history_thresholds():
         "rel_validation": _REL_VALIDATION_THRESHOLD,
         "rel_drop": _REL_DROP_THRESHOLD,
         "merge_tier3_cap": _MERGE_TIER3_CAP,
+        # The pool armed for the book in progress when this stamp
+        # is taken (v2.13.33): the per-book pool beside the floor
+        # constant above, so a run's records carry the scaled size
+        # and not only the floor it was scaled from. The artefact's
+        # own stamp (the reduce result's decision_pool) is the
+        # per-book record of record; this key rides the same dict
+        # for any reader that only sees the thresholds stamp.
+        "decision_pool": _DM_BUDGET_POOL,
         # The budget-governance scheme in effect (spec §1.2/§1.3/
         # §1.6): which validation order produced this run's
         # results, the reserve slices that bounded its budget, and
@@ -21044,6 +21074,40 @@ def _history_scan_mode():
 _DM_BUDGET_LOCK = threading.Lock()
 _DM_BUDGET_USED = 0
 _DM_BUDGET_BY_CONSUMER = {}
+# The pool armed for the book currently being processed, and the
+# chapter count it was computed from (None until a book arms it).
+# Before any arming — a direct reduce / merge call in a test or an
+# eval harness, which never passes through process_file_v2 — the
+# floor governs, so a draw made before a count exists can never
+# spend a scaled pool the book was never granted.
+_DM_BUDGET_POOL = _MERGE_TIER3_CAP
+_DM_BUDGET_CHAPTER_COUNT = None
+
+
+def _decision_pool_for_chapters(chapter_count):
+    """The per-book decision pool for a chapter count (Decision,
+    2026-10-18): one call per chapter, floored at _MERGE_TIER3_CAP
+    and capped at _DECISION_POOL_CEILING. An unknown count (None,
+    or a value that is not a positive integer) gets the floor —
+    scaling is earned by a count the pipeline actually knows, and
+    a bad count must never shrink a book below the old flat pool
+    or inflate it past the ceiling."""
+    try:
+        n = int(chapter_count)
+    except (TypeError, ValueError):
+        return _MERGE_TIER3_CAP
+    if n <= 0:
+        return _MERGE_TIER3_CAP
+    return min(_DECISION_POOL_CEILING, max(_MERGE_TIER3_CAP, n))
+
+
+def _dm_budget_pool():
+    """The pool armed for the current book (the floor before any
+    book has armed one). Read by the stamps that record the pool
+    beside the scheme, so a calibration pass can attribute judged
+    coverage to the pool size that produced it."""
+    with _DM_BUDGET_LOCK:
+        return _DM_BUDGET_POOL
 
 # Hard reserves (spec §1.3 final form, Decision K2): every budget
 # consumer is guaranteed a minimum slice of the shared per-book
@@ -21052,7 +21116,10 @@ _DM_BUDGET_BY_CONSUMER = {}
 # consumer's reserve survives while it is still waiting to run.
 # The old provisional trigger floor is not a second mechanism: it
 # is trigger_gate's reserve slice in this scheme. The single
-# per-book ceiling (_MERGE_TIER3_CAP) still binds the pool.
+# per-book pool (armed per book, scaled by chapter count since
+# v2.13.33) still binds the pool. The reserves below are ABSOLUTE
+# floors at every pool size — they do not scale with the pool;
+# the scaled increment lands in the shared remainder above them.
 #
 # Sizing (first measured data comes from run-17 + this module's
 # per-consumer accounting):
@@ -21099,13 +21166,24 @@ _DM_BUDGET_FINISHED = set()
 _TRIGGER_GATE_FLOOR = _DM_BUDGET_RESERVES["trigger_gate"]
 
 
-def _dm_budget_reset():
-    """Reset the per-book decision-model call budget. Call at book start."""
-    global _DM_BUDGET_USED
+def _dm_budget_reset(chapter_count=None):
+    """Reset the per-book decision-model call budget and arm the
+    book's pool. Call at book start, with the book's chapter count
+    as the pipeline knows it at that moment: the pool scales from
+    it (_decision_pool_for_chapters). With no count, the floor is
+    armed — the safe default for any caller that draws before a
+    count exists."""
+    global _DM_BUDGET_USED, _DM_BUDGET_POOL, _DM_BUDGET_CHAPTER_COUNT
     with _DM_BUDGET_LOCK:
         _DM_BUDGET_USED = 0
         _DM_BUDGET_BY_CONSUMER.clear()
         _DM_BUDGET_FINISHED.clear()
+        _DM_BUDGET_POOL = _decision_pool_for_chapters(chapter_count)
+        try:
+            _DM_BUDGET_CHAPTER_COUNT = int(chapter_count) \
+                if chapter_count is not None else None
+        except (TypeError, ValueError):
+            _DM_BUDGET_CHAPTER_COUNT = None
 
 
 def _dm_budget_finish(consumer):
@@ -21135,7 +21213,9 @@ def _dm_budget_scheme():
     Recorded on the run record so the §1 calibration checkpoint
     can attribute results to the scheme that produced them."""
     with _DM_BUDGET_LOCK:
-        return {"cap": _MERGE_TIER3_CAP,
+        return {"cap": _DM_BUDGET_POOL,
+                "pool": _DM_BUDGET_POOL,
+                "chapter_count": _DM_BUDGET_CHAPTER_COUNT,
                 "reserves": dict(_DM_BUDGET_RESERVES),
                 "pipeline_order": list(_DM_BUDGET_ORDER),
                 "finished": sorted(_DM_BUDGET_FINISHED)}
@@ -21170,7 +21250,7 @@ def _dm_budget_claim(n=1, consumer=None):
                 continue
             if _c not in _DM_BUDGET_FINISHED or not _unlocked:
                 _protected += _DM_BUDGET_RESERVES.get(_c, 0)
-        limit = _MERGE_TIER3_CAP - _protected
+        limit = _DM_BUDGET_POOL - _protected
         if _DM_BUDGET_USED + n > limit:
             granted, used = False, _DM_BUDGET_USED
         else:
@@ -21193,7 +21273,7 @@ def _dm_budget_claim(n=1, consumer=None):
         # claims budget), so the lock order budget -> sink is the
         # only order ever taken. A no-op when no flagged run is live.
         _run_event({"event": "decision", "n": n, "used": used,
-                    "cap": _MERGE_TIER3_CAP, "granted": granted,
+                    "cap": _DM_BUDGET_POOL, "granted": granted,
                     "consumer": tag})
     return granted
 
@@ -23929,8 +24009,15 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             fpath, preview=preview, dry_run=dry_run):
         return False
     # Reset the per-book decision-model call budget (merges + relationship
-    # validation share it; merges run first).
-    _dm_budget_reset()
+    # validation share it; merges run first) and arm the book's
+    # scaled pool. The chapter count is already known here on
+    # every acquisition path (corpus, EPUB, prose): chapters were
+    # parsed above, before this point, and every shared-pool
+    # consumer — merge Tier 3 in post_pass_merge, relationship
+    # validation and the trigger gate in v2_reduce, the quote
+    # poll after it — draws later in this function, so no
+    # consumer can draw before the count exists on this path.
+    _dm_budget_reset(chapter_count=len(chapters))
     # Series detection: --series flag > EPUB calibre metadata > filename
     # pattern > Open Library. Used for cross-book character continuity.
     _series_name, _series_pos, _series_source = _detect_series(
@@ -24682,6 +24769,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "dropped_relationships": red.get("dropped_relationships", []),
         "pair_losers": red.get("pair_losers", []),
         "validation_order": red.get("validation_order"),
+        "decision_pool": red.get("decision_pool"),
         "rel_registry": red.get("rel_registry"),
         "relationship_type_vocabulary": red.get(
             "relationship_type_vocabulary"),

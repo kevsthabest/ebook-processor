@@ -1,8 +1,12 @@
 """Tests for Tier-3 decision-model budget exhaustion.
 
-The 50-call per-book budget is shared between merge decisions and
+The per-book budget is shared between merge decisions and
 relationship validation. Merges claim first; validation gets leftovers.
-These tests pin the priority ordering and the exhaustion behavior.
+These tests pin the priority ordering and the exhaustion behavior
+at the pool's FLOOR case: every test here resets the budget with
+no chapter count, so the armed pool is the 50-call floor
+(v2.13.33 — the pool scales with chapter count when a count is
+armed; that scaling is pinned in test_budget_pool_scaling.py).
 
 Stdlib unittest only. No network, no real models — budget functions
 are pure counter logic.
@@ -35,8 +39,13 @@ class TestBudgetBasics(unittest.TestCase):
         pp._dm_budget_reset()
         _finish_all_consumers()
 
-    def test_cap_is_50(self):
+    def test_floor_is_50_when_no_chapter_count_is_armed(self):
+        # Amended 2026-10-18 (2.13.33): this used to pin a flat
+        # 50-call cap as the behaviour. 50 is now the FLOOR: with
+        # no chapter count armed, the pool is exactly the floor
+        # constant, and the constant itself is that floor.
         self.assertEqual(pp._MERGE_TIER3_CAP, 50)
+        self.assertEqual(pp._dm_budget_pool(), 50)
 
     def test_claim_within_budget(self):
         for _ in range(50):
