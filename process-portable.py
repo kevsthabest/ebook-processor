@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.42"
+PORTABLE_VERSION = "2.13.43"
 
 
 import argparse
@@ -19475,12 +19475,26 @@ def _sb_fetch_all(table, params, order="id.asc"):
 
 
 def norm(s):
-    """Lowercase, strip accents and punctuation, collapse whitespace to single
-    spaces. Matches the app's tropeNormIdent: "Fourth Wing" -> "fourth wing"."""
-    s = unicodedata.normalize("NFKD", s or "")
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = re.sub(r"[\W_]+", " ", s.lower())
-    return re.sub(r"\s+", " ", s).strip()
+    """The canonical work-identity norm, byte-for-byte the algorithm the
+    app (js/157 tropeNormIdent) and the work-identity backfill script
+    (normIdent) share: lowercase, fold accents (NFKD, then strip the
+    U+0300..U+036F combining-mark range), map every [^a-z0-9]+ run to one
+    space, trim, and strip one leading article "the".
+
+    Why each step matters: this value is the works.title_norm /
+    author_norm match key, so any divergence from the surfaces that
+    create work rows mints a duplicate row for the same book (issue
+    #30). Lowercasing comes first because a few letters (e.g. 'İ')
+    lowercase into a base letter plus a combining mark that the mark
+    strip must then remove. Only the U+0300..U+036F range is stripped
+    — the range the canonical implementations strip — and letters with
+    no decomposition (ø, æ, ß) fall through to the [^a-z0-9] mapping
+    and become spaces, exactly as they do in the app."""
+    s = (s or "").lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = re.sub(r"[\u0300-\u036f]", "", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s).strip()
+    return re.sub(r"^the\s+", "", s)
 
 
 def norm_name(n):
@@ -22047,11 +22061,49 @@ def correct_metadata(title, author, identifiers):
     return _display_title(t), _canonical_author(a), fixed
 
 
+def _isbn_forms(isbn):
+    """Every stored form an ISBN lookup must probe, original form first.
+
+    Works and editions rows carry the ISBN as whichever surface inserted
+    them — the app registers some works ISBN-10-only, while the processor
+    normalizes its own books to ISBN-13 — so probing only the form in
+    hand misses the other surface's row, and resolution falls through to
+    the title path, where a key divergence mints a duplicate (issues
+    #30/#31, which ship together for exactly that reason).
+
+    The alternate form is derived, never guessed: 10 -> 13 prefixes 978
+    and recomputes the mod-10 check digit (that is _clean_isbn, which
+    also validated the source ISBN); 13 -> 10 is defined only for the
+    978 prefix — strip it and recompute the mod-11 check digit, which
+    may be 'X'. A 979-prefixed 13 has no ISBN-10 form and probes alone.
+    An ISBN that fails check-digit validation yields just itself,
+    verbatim: probing such a value as-is is the historical behaviour,
+    and inventing a conversion for an invalid ISBN would be fabrication.
+    """
+    valid = _validate_isbn(isbn)
+    if not valid:
+        return [isbn] if isbn else []
+    if len(valid) == 10:
+        return [valid, _clean_isbn(valid)]
+    forms = [valid]
+    if valid.startswith("978"):
+        core = valid[3:12]
+        total = sum(int(c) * (10 - i) for i, c in enumerate(core))
+        check = (11 - total % 11) % 11
+        forms.append(core + ("X" if check == 10 else str(check)))
+    return forms
+
+
 def resolve_work(title, author, identifiers, is_anthology=False, create=True):
     """Return (work_id, how). Resolution order: ISBN -> edition -> work,
     then provider_ids ISBN -> work (catches re-runs whose title form changed),
     then exact canonical title/author match. With create=False (preview) never
     POSTs: how is 'new' when nothing matched.
+
+    ISBN lookups probe both ISBN forms (see _isbn_forms): the stored row
+    may carry the other form than the one this book carries. Editions
+    keep precedence over the provider_ids fallback across all forms, and
+    'how' names the form that actually matched.
 
     Author-name-only titles are refused outright ('author_title'): never
     matched, never created. Edition suffixes and invisible characters are
@@ -22060,17 +22112,20 @@ def resolve_work(title, author, identifiers, is_anthology=False, create=True):
     """
     isbn = (identifiers or {}).get("isbn")
     if isbn:
-        rows = sb("editions", params=f"?isbn=eq.{quote(isbn, safe='')}&select=work_id&limit=1")
-        if rows is None:
-            return None, "db_error"
-        if rows and rows[0].get("work_id"):
-            return rows[0]["work_id"], f"isbn:{isbn}"
-        rows = sb("works",
-                  params=f"?provider_ids->>isbn=eq.{quote(isbn, safe='')}&select=id&limit=1")
-        if rows is None:
-            return None, "db_error"
-        if rows:
-            return rows[0]["id"], f"work_isbn:{isbn}"
+        forms = _isbn_forms(isbn)
+        for form in forms:
+            rows = sb("editions", params=f"?isbn=eq.{quote(form, safe='')}&select=work_id&limit=1")
+            if rows is None:
+                return None, "db_error"
+            if rows and rows[0].get("work_id"):
+                return rows[0]["work_id"], f"isbn:{form}"
+        for form in forms:
+            rows = sb("works",
+                      params=f"?provider_ids->>isbn=eq.{quote(form, safe='')}&select=id&limit=1")
+            if rows is None:
+                return None, "db_error"
+            if rows:
+                return rows[0]["id"], f"work_isbn:{form}"
     tn, an = _work_key(title, author)
     if not tn:
         print("  Cannot build a match key from the title; refusing to create a work")

@@ -4,8 +4,11 @@ Stdlib unittest only. No network, no Supabase (sb is mocked), no real ebooks.
 Run: python -m unittest discover -s tests -v
 """
 import json
+import re
+import unicodedata
 import unittest
 from pathlib import Path
+from urllib.parse import unquote
 import importlib.util
 
 _MOD_PATH = str(Path(__file__).resolve().parent.parent / "process-portable.py")
@@ -171,6 +174,184 @@ class TestResolveWork(unittest.TestCase):
                              (None, "db_error"))
         finally:
             pp.sb = self.mock
+
+
+def _canonical_norm(s):
+    """Verbatim port of the canonical work norm shared by the app
+    (js/157 tropeNormIdent in the Cozy Libram repo) and the backfill
+    script (scripts/backfill-work-identities.js normIdent) — the two
+    reference implementations agree exactly: lowercase, NFKD, strip
+    U+0300..U+036F combining marks, map every [^a-z0-9]+ run to one
+    space, trim, strip one leading "the"."""
+    s = (s or "").lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = re.sub(r"[\u0300-\u036f]", "", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s).strip()
+    s = re.sub(r"^the\s+", "", s)
+    return s
+
+
+class TestCanonicalNorm(unittest.TestCase):
+    """Issue #30: the processor's norm must produce byte-for-byte the
+    canonical work key for the same input, or the same book mints a
+    second works row depending on which surface saw it first."""
+
+    VECTORS = [
+        # Leading article: only "the" strips, in any casing, once.
+        ("The Hunger Games", "hunger games"),
+        ("THE HUNGER GAMES", "hunger games"),
+        ("ThE HuNgEr GaMeS", "hunger games"),
+        ("The", "the"),              # no trailing space -> nothing strips
+        ("The The", "the"),          # exactly one leading article strips
+        ("A Tale of Two Cities", "a tale of two cities"),
+        ("Naïve—The Beginning", "naive the beginning"),  # inner "the" kept
+        # Accents that decompose fold to their base letter.
+        ("Café Society", "cafe society"),
+        ("The Café Society", "cafe society"),
+        ("José Ángel", "jose angel"),
+        ("L'Étranger", "l etranger"),
+        ("İstanbul", "istanbul"),    # lowercases to i + U+0307, mark stripped
+        # Letters with no decomposition become a space, like any other
+        # non-[a-z0-9] run — they are never kept as letters.
+        ("Søren Kierkegaard", "s ren kierkegaard"),
+        ("Æsop's Fables", "sop s fables"),
+        ("Œuvres complètes", "uvres completes"),
+        ("Faß", "fa"),
+        # Punctuation runs collapse to one space; apostrophes split.
+        ("Dune: Part—Two!!", "dune part two"),
+        ("snake_case_title", "snake case title"),
+        # Digits survive; mixed case folds.
+        ("Apollo 13", "apollo 13"),
+        ("", ""),
+        # The same norm keys authors: a leading "the" strips there too.
+        ("The Authors", "authors"),
+    ]
+
+    def test_norm_matches_canonical_vectors(self):
+        for raw, expected in self.VECTORS:
+            with self.subTest(raw=raw):
+                self.assertEqual(pp.norm(raw), expected)
+                self.assertEqual(pp.norm(raw), _canonical_norm(raw))
+
+    def test_norm_none_is_empty(self):
+        self.assertEqual(pp.norm(None), "")
+
+    def test_same_book_same_work_key_across_surfaces(self):
+        # Title/author forms the app or backfill would key differently
+        # from a raw ebook's metadata must still land on one work key.
+        self.assertEqual(
+            pp._work_key("The Café Society", "Søren Kierkegaard"),
+            pp._work_key("Cafe Society", "S Ren Kierkegaard"))
+        self.assertEqual(
+            pp._work_key("The Hunger Games", "Suzanne Collins"),
+            ("hunger games", "suzanne collins"))
+
+
+class _IsbnStore:
+    """Fake sb() keyed by exact ISBN string, like the real tables: an
+    editions row or a works.provider_ids entry matches only the exact
+    ISBN form it was stored under. Title/author lookups never match."""
+
+    def __init__(self, editions=None, provider_isbns=None):
+        self.editions = dict(editions or {})
+        self.provider_isbns = dict(provider_isbns or {})
+        self.calls = []
+
+    def __call__(self, table, method="GET", data=None, params="", prefer=None):
+        self.calls.append({"table": table, "method": method,
+                           "data": data, "params": params})
+        if method == "POST":
+            return [{"id": "w-created"}]
+        m = re.search(r"isbn=eq\.([^&]+)", params or "")
+        isbn = unquote(m.group(1)) if m else None
+        if table == "editions" and isbn in self.editions:
+            return [{"work_id": self.editions[isbn]}]
+        if table == "works" and "provider_ids" in (params or "") \
+                and isbn in self.provider_isbns:
+            return [{"id": self.provider_isbns[isbn]}]
+        return []
+
+    def probed_isbns(self):
+        out = []
+        for c in self.calls:
+            if c["method"] != "GET":
+                continue
+            m = re.search(r"isbn=eq\.([^&]+)", c["params"] or "")
+            if m:
+                out.append(unquote(m.group(1)))
+        return out
+
+    def posts(self):
+        return [c for c in self.calls if c["method"] == "POST"]
+
+
+class TestIsbnForms(unittest.TestCase):
+    """Issue #31: ISBN resolution must probe both ISBN forms. Fixture
+    pairs are real check-digit-valid conversions (the X pair exercises
+    the mod-11 'X' check digit in both directions)."""
+
+    PAIR_A = ("0306406152", "9780306406157")
+    PAIR_X = ("080442957X", "9780804429573")
+    ISBN_979 = "9791234567896"  # valid 979-13: no ISBN-10 form exists
+
+    def test_fixtures_are_valid_isbns(self):
+        for isbn in (*self.PAIR_A, *self.PAIR_X, self.ISBN_979):
+            self.assertEqual(pp._validate_isbn(isbn), isbn)
+        self.assertEqual(pp._clean_isbn(self.PAIR_A[0]), self.PAIR_A[1])
+        self.assertEqual(pp._clean_isbn(self.PAIR_X[0]), self.PAIR_X[1])
+
+    def test_isbn_forms_helper(self):
+        self.assertEqual(pp._isbn_forms(self.PAIR_A[1]),
+                         [self.PAIR_A[1], self.PAIR_A[0]])
+        self.assertEqual(pp._isbn_forms(self.PAIR_A[0]),
+                         [self.PAIR_A[0], self.PAIR_A[1]])
+        self.assertEqual(pp._isbn_forms(self.PAIR_X[1]),
+                         [self.PAIR_X[1], self.PAIR_X[0]])
+        self.assertEqual(pp._isbn_forms(self.PAIR_X[0]),
+                         [self.PAIR_X[0], self.PAIR_X[1]])
+        self.assertEqual(pp._isbn_forms(self.ISBN_979), [self.ISBN_979])
+
+
+class TestResolveWorkIsbnForms(unittest.TestCase):
+    def setUp(self):
+        self.orig = pp.sb
+
+    def tearDown(self):
+        pp.sb = self.orig
+
+    def _resolve(self, store, isbn):
+        pp.sb = store
+        return pp.resolve_work("Unmatched Title", "Unmatched Author",
+                               {"isbn": isbn})
+
+    def test_isbn13_book_finds_isbn10_edition(self):
+        store = _IsbnStore(editions={"080442957X": "w-x"})
+        wid, how = self._resolve(store, "9780804429573")
+        self.assertEqual((wid, how), ("w-x", "isbn:080442957X"))
+
+    def test_isbn13_book_finds_isbn10_provider_work(self):
+        store = _IsbnStore(provider_isbns={"0306406152": "w-10"})
+        wid, how = self._resolve(store, "9780306406157")
+        self.assertEqual((wid, how), ("w-10", "work_isbn:0306406152"))
+
+    def test_isbn10_book_finds_isbn13_edition(self):
+        store = _IsbnStore(editions={"9780306406157": "w-13"})
+        wid, how = self._resolve(store, "0306406152")
+        self.assertEqual((wid, how), ("w-13", "isbn:9780306406157"))
+
+    def test_isbn10_book_finds_isbn13_provider_work(self):
+        store = _IsbnStore(provider_isbns={"9780804429573": "w-13x"})
+        wid, how = self._resolve(store, "080442957X")
+        self.assertEqual((wid, how), ("w-13x", "work_isbn:9780804429573"))
+
+    def test_979_probes_only_its_own_form(self):
+        store = _IsbnStore()
+        pp.sb = store
+        wid, how = pp.resolve_work("Unmatched Title", "Unmatched Author",
+                                   {"isbn": "9791234567896"}, create=False)
+        self.assertEqual((wid, how), (None, "new"))
+        self.assertEqual(set(store.probed_isbns()), {"9791234567896"})
+        self.assertEqual(store.posts(), [])
 
 
 if __name__ == "__main__":
