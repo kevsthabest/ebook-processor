@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.57"
+PORTABLE_VERSION = "2.13.58"
 
 
 import argparse
@@ -7625,7 +7625,10 @@ def corpus_select_quotes(db, fingerprint, *, ask=None):
     if not _dm_budget_claim(1, consumer="quote_poll"):
         # Lowest priority in the shared pool, first shed (§10.5).
         return _quote_select_shed(db, fingerprint, "budget")
+    _tel_t0 = time.monotonic()
     votes = corpus_quote_poll(poll_set, ask)
+    _telemetry_decision_elapsed(
+        "quote", time.monotonic() - _tel_t0)
     if votes is None:
         return _quote_select_shed(db, fingerprint, "poll_failed")
 
@@ -16000,9 +16003,12 @@ def post_pass_merge(roster, validator=None):
                 "name_a": _na, "name_b": _nb, "p_yes": None,
                 "reason": "unresolved (Tier 3 cap reached)"})
             continue
+        _tel_t0 = time.monotonic()
         _merged, _p = validator.ask_same_person(
             _na, _roster_best_desc(ea), ea.get("evidence", ""),
             _nb, _roster_best_desc(eb), eb.get("evidence", ""))
+        _telemetry_decision_elapsed(
+            "merge", time.monotonic() - _tel_t0)
         if _merged is None:
             possible_merges.append({
                 "name_a": _na, "name_b": _nb, "p_yes": None,
@@ -16833,16 +16839,22 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         if not _dm_budget_claim(1, consumer=consumer):
             return None, "budget"
         _val_stats["attempts"] += 1
+        _tel_t0 = time.monotonic()
         _v, _p = _DECISION_VALIDATOR.validate_relationship(
             rel["from"], rel["to"], rtype, ev, context=ctx)
+        _telemetry_decision_elapsed(
+            "relationship", time.monotonic() - _tel_t0)
         if _p is not None:
             return _p, "ok"
         # One retry per claim (Decision K4). If the retry cannot
         # claim budget, the claim stands as an error — the retry
         # was owed a call the pool could not give.
         if _dm_budget_claim(1, consumer=consumer):
+            _tel_t0 = time.monotonic()
             _v, _p = _DECISION_VALIDATOR.validate_relationship(
                 rel["from"], rel["to"], rtype, ev, context=ctx)
+            _telemetry_decision_elapsed(
+                "relationship", time.monotonic() - _tel_t0)
             if _p is not None:
                 return _p, "ok"
         _val_stats["errors"] += 1
@@ -17300,7 +17312,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                         # understated real spend by every trigger call).
                         _dv_error = True
                         break
+                    _tel_t0 = time.monotonic()
                     _v, _p = _DECISION_VALIDATOR.validate(cat, _q, _ctx)
+                    _telemetry_decision_elapsed(
+                        "trigger", time.monotonic() - _tel_t0)
                     if _v is None:
                         _dv_error = True
                         break
@@ -17959,6 +17974,12 @@ def llm_ollama(prompt, chunk, i, n):
                            "options": payload["options"]}
             resp = _post_json(f"{CONFIG['ollama_host']}{endpoint}", payload,
                               {"Content-Type": "application/json"}, 300)
+            # Telemetry usage stash (spec §6): Ollama reports its
+            # token counts as prompt_eval_count / eval_count on the
+            # same response; absent fields stay None (unreported).
+            _DIAG.telemetry_usage = {
+                "prompt_tokens": resp.get("prompt_eval_count"),
+                "completion_tokens": resp.get("eval_count")}
             if key == "message":
                 return resp.get("message", {}).get("content", "")
             return resp.get("response", "")
@@ -17985,6 +18006,12 @@ def llm_openrouter(prompt, chunk, i, n):
             {"Content-Type": "application/json",
              "Authorization": f"Bearer {CONFIG['openrouter_key']}",
              "HTTP-Referer": "https://cozylibram.pages.dev"}, 120)
+        # Telemetry usage stash (spec §6): OpenRouter speaks the
+        # OpenAI usage shape; an absent block stays None.
+        _or_usage = resp.get("usage") or {}
+        _DIAG.telemetry_usage = {
+            "prompt_tokens": _or_usage.get("prompt_tokens"),
+            "completion_tokens": _or_usage.get("completion_tokens")}
         return resp["choices"][0]["message"]["content"]
     except urllib.error.HTTPError as e:
         print(f"\n  OpenRouter {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}")
@@ -18511,6 +18538,10 @@ def effective_batch_size():
 def _diag_reset():
     _DIAG.info = {"finish_reason": None, "completion_tokens": None,
                   "reasoning_content": False}
+    # The per-attempt usage stash the telemetry recorder reads
+    # (see _telemetry_record_task): reset with the rest of the
+    # diagnostics so it always describes THIS attempt's response.
+    _DIAG.telemetry_usage = None
 
 
 # Per-session cache for the json_schema fallback chain: None = untested,
@@ -18606,6 +18637,20 @@ def llm_openai_compat(prompt, chunk, i, n):
             "reasoning_content": bool(msg.get("reasoning_content")),
             "prompt_n": timings.get("prompt_n"),
             "cache_n": timings.get("cache_n"),
+        }
+        # Telemetry usage stash (spec §6): prompt tokens are the
+        # server-reported usage figure when the endpoint supplies
+        # one; llama.cpp-style servers report it under
+        # timings.prompt_n instead, which is the same measurement
+        # from the same server, so it fills the same field. Absent
+        # both, the fields stay None and the recorder falls back
+        # to the prompt character estimate.
+        _pt = usage.get("prompt_tokens")
+        if _pt is None:
+            _pt = timings.get("prompt_n")
+        _DIAG.telemetry_usage = {
+            "prompt_tokens": _pt,
+            "completion_tokens": usage.get("completion_tokens"),
         }
         if CONFIG.get("debug") and timings.get("prompt_n"):
             _p = timings.get("prompt_n") or 0
@@ -18870,10 +18915,21 @@ def _run_task(call, prompt, chunk, i, n, task_name, sanitize_fn=None):
     boosted = False
     for attempt in (1, 2):
         _DIAG.token_boost = boosted
+        # Phase 0 telemetry (spec §6): time this attempt and record
+        # it against Call A / Call B. The usage stash is cleared
+        # BEFORE the call so a backend that reports nothing can
+        # never inherit the previous attempt's usage; the recorder
+        # reads-and-clears it after. Recording happens in the
+        # finally so a failed attempt still counts — it was still
+        # a request the run made and paid time for.
+        _DIAG.telemetry_usage = None
+        _tel_t0 = time.monotonic()
         try:
             out = call(prompt, chunk, i, n)
         finally:
             _DIAG.token_boost = False
+            _telemetry_record_task(
+                task_name, prompt, chunk, time.monotonic() - _tel_t0)
         result = san(parse_json_obj(out)) if out is not None else None
         if result is not None:
             return result
@@ -20203,6 +20259,16 @@ class _run_events_book:
                         "decision_calls": _DM_BUDGET_USED
                         if _attributable else None,
                         "decision_budget": _dm_budget_snapshot()
+                        if _attributable else None,
+                        # Phase 0 telemetry (spec §6): additive
+                        # field, stamped under the SAME attribution
+                        # proof as the budget fields above — the
+                        # telemetry counters arm at the same seam
+                        # (_dm_budget_reset), so a book that cannot
+                        # prove its decision counts cannot prove
+                        # its telemetry either, and stamps None
+                        # rather than a predecessor's numbers.
+                        "telemetry": _telemetry_snapshot()
                         if _attributable else None})
             self._sink.set_book(self._prev)
         _history_book_end(self._fpath, exc[1] if len(exc) > 1 else None)
@@ -22368,6 +22434,174 @@ def _history_scan_mode():
     return "watch_cycle" if _HISTORY_WATCH is not None else "scan"
 
 
+# ---------------------------------------------------------------------------
+# Corpus-routing Phase 0 telemetry (docs/corpus-routing-spec.md §6,
+# scoped by adopted amendment A2: telemetry ONLY — no router, no
+# routing marker, no config key, no CLI flag; accounting changes
+# nothing about model inputs, calls made, or extraction outputs).
+#
+# Per-book accounting for a v2 run, emitted in the preview JSON and
+# in the run-event book-end payload: Call A / Call B request counts,
+# prompt and completion tokens, elapsed seconds, and the decision
+# stages' call counts and elapsed seconds.
+#
+# Arming discipline is the decision budget's, shared on purpose:
+# _dm_budget_reset is the one seam that arms per-book state at book
+# start in process_file_v2, and it arms telemetry at the same
+# moment (see _telemetry_arm), so these counters follow exactly the
+# attribution rules the budget stamps already obey — every counter
+# starts at zero for each book, and a reader stamps a book's numbers
+# only under the same guard that stamps its decision counts (the
+# run-events book-end reuses its _attributable proof verbatim).
+# That is the 2.13.49/2.13.50 stamp-leak lesson applied to a new
+# counter set instead of relearned by it.
+#
+# Honesty rules: prompt tokens come only from server-reported
+# usage. A request whose endpoint reported no prompt tokens
+# contributes its prompt character count (the prompt and excerpt
+# texts handed to the backend, in characters) to
+# prompt_chars_estimate instead — an estimate is never presented
+# under a token field name, and a token field with no measurement
+# behind it stays None, never a dressed-up zero. Decision call
+# counts are NOT counted here at all: the snapshot derives them
+# from the budget's existing per-consumer accounting, so the
+# per-stage split reconciles with the run's decision-call total
+# by construction rather than by a second count of the same calls.
+_TELEMETRY_LOCK = threading.Lock()
+_TELEMETRY_CALLS = {}
+_TELEMETRY_DECISION_ELAPSED = {}
+# The four decision stages the snapshot reports, and the budget
+# consumers each stage's call count is derived from. Relationship
+# is one stage with two consumers (family runs before non-family
+# in pipeline order, but both judge relationship claims).
+_TELEMETRY_DECISION_STAGES = (
+    ("merge", ("merge_tier3",)),
+    ("relationship", ("rel_family", "rel_nonfamily")),
+    ("trigger", ("trigger_gate",)),
+    ("quote", ("quote_poll",)),
+)
+
+
+def _telemetry_fresh_calls():
+    """Zeroed Call A / Call B counters. Token fields start as None
+    (unmeasured), not 0: a measured zero and an absent measurement
+    must stay distinguishable in every artefact these feed."""
+    return {kind: {"requests": 0, "prompt_tokens": None,
+                   "prompt_chars_estimate": None,
+                   "completion_tokens": None, "elapsed_sec": 0.0}
+            for kind in ("call_a", "call_b")}
+
+
+def _telemetry_arm():
+    """Zero every telemetry counter for the book now starting.
+    Called from _dm_budget_reset — the one per-book arming seam —
+    so telemetry and the decision budget always describe the same
+    book, armed at the same moment, under the same sequence."""
+    with _TELEMETRY_LOCK:
+        _TELEMETRY_CALLS.clear()
+        _TELEMETRY_CALLS.update(_telemetry_fresh_calls())
+        _TELEMETRY_DECISION_ELAPSED.clear()
+        for stage, _consumers in _TELEMETRY_DECISION_STAGES:
+            _TELEMETRY_DECISION_ELAPSED[stage] = 0.0
+
+
+_telemetry_arm()
+
+
+def _telemetry_token(value):
+    """A server-reported token count, or None when the value is
+    not a usable measurement (absent, boolean, negative, or not a
+    number at all — a malformed usage block must degrade to
+    'unreported', never to a fabricated count)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0:
+        return None
+    return int(value)
+
+
+def _telemetry_record_task(task_name, prompt, chunk, elapsed_sec):
+    """Record one _run_task attempt against Call A or Call B.
+
+    Which call a task belongs to is in its name (the v2 chapter
+    tasks are the only ones recorded: v2-ch<N>-identity and its
+    -fallback are Call A, v2-ch<N>-content is Call B; the legacy
+    tasks, the trope gate, and the evidence judge are not Call A/B
+    and are not recorded). The backend's usage stash for THIS
+    attempt rides the thread-local _DIAG.telemetry_usage, set by
+    the backend that served the request and read-and-cleared here
+    so one call's usage can never be stamped onto the next call —
+    the same borrowed-stamp failure the per-book arming exists to
+    prevent, one level down."""
+    usage = getattr(_DIAG, "telemetry_usage", None)
+    _DIAG.telemetry_usage = None
+    kind = None
+    if task_name.startswith("v2-ch"):
+        if "-identity" in task_name:
+            kind = "call_a"
+        elif task_name.endswith("-content"):
+            kind = "call_b"
+    if kind is None:
+        return
+    prompt_tokens = completion_tokens = None
+    if isinstance(usage, dict):
+        prompt_tokens = _telemetry_token(usage.get("prompt_tokens"))
+        completion_tokens = _telemetry_token(
+            usage.get("completion_tokens"))
+    with _TELEMETRY_LOCK:
+        entry = _TELEMETRY_CALLS[kind]
+        entry["requests"] += 1
+        entry["elapsed_sec"] += max(0.0, float(elapsed_sec))
+        if prompt_tokens is not None:
+            entry["prompt_tokens"] = \
+                (entry["prompt_tokens"] or 0) + prompt_tokens
+        else:
+            # No server-reported prompt tokens for this request:
+            # the honest fallback is a character count, recorded
+            # under its own estimate name (spec §6).
+            chars = (len(prompt) if isinstance(prompt, str) else 0) \
+                + (len(chunk) if isinstance(chunk, str) else 0)
+            entry["prompt_chars_estimate"] = \
+                (entry["prompt_chars_estimate"] or 0) + chars
+        if completion_tokens is not None:
+            entry["completion_tokens"] = \
+                (entry["completion_tokens"] or 0) + completion_tokens
+
+
+def _telemetry_decision_elapsed(stage, elapsed_sec):
+    """Add one decision call's elapsed seconds to its stage. Only
+    elapsed is recorded here: the stage's call COUNT comes from
+    the budget accounting at snapshot time (see the section
+    header), so this helper can never become a second count."""
+    with _TELEMETRY_LOCK:
+        if stage in _TELEMETRY_DECISION_ELAPSED:
+            _TELEMETRY_DECISION_ELAPSED[stage] += \
+                max(0.0, float(elapsed_sec))
+
+
+def _telemetry_snapshot():
+    """This book's telemetry, in the shape the preview JSON and
+    the run-event book-end payload both carry: {"call_a", "call_b",
+    "decision": {stage: {"calls", "elapsed_sec"}}}. A copy — the
+    live counters keep accumulating for the book still running."""
+    budget = _dm_budget_snapshot()
+    spent = {consumer: acct.get("spent", 0)
+             for consumer, acct in budget.items()}
+    with _TELEMETRY_LOCK:
+        calls = {kind: dict(entry)
+                 for kind, entry in _TELEMETRY_CALLS.items()}
+        elapsed = dict(_TELEMETRY_DECISION_ELAPSED)
+    for entry in calls.values():
+        entry["elapsed_sec"] = round(entry["elapsed_sec"], 3)
+    decision = {}
+    for stage, consumers in _TELEMETRY_DECISION_STAGES:
+        decision[stage] = {
+            "calls": sum(spent.get(c, 0) for c in consumers),
+            "elapsed_sec": round(elapsed.get(stage, 0.0), 3)}
+    return {"call_a": calls["call_a"], "call_b": calls["call_b"],
+            "decision": decision}
+
+
 # Shared decision-model call budget per book. Five consumers draw
 # on the one pool, in pipeline order: roster-merge Tier 3
 # judgments, family relationship validation, non-family
@@ -22503,6 +22737,10 @@ def _dm_budget_reset(chapter_count=None):
                 if chapter_count is not None else None
         except (TypeError, ValueError):
             _DM_BUDGET_CHAPTER_COUNT = None
+    # Phase 0 telemetry arms at this same seam (see the telemetry
+    # section header): one arming moment for every per-book counter
+    # set, so no reader ever has to reconcile two books' boundaries.
+    _telemetry_arm()
 
 
 def _dm_budget_arm_seq():
@@ -26518,6 +26756,13 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "aborted": aborted, "chunks_ok": a_ok,
         "tasks": {"discipline": b_ok, "identity": a_ok,
                   "identity_simple": a_fallback},
+        # Phase 0 telemetry (spec §6, amendment A2): this book's
+        # per-stage accounting, armed at this book's start by
+        # _dm_budget_reset above — the snapshot is taken here,
+        # after every stage (merge, validation, trigger gate,
+        # quote poll) has run, so it carries the book's whole
+        # measured work and nothing from any other book.
+        "telemetry": _telemetry_snapshot(),
         "verification": red["verification"],
         "roster_size": len(roster),
         # Saved for future remapping (--trope-map can retry these later).
