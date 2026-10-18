@@ -10,7 +10,10 @@ never regress is the resolution order and the loud failures.
 The central pins: the stored set is excluded from Tier 3 however
 it was resolved; an import replaces a book's characters and
 candidates atomically while the push ledger — the User's own
-curation data — survives untouched; unconfirmed candidates of
+curation data — survives untouched; the rejected-types record
+is curation data of the same standing: it survives untouched
+too, and a later import annotates a re-proposed rejected string
+instead of re-queueing it; unconfirmed candidates of
 all four kinds are captured, including a dropped type proposal
 found only in the chapter deltas; and the report's
 reconciliation equation (roster == stored + Tier 3) is checked,
@@ -687,6 +690,161 @@ class StoredSourceCandidateTests(Tier3Case):
         alerts = store.collect_alerts(self.db)
         self.assertEqual(
             sum(1 for a in alerts if a["score"] == 0.58), 1)
+
+
+class RejectedTypesTests(Tier3Case):
+    """The rejected-wins record for type proposals (this seat's
+    ruling on the Data & Sync parity flag): a type string the
+    User rejected is never re-queued as a fresh proposal by a
+    later import, but the proposal row is kept — annotated with
+    the recorded reason and date — because its occurrence is
+    evidence. The record itself is curation data, like the push
+    ledger: imports never modify it."""
+
+    def proposals(self, work_id="work-test-1"):
+        conn = sqlite3.connect(self.db)
+        try:
+            return [json.loads(r[0]) for r in conn.execute(
+                "SELECT payload_json FROM tier3_candidates "
+                "WHERE work_id = ? AND kind = 'type_proposal'",
+                (work_id,))]
+        finally:
+            conn.close()
+
+    def fresh_proposal_types(self, work_id="work-test-1"):
+        return [p["type"] for p in self.proposals(work_id)
+                if "previously_rejected" not in p]
+
+    def reject_boss(self, reason="not a relationship"):
+        code, _ = self.run_cli(
+            ["reject-type", "--db", self.db, "--type", "boss",
+             "--reason", reason])
+        self.assertEqual(code, 0)
+
+    def test_reject_then_reimport_annotates_and_does_not_requeue(self):
+        result = self.import_it()  # 'boss' proposed fresh
+        self.assertEqual(self.fresh_proposal_types(), ["boss"])
+        self.assertEqual(result["previously_rejected_types"], [])
+        self.reject_boss("duplicate of an existing type")
+        result = self.import_it()
+        # The row is kept (occurrence evidence) — the candidates
+        # table still holds one type_proposal — but it is no
+        # longer a fresh proposal: it carries the rejection.
+        self.assertEqual(len(self.proposals()), 1)
+        self.assertEqual(self.fresh_proposal_types(), [])
+        hit = self.proposals()[0]["previously_rejected"]
+        self.assertEqual(hit["reason"],
+                         "duplicate of an existing type")
+        self.assertTrue(hit["decided_at"])
+        self.assertEqual(result["previously_rejected_types"],
+                         ["boss"])
+
+    def test_rejection_recorded_before_any_import_applies(self):
+        # The record is consulted at import, so rejecting a
+        # string no run has proposed yet governs the first
+        # import that proposes it.
+        self.reject_boss()
+        self.import_it()
+        self.assertEqual(self.fresh_proposal_types(), [])
+        self.assertEqual(len(self.proposals()), 1)
+
+    def test_unreject_restores_fresh_on_next_import(self):
+        self.import_it()
+        self.reject_boss()
+        self.import_it()
+        self.assertEqual(self.fresh_proposal_types(), [])
+        code, _ = self.run_cli(
+            ["unreject-type", "--db", self.db, "--type", "boss"])
+        self.assertEqual(code, 0)
+        # Already-imported rows keep the annotation; only the
+        # NEXT import re-derives the book's candidates.
+        self.assertEqual(self.fresh_proposal_types(), [])
+        self.import_it()
+        self.assertEqual(self.fresh_proposal_types(), ["boss"])
+        code, _ = self.run_cli(
+            ["unreject-type", "--db", self.db, "--type", "boss"])
+        self.assertEqual(code, 2)  # nothing left to remove
+
+    def test_reject_without_a_reason_fails(self):
+        # Missing entirely: an argparse usage error (SystemExit
+        # 2 before any command runs). Blank: refused as a
+        # Tier3Error for the same reason — a rejection whose
+        # reason says nothing is not a reasoned rejection.
+        import contextlib
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                store.main(["reject-type", "--db", self.db,
+                            "--type", "boss"])
+        self.assertEqual(cm.exception.code, 2)
+        code, _ = self.run_cli(
+            ["reject-type", "--db", self.db, "--type", "boss",
+             "--reason", "   "])
+        self.assertEqual(code, 2)
+        # Neither failure path recorded anything (both refuse
+        # before the store is even opened, so the record is
+        # read back through the tool's own connection).
+        conn = store._connect(self.db)
+        try:
+            n = conn.execute(
+                "SELECT COUNT(*) AS n FROM rejected_types") \
+                .fetchone()["n"]
+        finally:
+            conn.close()
+        self.assertEqual(n, 0)
+
+    def test_record_survives_reimport_byte_intact(self):
+        self.import_it()
+        self.reject_boss("covered by crewmate")
+        conn = sqlite3.connect(self.db)
+        try:
+            before = conn.execute(
+                "SELECT type, reason, decided_at "
+                "FROM rejected_types").fetchall()
+        finally:
+            conn.close()
+        self.import_it()
+        self.import_it()
+        conn = sqlite3.connect(self.db)
+        try:
+            after = conn.execute(
+                "SELECT type, reason, decided_at "
+                "FROM rejected_types").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(before, after)
+        self.assertEqual(after[0][0], "boss")
+
+    def test_list_groups_previously_rejected_apart(self):
+        self.import_it()
+        self.reject_boss("not a relationship")
+        self.import_it()
+        code, out = self.run_cli(["list", "--db", self.db])
+        self.assertEqual(code, 0)
+        self.assertIn("previously rejected type proposals: "
+                      "boss — not a relationship", out)
+        # ...and the fresh candidate counts no longer include
+        # it: the standard book's only type proposal is 'boss'.
+        cand_line = next(l for l in out.splitlines()
+                         if l.strip().startswith("candidates:"))
+        self.assertNotIn("type_proposal", cand_line)
+
+    def test_report_shows_the_record(self):
+        self.import_it()
+        self.reject_boss()
+        report = store.build_report(self.db)
+        self.assertIn("rejected types: 1 — boss", report)
+
+    def test_alerts_ignore_type_proposals(self):
+        # The digest reads claims and merges only — a vocabulary
+        # question is not a near-miss claim, fresh or rejected.
+        self.import_it()
+        self.reject_boss()
+        self.import_it()
+        alerts = store.collect_alerts(self.db)
+        self.assertTrue(alerts)
+        self.assertTrue(all(a["kind"] in ("claim", "merge")
+                            for a in alerts))
+        self.assertEqual([a["score"] for a in alerts], [0.72])
 
 
 if __name__ == "__main__":

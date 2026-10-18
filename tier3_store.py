@@ -16,7 +16,7 @@ is specified in the Tier 3 local store design note
 (2026-10-18), under the curation-console brief and its tiers
 addendum.
 
-Three tables:
+Four tables:
 
   tier3_characters   one row per (work, roster character who was
                      NOT in the run's stored prod set): the
@@ -47,6 +47,20 @@ Three tables:
                      decided-at). This is his curation data: an
                      import NEVER modifies it, so decisions survive
                      re-runs and re-imports.
+  rejected_types     type strings the User has rejected as
+                     registry proposals, each with its mandatory
+                     reason and the date he decided it. This is
+                     the rejected-wins record for types — the same
+                     doctrine the rest of the system applies to
+                     human rejections — and an import NEVER
+                     modifies it either. A later run that
+                     re-proposes a rejected string does not get
+                     to re-ask the question: the proposal row is
+                     kept (its occurrence evidence matters — a
+                     string proposed again and again is signal)
+                     but annotated previously_rejected with the
+                     recorded reason and date, and the list groups
+                     it apart from fresh proposals.
 
 The push itself does not happen here. Marking a character as
 "other cast" in prod needs the tier representation the
@@ -69,7 +83,10 @@ draw is the canonical case). The floor is
 configurable (default 0.30) and the digest sorts by score
 descending, closest calls first, each entry carrying the state
 or reason that left it unconfirmed. Scores are read out of the
-recorded payloads at alert time; the digest never writes.
+recorded payloads at alert time; the digest never writes. (Type
+proposals are not alerts and the digest never reads them,
+previously-rejected or not — a vocabulary question is not a
+near-miss claim.)
 
 The stored prod set for a work — the names excluded from Tier 3 —
 is resolved in this order:
@@ -97,6 +114,8 @@ Usage:
                                   [--floor 0.30]
     python3 tier3_store.py approve --work <w> --name <n>
     python3 tier3_store.py unapprove --work <w> --name <n>
+    python3 tier3_store.py reject-type --type <s> --reason <r>
+    python3 tier3_store.py unreject-type --type <s>
     python3 tier3_store.py report
 
 Stdlib only, Python 3.8+, Windows and Linux: the User runs this
@@ -147,11 +166,13 @@ def _now_iso():
 
 
 # ---------------------------------------------------------------------------
-# Database. The push ledger is created alongside the rest but is
-# only ever written by approve/unapprove: imports replace a book's
-# characters and candidates inside one transaction and never
-# reference the ledger at all, which is what makes "imports never
-# modify the ledger" a structural fact rather than a promise.
+# Database. The push ledger and the rejected-types record are
+# created alongside the rest but are only ever written by their
+# own subcommands (approve/unapprove, reject-type/unreject-type):
+# imports replace a book's characters and candidates inside one
+# transaction and never reference either record at all, which is
+# what makes "imports never modify the User's curation data" a
+# structural fact rather than a promise.
 # ---------------------------------------------------------------------------
 
 _SCHEMA = """
@@ -196,6 +217,11 @@ CREATE TABLE IF NOT EXISTS push_ledger (
     pushed_at TEXT,
     prod_row_id TEXT,
     PRIMARY KEY (work_id, name)
+);
+CREATE TABLE IF NOT EXISTS rejected_types (
+    type TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    decided_at TEXT
 );
 """
 
@@ -502,6 +528,28 @@ def _candidates(artefact, stored_set=()):
 
 
 # ---------------------------------------------------------------------------
+# The rejected-types record. A flat map by type string, global
+# to the store (vocabulary is global, like the registry it feeds).
+# Matching is by exact string: the importer derives a proposal
+# string from the artefact's recorded type verbatim, with no
+# case-folding or other normalization anywhere in that pass, so
+# an exact match IS the importer's normalization. (The
+# subcommands strip surrounding whitespace from --type — the
+# same trim stored-names lines get — because a type string
+# recorded in JSON never carries edge whitespace, so the trim
+# cannot diverge from a recorded string.)
+# ---------------------------------------------------------------------------
+
+def _rejected_types_map(conn):
+    """type string -> {"reason": ..., "decided_at": ...}."""
+    return {r["type"]: {"reason": r["reason"],
+                         "decided_at": r["decided_at"]}
+            for r in conn.execute(
+                "SELECT type, reason, decided_at "
+                "FROM rejected_types")}
+
+
+# ---------------------------------------------------------------------------
 # Import. Replaces one book's characters and candidates inside a
 # single transaction; the push ledger is not referenced here at
 # all. The book row records how the stored set was resolved, so
@@ -550,8 +598,24 @@ def import_preview(db_path, preview_path, stored_names_path=None,
                      json.dumps(by_source.get(name, [])),
                      run_key, now))
             cand_counts = {}
+            previously_rejected = []
+            rejected = _rejected_types_map(conn)
             for kind, state, payload in _candidates(
                     artefact, stored_set):
+                if kind == "type_proposal":
+                    # Rejected-wins: a string the User already
+                    # rejected is kept as a candidate (its
+                    # occurrence is evidence) but annotated, so
+                    # no surface re-queues it as a fresh
+                    # proposal. The record itself is not
+                    # modified here — annotation copies it into
+                    # the payload, never the other way round.
+                    hit = rejected.get(payload.get("type"))
+                    if hit is not None:
+                        payload = dict(payload)
+                        payload["previously_rejected"] = hit
+                        previously_rejected.append(
+                            payload["type"])
                 conn.execute(
                     "INSERT INTO tier3_candidates (work_id, kind, "
                     "state, payload_json, run_key, imported_at) "
@@ -582,6 +646,8 @@ def import_preview(db_path, preview_path, stored_names_path=None,
         "stored_absent_from_roster": absent,
         "tier3_count": len(tier3_names),
         "candidates": cand_counts,
+        "previously_rejected_types": sorted(
+            set(previously_rejected)),
         "has_chapter_data": bool(
             (artefact.get("chapter_data") or {}).get("chapters")),
     }
@@ -622,10 +688,27 @@ def _book_lines(conn, work_id):
         "SELECT name, appearances FROM tier3_characters "
         "WHERE work_id = ? ORDER BY appearances DESC, name",
         (work_id,)).fetchall()
-    cand = conn.execute(
+    cand = {r["kind"]: r["n"] for r in conn.execute(
         "SELECT kind, COUNT(*) AS n FROM tier3_candidates "
         "WHERE work_id = ? GROUP BY kind ORDER BY kind",
-        (work_id,)).fetchall()
+        (work_id,))}
+    # Previously rejected type proposals stay in the candidates
+    # table (their occurrences are evidence) but are not fresh
+    # proposals: they come out of the kind counts and get their
+    # own grouping below, with the reason he recorded.
+    prev_rejected = []
+    for r in conn.execute(
+            "SELECT payload_json FROM tier3_candidates "
+            "WHERE work_id = ? AND kind = 'type_proposal'",
+            (work_id,)):
+        payload = json.loads(r["payload_json"])
+        hit = payload.get("previously_rejected")
+        if hit:
+            prev_rejected.append((payload.get("type"), hit))
+    if prev_rejected:
+        cand["type_proposal"] -= len(prev_rejected)
+        if cand["type_proposal"] <= 0:
+            del cand["type_proposal"]
     ledger = {r["name"] for r in conn.execute(
         "SELECT name FROM push_ledger WHERE work_id = ?",
         (work_id,))}
@@ -637,9 +720,14 @@ def _book_lines(conn, work_id):
     ]
     if cand:
         lines.append("  candidates: " + ", ".join(
-            f"{r['kind']} {r['n']}" for r in cand))
+            f"{k} {n}" for k, n in sorted(cand.items())))
     else:
         lines.append("  candidates: none")
+    if prev_rejected:
+        lines.append("  previously rejected type proposals: "
+                     + "; ".join(
+                         f"{t} — {h['reason']}"
+                         for t, h in prev_rejected))
     for row in chars:
         mark = "  [approved for push]" if row["name"] in ledger \
             else ""
@@ -669,6 +757,10 @@ def cmd_import(args):
             f"{k} {v}" for k, v in sorted(cand.items())))
     else:
         print("  candidates: none")
+    if result["previously_rejected_types"]:
+        print("  previously rejected type proposal(s), kept "
+              "annotated rather than re-queued: "
+              + ", ".join(result["previously_rejected_types"]))
     if not result["has_chapter_data"]:
         print("  note: artefact carries no chapter_data — dropped "
               "type proposals cannot be determined from it, so "
@@ -749,6 +841,61 @@ def cmd_unapprove(args):
         conn.close()
 
 
+def cmd_reject_type(args):
+    # The reason is the ruling, not paperwork: it is the text a
+    # future surface shows when the string resurfaces, and the
+    # User's curation rule is that every rejection carries one.
+    # argparse already refuses a missing --reason; a blank one
+    # is refused here for the same reason.
+    reason = (args.reason or "").strip()
+    if not reason:
+        raise Tier3Error(
+            "--reason must say why the type is rejected — every "
+            "rejection carries a reason, and this one is what a "
+            "future reader sees when the string resurfaces")
+    type_str = (args.type or "").strip()
+    if not type_str:
+        raise Tier3Error("--type must not be empty")
+    conn = _connect(args.db)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO rejected_types (type, reason, "
+                "decided_at) VALUES (?,?,?) "
+                "ON CONFLICT(type) DO UPDATE SET "
+                "reason=excluded.reason, "
+                "decided_at=excluded.decided_at",
+                (type_str, reason, _now_iso()))
+        print(f"rejected type: {type_str} — {reason}")
+        print("  recorded locally; imports from now on keep "
+              "proposals of this string annotated as previously "
+              "rejected instead of re-queueing them")
+        return 0
+    finally:
+        conn.close()
+
+
+def cmd_unreject_type(args):
+    type_str = (args.type or "").strip()
+    conn = _connect(args.db)
+    try:
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM rejected_types WHERE type = ?",
+                (type_str,))
+        if cur.rowcount == 0:
+            raise Tier3Error(
+                f"{type_str!r} is not in the rejected-types "
+                f"record — nothing to remove")
+        print(f"rejection removed: {type_str} — the next import "
+              f"queues proposals of it as fresh again (rows "
+              f"already imported keep their annotation until "
+              f"then)")
+        return 0
+    finally:
+        conn.close()
+
+
 def build_report(db_path):
     conn = _connect(db_path)
     try:
@@ -774,6 +921,11 @@ def build_report(db_path):
                 f"{r['kind']} {r['n']}" for r in cand_totals))
         else:
             lines.append("  candidates: none")
+        rejected = [r["type"] for r in conn.execute(
+            "SELECT type FROM rejected_types ORDER BY type")]
+        lines.append(
+            f"  rejected types: {len(rejected)}"
+            + (f" — {', '.join(rejected)}" if rejected else ""))
         verdicts = []
         for book in books:
             stored = json.loads(book["stored_names_json"])
@@ -1107,6 +1259,29 @@ def main(argv=None):
                              help="character name, exactly as "
                                   "recorded")
     p_unapprove.set_defaults(fn=cmd_unapprove)
+
+    p_reject = sub.add_parser(
+        "reject-type", help="record a relationship-type string "
+                            "as rejected (with its mandatory "
+                            "reason), so future proposals of it "
+                            "are annotated, not re-queued")
+    _add_db(p_reject)
+    p_reject.add_argument("--type", required=True,
+                          help="the proposed type string, "
+                               "exactly as recorded")
+    p_reject.add_argument("--reason", required=True,
+                          help="why it is rejected — mandatory; "
+                               "shown wherever the string "
+                               "resurfaces")
+    p_reject.set_defaults(fn=cmd_reject_type)
+
+    p_unreject = sub.add_parser(
+        "unreject-type", help="remove a type string from the "
+                              "rejected-types record")
+    _add_db(p_unreject)
+    p_unreject.add_argument("--type", required=True,
+                            help="the rejected type string")
+    p_unreject.set_defaults(fn=cmd_unreject_type)
 
     p_report = sub.add_parser(
         "report", help="store-wide counts and per-book "
