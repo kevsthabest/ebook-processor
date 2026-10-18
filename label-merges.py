@@ -18,7 +18,83 @@ Controls:
 
 import argparse
 import json
+import os
 import sys
+import tempfile
+from pathlib import Path
+
+
+class LabelError(Exception):
+    """A user-facing failure: an existing labels file that cannot
+    be used. Printed as one line; no traceback for expected cases."""
+
+
+def _atomic_write_text(path, text):
+    """Write text to path atomically: the new content lands in a
+    temp file in the same directory first and is then moved over
+    the target with os.replace, so a crash mid-save leaves the
+    previous good file intact instead of a torn one the next load
+    would have to judge."""
+    path = Path(path)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=str(path.parent),
+                prefix=path.name + ".", suffix=".tmp",
+                delete=False) as fh:
+            tmp = Path(fh.name)
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _load_merges(path):
+    """Load the existing labels from path.
+
+    A missing file is the normal fresh start and returns an empty
+    store. A file that exists but cannot be parsed is a loud stop:
+    the labels are hand-made curation state, so treating a corrupt
+    file as empty would let the next save overwrite it and destroy
+    them silently. The operator proceeds deliberately — fix the
+    file, or move it aside to start fresh — never by default."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as e:
+        raise LabelError(
+            f"labels file is not valid JSON: {path} ({e}) — "
+            f"refusing to start, because treating it as empty "
+            f"would overwrite the labels it holds. Fix the file, "
+            f"or move it aside to start fresh, then re-run.")
+    except OSError as e:
+        raise LabelError(
+            f"labels file cannot be read: {path} ({e}) — "
+            f"refusing to start, because treating it as empty "
+            f"would overwrite the labels it holds. Fix the file, "
+            f"or move it aside to start fresh, then re-run.")
+    if not isinstance(data, dict):
+        raise LabelError(
+            f"labels file is not a JSON object: {path} — "
+            f"refusing to start, because treating it as empty "
+            f"would overwrite the labels it holds. Fix the file, "
+            f"or move it aside to start fresh, then re-run.")
+    return data
+
+
+def _save_merges(path, labels):
+    """Save the labels atomically — see _atomic_write_text for why
+    an in-place write is not safe for a file the operator edits."""
+    _atomic_write_text(path, json.dumps(labels, indent=2))
 
 
 def load_pairs(json_path, max_pairs=100):
@@ -63,21 +139,24 @@ def load_pairs(json_path, max_pairs=100):
     return pairs[:max_pairs]
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="Interactive merge labeler")
     ap.add_argument('--json', required=True, help="Preview JSON file")
     ap.add_argument('--output', default='merge-labels.json',
                     help="Output labels file")
     ap.add_argument('--max-pairs', type=int, default=100)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
-    # Load existing labels
-    labels = {}
+    # Load existing labels. A corrupt file stops here, before any
+    # save can run — see _load_merges for why it is never treated
+    # as an empty store.
     try:
-        labels = json.load(open(args.output, encoding='utf-8'))
+        labels = _load_merges(args.output)
+    except LabelError as e:
+        print(f"label-merges: {e}", file=sys.stderr)
+        return 2
+    if Path(args.output).exists():
         print(f"Loaded {len(labels)} existing labels from {args.output}")
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
 
     pairs = load_pairs(args.json, args.max_pairs)
     # Skip already-labeled
@@ -118,12 +197,14 @@ def main():
         }
         count += 1
 
-        # Save incrementally
-        json.dump(labels, open(args.output, 'w', encoding='utf-8'), indent=2)
+        # Save incrementally, atomically: a crash here must not
+        # tear the labels file the operator has accumulated.
+        _save_merges(args.output, labels)
 
     print(f"\nDone. {count} new labels saved to {args.output}")
     print(f"Total: {len(labels)} labels")
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

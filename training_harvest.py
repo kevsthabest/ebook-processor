@@ -79,9 +79,11 @@ artefacts, his corpus and his config live.
 import argparse
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -288,44 +290,109 @@ def _ensure_store(store):
     return paths
 
 
+def _atomic_write_text(path, text):
+    """Write text to path atomically: the new content lands in a
+    temp file in the same directory first and is then moved over
+    the target with os.replace, so a crash mid-save leaves the
+    previous good file intact instead of a torn one the next load
+    would have to judge."""
+    path = Path(path)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=str(path.parent),
+                prefix=path.name + ".", suffix=".tmp",
+                delete=False) as fh:
+            tmp = Path(fh.name)
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _corrupt_state_error(kind, path, detail):
+    """The loud stop for a state file that exists but cannot be
+    used. The manifest and the split map are accumulated and
+    hand-edited state, so treating a corrupt file as empty would
+    let the next save overwrite it and destroy it silently; the
+    operator proceeds deliberately — fix the file, or move it
+    aside to start fresh — never by default."""
+    return HarvestError(
+        f"{kind} is not usable: {path} ({detail}) — refusing to "
+        f"start, because treating it as empty would overwrite "
+        f"the state it holds. Fix the file, or move it aside to "
+        f"start fresh, then re-run.")
+
+
 def _load_manifest(paths):
-    if paths["manifest"].exists():
-        try:
-            m = json.loads(paths["manifest"].read_text(encoding="utf-8"))
-            if isinstance(m, dict):
-                m.setdefault("archives", [])
-                m.setdefault("exports", [])
-                return m
-        except ValueError:
-            pass
-    return {"version": 1, "created_at": _now_iso(),
-            "archives": [], "exports": []}
+    """Load the store manifest. A missing file is the normal
+    fresh start; a file that exists but cannot be parsed is a
+    loud stop (see _corrupt_state_error). Loading never writes."""
+    if not paths["manifest"].exists():
+        return {"version": 1, "created_at": _now_iso(),
+                "archives": [], "exports": []}
+    try:
+        m = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    except ValueError as e:
+        raise _corrupt_state_error(
+            "manifest", paths["manifest"], f"not valid JSON: {e}")
+    except OSError as e:
+        raise _corrupt_state_error(
+            "manifest", paths["manifest"], f"cannot be read: {e}")
+    if not isinstance(m, dict):
+        raise _corrupt_state_error(
+            "manifest", paths["manifest"], "not a JSON object")
+    m.setdefault("archives", [])
+    m.setdefault("exports", [])
+    return m
 
 
 def _save_manifest(paths, manifest):
     manifest["updated_at"] = _now_iso()
-    paths["manifest"].write_text(
-        json.dumps(manifest, indent=1, ensure_ascii=False),
-        encoding="utf-8")
+    _atomic_write_text(
+        paths["manifest"],
+        json.dumps(manifest, indent=1, ensure_ascii=False))
 
 
 def _load_split_map(paths):
     """The split map is an explicit file in the store. On first use
     it is seeded with the standing holdout books; afterwards this
     tool only ever reads it — moving a book across the line is a
-    deliberate human edit, never a side effect of a harvest."""
-    if paths["split_map"].exists():
-        try:
-            m = json.loads(paths["split_map"].read_text(encoding="utf-8"))
-            if isinstance(m, dict):
-                return {str(k): str(v) for k, v in m.items()}
-        except ValueError:
-            pass
-    seeded = {title: "holdout" for title in DEFAULT_HOLDOUT_BOOKS}
-    paths["split_map"].write_text(
-        json.dumps(seeded, indent=1, ensure_ascii=False),
-        encoding="utf-8")
-    return seeded
+    deliberate human edit, never a side effect of a harvest.
+
+    Loading never writes: when the file is missing the seed is
+    derived in memory only, and it reaches disk only through
+    _save_split_map, called by a command that saves state. A file
+    that exists but cannot be parsed is a loud stop — reseeding
+    over it would silently overwrite the deliberate holdout
+    assignments it holds."""
+    if not paths["split_map"].exists():
+        return {title: "holdout" for title in DEFAULT_HOLDOUT_BOOKS}
+    try:
+        m = json.loads(paths["split_map"].read_text(encoding="utf-8"))
+    except ValueError as e:
+        raise _corrupt_state_error(
+            "split map", paths["split_map"], f"not valid JSON: {e}")
+    except OSError as e:
+        raise _corrupt_state_error(
+            "split map", paths["split_map"], f"cannot be read: {e}")
+    if not isinstance(m, dict):
+        raise _corrupt_state_error(
+            "split map", paths["split_map"], "not a JSON object")
+    return {str(k): str(v) for k, v in m.items()}
+
+
+def _save_split_map(paths, split_map):
+    _atomic_write_text(
+        paths["split_map"],
+        json.dumps(split_map, indent=1, ensure_ascii=False))
 
 
 def _split_for(split_map, title):
@@ -366,6 +433,10 @@ def archive_sources(store, preview_dir, run_events_dir):
     counters dict; also records each new file in the manifest."""
     paths = _ensure_store(store)
     manifest = _load_manifest(paths)
+    # Loaded here only to judge it: a corrupt split map stops the
+    # command before anything is saved, the same as a corrupt
+    # manifest — the derived value is reused for the seed below.
+    split_map = _load_split_map(paths)
     known_hashes = {a["sha256"] for a in manifest["archives"]}
     counts = {"previews_new": 0, "previews_skipped_known": 0,
               "previews_skipped_nonartefact": 0,
@@ -436,6 +507,12 @@ def archive_sources(store, preview_dir, run_events_dir):
             counts["run_events_new"] += 1
 
     _save_manifest(paths, manifest)
+    # Archiving is a command that saves state, so it is also the
+    # place the split-map seed reaches disk: _load_split_map only
+    # ever derives it in memory, and without a saving command ever
+    # persisting it the operator would have no file to edit.
+    if not paths["split_map"].exists():
+        _save_split_map(paths, split_map)
     return counts
 
 
