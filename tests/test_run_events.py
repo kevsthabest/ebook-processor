@@ -489,16 +489,21 @@ def _history_rec(result, outcome="failed", skip_reason=None):
             "book_key": "bk-history-breaker", "source": "file",
             "outcome": outcome, "skip_reason": skip_reason,
             "duration_ms": None, "decision_calls": None,
+            "decision_pool": None,
             "replace_result": None, "error_class": None,
             "error_message": None}
 
 
 # The book payload's top-level keys are the processor_run_books
-# columns (docs/run-history-spec.md §4): the breaker fix must ride
-# existing carriers only, so this set may not grow.
+# columns (docs/run-history-spec.md §4): the breaker fix rides
+# existing carriers only, so this set grows only when the table
+# itself gains a column by a ruled schema change — decision_pool
+# joined it that way (Option A ruling, migration applied live
+# 2026-10-18, v2.13.36), never by a writer edit alone.
 _HISTORY_BOOK_KEYS = {
     "run_id", "book_key", "title", "work_id", "source", "outcome",
     "skip_reason", "chapters", "duration_ms", "decision_calls",
+    "decision_pool",
     "claims", "characters", "quotes", "suppressed_by_verdict",
     "replace_result", "error_class", "error_message"}
 

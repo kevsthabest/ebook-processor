@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.35"
+PORTABLE_VERSION = "2.13.36"
 
 
 import argparse
@@ -19944,12 +19944,13 @@ def _history_thresholds():
         # process the same configuration could fingerprint
         # differently depending on which book armed last. The
         # pool's per-book record of record stays the reduce
-        # artefact's own decision_pool stamp (unchanged); a
-        # run-history book-row stamp awaits a schema decision,
-        # because the book payload's keys are the live table's
-        # columns and processor_run_books has no decision_pool
-        # column. The floor the pool scales from is the constant
-        # above.
+        # artefact's own decision_pool stamp (unchanged). The
+        # run-history book row gained its own decision_pool stamp
+        # once the Option A ruling added that column to
+        # processor_run_books — the payload's keys are pinned to
+        # the table's columns, so the stamp could only land after
+        # the migration did. The floor the pool scales from is
+        # the constant above.
         # The budget-governance scheme in effect (spec §1.2/§1.3/
         # §1.6): which validation order produced this run's
         # results, the reserve slices that bounded its budget, and
@@ -20068,7 +20069,8 @@ class _RunHistoryRecorder:
                    "duration_ms": None, "outcome": None,
                    "skip_reason": None, "result": None,
                    "error_class": None, "error_message": None,
-                   "decision_calls": None, "decision_budget": None,
+                   "decision_calls": None, "decision_pool": None,
+                   "decision_budget": None,
                    "book_key": None,
                    "source": None, "chapters": None,
                    "ingest_title": None, "replace_result": None}
@@ -20171,6 +20173,17 @@ class _RunHistoryRecorder:
                 # claiming a measured zero breakdown.
                 _snap = _dm_budget_snapshot()
                 rec["decision_budget"] = _snap or None
+                # The pool this book was armed with, captured under
+                # the same attribution guard through the locked
+                # accessor. The pool is armed from a chapter count,
+                # so no armed count means this book never measured
+                # one — it ended before the pipeline armed it — and
+                # the stamp stays None rather than reporting the
+                # floor the accessor returns for an unarmed book:
+                # that floor would read as a measurement the run
+                # never made.
+                if _DM_BUDGET_CHAPTER_COUNT is not None:
+                    rec["decision_pool"] = _dm_budget_pool()
             wrote = getattr(_DIAG, "wrote_stats", None)
             replace = getattr(_DIAG, "replace_stats", None)
             if wrote is not None or replace is not None:
@@ -20647,6 +20660,7 @@ def _history_book_payload(rec, run_id):
         "chapters": chapters,
         "duration_ms": rec["duration_ms"],
         "decision_calls": rec["decision_calls"],
+        "decision_pool": rec["decision_pool"],
         "claims": claims,
         "characters": _history_characters(result),
         "quotes": _history_quotes(result),
@@ -21122,8 +21136,9 @@ def _decision_pool_for_chapters(chapter_count):
 def _dm_budget_pool():
     """The pool armed for the current book (the floor before any
     book has armed one). Read by the stamps that record the pool
-    beside the scheme, so a calibration pass can attribute judged
-    coverage to the pool size that produced it."""
+    beside the scheme and by the run-history recorder's per-book
+    stamp, so a calibration pass can attribute judged coverage
+    to the pool size that produced it."""
     with _DM_BUDGET_LOCK:
         return _DM_BUDGET_POOL
 

@@ -434,10 +434,10 @@ class PoolFingerprintTests(_Base):
     before any book arms its pool). A per-book stamp on the
     run-history book row is NOT part of this fix: the book
     payload's keys are the live processor_run_books columns and
-    that table has no decision_pool column, so the placement
-    (new column vs an existing jsonb carrier) is a separate
-    schema decision. The reduce artefact's own decision_pool
-    stamp is the per-book record of record meanwhile."""
+    that table had no decision_pool column, so the placement was
+    a separate schema decision — ruled Option A (a real column)
+    and landed in v2.13.36; see DecisionPoolHistoryTests. The
+    reduce artefact's own decision_pool stamp is unchanged."""
 
     def tearDown(self):
         pp._dm_budget_reset()
@@ -465,6 +465,81 @@ class PoolFingerprintTests(_Base):
             "scan", True, False, str(self.tmp))
         self.assertEqual(rec_a.config_fingerprint,
                          rec_b.config_fingerprint)
+
+
+class DecisionPoolHistoryTests(_Base):
+    """v2.13.36: step 2 of the v2.13.35 fix, unlocked by the
+    Option A ruling (the User's call, 2026-10-18): the migration
+    adding processor_run_books.decision_pool was approved and
+    applied live — and verified from information_schema — before
+    this writer shipped, so the book payload may now carry the
+    key. The stamp is captured under the recorder's existing
+    per-book budget attribution guard (v2 pipeline, single job),
+    and a book whose pool was never armed stamps NULL: the column
+    reads "not recorded", never a guessed or floor value."""
+
+    def tearDown(self):
+        pp._dm_budget_reset()
+        super().tearDown()
+
+    def book_payloads(self):
+        posts = self.fake.posts("processor_run_books")
+        self.assertEqual(len(posts), 1)
+        return {row["book_key"]: row for row in posts[0]["data"]}
+
+    def drive_two_books(self):
+        book2 = self.tmp / "book2.epub"
+        book2.write_bytes(b"second fake epub bytes for history tests")
+        key2 = hashlib.sha256(book2.read_bytes()).hexdigest()
+        pp._history_begin("scan", preview=True,
+                          learn_dir=str(self.tmp), files_seen=2)
+        pp._history_book_start(self.book)
+        pp._dm_budget_reset(chapter_count=60)
+        pp._history_note_result(self.book, v2_result())
+        pp._history_book_outcome(self.book, True)
+        pp._history_book_start(book2)
+        pp._dm_budget_reset(chapter_count=200)
+        pp._history_note_result(book2, v2_result())
+        pp._history_book_outcome(book2, True)
+        pp._history_finish(failures=0)
+        return key2
+
+    def test_two_books_stamp_their_own_armed_pools(self):
+        key2 = self.drive_two_books()
+        rows = self.book_payloads()
+        self.assertEqual(rows[self.book_key]["decision_pool"], 60)
+        self.assertEqual(rows[key2]["decision_pool"], 200)
+
+    def test_unmeasured_book_stamps_null_not_the_floor(self):
+        # No book armed a pool: the locked accessor reports the
+        # floor for an unarmed book, and stamping that would
+        # record a measurement that never happened.
+        pp._dm_budget_reset()
+        self.assertEqual(pp._dm_budget_pool(), pp._MERGE_TIER3_CAP)
+        self.drive_one_book(result=v2_result())
+        self.assertIsNone(self.book_payload()["decision_pool"])
+
+    def test_pool_null_when_attribution_refused(self):
+        # Parallel mode shares the budget across books, so a
+        # per-book pool would be an attribution the run cannot
+        # support — the same guard that keeps decision_calls NULL.
+        pp.CONFIG["jobs"] = 2
+        pp._dm_budget_reset(chapter_count=60)
+        self.drive_one_book(result=v2_result())
+        self.assertIsNone(self.book_payload()["decision_pool"])
+
+    def test_book_payload_keys_are_the_live_columns(self):
+        # The payload's keys are pinned to the migrated table's
+        # columns: decision_pool joins the set only because the
+        # column now exists live (verified before this shipped).
+        pp._dm_budget_reset(chapter_count=60)
+        self.drive_one_book(result=v2_result())
+        self.assertEqual(set(self.book_payload()), {
+            "run_id", "book_key", "title", "work_id", "source",
+            "outcome", "skip_reason", "chapters", "duration_ms",
+            "decision_calls", "decision_pool", "claims",
+            "characters", "quotes", "suppressed_by_verdict",
+            "replace_result", "error_class", "error_message"})
 
 
 class CollisionTests(_Base):

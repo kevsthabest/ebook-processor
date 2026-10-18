@@ -199,11 +199,10 @@ class PoolStampTests(unittest.TestCase):
         # v2.13.35 (Advisor R2 on the 2.13.33 stamp below): the
         # thresholds dict is the config fingerprint's input, and
         # the armed pool is per-book runtime state, not config —
-        # it no longer rides this dict at all. A run-history
-        # book-row stamp awaits a schema decision (the live
-        # processor_run_books table has no decision_pool column);
-        # the artefact stamp below is unchanged and stays the
-        # per-book record of record.
+        # it no longer rides this dict at all. The run-history
+        # book row carries its own stamp since the Option A
+        # column landed (v2.13.36); the artefact stamp below is
+        # unchanged and stays the per-book record of record.
         pp._dm_budget_reset(chapter_count=115)
         thresholds = pp._history_thresholds()
         self.assertNotIn("decision_pool", thresholds)
