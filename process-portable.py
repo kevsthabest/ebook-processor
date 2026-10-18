@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.38"
+PORTABLE_VERSION = "2.13.39"
 
 
 import argparse
@@ -19314,24 +19314,31 @@ def sb(table, method="GET", data=None, params="", prefer=None,
     schema, and claim writes must not grow new headers as a side
     effect of sharing this helper."""
     global _SB_LAST_ERROR
-    url = f"{CONFIG['supabase_url']}/rest/v1/{table}{params}"
-    _prefer = "return=representation"
-    if prefer:
-        _prefer = f"{_prefer},{prefer}"
-    headers = {
-        "apikey": CONFIG["supabase_key"],
-        "Authorization": f"Bearer {CONFIG['supabase_key']}",
-        "Content-Type": "application/json",
-        "Prefer": _prefer,
-    }
-    if schema:
-        if method == "GET":
-            headers["Accept-Profile"] = schema
-        else:
-            headers["Content-Profile"] = schema
-    body = json.dumps(data).encode("utf-8") if data is not None else None
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
+        url = f"{CONFIG['supabase_url']}/rest/v1/{table}{params}"
+        _prefer = "return=representation"
+        if prefer:
+            _prefer = f"{_prefer},{prefer}"
+        headers = {
+            "apikey": CONFIG["supabase_key"],
+            "Authorization": f"Bearer {CONFIG['supabase_key']}",
+            "Content-Type": "application/json",
+            "Prefer": _prefer,
+        }
+        if schema:
+            if method == "GET":
+                headers["Accept-Profile"] = schema
+            else:
+                headers["Content-Profile"] = schema
+        # The body is built inside the try on purpose: callers treat
+        # None as "this call failed, nothing landed" and build their
+        # failure handling (including the write path's restore of
+        # already-deleted rows) on that contract. A non-serializable
+        # row value must arrive as the same None, not escape as a
+        # raise halfway through a multi-section write.
+        body = json.dumps(data).encode("utf-8") if data is not None else None
+        req = urllib.request.Request(url, data=body, headers=headers,
+                                     method=method)
         with urllib.request.urlopen(req, timeout=30) as r:
             _SB_LAST_ERROR = None
             return json.loads(r.read().decode("utf-8") or "[]")
@@ -22124,14 +22131,51 @@ def _delete_processor_claims(table, work_id):
     row was deleted while its key stayed in the skip set — deleted and
     never re-inserted. NULL-status rows are unaffected either way (no
     neq filter matches NULL).
-    Returns the number of rows deleted, or None on error."""
+    Returns the deleted rows themselves (the DELETE asks for
+    return=representation, so they arrive complete), or None on
+    error. The rows — not just their count — are the compensation
+    record for the write path: the delete and the section's insert
+    are separate calls, so if the insert then fails the caller
+    re-inserts exactly these rows (see _restore_deleted_rows).
+    Fetching them any other way would either cost an extra read on
+    every happy-path write or come from the state read, which
+    selects only the partition columns and cannot rebuild a row."""
     src = _CLAIM_TABLES[table]["source"]
     params = (f"?work_id=eq.{quote(str(work_id), safe='')}"
               f"&source_type=eq.{src}")
     if table != "book_quotes":
         params += "&status=neq.rejected&status=neq.confirmed&status=neq."
-    gone = sb(table, method="DELETE", params=params)
-    return None if gone is None else len(gone)
+    return sb(table, method="DELETE", params=params)
+
+
+def _restore_deleted_rows(table, work_id, deleted_rows):
+    """Put back rows a section deleted when its replacement insert failed.
+
+    The invariant this serves: a failed write attempt never leaves a
+    table worse than it found it. The rows handed in are exactly the
+    rows the section's scoped DELETE removed — they were in scope
+    for that delete, so they are in scope for this re-insert, and no
+    contributor, rejected, or confirmed row can be among them.
+    Returns True when the table is whole again (including the
+    nothing-was-deleted case, which needs no call at all). When the
+    restore itself fails the book IS worse than the section found
+    it, and a single counted error would bury that fact, so the
+    failure is printed as an unmistakable RESTORE FAILED line naming
+    the table and work — the operator's cue that this book needs
+    reprocessing — and False is returned so the caller counts it as
+    an additional error on top of the failed insert."""
+    if not deleted_rows:
+        return True
+    if sb(table, method="POST",
+          data=[dict(r) for r in deleted_rows]) is None:
+        print(f"  RESTORE FAILED: {table} for work {work_id} — "
+              f"{len(deleted_rows)} deleted processor row(s) could not "
+              f"be restored after the replacement insert failed; "
+              f"this book needs reprocessing")
+        return False
+    print(f"  Restored {len(deleted_rows)} deleted {table} row(s) for "
+          f"work {work_id} after the replacement insert failed")
+    return True
 
 
 _SPLIT_PART_SUFFIX_RE = re.compile(r"\s*\(part \d+\)\s*$")
@@ -22601,6 +22645,13 @@ def write_claims(work_id, result, trope_mappings=None):
         is kept) and the new run dedupes against them, so a rejected claim
         is never resurrected and a confirmed claim never silently
         reverts to a fresh candidate.
+      * A failed insert never strands a section: the delete and the
+        insert are separate calls, so each section holds the rows its
+        DELETE returned and re-inserts them when the new rows cannot
+        land (_restore_deleted_rows). A restore that also fails prints
+        a RESTORE FAILED line naming the table and work, beyond the
+        error count, so the operator knows the book needs
+        reprocessing.
     trope_proposals is scoped by book_key + status='pending' +
     _proposal_scope() (it has no source_type, so proposed_by is the
     structural own-rows boundary). works.spice_detected is already an overwrite; book_meta
@@ -22656,16 +22707,21 @@ def write_claims(work_id, result, trope_mappings=None):
                   f"({', '.join(_lookup_failed[:3])}); counted as "
                   f"errors, not filed as proposals")
         _ok = True
+        _gone_rows = []
         if _ndel:
-            _gone = _delete_processor_claims("book_trope_claims", work_id)
-            if _gone is None:
+            _gone_rows = _delete_processor_claims("book_trope_claims", work_id)
+            if _gone_rows is None:
                 errors += 1
                 _ok = False  # old rows remain; inserting would duplicate them
+                _gone_rows = []
             else:
-                deleted["tropes"] = _gone
+                deleted["tropes"] = len(_gone_rows)
         if _ok and rows:
             if sb("book_trope_claims", method="POST", data=rows) is None:
                 errors += 1
+                if not _restore_deleted_rows(
+                        "book_trope_claims", work_id, _gone_rows):
+                    errors += 1
             else:
                 wrote["tropes"] = len(rows)
 
@@ -22686,6 +22742,7 @@ def write_claims(work_id, result, trope_mappings=None):
         prop_rows = _build_proposal_rows(
             result, unmatched, _all_keys - _own_pending)
         _ok = True
+        _gone_rows = []
         if _own_pending:
             _gone_rows = sb(
                 "trope_proposals", method="DELETE",
@@ -22694,11 +22751,15 @@ def write_claims(work_id, result, trope_mappings=None):
             if _gone_rows is None:
                 errors += 1
                 _ok = False
+                _gone_rows = []
             else:
                 deleted["proposals"] = len(_gone_rows)
         if _ok and prop_rows:
             if sb("trope_proposals", method="POST", data=prop_rows) is None:
                 errors += 1
+                if not _restore_deleted_rows(
+                        "trope_proposals", work_id, _gone_rows):
+                    errors += 1
             else:
                 wrote["proposals"] = len(prop_rows)
 
@@ -22713,16 +22774,21 @@ def write_claims(work_id, result, trope_mappings=None):
                               if (r.get("status") or "") == "confirmed")
         rows = _build_trigger_rows(work_id, result, model, _preserved)
         _ok = True
+        _gone_rows = []
         if _ndel:
-            _gone = _delete_processor_claims("book_trigger_claims", work_id)
-            if _gone is None:
+            _gone_rows = _delete_processor_claims("book_trigger_claims", work_id)
+            if _gone_rows is None:
                 errors += 1
                 _ok = False
+                _gone_rows = []
             else:
-                deleted["triggers"] = _gone
+                deleted["triggers"] = len(_gone_rows)
         if _ok and rows:
             if sb("book_trigger_claims", method="POST", data=rows) is None:
                 errors += 1
+                if not _restore_deleted_rows(
+                        "book_trigger_claims", work_id, _gone_rows):
+                    errors += 1
             else:
                 wrote["triggers"] = len(rows)
 
@@ -22746,17 +22812,22 @@ def write_claims(work_id, result, trope_mappings=None):
                   f"({', '.join(c.get('name', '') for c in _earners)})")
         rows = _build_character_rows(work_id, result, rel_map, _preserved)
         _ok = True
+        _gone_rows = []
         if _ndel:
-            _gone = _delete_processor_claims("book_characters", work_id)
-            if _gone is None:
+            _gone_rows = _delete_processor_claims("book_characters", work_id)
+            if _gone_rows is None:
                 errors += 1
                 _ok = False
+                _gone_rows = []
             else:
-                deleted["characters"] = _gone
+                deleted["characters"] = len(_gone_rows)
         if _ok and rows:
             inserted = sb("book_characters", method="POST", data=rows)
             if inserted is None:
                 errors += 1
+                if not _restore_deleted_rows(
+                        "book_characters", work_id, _gone_rows):
+                    errors += 1
             else:
                 wrote["characters"] = len(rows)
                 # Suggest canonical character links via name_norm match.
@@ -22847,15 +22918,32 @@ def write_claims(work_id, result, trope_mappings=None):
                 # book_meta update instead and count the failure.
                 errors += 1
             else:
-                merged = dict(existing[0]["data"]) if existing and existing[0].get("data") else {}
-                merged.update(meta_updates)
-                # POST with upsert (merge-duplicates required for on_conflict)
-                r = sb("book_meta", method="POST",
-                       params="?on_conflict=isbn",
-                       data={"isbn": isbn, "data": merged},
-                       prefer="resolution=merge-duplicates")
-                if r is None:
+                _stored = existing[0].get("data") if existing else None
+                if _stored and not isinstance(_stored, dict):
+                    # A truthy non-dict blob is stored data this merge
+                    # cannot read, not an empty store: dict() on it
+                    # raises, and that raise used to escape here —
+                    # after the claims sections had already replaced,
+                    # before quotes ran — leaving a mixed-generation
+                    # book. Count it and skip the upsert instead, so
+                    # the stored blob is never overwritten by a merge
+                    # that never saw its contents, and the sections
+                    # after this one still run.
                     errors += 1
+                    print(f"  book_meta for ISBN {isbn} holds a "
+                          f"non-object data blob ({type(_stored).__name__}); "
+                          f"meta update skipped and counted, stored blob "
+                          f"left untouched")
+                else:
+                    merged = dict(_stored) if _stored else {}
+                    merged.update(meta_updates)
+                    # POST with upsert (merge-duplicates required for on_conflict)
+                    r = sb("book_meta", method="POST",
+                           params="?on_conflict=isbn",
+                           data={"isbn": isbn, "data": merged},
+                           prefer="resolution=merge-duplicates")
+                    if r is None:
+                        errors += 1
 
     # Quotes -> book_quotes (3-5 memorable per book, no speaker
     # attribution yet). Runs unconditionally, like the other sections:
@@ -22868,16 +22956,21 @@ def write_claims(work_id, result, trope_mappings=None):
         _preserved, _rejected, _ndel = _partition_claims("book_quotes", _qstate)
         qrows = _build_quote_rows(work_id, result, _preserved)
         _ok = True
+        _gone_rows = []
         if _ndel:
-            _gone = _delete_processor_claims("book_quotes", work_id)
-            if _gone is None:
+            _gone_rows = _delete_processor_claims("book_quotes", work_id)
+            if _gone_rows is None:
                 errors += 1
                 _ok = False
+                _gone_rows = []
             else:
-                deleted["quotes"] = _gone
+                deleted["quotes"] = len(_gone_rows)
         if _ok and qrows:
             if sb("book_quotes", method="POST", data=qrows) is None:
                 errors += 1
+                if not _restore_deleted_rows(
+                        "book_quotes", work_id, _gone_rows):
+                    errors += 1
             else:
                 wrote["quotes"] = len(qrows)
 
