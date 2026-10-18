@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.33"
+PORTABLE_VERSION = "2.13.34"
 
 
 import argparse
@@ -16751,6 +16751,20 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         relationships = [r for r in relationships if id(r) not in _drop_ids]
         print(f"  Relationship validation: dropped "
               f"{len(_dropped_relationships)} hallucinated relationship(s)")
+    # The non-family stage is done: its pass above is complete, so
+    # its unused reserve becomes borrowable by everything that
+    # still runs — the revival loop immediately below, and after
+    # it the trigger gate and the quote poll (spec §1.3). Marking
+    # the stage finished must precede the revival loop, not
+    # follow it: a revived family claim draws as rel_family,
+    # which sits earlier in pipeline order than rel_nonfamily,
+    # so while the non-family stage was still marked unfinished
+    # its reserve stayed protected from revival draws and a
+    # revival could be budget-denied with up to the whole
+    # 5-call non-family reserve provably unused (v2.13.34).
+    # The accounting rules themselves do not move: only the
+    # moment of this marking changes.
+    _dm_budget_finish("rel_nonfamily")
     # --- Runner-up revival (F-24-1) ---
     # A pair whose winning claim was rejected — fail-closed at
     # the evidence stage or drawn and dropped — used to ship
@@ -16829,9 +16843,6 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # Audit trail only: these claims lost to a family claim for the
         # same pair (family guard above); they were never emitted.
         _dropped_relationships.extend(_guard_suppressed)
-    # The non-family stage is done: its unused reserve becomes
-    # borrowable by the trigger gate and the quote poll (spec §1.3).
-    _dm_budget_finish("rel_nonfamily")
     # Validator-error circuit breaker (spec §1.6, Decision K4):
     # the book's error rate over the claims validation actually
     # attempted. The breaker trips only at or above the minimum
