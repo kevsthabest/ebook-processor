@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.27"
+PORTABLE_VERSION = "2.13.28"
 
 
 import argparse
@@ -21858,13 +21858,83 @@ def _roster_canonical_names(result):
         "canonical_names") or {}
 
 
+# Judged claim states for the claim-earner storage rule (Decision,
+# 2026-10-18). "validated" is a claim the validator scored and kept
+# or downgraded. "review_required" is the residual curation state
+# (spec §1.5): it holds claims the judge drew into the middle —
+# direction-guard demotions of validated claims among them — AND
+# claims nobody judged: an exempt "other", a claim with nothing to
+# judge, a run with no validator configured. The storage rule
+# counts both states as judged anyway: a stored row is a curation
+# surface, and a minor whose claim awaits a human decision needs
+# the row for that decision to land on. The states that dispose of
+# a claim without any judgment landing — "budget_exhausted",
+# "validator_error", "rejected" — earn nothing.
+_JUDGED_CLAIM_STATES = frozenset({"validated", "review_required"})
+
+
+def _claim_earner_chars(result):
+    """Non-principal roster entries that earn a stored character row.
+
+    The principal filter keeps every claim with a non-principal
+    endpoint out of the stored set, which silently discarded judged
+    claims whose SOURCE is a minor character: the claim shipped in
+    the run's judgement, but claims embed on the source's row and
+    the source had none — and the wholesale rewrite deleted the
+    character's previously stored row along with the rest. The rule
+    (Decision, 2026-10-18): a character who sources at least one
+    shipping claim the validator judged is stored like a principal.
+
+    The candidates are the surviving claims the filter removed
+    solely for their source (result["minor_sourced_relationships"],
+    retained where the filter runs). A claim was judged when its
+    effective validation_state is a judged state; the effective
+    state is the recorded state, derived from the note when the
+    claim carries none — the same expression _build_rel_map stamps
+    into stored claims, so the row decision and the stored state
+    cannot disagree about whether a claim was judged. Returns the
+    roster entries from result["minor_characters"], in roster
+    order; empty when the retention never ran (principal filter
+    off, a pipeline that does not retain, hand-built fixtures)."""
+    retained = result.get("minor_sourced_relationships") or []
+    if not retained:
+        return []
+    judged_sources = set()
+    for r in retained:
+        if not r.get("evidence"):
+            # Not a shipping claim: the write pass stores no
+            # evidence-less claim (it stays in the preview only),
+            # so it cannot qualify its source — the row it earned
+            # would embed nothing. The test is _build_rel_map's
+            # own, so the two decisions cannot disagree.
+            continue
+        state = r.get("validation_state") or _rel_validation_state(r)
+        if state in _JUDGED_CLAIM_STATES:
+            judged_sources.add(norm_name(r.get("from", "")))
+    if not judged_sources:
+        return []
+    return [c for c in result.get("minor_characters") or []
+            if norm_name(c.get("name", "")) in judged_sources]
+
+
 def _build_rel_map(result):
     """Map character name (lower) -> relationship list for DB promotion.
     Evidence-less relationships stay in the preview JSON only.
     Returns (rel_map, n_evidenceless)."""
     _canon = _roster_canonical_names(result)
+    # Claim-earner rule (see _claim_earner_chars): a character who
+    # earned a stored row embeds their FULL shipping claim set, not
+    # only the claim that qualified — so the map is built over the
+    # filtered claims plus every retained claim an earner sources.
+    _earner_names = {norm_name(c.get("name", ""))
+                     for c in _claim_earner_chars(result)}
+    _claims = list(result["relationships"])
+    if _earner_names:
+        _claims += [r for r in
+                    result.get("minor_sourced_relationships") or []
+                    if norm_name(r.get("from", "")) in _earner_names]
     rel_map, evidenceless = {}, 0
-    for r in result["relationships"]:
+    for r in _claims:
         if not r.get("evidence"):
             evidenceless += 1
             continue
@@ -21899,7 +21969,11 @@ def _build_character_rows(work_id, result, rel_map, skip_names):
     _suppressed = set((result.get("roster_persistence") or {}).get(
         "suppressed_entities") or ())
     rows, seen = [], set(skip_names)
-    for c in result["characters"]:
+    # Principals plus claim earners (see _claim_earner_chars): an
+    # earner goes through this same builder, so its row is identical
+    # in shape and fields to a principal's, with its full claim set
+    # embedded from the rel map.
+    for c in list(result["characters"]) + _claim_earner_chars(result):
         # Option B (OC-3): a character whose entity is a rejected
         # anchor, linked at tier 0/1, ships no candidate row under
         # any observed form — the human rejected the person, not
@@ -22164,6 +22238,11 @@ def write_claims(work_id, result, trope_mappings=None):
         preserved_conf += sum(1 for r in _cstate
                               if (r.get("status") or "") == "confirmed")
         pre_existing = set(_preserved)  # surviving rows: backfill targets
+        _earners = _claim_earner_chars(result)
+        if _earners:
+            print(f"  Claim-earner rows: {len(_earners)} non-principal "
+                  f"character(s) stored on judged claims "
+                  f"({', '.join(c.get('name', '') for c in _earners)})")
         rows = _build_character_rows(work_id, result, rel_map, _preserved)
         _ok = True
         if _ndel:
@@ -22189,7 +22268,10 @@ def write_claims(work_id, result, trope_mappings=None):
         # overwrite. (Processor rows were replaced above with full data.)
         if _ok:
             _backfilled = 0
-            for c in result["characters"]:
+            # Earners are stored identically to principals, so a
+            # surviving row of theirs backfills on the same terms.
+            for c in (list(result["characters"])
+                      + _claim_earner_chars(result)):
                 if c["name"].lower() not in pre_existing:
                     continue  # only backfill rows that survived the replace
                 patch = {}
@@ -24562,6 +24644,18 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         result["characters"] = _princs
         result["relationships"] = _prels
         result["minor_characters"] = _minors
+        # Claim-earner retention (see _claim_earner_chars): the
+        # claims this filter removes solely because their source is
+        # not a principal are kept on the result. Once the filter
+        # runs they exist nowhere else — the result is the only
+        # record the write path (and any later push of the saved
+        # preview) ever sees — and without them a judged claim
+        # sourced by a minor could never reach storage.
+        _principal_names = {norm_name(c.get("name", ""))
+                            for c in _princs}
+        result["minor_sourced_relationships"] = [
+            r for r in _full_relationships
+            if norm_name(r.get("from", "")) not in _principal_names]
         print(f"  Principals: {len(_princs)}/{len(_full_characters)} characters, "
               f"{len(_prels)}/{len(_full_relationships)} relationships "
               f"(min_frequency={_min_freq})")
