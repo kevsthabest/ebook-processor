@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.55"
+PORTABLE_VERSION = "2.13.56"
 
 
 import argparse
@@ -20331,31 +20331,42 @@ _HISTORY_WINPATH_RE = re.compile(r"[A-Za-z]:\\[^\s]*")
 _HISTORY_UNCPATH_RE = re.compile(r"\\\\[^\s]*")
 _HISTORY_POSIXPATH_RE = re.compile(r"(?<![\w.])/(?:[\w.\-]+/)+[\w.\-]*")
 _HISTORY_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
-# The token classes carry the punctuation real ebook filenames use
-# (parentheses, commas, #, brackets): without those characters the
-# match broke at the first one and the rest of a spaced filename —
-# title words included — survived sanitizing untouched. Brackets
-# are barred from a match's first token (except a bracket that does
-# not open a redaction placeholder), because this pattern runs
-# AFTER the path substitutions: a match allowed to start at the
-# "[path]" placeholder those substitutions just wrote would swallow
-# the placeholder itself into the filename it replaces.
-# The repetitions are bounded — a token is at most 64 characters
-# and a filename at most 25 tokens — because unbounded, the pattern
-# backtracked quadratically on a crafted punctuation-token stream
-# carrying no book extension: every starting position retried
-# every split of the remaining text before failing. Real filenames
-# sit far inside both bounds (a filesystem name is at most 255
-# characters in total), so the bounds change nothing that can
-# actually be a filename; they only cap how much work a failed
-# match attempt can do before the engine moves on.
-_HISTORY_BARE_FILE_RE = re.compile(
-    r"(?:\[(?!path\]|file\]|url\]|email\]|key\])"
-    r"[A-Za-z0-9_'\-(),#\[\]&+!]{1,64}"
-    r"|[A-Za-z0-9_'\-(),#&+!]{1,64})"
-    r"(?: [A-Za-z0-9_'\-(),#\[\]&+!]{1,64}){0,24}"
-    r"\.(?:epub|mobi|azw3)\b",
-    re.IGNORECASE)
+# A bare ebook filename is found from its extension, never by
+# matching a name-shaped pattern against the text: the search finds
+# each ebook extension, then _history_bare_file_spans walks left
+# from it one whole token at a time until the name runs out. Whole
+# consumption is therefore true by construction — a candidate is
+# replaced from the first character of its first token or not at
+# all, at any token length and any token count. That invariant is
+# the reason for this shape: a name pattern with bounded
+# repetitions can start mid-name once a real name outgrows the
+# bounds and match only the suffix, shipping the head verbatim,
+# while the unbounded pattern the bounds replaced backtracked
+# quadratically on a crafted punctuation stream carrying no book
+# extension (every starting position retried every split of the
+# remaining text before failing). Anchoring on the extension
+# avoids both failure modes: text with no extension costs one
+# linear scan, and the leftward walk visits each character at most
+# once, so there is no repetition to bound and no backtracking to
+# cap.
+# The token character class carries the punctuation real ebook
+# filenames use (parentheses, commas, #, brackets): without those
+# characters the walk would stop at the first one and the rest of
+# a spaced filename — title words included — would survive
+# sanitizing untouched.
+_HISTORY_FILE_EXT_RE = re.compile(r"\.(?:epub|mobi|azw3)\b",
+                                  re.IGNORECASE)
+_HISTORY_FILENAME_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    "0123456789_'(),#[]&+!-")
+# The placeholders the substitutions before this step write. A
+# placeholder token stops the leftward walk instead of being
+# swallowed by it, because the walk runs AFTER those
+# substitutions: "[path] Daemon - ....epub" must sanitise to
+# "[path] [file]", the already-safe placeholder left standing in
+# front of the replacement.
+_HISTORY_PLACEHOLDER_TOKENS = frozenset(
+    ("[path]", "[file]", "[url]", "[email]", "[key]"))
 _HISTORY_BEARER_RE = re.compile(r"Bearer\s+\S+", re.IGNORECASE)
 _HISTORY_JWT_RE = re.compile(r"eyJ[\w.\-]{10,}")
 _HISTORY_APIKEY_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}")
@@ -20367,8 +20378,63 @@ _HISTORY_APIKEY_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}")
 # is what a partially eaten filename leaves behind (the pre-fix
 # sanitizer turned "#1.epub" into "#[file]", stranding both the scar
 # and the name text before it).
-_HISTORY_SCAN_EXT_RE = re.compile(r"\.(?:epub|mobi|azw3)\b", re.IGNORECASE)
+_HISTORY_SCAN_EXT_RE = _HISTORY_FILE_EXT_RE
 _HISTORY_SCAN_SCAR_RE = re.compile(r"[,#]\s*\[(?:file|path)\]")
+
+
+def _history_bare_file_spans(s):
+    """The (start, end) spans of s that are bare ebook filenames,
+    each span covering the whole name plus its extension. The walk
+    from an extension moves left token by token — a token is a
+    maximal run of filename characters, tokens are joined by
+    single spaces — and stops at the first token it cannot take:
+    a redaction placeholder, or the edge of the text the walk has
+    not already claimed. Claimed text is never re-walked
+    (covered_until), because an extension's own letters are
+    filename characters and a second extension must not walk back
+    into the span the first one produced."""
+    spans = []
+    covered_until = 0
+    for m in _HISTORY_FILE_EXT_RE.finditer(s):
+        if m.start() < covered_until:
+            continue
+        run_start = None
+        cursor = m.start()
+        while cursor > covered_until:
+            t = cursor
+            while (t > covered_until
+                   and s[t - 1] in _HISTORY_FILENAME_CHARS):
+                t -= 1
+            if t == cursor:
+                break
+            if s[t:cursor].lower() in _HISTORY_PLACEHOLDER_TOKENS:
+                break
+            run_start = t
+            if (t >= covered_until + 2 and s[t - 1] == " "
+                    and s[t - 2] in _HISTORY_FILENAME_CHARS):
+                cursor = t - 1
+            else:
+                break
+        if run_start is not None:
+            spans.append((run_start, m.end()))
+            covered_until = m.end()
+    return spans
+
+
+def _history_redact_bare_files(s):
+    """s with every bare ebook filename replaced by "[file]",
+    each replacement covering the filename's whole span."""
+    spans = _history_bare_file_spans(s)
+    if not spans:
+        return s
+    out = []
+    pos = 0
+    for start, end in spans:
+        out.append(s[pos:start])
+        out.append("[file]")
+        pos = end
+    out.append(s[pos:])
+    return "".join(out)
 
 
 def _history_sanitize(text, limit=500):
@@ -20389,7 +20455,7 @@ def _history_sanitize(text, limit=500):
     s = _HISTORY_BEARER_RE.sub("Bearer [key]", s)
     s = _HISTORY_JWT_RE.sub("[key]", s)
     s = _HISTORY_APIKEY_RE.sub("[key]", s)
-    s = _HISTORY_BARE_FILE_RE.sub("[file]", s)
+    s = _history_redact_bare_files(s)
     s = re.sub(r"\s+", " ", s).strip()
     return s[:limit] if s else None
 
@@ -20399,15 +20465,20 @@ def _history_denylist_scan(payload):
     payload builders are allowlist-built; this scan is the tripwire
     the suite uses to prove the allowlist held (spec §5/§10)."""
     blob = json.dumps(payload, ensure_ascii=False, default=str)
-    return [name for name, rx in (
+    hits = [name for name, rx in (
         ("url", _HISTORY_URL_RE), ("windows-path", _HISTORY_WINPATH_RE),
         ("unc-path", _HISTORY_UNCPATH_RE),
         ("posix-path", _HISTORY_POSIXPATH_RE),
         ("email", _HISTORY_EMAIL_RE), ("bearer", _HISTORY_BEARER_RE),
         ("jwt", _HISTORY_JWT_RE), ("api-key", _HISTORY_APIKEY_RE),
-        ("bare-file", _HISTORY_BARE_FILE_RE),
         ("file-extension", _HISTORY_SCAN_EXT_RE),
         ("file-remnant", _HISTORY_SCAN_SCAR_RE)) if rx.search(blob)]
+    # The bare-file tripwire uses the sanitizer's own span walk, so
+    # an over-bound name the sanitizer must consume whole is also a
+    # name the scan can see whole.
+    if _history_bare_file_spans(blob):
+        hits.append("bare-file")
+    return hits
 
 
 def _history_flags(mode):

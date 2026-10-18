@@ -263,6 +263,37 @@ class TestHistorySanitizePunctuation(unittest.TestCase):
                          [])
 
 
+class TestHistorySanitizeOverBoundNames(unittest.TestCase):
+    """Issue #64 reopened: bounding the bare-filename pattern let it
+    match a SUFFIX of an over-bound filename, shipping the head
+    verbatim. A candidate must be consumed whole or not at all, at
+    any token count and any token length."""
+
+    NAME_30 = " ".join(f"word{i:02d}" for i in range(30)) + ".epub"
+    NAME_LONG_TOKEN = "a" * 100 + ".epub"
+
+    def test_thirty_token_spaced_name_fully_redacted(self):
+        cleaned = pp._history_sanitize(f"failed: {self.NAME_30} again")
+        self.assertEqual(cleaned, "failed: [file] again")
+        embedded = pp._history_sanitize(f"failed on {self.NAME_30} today")
+        for token in self.NAME_30.split():
+            self.assertNotIn(token, embedded)
+
+    def test_hundred_char_token_name_fully_redacted(self):
+        cleaned = pp._history_sanitize(
+            f"failed: {self.NAME_LONG_TOKEN} again")
+        self.assertEqual(cleaned, "failed: [file] again")
+        self.assertNotIn("aaaa", cleaned)
+
+    def test_denylist_scan_flags_over_bound_names(self):
+        for raw in (self.NAME_30, self.NAME_LONG_TOKEN):
+            self.assertNotEqual(
+                pp._history_denylist_scan({"x": raw}), [], raw)
+            self.assertEqual(
+                pp._history_denylist_scan(
+                    {"x": pp._history_sanitize(raw)}), [], raw)
+
+
 class TestHistorySanitizeAdversarialShape(unittest.TestCase):
     """Issue #64: the widened bare-filename pattern backtracked
     quadratically on a crafted shape — a dense punctuation-token
@@ -275,6 +306,16 @@ class TestHistorySanitizeAdversarialShape(unittest.TestCase):
 
     def test_dense_punctuation_stream_stays_fast(self):
         adversarial = "a,b#c!d&e+f-g" * 600  # 7,800 chars, no extension
+        start = time.process_time()
+        cleaned = pp._history_sanitize(adversarial)
+        elapsed = time.process_time() - start
+        self.assertIsInstance(cleaned, str)
+        self.assertLess(elapsed, 1.0)
+
+    def test_spaced_token_stream_stays_fast(self):
+        # The second #64 shape: the same punctuation tokens spaced
+        # into a token stream, still with no book extension.
+        adversarial = " ".join(["a,b#c!d&e+f-g"] * 600)
         start = time.process_time()
         cleaned = pp._history_sanitize(adversarial)
         elapsed = time.process_time() - start
