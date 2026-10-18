@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.51"
+PORTABLE_VERSION = "2.13.52"
 
 
 import argparse
@@ -19179,38 +19179,51 @@ def _preview_shape_problems(result):
 def cmd_push_preview(preview_path):
     """Push a preview JSON's data to Supabase without re-running the LLM.
     Resolves the work, then runs write_claims. Use for retrying failed writes.
-    Accepts a single file or a directory (all .json files except trope-maps)."""
+    Accepts a single file or a directory (all .json files except trope-maps).
+
+    Returns an exit code: 0 when the push completed (or the preview
+    itself / the operator at the prompt said not to push — an ABORTED
+    or fallback preview, a declined new-work prompt), 1 when the
+    requested push did not happen or did not fully land — missing
+    config or file, a shape/resolution refusal, or write_claims
+    reporting failed operations. main() exits with this code: a
+    caller chaining on rc==0 (the portal reads it as "done") must
+    never see success for a push that failed. A directory push is 1
+    when ANY file in it fails; partial success is not success."""
     import os
     import glob as _glob
     if not (CONFIG.get("supabase_url") and CONFIG.get("supabase_key")):
         print("  ERROR: supabase_url and supabase_key must be set in config.json")
-        return
+        return 1
     if os.path.isdir(preview_path):
         files = sorted(_glob.glob(os.path.join(preview_path, "*.json")))
         files = [f for f in files if "trope-map" not in os.path.basename(f)]
         print(f"  Pushing {len(files)} preview files...")
+        failures = 0
         for f in files:
             try:
-                cmd_push_preview(f)
+                if cmd_push_preview(f):
+                    failures += 1
             except Exception as e:
+                failures += 1
                 print(f"  FAILED {os.path.basename(f)}: {type(e).__name__}: {e}")
-        return
+        return 1 if failures else 0
     if not os.path.isfile(preview_path):
         print(f"  Not found: {preview_path}")
-        return
+        return 1
     result = json.load(open(preview_path, encoding="utf-8"))
     if not isinstance(result, dict):
         print(f"  Refusing to push {preview_path}: preview is not a JSON "
               f"object — no writes made")
-        return
+        return 1
     title = result.get("title") or os.path.basename(preview_path)
     if result.get("aborted"):
         print(f"  Skipping {title}: preview is marked ABORTED (partial results)")
-        return
+        return 0
     if result.get("chapter_detection") == "fallback":
         print(f"  Skipping {title}: chapter detection used FALLBACK splitting "
               f"(unreliable chapters) — re-run from a clean EPUB")
-        return
+        return 0
     # Shape gate: the write builders direct-index sections and item
     # keys, and sections replace sequentially — a malformed preview
     # must be refused HERE, before any work resolution or write, not
@@ -19225,7 +19238,7 @@ def cmd_push_preview(preview_path):
         if len(problems) > 10:
             print(f"    - ... and {len(problems) - 10} more")
         print("  Re-run the book to regenerate a complete preview.")
-        return
+        return 1
     print(f"  Pushing: {title}")
     # Resolve work (create if needed).
     identifiers = {}
@@ -19245,12 +19258,12 @@ def cmd_push_preview(preview_path):
             ans = "n"
         if ans != "y":
             print("  Skipped (new work not confirmed)")
-            return
+            return 0
         wid, how = resolve_work(title, result.get("author"), identifiers, False,
                                 create=True)
     if not wid:
         print(f"  Could not resolve work ({how})")
-        return
+        return 1
     print(f"  Work ID: {wid} ({how})")
     # The only backfills: both are semantically safe when absent —
     # an empty catalog map just means per-trope DB lookups, an empty
@@ -19262,8 +19275,9 @@ def cmd_push_preview(preview_path):
     errors = write_claims(wid, result)
     if errors:
         print(f"  {errors} database operation(s) failed")
-    else:
-        print(f"  Push complete, no errors")
+        return 1
+    print(f"  Push complete, no errors")
+    return 0
 
 
 def cmd_retry_failed(preview_path):
@@ -26791,7 +26805,14 @@ def _run_once_inner(dry_run, preview, files):
         _history_book_outcome(f, ok)
         if not ok:
             failures += 1
-        if not dry_run and not preview:
+        # The don't-move guard must match _process_one's: a book the
+        # operator named with --file is processed in place, wherever
+        # it lives — only import-folder books take the scan ->
+        # done/failed lifecycle. This sequential loop is the branch
+        # every --file run actually takes (a single file never
+        # satisfies the parallel branch's len(files) > 1), so a
+        # missing guard here left the parallel one unreachable.
+        if not dry_run and not preview and not _is_single_file_run(f):
             try:
                 safe_move(f, DONE_DIR if ok else FAILED_DIR)
             except Exception as e:
@@ -27441,10 +27462,132 @@ def _watch_cycle(args):
         _HISTORY_WATCH = None
 
 
+# One-shot commands dispatch and exit: exactly one operation runs and
+# every other operation or mode flag on the command line is silently
+# dropped. The dispatch chain below main's parse is a long sequence
+# of `if args.<flag>: ... return`, so `--validate X --push-preview X`
+# validated only, `--watch --verify X` verified and never watched,
+# and `--push-preview X --file book.epub` pushed and never processed
+# the book — with no notice anywhere. Combinations now refuse at
+# startup instead: a requested operation that will not happen must
+# be named, not silently ignored.
+#
+# The two lists are deliberately narrow. Companion arguments that aim
+# a one-shot (--learn-dir, --json, --quote, --work, --explain-claim,
+# --ingest-reason/--ingest-force, ...) are NOT conflicts: the winning
+# command honours them. Run-shaping settings (--llm, --batch, --jobs,
+# --run-history, ...) are NOT conflicts either: they are configuration
+# the run path threads into CONFIG, and no second operation hides
+# among them. What conflicts is a second OPERATION (another one-shot)
+# or a MODE/TARGET that only a book-processing run or watch/replay
+# cycle could honour — those are what a one-shot dispatch drops.
+_ONE_SHOT_FLAGS = {
+    "list_profiles": "--list-profiles",
+    "save_profile": "--save-profile",
+    "trope_map": "--trope-map",
+    "preview_diff": "--preview-diff",
+    "recalibrate_spice": "--recalibrate-spice",
+    "validate": "--validate",
+    "push_preview": "--push-preview",
+    "retry_failed": "--retry-failed",
+    "verify": "--verify",
+    "learn_status": "--learn-status",
+    "apply_uncertainty_labels": "--apply-uncertainty-labels",
+    "staging_report": "--staging-report",
+    "roster_report": "--roster-report",
+    "roster_link": "--roster-link",
+    "roster_unlink": "--roster-unlink",
+    "roster_split": "--roster-split",
+    "corpus_status": "--corpus-status",
+    "corpus_snapshot": "--corpus-snapshot",
+    "explain": "--explain",
+    "corpus_verify_quote": "--corpus-verify-quote",
+    "backup_state": "--backup-state",
+    "restore_state": "--restore-state",
+    "ingest": "--ingest",
+    "corpus_remove": "--corpus-remove",
+    "corpus_reembed": "--corpus-reembed",
+    "calibration_report": "--calibration-report",
+    # --replay dispatches in the run path rather than the chain
+    # above, but it is the same shape: it runs alone and exits, so a
+    # second operation beside it would be dropped exactly the same.
+    "replay": "--replay",
+}
+
+# Modes, targets and per-run selectors that only a book-processing
+# run (or watch cycle) honours — silently dropped when a one-shot
+# dispatch pre-empts the run.
+_RUN_MODE_FLAGS = {
+    "watch": "--watch",
+    "watch_ingest": "--watch-ingest",
+    "file": "--file",
+    "preview": "--preview",
+    "dry_run": "--dry-run",
+    "guided": "--guided",
+    "profile": "--profile",
+    "auto_update": "--auto-update",
+    "capture_snapshot": "--capture-snapshot",
+    "resume": "--resume",
+    "alias": "--alias",
+    "chunks": "--chunks",
+    "import_labels": "--import-labels",
+    "import_rejections": "--import-rejections",
+    "from_supabase": "--from-supabase",
+    "isbn": "--isbn",
+    "max_books": "--max-books",
+    "series": "--series",
+    "series_position": "--series-position",
+}
+
+
+def _flag_conflicts(args, defaults):
+    """Name an operation/mode combination the dispatch would
+    silently half-serve, or None when the invocation is coherent.
+
+    A flag counts as present when its parsed value differs from its
+    default (the _apply_profile test for "explicitly set"), so a
+    defaulted dest never trips the check. --file beside --replay is
+    the one designed pairing in these lists: replay replays against
+    its own book file and refuses without one, so it is exempted —
+    every other run-mode flag beside a one-shot is a drop."""
+    def _present(mapping):
+        return [flag for dest, flag in mapping.items()
+                if getattr(args, dest, None) != getattr(defaults, dest, None)]
+
+    shots = _present(_ONE_SHOT_FLAGS)
+    if not shots:
+        return None
+    modes = _present(_RUN_MODE_FLAGS)
+    if shots == ["--replay"]:
+        modes = [m for m in modes if m != "--file"]
+    if len(shots) == 1 and not modes:
+        return None
+    parts = []
+    if len(shots) > 1:
+        parts.append(f"{', '.join(shots)} are separate one-shot "
+                     "commands — only the first would run and the "
+                     "rest would be silently ignored")
+    if modes:
+        parts.append(f"{shots[0]} is a one-shot command and cannot "
+                     f"combine with {', '.join(modes)} — the run/mode "
+                     "flags would be silently ignored")
+    return "conflicting flags: " + "; ".join(parts) + \
+        "; run them separately"
+
+
 def main():
     ap = _build_parser()
     args = ap.parse_args()
     defaults = ap.parse_args([])
+
+    # Refuse operation/mode combinations the dispatch chain would
+    # silently half-serve (#51) BEFORE anything runs — before profile
+    # loading, guided prompts, or any state migration — so a refused
+    # invocation has no side effects. ap.error exits 2 with the
+    # conflict named.
+    _conflict = _flag_conflicts(args, defaults)
+    if _conflict:
+        ap.error(_conflict)
 
     if args.list_profiles:
         for name, src in sorted(_available_profiles().items()):
@@ -27496,8 +27639,11 @@ def main():
 
     if args.push_preview:
         load_config()
-        cmd_push_preview(args.push_preview)
-        return
+        # cmd_push_preview returns the exit code (the corpus_snapshot
+        # convention): a push whose writes failed must exit nonzero,
+        # or a caller chaining on the exit code reads a partial
+        # write as success.
+        sys.exit(cmd_push_preview(args.push_preview))
 
     if args.retry_failed:
         load_config()
@@ -27572,13 +27718,22 @@ def main():
             learn_dir=args.learn_dir or None))
     if args.backup_state:
         load_config()
-        cmd_backup_state(args.backup_state,
-                         learn_dir=args.learn_dir or None)
+        # The cmd reports refusal as {"ok": False} (nothing was
+        # backed up); the exit code must say the same, or the portal
+        # marks a Backup that did nothing as "done".
+        _bk = cmd_backup_state(args.backup_state,
+                               learn_dir=args.learn_dir or None)
+        if isinstance(_bk, dict) and not _bk.get("ok"):
+            sys.exit(1)
         return
     if args.restore_state:
         load_config()
-        cmd_restore_state(args.restore_state,
-                          learn_dir=args.learn_dir or None)
+        # Same contract as backup: an {"ok": False} refusal (no
+        # manifest, hash mismatch, ...) exits nonzero.
+        _rs = cmd_restore_state(args.restore_state,
+                                learn_dir=args.learn_dir or None)
+        if isinstance(_rs, dict) and not _rs.get("ok"):
+            sys.exit(1)
         return
     if args.ingest:
         load_config()
@@ -27641,7 +27796,12 @@ def main():
                     args.decision_model_url, CONFIG)
         except ValueError as e:
             print(f"  Error: {e}")
-            return
+            # A decision model was requested but cannot be configured
+            # (missing key / base URL): nothing will be processed, so
+            # the exit code must not claim success — the portal reads
+            # rc==0 as "done". A run that never asked for a decision
+            # model never reaches this resolution and is unaffected.
+            sys.exit(1)
         global _DECISION_VALIDATOR
         _DECISION_VALIDATOR = DecisionValidator(
             _dm_endpoint, model=_dm_model, api_key=_dm_key,

@@ -508,8 +508,14 @@ class TestMainDispatch(_ConfigGuard):
         m.assert_called_once_with("x.json")
 
     def test_push_preview_flag_routes(self):
-        with mock.patch.object(pp, "cmd_push_preview") as m:
-            self._main(["process-portable.py", "--push-preview", "x.json"])
+        # main() exits with cmd_push_preview's return code (the
+        # corpus_snapshot convention), so the double returns one.
+        with mock.patch.object(pp, "cmd_push_preview",
+                               return_value=0) as m:
+            with self.assertRaises(SystemExit) as cm:
+                self._main(["process-portable.py", "--push-preview",
+                            "x.json"])
+        self.assertEqual(cm.exception.code, 0)
         m.assert_called_once_with("x.json")
 
     def test_preview_flag_routes_to_run_once(self):
