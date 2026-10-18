@@ -45,10 +45,11 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.40"
+PORTABLE_VERSION = "2.13.41"
 
 
 import argparse
+import codecs
 import difflib
 import json
 import math
@@ -750,6 +751,77 @@ def extract_headings(html, limit=1):
     return heads
 
 
+# The XML declaration is the only place a spine document states how
+# its bytes mean characters, and it sits at the very start of the
+# file, so searching a bounded prefix cannot be fooled by an
+# "encoding=" string appearing later in prose.
+_DECLARED_ENCODING_RE = re.compile(
+    br"<\?xml[^>]*?\bencoding\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
+
+
+def _decode_book_document(raw, label):
+    """Decode one book-content document (spine XHTML, converted HTML).
+
+    Why this ladder exists: decoding every spine file as UTF-8 with
+    errors="ignore" silently deletes each non-ASCII byte of a book
+    whose bytes are really windows-1252 — legal under EPUB 2 with a
+    declared encoding, and common in older and self-published
+    catalogues — and everything downstream (evidence, judging, claim
+    writes) then works over mangled text nobody can see was mangled.
+    So the document's own declared encoding goes first (a byte-order
+    mark counts as a declaration: it can only mean UTF-16), then
+    UTF-8, the EPUB default, then windows-1252, whose byte range
+    covers the Latin-script books this corpus actually holds. Each
+    rung is tried strictly, and a rung that fails hands over to the
+    next instead of dropping characters. When every rung fails, the
+    bytes are decoded by the declared codec (windows-1252 when there
+    is no declaration) with errors="replace", so the characters that
+    codec does know survive and only the truly undecodable bytes
+    become visible replacement characters, with a warning: a visible
+    defect can be spotted and fixed, a silently deleted character
+    cannot. Falling back past the first applicable rung prints a
+    warning for the same reason — a decode the operator cannot see
+    is a corruption they cannot rule out.
+    """
+    declared = None
+    if raw[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
+        declared = "utf-16"
+    else:
+        m = _DECLARED_ENCODING_RE.search(raw[:1024])
+        if m:
+            try:
+                declared = codecs.lookup(
+                    m.group(1).decode("ascii", errors="ignore").strip()).name
+            except LookupError:
+                print(f"  Warning: {label}: unknown declared encoding "
+                      f"{m.group(1)!r}; ignoring the declaration")
+    ladder = []
+    for enc in (declared, "utf-8", "windows-1252"):
+        if enc and enc not in ladder:
+            ladder.append(enc)
+    for pos, enc in enumerate(ladder):
+        try:
+            text = raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        if pos:
+            print(f"  Warning: {label}: decoded as {enc} instead of "
+                  f"{ladder[0]} so no characters are dropped")
+        return text
+    fallback = declared or "windows-1252"
+    print(f"  Warning: {label}: no encoding in {ladder} could decode "
+          f"the file; showing undecodable bytes as replacement "
+          f"characters from a {fallback} decode instead of "
+          f"discarding them")
+    try:
+        return raw.decode(fallback, errors="replace")
+    except (UnicodeDecodeError, LookupError):
+        # A declaration naming a non-text codec (base64 and friends)
+        # can reach this rung: bytes.decode refuses those outright,
+        # so the last resort is the plainest one that cannot refuse.
+        return raw.decode("utf-8", errors="replace")
+
+
 def extract_epub_units(epub_path):
     """Return ([{"spine", "label", "text"}], title, author, identifiers).
 
@@ -769,7 +841,7 @@ def extract_epub_units(epub_path):
             if fname not in available:
                 continue
             try:
-                content = z.read(fname).decode("utf-8", errors="ignore")
+                content = _decode_book_document(z.read(fname), fname)
                 text = html_to_text(content)
                 if len(text) > 100:
                     heads = extract_headings(content)
@@ -23553,7 +23625,11 @@ def read_ebook(fpath):
             identifiers["raw"].extend(epub_ids["raw"])
             return text, title, author, identifiers
         if outpath.suffix.lower() in (".html", ".htm"):
-            html = outpath.read_text(encoding="utf-8", errors="ignore")
+            # Converted MOBI output is book text too, so it goes
+            # through the same declared-encoding ladder as EPUB spine
+            # files instead of a decode that drops non-ASCII bytes.
+            html = _decode_book_document(outpath.read_bytes(),
+                                         outpath.name)
             return html_to_text(html), fpath.stem, None, identifiers
         print(f"  Unsupported extracted format: {outpath.suffix}")
         return None
