@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.41"
+PORTABLE_VERSION = "2.13.42"
 
 
 import argparse
@@ -784,7 +784,12 @@ def _decode_book_document(raw, label):
     is a corruption they cannot rule out.
     """
     declared = None
-    if raw[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
+    if raw[:4] in (codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE):
+        # A UTF-32 BOM starts with the UTF-16-LE BOM's two bytes, so
+        # the four-byte check must come first: claimed for UTF-16, a
+        # UTF-32 file decodes without error into garbage text.
+        declared = "utf-32"
+    elif raw[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
         declared = "utf-16"
     else:
         m = _DECLARED_ENCODING_RE.search(raw[:1024])
@@ -802,7 +807,11 @@ def _decode_book_document(raw, label):
     for pos, enc in enumerate(ladder):
         try:
             text = raw.decode(enc)
-        except (UnicodeDecodeError, LookupError):
+        except (UnicodeError, LookupError):
+            # UnicodeError, not just its UnicodeDecodeError subclass:
+            # lookup-valid names that are not document encodings
+            # ('undefined', 'idna') raise the parent class directly,
+            # and letting it escape drops the whole spine unit.
             continue
         if pos:
             print(f"  Warning: {label}: decoded as {enc} instead of "
@@ -815,7 +824,7 @@ def _decode_book_document(raw, label):
           f"discarding them")
     try:
         return raw.decode(fallback, errors="replace")
-    except (UnicodeDecodeError, LookupError):
+    except (UnicodeError, LookupError):
         # A declaration naming a non-text codec (base64 and friends)
         # can reach this rung: bytes.decode refuses those outright,
         # so the last resort is the plainest one that cannot refuse.
@@ -26263,12 +26272,64 @@ BUILTIN_PROFILES = {
     },
 }
 
-# Dests that --save-profile never persists (per-run values or meta commands).
+# Profile classification: every dest the parser defines is in exactly
+# one of these two sets, and tests.test_profiles_issue44 enumerates the
+# parser to prove it — a future flag shipped unclassified fails the
+# suite loudly instead of silently deciding for itself whether
+# profiles persist it.
+#
+# Why saving gates on the allowlist rather than the exclusion list:
+# the two failure modes are not symmetric. A new run-shaping flag
+# missing from the allowlist is merely dropped from saved profiles
+# until someone classifies it; a new one-shot command missing from a
+# denylist would be persisted and then replayed on every later
+# --profile invocation, pre-empting the requested run — with
+# corpus_remove or restore_state, destructively. Profiles are applied
+# before the whole dispatch chain in main, so a persisted one-shot
+# always wins. The safe side is the allowlist.
+_PROFILE_PERSISTABLE = frozenset({
+    # Run-shaping settings only: models, pipeline and feature toggles,
+    # output modes, and thresholds — the values an operator wants the
+    # same on every run until the profile itself is changed.
+    "allow_no_isbn", "batch", "corpus_only", "corpus_quotes", "debug",
+    "decision_model", "decision_model_provider", "decision_model_url",
+    "dedupe", "discovery_embedding_rank", "discovery_shadow",
+    "dry_run", "emit_run_events", "emit_uncertainty",
+    "evidence_retrieval", "explain_blocks", "full", "jobs", "learn",
+    "llm", "min_frequency", "no_viz", "persist_roster", "pipeline",
+    "preview", "preview_summary", "principals_only", "prompt_cache",
+    "rename_no_isbn", "roster_reconcile", "run_history", "sample",
+    "shared_system", "show_matrices", "staging_gate", "task_last",
+    "use_corpus",
+})
+
+# Dests that --save-profile never persists and --profile never
+# applies: one-shot commands (a stored corpus_remove / restore_state /
+# ingest replaying on every profile run is the issue #44 defect),
+# per-run selectors and overrides that name one run's target,
+# companion arguments whose only job is aiming a one-shot, profile
+# meta dests, and the state-location path selector (a profile must
+# not silently redirect where learned state lives).
 _PROFILE_EXCLUDE = frozenset({
-    "file", "isbn", "series", "series_position",
-    "import_labels", "import_rejections", "from_supabase",
-    "trope_map", "validate", "push_preview", "verify",
-    "profile", "save_profile", "list_profiles", "guided",
+    # one-shot commands that dispatch and exit
+    "apply_uncertainty_labels", "auto_update", "backup_state",
+    "calibration_report", "capture_snapshot", "corpus_reembed",
+    "corpus_remove", "corpus_snapshot", "corpus_status",
+    "corpus_verify_quote", "explain", "ingest", "learn_status",
+    "preview_diff", "push_preview", "recalibrate_spice", "replay",
+    "restore_state", "retry_failed", "roster_link", "roster_report",
+    "roster_split", "roster_unlink", "staging_report", "trope_map",
+    "validate", "verify", "watch",
+    # per-run selectors / overrides for a single run
+    "alias", "chunks", "file", "import_labels", "import_rejections",
+    "from_supabase", "isbn", "max_books", "resume", "series",
+    "series_position",
+    # companion arguments that only aim a one-shot command
+    "explain_character", "explain_claim", "ingest_force",
+    "ingest_reason", "json", "quote", "snapshot_reason", "watch_ingest",
+    "work",
+    # profile meta dests and the state-location path selector
+    "guided", "learn_dir", "list_profiles", "profile", "save_profile",
 })
 
 
@@ -26305,11 +26366,17 @@ def _load_profile(name):
 
 
 def _save_profile(name, args, defaults):
-    """Persist non-default, non-excluded flag values as JSON. Returns path."""
+    """Persist non-default run-shaping flag values as JSON. Returns path.
+
+    The gate is the _PROFILE_PERSISTABLE allowlist, not the exclusion
+    list: an unclassified dest (a flag added without updating the
+    classification) is dropped from the profile, never persisted on
+    the chance it might be a one-shot command.
+    """
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     data = {}
     for dest, val in vars(args).items():
-        if dest in _PROFILE_EXCLUDE:
+        if dest not in _PROFILE_PERSISTABLE:
             continue
         if val != getattr(defaults, dest, None):
             data[dest] = val
@@ -26324,11 +26391,21 @@ def _apply_profile(args, defaults, profile):
 
     Explicit CLI flags win: a flag counts as explicit when its parsed value
     differs from the argparse default.
+
+    Only run-shaping keys are applied. A profile file written before
+    the classification existed can carry a persisted one-shot dest;
+    restoring it would dispatch that command again on this run, so it
+    is ignored with a note instead — the file's run-shaping settings
+    still apply, so old profiles keep working for what they were for.
     """
     applied = []
     for dest, val in profile.items():
-        if not hasattr(args, dest):
-            print(f"  WARNING: profile key '{dest}' is not a known flag, ignored")
+        if dest not in _PROFILE_PERSISTABLE:
+            if hasattr(args, dest):
+                print(f"  WARNING: profile key '{dest}' is not a "
+                      "run-shaping setting (one-shot or per-run), ignored")
+            else:
+                print(f"  WARNING: profile key '{dest}' is not a known flag, ignored")
             continue
         if getattr(args, dest) != getattr(defaults, dest, None):
             continue  # explicit CLI flag overrides the profile

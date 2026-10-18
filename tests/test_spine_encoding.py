@@ -180,5 +180,53 @@ class TestFallbackLadder(unittest.TestCase):
         self.assertIn("replace", warnings)
 
 
+class TestLookupValidButUnusableCodecs(unittest.TestCase):
+    """Issue #53: 'undefined' and 'idna' pass codecs.lookup, so the
+    declared-encoding rung accepts them, but they are not document
+    encodings — 'undefined' raises UnicodeError (the parent class,
+    not UnicodeDecodeError) on any strict decode, and 'idna' raises
+    UnicodeError in the errors="replace" fallback. Both escapes
+    dropped the spine unit entirely. The unit must survive with
+    U+FFFD replacement characters, like every other pathological
+    declaration."""
+
+    def _chapter_with_undecodable_byte(self, declared):
+        html = (f"<?xml version='1.0' encoding='{declared}'?>"
+                "<html xmlns='http://www.w3.org/1999/xhtml'><head><title>t</title>"
+                "</head><body><h1>First Chapter</h1><p>" + _PROSE +
+                " Marker \x81 end of the marked passage here.</p></body></html>")
+        chapter = html.encode("cp1252", errors="xmlcharrefreplace")
+        chapter = chapter.replace(b"&#129;", b"\x81")
+        self.assertIn(b"\x81", chapter)
+        return _epub_bytes({"OEBPS/ch01.xhtml": chapter})
+
+    def test_declared_undefined_unit_survives_with_replacement(self):
+        epub = self._chapter_with_undecodable_byte("undefined")
+        units, _warnings = _extract(epub)
+        self.assertEqual(len(units), 1)
+        self.assertIn("whispered", units[0]["text"])
+        self.assertIn("\ufffd", units[0]["text"])
+
+    def test_declared_idna_unit_survives_with_replacement(self):
+        epub = self._chapter_with_undecodable_byte("idna")
+        units, _warnings = _extract(epub)
+        self.assertEqual(len(units), 1)
+        self.assertIn("whispered", units[0]["text"])
+        self.assertIn("\ufffd", units[0]["text"])
+
+    def test_utf32_bom_is_not_misread_as_utf16(self):
+        # A UTF-32 BOM starts with the UTF-16-LE BOM's two bytes, so
+        # a two-byte check claims the file for UTF-16 and the text
+        # comes out as garbage. The four-byte check must win.
+        html = ("<html xmlns='http://www.w3.org/1999/xhtml'>"
+                "<head><title>t</title></head><body>"
+                f"<h1>First Chapter</h1><p>{_PROSE}</p></body></html>")
+        epub = _epub_bytes({"OEBPS/ch01.xhtml": html.encode("utf-32")})
+        units, _warnings = _extract(epub)
+        self.assertEqual(len(units), 1)
+        self.assertIn("Sébastien", units[0]["text"])
+        self.assertIn("jalapeños", units[0]["text"])
+
+
 if __name__ == "__main__":
     unittest.main()

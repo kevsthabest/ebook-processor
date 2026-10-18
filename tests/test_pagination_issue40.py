@@ -295,5 +295,45 @@ class TestBelowCapPin(_Base):
         self.assertEqual(len(gets), 1)
 
 
+class TestFetchAllPins(_Base):
+    """Pins owed from the v2.13.40 gate: _sb_fetch_all's failure and
+    exact-multiple contracts were exercised only implicitly by the
+    partition tests above."""
+
+    def test_page2_fetch_failure_returns_none(self):
+        # First page full (1000 rows), second page fails: the helper
+        # must return None (the read failed, trust nothing), never a
+        # silently truncated 1000-row list dressed as complete.
+        calls = []
+
+        def flaky_sb(table, params=None, method="GET", data=None,
+                     prefer=None, schema=None):
+            calls.append(params or "")
+            if len(calls) == 1:
+                return [{"id": i + 1} for i in range(1000)]
+            return None
+
+        pp.sb = flaky_sb
+        self.assertIsNone(pp._sb_fetch_all("book_characters",
+                                            "?select=id"))
+        self.assertEqual(len(calls), 2)
+
+    def test_exact_multiple_2000_rows_terminates_with_full_set(self):
+        # 2000 rows is an exact multiple of the 1000-row page size:
+        # the helper must fetch one more (empty) page, see it is
+        # short, and stop with the full set — not loop forever and
+        # not stop a page early at 1000.
+        seed = [{"id": i + 1, "work_id": 1, "name": f"Char {i:04d}",
+                 "status": "candidate", "source_type": "ai"}
+                for i in range(2000)]
+        fake = self.install(_PaginatedSB({"book_characters": seed}))
+        rows = pp._sb_fetch_all("book_characters", "?select=id,work_id")
+        self.assertIsNotNone(rows)
+        self.assertEqual(len(rows), 2000)
+        self.assertEqual([r["id"] for r in rows],
+                         [r["id"] for r in seed])
+        self.assertEqual(len(fake.get_calls("book_characters")), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
