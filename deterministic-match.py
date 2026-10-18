@@ -107,9 +107,15 @@ def main():
     total = len(pairs)
     ambig = len(results['ambiguous'])
 
+    # With no surviving pairs the ratios are 0/0: report them as
+    # 0.0% rather than dividing by zero, so an empty or all-uncertain
+    # labels file still gets its (truthfully empty) summary and a
+    # normal exit instead of a ZeroDivisionError with no results.
+    decided_pct = total_det / total if total else 0.0
+    ambig_pct = ambig / total if total else 0.0
     print(f"=== DETERMINISTIC TIERS ===")
-    print(f"Decided: {total_det}/{total} ({total_det/total:.1%})")
-    print(f"Ambiguous (needs model/human): {ambig}/{total} ({ambig/total:.1%})")
+    print(f"Decided: {total_det}/{total} ({decided_pct:.1%})")
+    print(f"Ambiguous (needs model/human): {ambig}/{total} ({ambig_pct:.1%})")
     if total_det:
         acc = (tp + tn) / total_det
         print(f"Accuracy on decided: {acc:.1%} ({tp+tn}/{total_det})")
