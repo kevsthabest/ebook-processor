@@ -152,7 +152,9 @@ artefacts and his config live. The database defaults to
 ~/.ebook-processor/tier3.db, beside the learned state.
 """
 import argparse
+import http.client
 import json
+import math
 import re
 import sqlite3
 import sys
@@ -392,6 +394,20 @@ def _supabase_stored_names(config_path, work_id):
             f"Supabase stored-set query unreachable ({e.reason}) "
             f"— refusing to fall back to derivation. Fix the "
             f"connection or pass --stored-names.")
+    except (http.client.HTTPException, ConnectionError) as e:
+        # A connection that drops mid-request raises
+        # RemoteDisconnected — a ConnectionResetError and an
+        # http.client.HTTPException, but neither an HTTPError nor
+        # a URLError — so without this catch it escaped the
+        # fail-closed contract above as a traceback. It is the
+        # same operator situation as an unreachable host (the
+        # stored set could not be read from prod), so it earns
+        # the same one-line error.
+        raise Tier3Error(
+            f"Supabase stored-set query failed — the connection "
+            f"dropped mid-request ({e}) — refusing to fall back "
+            f"to derivation. Fix the connection or pass "
+            f"--stored-names.")
     return sorted({r["name"] for r in rows if r.get("name")})
 
 
@@ -533,10 +549,17 @@ def _candidates(artefact, stored_set=()):
     # claim passes' convention below. An entry missing either
     # name cannot form the key, so it yields as recorded: no
     # rejection is invented for a shape nothing asked about.
+    # The same treatment covers a non-string name: sorted() on
+    # mixed types raises TypeError, which would escape as a
+    # traceback and lose a row the store could have kept
+    # inspectable, so dedupe applies only when both names are
+    # strings — the only shape that can form the key honestly.
     seen_merges = set()
     for entry in artefact.get("possible_merges") or []:
         if isinstance(entry, dict):
-            if entry.get("name_a") and entry.get("name_b"):
+            if isinstance(entry.get("name_a"), str) and \
+                    isinstance(entry.get("name_b"), str) and \
+                    entry["name_a"] and entry["name_b"]:
                 pair = tuple(sorted(
                     (entry["name_a"], entry["name_b"])))
                 if pair in seen_merges:
@@ -1352,7 +1375,46 @@ def _connect_readonly(db_path):
     conn = sqlite3.connect(
         path.resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    # sqlite3.connect is lazy: a file that is not a database at
+    # all opens without complaint and fails only on the first
+    # query, as a DatabaseError at whichever read surface queries
+    # first. Probing the schema here means every read path
+    # (list, report, alerts) answers for a non-database file
+    # with the same named error instead of leaking that
+    # traceback. A genuine SQLite file that simply is not a
+    # Tier 3 store passes this probe and still fails at the
+    # call sites' own table queries, as before.
+    try:
+        conn.execute(
+            "SELECT name FROM sqlite_master LIMIT 1").fetchall()
+    except sqlite3.DatabaseError:
+        conn.close()
+        raise Tier3Error(
+            f"that file is not a Tier 3 store: {path} — the "
+            f"file is not a readable database. Import a preview "
+            f"first")
     return conn
+
+
+def _recorded_score(value):
+    """A score as recorded in a payload, as a number — or None
+    when the record carries no usable score. The processor's
+    contract is numeric-or-None: its score reader validates a
+    score as int/float (never bool), rejects non-finite values,
+    and returns a float or None, so a string score — even a
+    readable one like "0.72" — is outside the artefact contract
+    and is read as unscored, the digest's treatment of a missing
+    score, rather than coerced into a number the judge never
+    emitted. Before this, a string score reached the band
+    comparisons directly and one malformed candidate crashed
+    the whole digest with a TypeError."""
+    if isinstance(value, bool) or \
+            not isinstance(value, (int, float)):
+        return None
+    score = float(value)
+    if not math.isfinite(score):
+        return None
+    return score
 
 
 def _alert_claim_key(claim):
@@ -1432,7 +1494,7 @@ def collect_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
                     "tier3_candidates WHERE work_id = ? "
                     "AND kind = 'claim'", (work_id,)):
                 claim = json.loads(row["payload_json"])
-                p = claim.get("validation_p")
+                p = _recorded_score(claim.get("validation_p"))
                 if p is None or p < floor:
                     continue
                 add("claim",
@@ -1455,16 +1517,26 @@ def collect_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
                     "tier3_candidates WHERE work_id = ? "
                     "AND kind = 'merge'", (work_id,)):
                 entry = json.loads(row["payload_json"])
-                p = entry.get("p_yes")
+                p = _recorded_score(entry.get("p_yes"))
                 if p is None or p < floor or \
                         p >= MERGE_AUTO_THRESHOLD:
                     continue
                 pair = tuple(sorted(
                     (entry.get("name_a"), entry.get("name_b")),
-                    key=lambda n: n or ""))
-                add("merge", f"{pair[0]} ↔ {pair[1]}", "merge",
+                    key=lambda n: n if isinstance(n, str) else ""))
+                # A pair missing one side must not render
+                # Python's None into a human-facing label: the
+                # present name is shown and the missing side is
+                # marked as unnamed. A truthy non-string name
+                # (a malformed record the importer keeps as
+                # recorded) renders as its text form, so neither
+                # the sort nor the label can crash on it.
+                shown = [n if isinstance(n, str) and n
+                         else "(unnamed)" if not n else str(n)
+                         for n in pair]
+                add("merge", f"{shown[0]} ↔ {shown[1]}", "merge",
                     p, row["state"] or entry.get("reason")
-                    or "left for review", ("merge",) + pair)
+                    or "left for review", ("merge",) + tuple(shown))
 
             # (c) Scored claims inside Tier 3 characters'
             # recorded claim sets that did not ship as
@@ -1476,7 +1548,7 @@ def collect_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
                     "WHERE work_id = ?", (work_id,)):
                 for claim in json.loads(row["claims_json"]
                                         or "[]"):
-                    p = claim.get("validation_p")
+                    p = _recorded_score(claim.get("validation_p"))
                     if p is None or p < floor:
                         continue
                     if _shipped_confirmed(claim):
