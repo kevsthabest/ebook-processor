@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -155,6 +156,51 @@ class TestInjectIsbn(unittest.TestCase):
                              "9781615871100")
         self.assertEqual(code, 1)
 
+    def test_plain_isbn10_already_present_not_duplicated(self):
+        # Issue #63 rider: a plain ISBN-10 identifier is the same
+        # ISBN as its 978- form, so injecting the 13-digit form
+        # must see it and do nothing — 10<->13 canonicalisation
+        # is the subtlest logic the #35 fix added and was covered
+        # only by a manual probe before this test.
+        existing = '    <dc:identifier>0306406152</dc:identifier>\n'
+        _make_epub(self.epub, extra_identifiers=existing)
+        code = self._run_main(self.epub, "9780306406157")
+        self.assertEqual(code, 0)
+        opf = _read_opf(self.epub)
+        self.assertEqual(opf.count("0306406152"), 1)
+        self.assertNotIn("9780306406157", opf)
+
+    def test_plain_isbn13_seen_when_injecting_the_isbn10(self):
+        existing = '    <dc:identifier>9780306406157</dc:identifier>\n'
+        _make_epub(self.epub, extra_identifiers=existing)
+        code = self._run_main(self.epub, "0306406152")
+        self.assertEqual(code, 0)
+        opf = _read_opf(self.epub)
+        self.assertEqual(opf.count("9780306406157"), 1)
+        # Nothing was written: the already-present path returns
+        # before any rewrite, so no backup exists.
+        self.assertFalse(os.path.isfile(self.epub + ".bak"))
+
+    def test_stale_plain_isbn10_is_replaced(self):
+        old = '    <dc:identifier>0306406152</dc:identifier>\n'
+        _make_epub(self.epub, extra_identifiers=old)
+        self._run_main(self.epub, "9781615871100")
+        opf = _read_opf(self.epub)
+        self.assertIn("9781615871100", opf)
+        self.assertNotIn("0306406152", opf)
+
+    def test_whitespace_before_closing_tag_gt_is_recognised(self):
+        # Issue #63 rider: "</dc:identifier >" is valid XML, so
+        # an ISBN carried by that spelling must be detected and
+        # stripped consistently with the plain spelling.
+        existing = ('    <dc:identifier opf:scheme="ISBN">'
+                    '9781615871100</dc:identifier >\n')
+        _make_epub(self.epub, extra_identifiers=existing)
+        code = self._run_main(self.epub, "9781615871100")
+        self.assertEqual(code, 0)
+        opf = _read_opf(self.epub)
+        self.assertEqual(opf.count("9781615871100"), 1)
+
     def test_mimetype_stored_uncompressed(self):
         _make_epub(self.epub)
         self._run_main(self.epub, "9781615871100")
@@ -162,6 +208,52 @@ class TestInjectIsbn(unittest.TestCase):
             for info in z.infolist():
                 if info.filename == "mimetype":
                     self.assertEqual(info.compress_type, zipfile.ZIP_STORED)
+
+
+class TestIdentifierRegexShape(unittest.TestCase):
+    """Issue #63: the identifier regex's body must stay bounded
+    on a malformed OPF, and its behaviour on a well-formed OPF
+    must be exactly what it was before the bound."""
+
+    def test_unclosed_identifiers_terminate_fast(self):
+        # Repeated opening tags with no closing tag anywhere:
+        # the pre-fix lazy body scanned to end-of-string from
+        # every opening tag (64 KiB measured at ~4.6 s, scaling
+        # quadratically). Two seconds is a generous bound the
+        # pre-fix code blows at this size; the bounded body
+        # finishes in milliseconds.
+        opf = "<dc:identifier>" * 4096
+        start = time.perf_counter()
+        found = ii._opf_has_isbn(opf, "9781615871100")
+        stripped = ii._strip_isbn_identifiers(opf)
+        elapsed = time.perf_counter() - start
+        self.assertFalse(found)
+        self.assertEqual(stripped, opf)
+        self.assertLess(elapsed, 2.0)
+
+    def test_wellformed_opf_behaviour_unchanged(self):
+        opf = (
+            "<metadata>\n"
+            '    <dc:identifier opf:scheme="ISBN">'
+            "978-1-61587-110-0</dc:identifier>\n"
+            "    <dc:identifier>urn:uuid:12345678-1234-1234-1234-"
+            "123456789012</dc:identifier>\n"
+            "    <dc:identifier>0306406152</dc:identifier>\n"
+            "</metadata>")
+        self.assertTrue(ii._opf_has_isbn(opf, "9781615871100"))
+        self.assertTrue(ii._opf_has_isbn(opf, "0306406152"))
+        self.assertFalse(ii._opf_has_isbn(opf, "9780000000000"))
+        # Stripping removes the two ISBN elements (taking their
+        # trailing line whitespace along, as before) and leaves
+        # the non-ISBN identifier byte-for-byte. The expected
+        # string is the pre-fix output verbatim: the regex bound
+        # must not move well-formed behaviour at all.
+        self.assertEqual(
+            ii._strip_isbn_identifiers(opf),
+            "<metadata>\n"
+            "    <dc:identifier>urn:uuid:12345678-1234-1234-1234-"
+            "123456789012</dc:identifier>\n"
+            "    </metadata>")
 
 
 if __name__ == "__main__":

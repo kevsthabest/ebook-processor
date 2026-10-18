@@ -85,9 +85,16 @@ def validate_isbn(isbn):
 # One dc:identifier element: opening tag, body, closing tag plus any
 # whitespace that trails it (the whitespace belongs to the element's
 # line, so a removed element takes it along and a kept element keeps
-# it byte-for-byte).
+# it byte-for-byte). The body is bounded to non-"<" characters
+# because an identifier body is text-only: on a malformed OPF whose
+# opening tag is never closed, the match then fails at the next tag
+# instead of scanning to end-of-string from every opening tag,
+# which made the scan quadratic and could hang the tool on an
+# untrusted EPUB. Whitespace before the closing tag's ">" is valid
+# XML ("</dc:identifier >") and is matched so that spelling is
+# detected and stripped consistently with the plain one.
 _IDENTIFIER_RE = re.compile(
-    r"(<dc:identifier\b[^>]*>)(.*?)(</dc:identifier>\s*)",
+    r"(<dc:identifier\b[^>]*>)([^<]*)(</dc:identifier\s*>\s*)",
     re.DOTALL | re.IGNORECASE)
 
 

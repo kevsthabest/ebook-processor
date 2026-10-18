@@ -35,6 +35,8 @@ def _load(name, filename):
 
 
 em = _load("evaluate_merges_harness", "evaluate-merges.py")
+emb = _load("evaluate_merges_batched_harness",
+            "evaluate-merges-batched.py")
 pp = _load("process_portable_for_jev_eval", "process-portable.py")
 
 
@@ -95,6 +97,50 @@ class TestProductionMirror(unittest.TestCase):
         self.assertNotIn("d" * 601, state)
         self.assertIn("e" * 300, state)
         self.assertNotIn("e" * 301, state)
+
+
+class TestBatchedMirrorPin(unittest.TestCase):
+    """Issue #62: evaluate-merges-batched.py carries its own
+    verbatim copy of the production instructions and the
+    same-person state builder (it is a standalone artefact and
+    cannot import evaluate-merges.py). #52 aligned that copy
+    with production, but nothing pinned it: a future paraphrase
+    of the batched copy would pass every other test silently
+    and recreate exactly the non-production-baseline defect #52
+    closed. These pins compare the two modules directly — exact
+    instruction text, and builder outputs on a shared fixture
+    including the 600/300 truncations. If a pin fails, the copy
+    has drifted: realign it deliberately in the open, never as
+    a silent test edit."""
+
+    def test_batched_instructions_identical_to_single(self):
+        self.assertEqual(emb.PRODUCTION_INSTRUCTIONS,
+                         em.PRODUCTION_INSTRUCTIONS)
+
+    def test_batched_state_builder_matches_on_shared_fixture(self):
+        fixtures = [
+            ("A", "desc a", "ev a", "B", "desc b", "ev b"),
+            ("A", "", "", "B", "", ""),
+            ("A", "desc a", "", "B", "", "ev b"),
+            ("A", None, None, "B", None, None),
+        ]
+        for args in fixtures:
+            self.assertEqual(emb.build_same_person_state(*args),
+                             em.build_same_person_state(*args),
+                             args)
+
+    def test_batched_state_builder_truncates_like_single(self):
+        args = ("A", "d" * 700, "e" * 400, "B", "f" * 700, "g" * 400)
+        state = emb.build_same_person_state(*args)
+        self.assertEqual(state, em.build_same_person_state(*args))
+        self.assertIn("d" * 600, state)
+        self.assertNotIn("d" * 601, state)
+        self.assertIn("e" * 300, state)
+        self.assertNotIn("e" * 301, state)
+        self.assertIn("f" * 600, state)
+        self.assertNotIn("f" * 601, state)
+        self.assertIn("g" * 300, state)
+        self.assertNotIn("g" * 301, state)
 
 
 class TestBuildState(unittest.TestCase):

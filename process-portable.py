@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.54"
+PORTABLE_VERSION = "2.13.55"
 
 
 import argparse
@@ -20340,11 +20340,20 @@ _HISTORY_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 # AFTER the path substitutions: a match allowed to start at the
 # "[path]" placeholder those substitutions just wrote would swallow
 # the placeholder itself into the filename it replaces.
+# The repetitions are bounded — a token is at most 64 characters
+# and a filename at most 25 tokens — because unbounded, the pattern
+# backtracked quadratically on a crafted punctuation-token stream
+# carrying no book extension: every starting position retried
+# every split of the remaining text before failing. Real filenames
+# sit far inside both bounds (a filesystem name is at most 255
+# characters in total), so the bounds change nothing that can
+# actually be a filename; they only cap how much work a failed
+# match attempt can do before the engine moves on.
 _HISTORY_BARE_FILE_RE = re.compile(
     r"(?:\[(?!path\]|file\]|url\]|email\]|key\])"
-    r"[A-Za-z0-9_'\-(),#\[\]&+!]+"
-    r"|[A-Za-z0-9_'\-(),#&+!]+)"
-    r"(?: [A-Za-z0-9_'\-(),#\[\]&+!]+)*"
+    r"[A-Za-z0-9_'\-(),#\[\]&+!]{1,64}"
+    r"|[A-Za-z0-9_'\-(),#&+!]{1,64})"
+    r"(?: [A-Za-z0-9_'\-(),#\[\]&+!]{1,64}){0,24}"
     r"\.(?:epub|mobi|azw3)\b",
     re.IGNORECASE)
 _HISTORY_BEARER_RE = re.compile(r"Bearer\s+\S+", re.IGNORECASE)

@@ -1425,6 +1425,21 @@ def _alert_claim_key(claim):
             claim.get("chapter"))
 
 
+def _alert_claim_label(claim):
+    """The digest's label for one claim: its two endpoints joined
+    by an arrow. A claim missing an endpoint must not render
+    Python's None into a human-facing label: the present endpoint
+    is shown and the missing side is marked as unnamed — the same
+    treatment the merge band gives a one-sided pair. A truthy
+    non-string endpoint (a malformed record the importer keeps
+    as recorded) renders as its text form, so the label cannot
+    crash on it. What is stored does not change."""
+    shown = [n if isinstance(n, str) and n
+             else "(unnamed)" if not n else str(n)
+             for n in (claim.get("from"), claim.get("to"))]
+    return f"{shown[0]} → {shown[1]}"
+
+
 def _shipped_confirmed(claim):
     """True when a recorded claim shipped as validated under its
     claimed type. A downgrade also lands in state `validated`,
@@ -1498,7 +1513,7 @@ def collect_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
                 if p is None or p < floor:
                     continue
                 add("claim",
-                    f"{claim.get('from')} → {claim.get('to')}",
+                    _alert_claim_label(claim),
                     claim.get("type"), p,
                     row["state"] or claim.get("validation_note")
                     or claim.get("validation_state") or "dropped",
@@ -1554,7 +1569,7 @@ def collect_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
                     if _shipped_confirmed(claim):
                         continue
                     add("claim",
-                        f"{claim.get('from')} → {claim.get('to')}",
+                        _alert_claim_label(claim),
                         claim.get("type"), p,
                         claim.get("validation_note")
                         or claim.get("validation_state")

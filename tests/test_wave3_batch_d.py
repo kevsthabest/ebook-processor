@@ -31,6 +31,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -260,6 +261,25 @@ class TestHistorySanitizePunctuation(unittest.TestCase):
                          [])
         self.assertEqual(pp._history_denylist_scan({"x": "[path] missing"}),
                          [])
+
+
+class TestHistorySanitizeAdversarialShape(unittest.TestCase):
+    """Issue #64: the widened bare-filename pattern backtracked
+    quadratically on a crafted shape — a dense punctuation-token
+    stream with no book extension anywhere in it. (Realistic
+    punctuated error text was never slow; this is the crafted
+    shape only.) The bound is on CPU time, not wall time, so a
+    throttled machine cannot flake it: the pre-fix pattern
+    measures ~2.0 CPU-seconds at this size (and quadruples per
+    doubling), the bounded pattern finishes in milliseconds."""
+
+    def test_dense_punctuation_stream_stays_fast(self):
+        adversarial = "a,b#c!d&e+f-g" * 600  # 7,800 chars, no extension
+        start = time.process_time()
+        cleaned = pp._history_sanitize(adversarial)
+        elapsed = time.process_time() - start
+        self.assertIsInstance(cleaned, str)
+        self.assertLess(elapsed, 1.0)
 
 
 # ----------------------------------------------------------------------

@@ -251,6 +251,55 @@ class MissingMergeNameRenderTests(AlertsErrorsCase):
         self.assertNotIn("None", alerts[0]["label"])
 
 
+class MissingClaimEndpointRenderTests(AlertsErrorsCase):
+    """Issue #59: a claim candidate missing an endpoint rendered
+    as the literal pair 'None -> Hero' — the same null leak #26
+    fixed for merge candidates, in the claim bands. The rendering
+    names the present endpoint and marks the missing one
+    explicitly; what is stored does not change."""
+
+    def _claim(self, **over):
+        claim = {"from": "Hero", "to": "Mentor",
+                 "type": "sibling", "evidence": "A quote.",
+                 "chapter": "Chapter 1", "source": "extracted",
+                 "validation_state": "rejected",
+                 "validation_p": 0.72,
+                 "validation_note": "dropped"}
+        claim.update(over)
+        return claim
+
+    def test_missing_to_renders_unnamed_not_none(self):
+        claim = self._claim()
+        del claim["to"]
+        self.import_it(_artefact(dropped_relationships=[claim]))
+        alerts = store.collect_alerts(self.db)
+        self.assertEqual(len(alerts), 1)
+        label = alerts[0]["label"]
+        self.assertIn("Hero", label)
+        self.assertIn("(unnamed)", label)
+        self.assertNotIn("None", label)
+        self.assertNotIn("None", store.build_alerts(self.db))
+
+    def test_missing_from_renders_unnamed_not_none(self):
+        claim = self._claim()
+        del claim["from"]
+        self.import_it(_artefact(dropped_relationships=[claim]))
+        alerts = store.collect_alerts(self.db)
+        self.assertEqual(len(alerts), 1)
+        label = alerts[0]["label"]
+        self.assertIn("Mentor", label)
+        self.assertIn("(unnamed)", label)
+        self.assertNotIn("None", label)
+        self.assertNotIn("None", store.build_alerts(self.db))
+
+    def test_both_endpoints_present_render_unchanged(self):
+        self.import_it(_artefact(
+            dropped_relationships=[self._claim()]))
+        alerts = store.collect_alerts(self.db)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["label"], "Hero → Mentor")
+
+
 class NonStringMergeNameImportTests(AlertsErrorsCase):
     """Rider #58 (from batch B's gate): the merge dedupe ran
     tuple(sorted((name_a, name_b))) whenever both names were
