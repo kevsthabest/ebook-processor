@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.56"
+PORTABLE_VERSION = "2.13.57"
 
 
 import argparse
@@ -21805,6 +21805,501 @@ def _history_finish(failures=None, interrupted=False, status=None,
         _history_warn(type(e).__name__, str(e))
 
 
+# ---------------------------------------------------------------------------
+# Run-history backfill (spec §8, phase 1.1): the re-send tool for a
+# run whose history flush was lost, or that ran without
+# --run-history. It reads the run-events JSONL — the ground truth
+# that survives on the machine — and ships the run's history rows
+# through the live writer's own payload builders, so a backfilled
+# row is built by the same code, under the same disciplines, as a
+# live one:
+#
+# - Metadata only, allowlist in, denylist scan before any POST.
+#   The artifact names books by FILENAME, and filenames are on the
+#   never-transfer list: a filename is used only to locate the book
+#   file on disk so its identity can be resolved the way the
+#   recorder resolves it (source hash, then corpus fingerprint).
+#   It never enters a payload.
+# - Fields the artifact never recorded stay None. The JSONL carries
+#   no processor version, models, prompt stamps, thresholds, mode
+#   or machine label, and no per-book outcome or title, so the
+#   backfilled run row stamps None for those rather than dressing
+#   the run in the backfilling machine's current configuration —
+#   a later comparison must be able to tell "not recorded" from a
+#   value the run actually ran under. Backfilled rows are told
+#   from live ones the way the schema provides: uploaded_at
+#   (default now()) lands at backfill time, long after the run's
+#   finished_at, where a live row's lands at run end.
+# - Idempotent on the run's natural key. A run already in the
+#   mirror under its run_key is reported and skipped, never
+#   overwritten and never duplicated under a suffix; the suffix
+#   path is reserved for a key a genuinely different run owns.
+# ---------------------------------------------------------------------------
+
+class _BackfillCorrupt(Exception):
+    """One artifact cannot be backfilled (unreadable, unparseable,
+    or not a run-events file). Raised per file so the caller can
+    name it, skip it, and continue with the rest."""
+
+
+# A stored row whose started_at is within this many seconds of the
+# artifact's own start is THIS run's row: the recorder's wall clock
+# and the sink's first event are stamped by two different lines of
+# the same run and can straddle a second boundary, while a foreign
+# run that merely collides on the key shares the key's second but
+# is told apart the live writer's way — probed for a suffix below.
+_BACKFILL_SAME_RUN_WINDOW_S = 5
+
+
+def _history_backfill_parse(path):
+    """Read one run-events artifact into the facts it actually
+    records: run identity and stamps from run_start/run_end, and
+    per book the decision counts its book_end carried plus the
+    trope impulses the run emitted inside its bracket.
+
+    Only allowlisted fields are read — any other field a line
+    carries (a future event kind, or a denylisted field planted in
+    the file) is ignored here and can never reach a payload. Any
+    structural failure raises _BackfillCorrupt: a run rebuilt from
+    half an artifact would be a partial row set claiming to be the
+    run, so a corrupt file backfills nothing at all."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except Exception as e:
+        raise _BackfillCorrupt(f"unreadable ({type(e).__name__})")
+    events = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            raise _BackfillCorrupt("a line is not valid JSON")
+        if not isinstance(ev, dict):
+            raise _BackfillCorrupt("a line is not a JSON object")
+        events.append(ev)
+    starts = [e for e in events if e.get("event") == "run_start"]
+    if len(starts) != 1:
+        raise _BackfillCorrupt(
+            "no run_start event" if not starts
+            else "more than one run_start event")
+    start = starts[0]
+    run_key = start.get("run_id") or Path(path).stem
+    if not isinstance(run_key, str) or not run_key:
+        raise _BackfillCorrupt("run_start carries no run_id")
+    ends = [e for e in events if e.get("event") == "run_end"]
+    run_end = ends[-1] if ends else None
+
+    # Books, keyed by bracket: book_start opens an entry for its
+    # filename, book_end closes the oldest still-open one (parallel
+    # books interleave their brackets in the stream). Resolver
+    # events carry their book's filename and attach to that book's
+    # open entry; only impulses are kept — pair/verdict events are
+    # character-dedupe detail with no claim-outcome counterpart the
+    # payload builders could carry honestly.
+    books = []
+    open_by_name = {}
+    for ev in events:
+        kind = ev.get("event")
+        name = ev.get("book")
+        if kind == "book_start" and isinstance(name, str):
+            entry = {"name": name, "start_ts": ev.get("ts"),
+                     "end_ts": None, "decision_calls": None,
+                     "decision_budget": None, "impulses": []}
+            books.append(entry)
+            open_by_name.setdefault(name, []).append(entry)
+        elif kind == "book_end" and isinstance(name, str):
+            queue = open_by_name.get(name) or []
+            entry = queue.pop(0) if queue else None
+            if entry is not None:
+                entry["end_ts"] = ev.get("ts")
+                dc = ev.get("decision_calls")
+                entry["decision_calls"] = dc \
+                    if isinstance(dc, int) else None
+                db = ev.get("decision_budget")
+                entry["decision_budget"] = db \
+                    if isinstance(db, dict) and db else None
+        elif kind == "impulse" and isinstance(name, str):
+            queue = open_by_name.get(name) or []
+            if queue:
+                queue[-1]["impulses"].append({
+                    "label": ev.get("label"),
+                    "fate": ev.get("fate"),
+                    "catalog_id": ev.get("catalog_id")})
+    started = start.get("ts")
+    finished = run_end.get("ts") if run_end else None
+    if run_end is not None and run_end.get("interrupted"):
+        status = "interrupted"
+    elif run_end is not None:
+        status = "completed"
+    else:
+        # No run_end: the sink's own lifecycle writes one even on a
+        # keyboard interrupt, so its absence means the process died
+        # before finish could run — interrupted is the honest
+        # bucket for a run that never recorded its own end.
+        status = "interrupted"
+    return {"run_key": run_key,
+            "preview": bool(start.get("preview")),
+            "dry_run": bool(start.get("dry_run")),
+            "started_ts": started if isinstance(started, (int, float))
+            else None,
+            "finished_ts": finished
+            if isinstance(finished, (int, float)) else None,
+            "status": status, "books": books}
+
+
+def _history_backfill_resolve(entry, learn_dir):
+    """Resolve one book entry's mirror identity and build the
+    recorder-shaped record _history_book_payload reads.
+
+    Identity is resolved exactly as the recorder resolves it: the
+    file's source hash, upgraded to the corpus fingerprint when
+    the corpus knows that source hash. The corpus record the
+    identity lands on also supplies the only title / work_id /
+    chapter count a backfill may stamp — corpus metadata, never
+    anything derived from the filename. A book whose file can no
+    longer be found has no key the mirror could name it by, so it
+    ships no row (the live flush drops unkeyed books the same
+    way); the caller counts and reports it."""
+    rec = {"result": None, "chapters": None, "ingest_title": None,
+           "book_key": None, "source": None, "outcome": None,
+           "skip_reason": None, "duration_ms": None,
+           "decision_calls": entry["decision_calls"],
+           "decision_pool": None,
+           "decision_budget": entry["decision_budget"],
+           "replace_result": None, "error_class": None,
+           "error_message": None, "outcome_seq": None}
+    if isinstance(entry["start_ts"], (int, float)) \
+            and isinstance(entry["end_ts"], (int, float)):
+        rec["duration_ms"] = int(
+            (entry["end_ts"] - entry["start_ts"]) * 1000)
+    fpath = IMPORT_DIR / entry["name"]
+    try:
+        data = fpath.read_bytes()
+    except Exception:
+        return rec
+    source_hash = _corpus_sha256(data)
+    rec["book_key"] = source_hash
+    rec["source"] = "file"
+    # Trope claim rows are the one claim-level fact the artifact
+    # records completely: every candidate the run mapped carries
+    # exactly one impulse with its catalogue identity and fate.
+    # Feeding the mapped candidates through _history_book_claims
+    # (via the payload builder) keys and verdicts them with the
+    # live writer's own code. The impulse's score is a catalogue
+    # similarity, NOT the claim confidence the live writer stamps,
+    # so no confidence is synthesised for these rows: it stays
+    # None rather than being relabelled into a measurement it is
+    # not. An unmapped candidate earns no row — whether it reached
+    # the book's final claim list is something the artifact does
+    # not record, and a row for it would be a guess.
+    result = {}
+    mapped = [i for i in entry["impulses"]
+              if i.get("fate") == "mapped" and i.get("catalog_id")
+              and isinstance(i.get("label"), str)]
+    if mapped:
+        result["tropes"] = [i["label"] for i in mapped]
+        result["trope_catalog_map"] = {
+            _tnorm(i["label"]): str(i["catalog_id"]) for i in mapped}
+    db = None
+    try:
+        db = _corpus_db_for(learn_dir, mode="processor")
+    except Exception:
+        db = None
+    if db is not None:
+        try:
+            rows = db.query(
+                "SELECT fingerprint FROM corpus_works "
+                "WHERE source_hash=? ORDER BY ingested_at DESC, "
+                "updated_at DESC, fingerprint", (source_hash,))
+        except Exception:
+            rows = None
+        if rows:
+            rec["book_key"] = rows[0][0]
+            try:
+                wrec = corpus_work_record(db, rec["book_key"]) or {}
+            except Exception:
+                wrec = {}
+            rec["ingest_title"] = wrec.get("title") or None
+            if isinstance(wrec.get("chapter_count"), int):
+                rec["chapters"] = wrec["chapter_count"]
+            wid = wrec.get("work_id")
+            if isinstance(wid, str) and _HISTORY_UUID_RE.match(wid):
+                result["work_id"] = wid
+    if result:
+        rec["result"] = result
+    return rec
+
+
+def _history_backfill_existing(run_key, started_ts):
+    """Probe the mirror for this run's row, the backfill form of
+    the live writer's collision guard. Returns (state, key):
+    ("own", key) when a row under key is this run's (a live row or
+    an earlier backfill's — started_at within the window), ("free",
+    key) with the first key no row owns, or (None, None) when a
+    probe failed and nothing may be written on a guess."""
+    candidate = run_key
+    suffix = 1
+    while True:
+        rows = sb("processor_runs", method="GET",
+                  params=(f"?run_key=eq.{candidate}"
+                          "&select=id,started_at,machine_label"),
+                  schema=_HISTORY_SCHEMA)
+        if rows is None:
+            return None, None
+        if not rows:
+            return "free", candidate
+        theirs = str(rows[0].get("started_at") or "")
+        m = re.match(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})",
+                     theirs)
+        if m and started_ts is not None:
+            import calendar as _cal
+            stored_ts = _cal.timegm(tuple(int(g) for g in m.groups())
+                                    + (0, 0, 0))
+            if abs(stored_ts - started_ts) \
+                    <= _BACKFILL_SAME_RUN_WINDOW_S:
+                return "own", candidate
+        suffix += 1
+        if suffix > 99:
+            return None, None
+        candidate = f"{run_key}-{suffix}"
+
+
+def _history_backfill_ship(parsed, path, learn_dir, dry_run=False):
+    """Build one run's payloads from its parsed artifact and ship
+    them in the live flush's order (run, books, claims; same
+    tables, schema, on_conflict targets and merge-duplicates
+    preference). Returns a counts dict; raises _BackfillCorrupt
+    when the run must be skipped whole (denylist tripwire, or a
+    failed probe), so the caller can name the file and move on."""
+    from types import SimpleNamespace
+    entries = []
+    unkeyed = 0
+    for entry in parsed["books"]:
+        rec = _history_backfill_resolve(entry, learn_dir)
+        if rec["book_key"]:
+            rec["outcome_seq"] = len(entries)
+            entries.append(rec)
+        else:
+            unkeyed += 1
+    entries, _collapsed = _history_collapse_duplicate_book_keys(
+        entries)
+    built = [_history_book_payload(r, None) for r in entries]
+    book_rows = [b for b, _ in built]
+    totals_rec = SimpleNamespace(
+        files_seen=None, admitted=None, corpus_filter_ran=False,
+        books={})
+    run_payload = {
+        "run_key": parsed["run_key"],
+        "started_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(parsed["started_ts"]))
+        if parsed["started_ts"] is not None else None,
+        "finished_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(parsed["finished_ts"]))
+        if parsed["finished_ts"] is not None else None,
+        "duration_ms": int((parsed["finished_ts"]
+                            - parsed["started_ts"]) * 1000)
+        if parsed["started_ts"] is not None
+        and parsed["finished_ts"] is not None else None,
+        "status": parsed["status"],
+        "processor_version": None,
+        "machine_label": None,
+        "mode": None,
+        "preview": parsed["preview"],
+        "dry_run": parsed["dry_run"],
+        "flags": {},
+        "models": {},
+        "prompt_variants": {},
+        "thresholds": {},
+        "config_fingerprint": None,
+        "corpus_generation": None,
+        "totals": _history_totals(
+            totals_rec, book_rows, [rows for _, rows in built],
+            entries),
+        "error_summary": None,
+    }
+    claim_rows = []
+    for (_payload, rows_for_book), entry in zip(built, entries):
+        for cr in rows_for_book:
+            claim_rows.append(
+                {"run_book_id": None,
+                 **{key: cr.get(key)
+                    for key in _HISTORY_OUTCOME_KEYS}})
+    # The tripwire runs before any network call, in dry-run too:
+    # a payload the denylist scan flags ships nothing, and the
+    # file is reported rather than partially mirrored.
+    for payload in ([run_payload], book_rows, claim_rows):
+        if payload:
+            hits = _history_denylist_scan(payload)
+            if hits:
+                raise _BackfillCorrupt(
+                    f"denylist scan tripped ({', '.join(hits)}); "
+                    "nothing shipped for this run")
+    counts = {"runs": 0, "books": 0, "claims": 0, "unkeyed": unkeyed,
+              "already": False}
+    if dry_run:
+        counts["runs"] = 1
+        counts["books"] = len(book_rows)
+        counts["claims"] = len(claim_rows)
+        return counts
+    state, key = _history_backfill_existing(
+        parsed["run_key"], parsed["started_ts"])
+    if state is None:
+        raise _BackfillCorrupt(
+            "the mirror could not be probed; nothing shipped")
+    if state == "own":
+        counts["already"] = True
+        return counts
+    if key != parsed["run_key"]:
+        print(f" Run history backfill: WARNING — run key "
+              f"{parsed['run_key']} already belongs to another run; "
+              f"this run is recorded as {key}.")
+        run_payload["run_key"] = key
+    rows = sb("processor_runs", method="POST", data=[run_payload],
+              params="?on_conflict=run_key",
+              prefer="resolution=merge-duplicates",
+              schema=_HISTORY_SCHEMA)
+    if not rows or not rows[0].get("id"):
+        raise _BackfillCorrupt("the run row upload failed")
+    counts["runs"] = 1
+    run_id = rows[0]["id"]
+    if not book_rows:
+        return counts
+    for b in book_rows:
+        b["run_id"] = run_id
+    brows = sb("processor_run_books", method="POST", data=book_rows,
+               params="?on_conflict=run_id,book_key",
+               prefer="resolution=merge-duplicates",
+               schema=_HISTORY_SCHEMA)
+    if brows is None:
+        # Same honesty rule as the live flush: a run row whose
+        # books never shipped must not keep totals describing
+        # them. The correction reposts through the live helper;
+        # either way this file's books did not land, so it is
+        # reported as failed rather than counted.
+        _history_repost_totals(totals_rec, run_payload, [], [], [])
+        raise _BackfillCorrupt("the book rows upload failed")
+    id_by_key = {b["book_key"]: b["id"] for b in brows
+                 if b.get("id") and b.get("book_key")}
+    counts["books"] = len(id_by_key)
+    if set(id_by_key) != {b["book_key"] for b in book_rows}:
+        _keep = [i for i, e in enumerate(entries)
+                 if e["book_key"] in id_by_key]
+        _history_repost_totals(
+            totals_rec, run_payload,
+            [book_rows[i] for i in _keep],
+            [built[i][1] for i in _keep],
+            [entries[i] for i in _keep])
+    shipped_claims = []
+    for (_payload, rows_for_book), entry in zip(built, entries):
+        book_row_id = id_by_key.get(entry["book_key"])
+        if book_row_id is None:
+            continue
+        for cr in rows_for_book:
+            row = {"run_book_id": book_row_id}
+            for k in _HISTORY_OUTCOME_KEYS:
+                row[k] = cr.get(k)
+            shipped_claims.append(row)
+    if shipped_claims:
+        crows = sb("processor_run_claim_outcomes", method="POST",
+                   data=shipped_claims,
+                   params="?on_conflict=run_book_id,axis,claim_key",
+                   prefer="resolution=merge-duplicates",
+                   schema=_HISTORY_SCHEMA)
+        if crows is None:
+            raise _BackfillCorrupt(
+                "the claim outcome rows upload failed")
+        counts["claims"] = len(shipped_claims)
+    return counts
+
+
+def cmd_run_history_backfill(paths, dry_run=False, learn_dir=None):
+    """--run-history-backfill <jsonl> [more files | a directory]:
+    ship history rows for runs whose flush was lost or never ran,
+    from their run-events artifacts (spec §8). Each argument is one
+    artifact file or a directory whose *.jsonl artifacts are all
+    backfilled. Files are isolated: a corrupt or failed file is
+    named, skipped, and the rest still land.
+
+    With the run path's own --dry-run flag the command is a
+    preview: payloads are built and denylist-scanned, counts are
+    printed, and nothing is written (zero transport calls).
+
+    Exit codes follow the corpus-snapshot convention: 0 every file
+    shipped or was already in history, 1 at least one file was
+    skipped or failed, 2 nothing to backfill (no artifacts found,
+    or Supabase not configured)."""
+    files = []
+    skipped = 0
+    for raw in paths or []:
+        p = Path(raw)
+        if p.is_dir():
+            files.extend(sorted(p.glob("*.jsonl")))
+        elif p.is_file():
+            files.append(p)
+        else:
+            print(f" Run-history backfill: {p.name}: skipped — "
+                  "no such file or directory.")
+            skipped += 1
+    if not files:
+        if not skipped:
+            print(" Run-history backfill: no run-events artifacts "
+                  "found — nothing to backfill.")
+        return 2 if not skipped else 1
+    if not dry_run and not (CONFIG.get("supabase_url")
+                            and CONFIG.get("supabase_key")):
+        print(" Run-history backfill: supabase_url/supabase_key are "
+              "not set in config.json — nothing uploaded.")
+        return 2
+    totals = {"runs": 0, "books": 0, "claims": 0}
+    already = 0
+    failed = skipped
+    for path in files:
+        # An artifact in <learn-dir>/run-events/ names its own
+        # learn dir; that is where its corpus (if any) lives.
+        file_learn = str(path.parent.parent) \
+            if path.parent.name == _RUN_EVENTS_DIRNAME \
+            else learn_dir
+        try:
+            parsed = _history_backfill_parse(path)
+            counts = _history_backfill_ship(
+                parsed, path, file_learn, dry_run=dry_run)
+        except _BackfillCorrupt as e:
+            print(f" Run-history backfill: {path.name}: skipped — "
+                  f"{e}.")
+            failed += 1
+            continue
+        except Exception as e:  # one file must never stop the rest
+            print(f" Run-history backfill: {path.name}: skipped — "
+                  f"{type(e).__name__}: {_history_sanitize(str(e), limit=200)}.")
+            failed += 1
+            continue
+        verb = "would write" if dry_run else "written"
+        if counts["already"]:
+            already += 1
+            print(f" Run-history backfill: {path.name}: run "
+                  f"{parsed['run_key']} is already in history — "
+                  "skipped.")
+            continue
+        totals["runs"] += counts["runs"]
+        totals["books"] += counts["books"]
+        totals["claims"] += counts["claims"]
+        line = (f" Run-history backfill: {path.name}: run "
+                f"{parsed['run_key']} — {counts['books']} book(s), "
+                f"{counts['claims']} claim outcome(s) {verb}.")
+        if counts["unkeyed"]:
+            line += (f" {counts['unkeyed']} book(s) not backfilled "
+                     "(their book files were not found, so no "
+                     "book_key could be resolved).")
+        print(line)
+    verb = "would write" if dry_run else "written"
+    print(f" Run-history backfill: {totals['runs']} run(s), "
+          f"{totals['books']} book row(s), {totals['claims']} claim "
+          f"outcome(s) {verb}; {already} already in history; "
+          f"{failed} file(s) skipped.")
+    return 1 if failed else 0
+
+
 def _history_book_start(fpath):
     if _HISTORY is not None:
         try:
@@ -27168,7 +27663,8 @@ _PROFILE_EXCLUDE = frozenset({
     "corpus_verify_quote", "explain", "ingest", "learn_status",
     "preview_diff", "push_preview", "recalibrate_spice", "replay",
     "restore_state", "retry_failed", "roster_link", "roster_report",
-    "roster_split", "roster_unlink", "staging_report", "trope_map",
+    "roster_split", "roster_unlink", "run_history_backfill",
+    "staging_report", "trope_map",
     "validate", "verify", "watch",
     # per-run selectors / overrides for a single run
     "alias", "chunks", "file", "import_labels", "import_rejections",
@@ -27438,6 +27934,17 @@ def _build_parser():
                          "schema in Supabase at run end; best-effort, "
                          "a failed upload never affects the run "
                          "(default off; see docs/run-history-spec.md)")
+
+    g_merge.add_argument("--run-history-backfill", nargs="+",
+                    metavar="JSONL", default=None,
+                    help="re-send run history for runs whose flush "
+                         "was lost or that ran without --run-history, "
+                         "built from their run-events JSONL artifacts "
+                         "and exit; each argument is one artifact or "
+                         "a directory of artifacts; combine with "
+                         "--dry-run to preview without writing "
+                         "(spec §8 phase 1.1; see "
+                         "docs/run-history-spec.md)")
 
     g_merge.add_argument("--persist-roster", action="store_true",
                     help="option B (v2): persist per-work roster "
@@ -27778,6 +28285,7 @@ _ONE_SHOT_FLAGS = {
     "roster_split": "--roster-split",
     "corpus_status": "--corpus-status",
     "corpus_snapshot": "--corpus-snapshot",
+    "run_history_backfill": "--run-history-backfill",
     "explain": "--explain",
     "corpus_verify_quote": "--corpus-verify-quote",
     "backup_state": "--backup-state",
@@ -27847,6 +28355,13 @@ def _flag_conflicts(args, defaults):
         # flag beside --save-profile still refuses as before.
         modes = [m for m in modes
                  if m not in ("--preview", "--dry-run")]
+    if shots == ["--run-history-backfill"]:
+        # --dry-run is the backfill's own preview posture: the
+        # command honours it (build and scan the payloads, write
+        # nothing), so the pairing is a served combination, not a
+        # dropped mode. Every other run-mode flag beside it still
+        # refuses as before.
+        modes = [m for m in modes if m != "--dry-run"]
     if len(shots) == 1 and not modes:
         return None
     parts = []
@@ -27991,6 +28506,15 @@ def main():
         load_config()
         sys.exit(cmd_corpus_snapshot(args.learn_dir or None,
                                      as_json=args.json))
+    if args.run_history_backfill:
+        load_config()
+        # cmd_run_history_backfill returns the exit code (the
+        # corpus_snapshot convention): a backfill that skipped a
+        # corrupt artifact must exit nonzero, or a caller chaining
+        # on the exit code reads a partial backfill as complete.
+        sys.exit(cmd_run_history_backfill(
+            args.run_history_backfill, dry_run=args.dry_run,
+            learn_dir=args.learn_dir or None))
     if args.explain:
         load_config()
         cmd_explain(args.explain,
