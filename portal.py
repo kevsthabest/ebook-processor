@@ -486,11 +486,26 @@ def _recent_runs(corpus_conn, works_by_fp, preview_dir):
         artifacts = [p for p in Path(preview_dir).glob("*.json")
                      if not p.name.endswith("-trope-map.json")
                      and not p.name.startswith(".")]
-        artifacts.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        # A preview file can vanish between the glob and either
+        # stat below (operator cleanup, harvest archiving while the
+        # Portal polls). A vanished file is simply absent from
+        # recent runs — a named, non-fatal outcome for that file —
+        # so both stat sites treat OSError as "not there" instead
+        # of failing the whole Home assembly.
+        def _sort_mtime(p):
+            try:
+                return p.stat().st_mtime
+            except OSError:
+                return float("-inf")
+
+        artifacts.sort(key=_sort_mtime, reverse=True)
         for path in artifacts[:25]:
-            when = datetime.fromtimestamp(
-                path.stat().st_mtime, tz=timezone.utc).strftime(
-                    "%Y-%m-%dT%H:%M:%S")
+            try:
+                when = datetime.fromtimestamp(
+                    path.stat().st_mtime, tz=timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%S")
+            except OSError:
+                continue
             title, outcome = path.stem, ""
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))

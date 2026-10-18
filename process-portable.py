@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.53"
+PORTABLE_VERSION = "2.13.54"
 
 
 import argparse
@@ -16098,11 +16098,28 @@ def _ground_entities(characters, relationships, chapters):
         else:
             _nm = ch.get("name") or "?"
             ungrounded_names.append(_nm)
-    # Chapter text lookup by label for relationship co-occurrence
-    label_to_text = {c.get("label"): c.get("text", "") for c in chapters}
+    # Chapter text lookup for relationship co-occurrence. Chapter
+    # labels repeat across a book's volumes, so resolution follows
+    # the same discipline as validation: a claim's own chapter
+    # index wins when it carries one, and the label fallback keeps
+    # the FIRST chapter carrying the label — a last-wins map would
+    # ground a claim against another volume's text and cross-sign
+    # the verdict in exactly the way the validation fix removed.
+    _ch_by_index = {c.get("index"): c for c in chapters
+                    if c.get("index") is not None}
+    label_to_text = {}
+    for c in chapters:
+        label_to_text.setdefault(c.get("label"), c.get("text", ""))
+
+    def _rel_chapter_text(rel):
+        _idx = rel.get("_idx")
+        if _idx is not None and _idx in _ch_by_index:
+            return _ch_by_index[_idx].get("text", "")
+        return label_to_text.get(rel.get("chapter", ""), "")
+
     rel_grounded = 0
     for rel in relationships:
-        ch_text = label_to_text.get(rel.get("chapter", ""), "")
+        ch_text = _rel_chapter_text(rel)
         a = (rel.get("from") or "")
         b = (rel.get("to") or "")
         ok = False
@@ -16279,7 +16296,15 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     # collection as ToC chapters (trope/trigger evidence, quotes, POVs).
     _fm_idx = {c["index"] for c in chapters if c.get("is_frontmatter")}
     _skip_evidence_idx = _toc_idx | _fm_idx
-    _label_to_text = {c["label"]: c.get("text", "") for c in chapters}
+    # First-wins by label, for the same reason as the grounding
+    # lookup: labels repeat across a book's volumes, and this map
+    # is only the trigger gate's fallback — the gate resolves each
+    # evidence entry through its own chapter index first, so the
+    # earliest chapter's text must never be silently replaced by a
+    # later volume's here either.
+    _label_to_text = {}
+    for c in chapters:
+        _label_to_text.setdefault(c["label"], c.get("text", ""))
     # Extraction coverage: chapters with successful Call B results. Failed
     # chapters are NOT treated as "no content" — frequency denominators use
     # n_successful, and low coverage sets a warning flag on the result.
@@ -16674,7 +16699,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         silently lands on the LAST chapter carrying that label
         and windows (or stamps provenance from) another volume's
         passage. The label lookup remains only as the fallback
-        for a claim that carries no index at all."""
+        for a claim that carries no index at all — and when an
+        index WAS supplied but no chapter carries it, the
+        fallback says so in the log rather than firing silently,
+        because that miss means the claim's chapter identity and
+        the chapter list disagree."""
         if chapter_index is not None:
             _ch = _chapters_by_index.get(chapter_index)
             if _ch is not None:
@@ -16683,6 +16712,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             _ch = _chapters_by_index.get(rel["_idx"])
             if _ch is not None:
                 return _ch
+        if chapter_index is not None or rel.get("_idx") is not None:
+            _missed = (chapter_index if chapter_index is not None
+                       else rel.get("_idx"))
+            print(f"  _claim_chapter: no chapter at index {_missed}; "
+                  f"falling back to label {rel.get('chapter')!r}")
         return _chapters_by_label.get(rel.get("chapter") or "")
 
     def _validation_context(ev_quote, rel, mined_idx=None):
@@ -16781,6 +16815,21 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         Retries claim budget again — a retry is a real second
         call, and accounting that hid it would understate spend
         exactly where the budget is tightest."""
+        if getattr(_DECISION_VALIDATOR, "disabled", False):
+            # A disabled validator makes no calls at all — its
+            # _ask_noul short-circuits before any request — so
+            # claiming budget here would record spend for calls
+            # that never happen, and the retry below would claim
+            # a second phantom unit for the same claim. The claim
+            # still counts as an attempted, errored judgment for
+            # the §1.6 accounting, exactly as it did when the
+            # empty calls were made: the outcome does not move,
+            # only the phantom spend stops. (The merge pass checks
+            # the same predicate before claiming; this is that
+            # pattern applied to the relationship passes.)
+            _val_stats["attempts"] += 1
+            _val_stats["errors"] += 1
+            return None, "error"
         if not _dm_budget_claim(1, consumer=consumer):
             return None, "budget"
         _val_stats["attempts"] += 1
@@ -17138,16 +17187,6 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # provenance record follows it (see _stamp_provenance).
         _stamp_provenance(rel, _mined["sentence"], _mined["chapter"])
 
-    # The internal chapter identity has served its purpose: every
-    # validation window and provenance stamp above is taken by
-    # now. It was never part of a shipped claim, and leaving it on
-    # would grow every artefact the reduce feeds (preview, write
-    # payload, run history) with plumbing no reader can use — so
-    # it comes off here, at the last point where only this
-    # function's own stages can still see it.
-    for rel in relationships + _dropped_relationships:
-        rel.pop("_idx", None)
-
     # Curation state + provenance (spec §1.5): every surviving and
     # dropped claim is stamped with its internal state name, so
     # the state is visible wherever claims are presented for
@@ -17197,8 +17236,15 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 acc["chapter_indices"].append(idx)
                 q = b["trigger_evidence"].get(cat)
                 if q and len(acc["evidence"]) < 3:
+                    # The chapter index rides the entry so the
+                    # gate below resolves its context from the
+                    # chapter the quote was actually extracted in
+                    # (labels repeat across volumes). It is
+                    # internal plumbing and is stripped before the
+                    # evidence ships in the trigger record.
                     acc["evidence"].append({"quote": q,
-                                            "chapter": idx_to_label.get(idx, "")})
+                                            "chapter": idx_to_label.get(idx, ""),
+                                            "_idx": idx})
     sev_names = ["none", "mentioned", "on_page", "graphic"]
     triggers = []
     _gated_dropped = 0
@@ -17233,8 +17279,18 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 _dv_error = False
                 for _ev in acc["evidence"]:
                     _q = _ev.get("quote", "")
-                    _ctx = _extract_quote_context(
-                        _label_to_text.get(_ev.get("chapter", ""), ""), _q)
+                    # Resolve the quote's chapter by index first:
+                    # its label repeats across the book's volumes,
+                    # and gating the first volume's quote against
+                    # the second volume's text cross-signs the
+                    # verdict. The label map is the fallback for an
+                    # entry that carries no index.
+                    _ev_ch = _chapters_by_index.get(_ev.get("_idx"))
+                    _ctx_text = (_ev_ch.get("text", "")
+                                 if _ev_ch is not None else
+                                 _label_to_text.get(
+                                     _ev.get("chapter", ""), ""))
+                    _ctx = _extract_quote_context(_ctx_text, _q)
                     if not _dm_budget_claim(1, consumer="trigger_gate"):
                         # Budget exhausted mid-gate: this category is
                         # NOT judged — take the regex-gate fallback,
@@ -17291,9 +17347,12 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         if len(acc["chapters"]) < 2 and sev < 2:
             continue
         # Stamp any evidence that never went through a gate (sev was already
-        # "mentioned", so no gate ran).
+        # "mentioned", so no gate ran). The chapter index comes off
+        # here too: every trigger that ships passes this loop, and
+        # the index was only ever the gate's resolution plumbing.
         for _ev in acc["evidence"]:
             _ev.setdefault("decision_gate", "none")
+            _ev.pop("_idx", None)
         triggers.append({
             "warning": cat,
             "severity": sev_names[sev],
@@ -17382,6 +17441,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 # candidate, so it cannot reach the gate or proposals.
                 _pov_tropes_dropped.add(k)
                 continue
+            if _is_null_trope_label(t):
+                # A null answer, not a trope: never counted, never
+                # a candidate, so it cannot reach the counts, the
+                # gate, or the confirmed list.
+                continue
             seen_this_chapter.add(k)
             trope_counts[k] += 1
             # Chapter-level evidence fallback: the embedding branch below
@@ -17439,6 +17503,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                         if not k:
                             continue
                         if _is_pov_trope_label(t):
+                            continue  # filtered in the union loop above
+                        if _is_null_trope_label(t):
                             continue  # filtered in the union loop above
                         cid = catalog_map.get(k)
                         shown = names.get(cid) if cid else None
@@ -17534,6 +17600,18 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
 
     # --- Grounding: verify names against raw text (catches hallucinations) ---
     _grounding = _ground_entities(characters, relationships, chapters)
+
+    # The internal chapter identity has now served its purpose:
+    # every validation window, provenance stamp and grounding check
+    # above is taken by now — grounding is the last consumer, and
+    # it resolves each claim's chapter through this index. It was
+    # never part of a shipped claim, and leaving it on would grow
+    # every artefact the reduce feeds (preview, write payload, run
+    # history) with plumbing no reader can use, so it comes off
+    # here, at the last point where only this function's own
+    # stages can still see it.
+    for rel in relationships + _dropped_relationships:
+        rel.pop("_idx", None)
 
     return {
         "characters": characters,
@@ -19357,16 +19435,39 @@ def cmd_retry_failed(preview_path):
     # destroy that state to make room for this retry's seeds.
     # Retry seeds (and pre-fingerprint legacy checkpoints) carry no
     # fingerprint: nothing live owns them, so they stay retryable
-    # exactly as before.
+    # exactly as before. A meta that exists but cannot be parsed to
+    # a dict is not in that class — it is refused below, because the
+    # directory it guards may still be a live run's.
     book_key = _checkpoint_book_key(fpath)
     _live_fp = None
+    _meta_corrupt = False
     _meta_path = _checkpoint_dir(book_key) / "meta.json"
-    try:
-        if _meta_path.is_file():
+    if _meta_path.is_file():
+        try:
             with open(_meta_path, encoding="utf-8") as _mf:
-                _live_fp = json.load(_mf).get("fingerprint")
-    except Exception:
-        _live_fp = None
+                _meta = json.load(_mf)
+            if isinstance(_meta, dict):
+                _live_fp = _meta.get("fingerprint")
+            else:
+                _meta_corrupt = True
+        except Exception:
+            _meta_corrupt = True
+    if _meta_corrupt:
+        # A meta that exists but cannot be parsed to a dict is
+        # exactly the state a crash during _checkpoint_save_meta
+        # leaves behind (that write is not atomic): truncated meta,
+        # intact chapter files that stay recoverable by hand until
+        # something deletes them. Unreadable is not the same as
+        # absent — treating it as absent would fall through to the
+        # checkpoint clear below and destroy those files — so this
+        # refuses with the same shape as the fingerprinted case.
+        print(f"  Refusing to retry: the checkpoints for '{book_key}' "
+              f"belong to an unfinished run (checkpoint metadata "
+              f"unreadable) and can still be resumed — the live "
+              f"checkpoint was left untouched. Resume that run, or "
+              f"clear preview/.checkpoints/{book_key} once it is "
+              f"finished, then retry.")
+        return
     if _live_fp:
         print(f"  Refusing to retry: the checkpoints for '{book_key}' "
               f"belong to an unfinished run (fingerprint {_live_fp}) "
@@ -20230,12 +20331,35 @@ _HISTORY_WINPATH_RE = re.compile(r"[A-Za-z]:\\[^\s]*")
 _HISTORY_UNCPATH_RE = re.compile(r"\\\\[^\s]*")
 _HISTORY_POSIXPATH_RE = re.compile(r"(?<![\w.])/(?:[\w.\-]+/)+[\w.\-]*")
 _HISTORY_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+# The token classes carry the punctuation real ebook filenames use
+# (parentheses, commas, #, brackets): without those characters the
+# match broke at the first one and the rest of a spaced filename —
+# title words included — survived sanitizing untouched. Brackets
+# are barred from a match's first token (except a bracket that does
+# not open a redaction placeholder), because this pattern runs
+# AFTER the path substitutions: a match allowed to start at the
+# "[path]" placeholder those substitutions just wrote would swallow
+# the placeholder itself into the filename it replaces.
 _HISTORY_BARE_FILE_RE = re.compile(
-    r"[A-Za-z0-9_'\-]+(?: [A-Za-z0-9_'\-]+)*\.(?:epub|mobi|azw3)\b",
+    r"(?:\[(?!path\]|file\]|url\]|email\]|key\])"
+    r"[A-Za-z0-9_'\-(),#\[\]&+!]+"
+    r"|[A-Za-z0-9_'\-(),#&+!]+)"
+    r"(?: [A-Za-z0-9_'\-(),#\[\]&+!]+)*"
+    r"\.(?:epub|mobi|azw3)\b",
     re.IGNORECASE)
 _HISTORY_BEARER_RE = re.compile(r"Bearer\s+\S+", re.IGNORECASE)
 _HISTORY_JWT_RE = re.compile(r"eyJ[\w.\-]{10,}")
 _HISTORY_APIKEY_RE = re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}")
+# Scan-only tripwires, deliberately broader than the sanitizer's own
+# patterns: the denylist scan exists to catch what the sanitizer
+# missed, so it must not share the sanitizer's exact shape. Any
+# surviving ebook extension is a filename remnant whatever characters
+# the name itself used, and a comma/hash scar touching a placeholder
+# is what a partially eaten filename leaves behind (the pre-fix
+# sanitizer turned "#1.epub" into "#[file]", stranding both the scar
+# and the name text before it).
+_HISTORY_SCAN_EXT_RE = re.compile(r"\.(?:epub|mobi|azw3)\b", re.IGNORECASE)
+_HISTORY_SCAN_SCAR_RE = re.compile(r"[,#]\s*\[(?:file|path)\]")
 
 
 def _history_sanitize(text, limit=500):
@@ -20272,7 +20396,9 @@ def _history_denylist_scan(payload):
         ("posix-path", _HISTORY_POSIXPATH_RE),
         ("email", _HISTORY_EMAIL_RE), ("bearer", _HISTORY_BEARER_RE),
         ("jwt", _HISTORY_JWT_RE), ("api-key", _HISTORY_APIKEY_RE),
-        ("bare-file", _HISTORY_BARE_FILE_RE)) if rx.search(blob)]
+        ("bare-file", _HISTORY_BARE_FILE_RE),
+        ("file-extension", _HISTORY_SCAN_EXT_RE),
+        ("file-remnant", _HISTORY_SCAN_SCAR_RE)) if rx.search(blob)]
 
 
 def _history_flags(mode):
@@ -22232,6 +22358,21 @@ def _is_pov_trope_label(label):
     do not count either ("Poverty" is not a POV label).
     """
     return any(tok in ("pov", "povs") for tok in norm(label).split())
+
+
+_TROPE_NULL_TOKENS = frozenset({"none", "n/a", "null"})
+
+
+def _is_null_trope_label(label):
+    """True when a trope candidate is really a null answer — the
+    extraction model writing "none" (or "n/a" / "null") into the
+    trope slot instead of returning the empty list the prompt asks
+    for. A null answer is no candidate at all: left in, the
+    candidate machinery counts it chapter over chapter, scores it,
+    and confirms it like a real trope. The match is on the WHOLE
+    normalised token, so a real name that merely contains a
+    sentinel as a substring ("nonexistent hero") is untouched."""
+    return _tnorm(label).replace(" / ", "/") in _TROPE_NULL_TOKENS
 
 
 _MALE_TOKENS = {"mr", "master", "sir", "lord", "king", "father", "dad",
