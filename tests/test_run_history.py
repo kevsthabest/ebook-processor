@@ -1303,5 +1303,132 @@ class WarnDetailTests(_Base):
         self.assertIn("run unaffected", text)
 
 
+def _earner_claim(frm="Laura Sebeck", to="Peter Sebeck",
+                  typ="spouse", state="validated", p=0.94):
+    """One retained minor-sourced claim in the shape the principal
+    filter leaves on the result: provenance stamped (the history
+    writer's existing gate for relationship rows), a curation
+    state, and the validator's score."""
+    return {"from": frm, "to": to, "type": typ,
+            "validation_state": state, "validation_p": p,
+            "endpoint_provenance": {
+                "from": _provenance(frm, "resolved_surname"),
+                "to": _provenance(to, "full")}}
+
+
+def earner_only_result():
+    """A book whose relationship claims are ONLY retained
+    minor-sourced (earner) claims: the filtered principal list and
+    the dropped list are both empty."""
+    result = v2_result()
+    result["relationships"] = []
+    result["dropped_relationships"] = []
+    result["minor_sourced_relationships"] = [
+        _earner_claim(),
+        _earner_claim(frm="Chris Sebeck", typ="other",
+                      state="validated", p=0.46),
+    ]
+    return result
+
+
+class MinorSourcedHistoryTests(_Base):
+    """Retained minor-sourced claims (v2.13.28) store in the app,
+    so they must also land in run-history outcomes, with exactly
+    the treatment a principal claim in the same state receives."""
+
+    def _rel_rows(self):
+        posts = self.fake.posts("processor_run_claim_outcomes")
+        self.assertEqual(len(posts), 1)
+        rows = posts[0]["data"]
+        return rows, [r for r in rows if r["axis"] == "relationships"]
+
+    def test_only_earner_claims_post_relationship_rows(self):
+        self.drive_one_book(result=earner_only_result())
+        _rows, rel_rows = self._rel_rows()
+        self.assertEqual(len(rel_rows), 2)
+        self.assertEqual({r["verdict"] for r in rel_rows},
+                         {"validated"})
+        self.assertEqual({r["confidence"] for r in rel_rows},
+                         {0.94, 0.46})
+        for r in rel_rows:
+            self.assertEqual(r["run_book_id"], BOOK_ID)
+            self.assertIsNotNone(r["endpoint_provenance"])
+        # Keys come from the existing relationship key path:
+        # catalogue-style identity here is the canonical pair and
+        # type, hashed with axis and book fingerprint — never a
+        # second, earner-specific derivation.
+        expect = {
+            hashlib.sha256(
+                f"relationships|{self.book_key}|"
+                "Laura Sebeck\x1fPeter Sebeck\x1fspouse"
+                .encode()).hexdigest(),
+            hashlib.sha256(
+                f"relationships|{self.book_key}|"
+                "Chris Sebeck\x1fPeter Sebeck\x1fother"
+                .encode()).hexdigest(),
+        }
+        self.assertEqual({r["claim_key"] for r in rel_rows}, expect)
+
+    def test_earner_claim_also_in_dropped_list_yields_one_row(self):
+        claim = _earner_claim()
+        result = earner_only_result()
+        result["minor_sourced_relationships"] = [claim]
+        result["dropped_relationships"] = [claim]
+        self.drive_one_book(result=result)
+        _rows, rel_rows = self._rel_rows()
+        self.assertEqual(len(rel_rows), 1)
+        self.assertEqual(rel_rows[0]["verdict"], "validated")
+        self.assertEqual(rel_rows[0]["confidence"], 0.94)
+
+    def test_earner_row_provenance_mirror_strips_basis_text(self):
+        self.drive_one_book(result=earner_only_result())
+        _rows, rel_rows = self._rel_rows()
+        self.assertTrue(rel_rows)
+        for row in rel_rows:
+            mirror = row["endpoint_provenance"]
+            self.assertEqual(set(mirror), {"from", "to"})
+            blob = json.dumps(mirror)
+            # The verbatim basis sentence from _provenance and the
+            # basis/mention fields carrying text never cross.
+            self.assertNotIn("Sebeck's son, Chris, stood", blob)
+            self.assertNotIn("text", blob)
+            self.assertNotIn("mention_text", blob)
+            for ep in mirror.values():
+                self.assertEqual(
+                    set(ep), {"matched_form", "basis_kinds",
+                              "basis_chapter", "basis_position"})
+        self.assertEqual(
+            pp._history_denylist_scan(
+                self.fake.posts(
+                    "processor_run_claim_outcomes")[0]["data"]), [])
+
+    def test_mixed_batch_with_earner_posts_one_uniform_key_set(self):
+        result = rel_result()
+        result["minor_sourced_relationships"] = [
+            _earner_claim(frm="Joseph Sebeck", typ="child",
+                          state="review_required", p=0.5)]
+        self.drive_one_book(result=result)
+        rows, rel_rows = self._rel_rows()
+        self.assertTrue(rows)
+        key_sets = {tuple(sorted(r)) for r in rows}
+        self.assertEqual(len(key_sets), 1)
+        self.assertEqual(
+            key_sets.pop(),
+            ("axis", "claim_key", "confidence",
+             "endpoint_provenance", "run_book_id", "verdict"))
+        # Mixed means mixed: trope, trigger and relationship rows
+        # all present, and relationships are principal (2) +
+        # dropped (1) + earner (1), the earner carrying the same
+        # verdict treatment as a principal in its state.
+        self.assertEqual({r["axis"] for r in rows},
+                         {"tropes", "triggers", "relationships"})
+        self.assertEqual(len(rel_rows), 4)
+        earner = [r for r in rel_rows
+                  if r["verdict"] == "review_required"]
+        self.assertEqual(len(earner), 1)
+        self.assertEqual(earner[0]["confidence"], 0.5)
+        self.assertIsNotNone(earner[0]["endpoint_provenance"])
+
+
 if __name__ == "__main__":
     unittest.main()

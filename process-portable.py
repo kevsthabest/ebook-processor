@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.29"
+PORTABLE_VERSION = "2.13.30"
 
 
 import argparse
@@ -20174,8 +20174,18 @@ def _history_book_claims(result):
     # provenance itself is the structured record only (see
     # _history_provenance_mirror): no verbatim text crosses.
     _seen_r = {}
+    _seen_r_identities = set()
+    # Retained minor-sourced claims ride along with the filtered
+    # and dropped lists: those claims now store in the app, so a
+    # run that omitted them here would leave stored claims with no
+    # history row at all. They go through this same loop on
+    # purpose — same provenance gate, same verdict and confidence
+    # fields, same pair-and-type identity hashed by the same key
+    # path — because a second, earner-specific construction would
+    # let the two treatments drift apart silently.
     for rel in list(result.get("relationships") or []) \
-            + list(result.get("dropped_relationships") or []):
+            + list(result.get("dropped_relationships") or []) \
+            + list(result.get("minor_sourced_relationships") or []):
         if not isinstance(rel, dict):
             continue
         _prov = rel.get("endpoint_provenance")
@@ -20185,17 +20195,41 @@ def _history_book_claims(result):
                           rel.get("type"))
         if not (_frm and _to and _typ):
             continue
+        # One claim can be reachable from more than one list (the
+        # retained list overlaps the dropped list when the same
+        # claim was both filtered and dropped). It is still one
+        # claim, so its identity is emitted once, first occurrence
+        # winning: suffixing the second occurrence, as the shared
+        # pending-marker axes need, would post two rows for one
+        # claim here and leave the table's UNIQUE constraint to
+        # catch a duplicate this writer already knew about.
+        _identity = f"{_frm}\x1f{_to}\x1f{_typ}"
+        if _identity in _seen_r_identities:
+            continue
+        _seen_r_identities.add(_identity)
         rows.append({
             "axis": "relationships",
             "claim_key": _history_claim_key(
                 "relationships", book_key,
-                _history_unique_identity(
-                    _seen_r, f"{_frm}\x1f{_to}\x1f{_typ}")),
+                _history_unique_identity(_seen_r, _identity)),
             "verdict": (rel.get("validation_state")
                         or _rel_validation_state(rel)),
             "confidence": rel.get("validation_p"),
             "endpoint_provenance": _history_provenance_mirror(_prov)})
-    return claims, rows
+    # Final guard in the terms the table enforces: no
+    # (axis, claim_key) pair is posted twice for one book. The
+    # per-axis constructions above already make keys unique, so
+    # this only fires if a future list starts overlapping another
+    # — exactly the failure it exists to keep off the wire.
+    _seen_keys = set()
+    _deduped = []
+    for _row in rows:
+        _k = (_row["axis"], _row["claim_key"])
+        if _k in _seen_keys:
+            continue
+        _seen_keys.add(_k)
+        _deduped.append(_row)
+    return claims, _deduped
 
 
 def _history_characters(result):
