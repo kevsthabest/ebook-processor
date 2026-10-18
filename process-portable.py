@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.47"
+PORTABLE_VERSION = "2.13.48"
 
 
 import argparse
@@ -22973,6 +22973,34 @@ def _build_quote_rows(work_id, result, skip_prefixes):
     return qrows
 
 
+def _proposal_book_key(result):
+    """The proposals book identity, as (book_key, isbn_keyed).
+
+    An ISBN is a book identity; a title is not — different works share
+    titles (series volumes, same-title editions), so a key built from
+    a title can name another work's rows, and anything selected by it
+    may belong to a stranger. Callers use isbn_keyed to decide what a
+    key is allowed to do: only an ISBN key may select rows for
+    deletion.
+
+    A valid ISBN is returned in its cleaned ISBN-13 form because that
+    is the form this section stores: without the shared form, the same
+    book arriving hyphenated on one run and bare on the next would
+    fetch and delete under one spelling while its earlier rows sit
+    under the other, and the replace would silently miss them. An
+    ISBN that fails validation is kept verbatim rather than dropped —
+    inventing a conversion for it would be fabrication, and dropping
+    it would demote the book to the title path its ISBN was meant to
+    keep it off.
+    """
+    result = result or {}
+    raw = result.get("isbn")
+    if raw and str(raw).strip():
+        text = str(raw).strip()
+        return _clean_isbn(text) or text, True
+    return result.get("title", "") or "", False
+
+
 def _build_proposal_rows(result, unmatched, skip_keys):
     """Build trope_proposals rows for unmapped tropes. skip_keys holds
     name_keys that will still exist after the replace (other works'
@@ -22996,7 +23024,7 @@ def _build_proposal_rows(result, unmatched, skip_keys):
         row = {"name": t, "name_key": key,
                "description": f"Detected by ebook processor in '{result.get('title', '')}'.",
                "genres": [],
-               "book_key": result.get("isbn") or result.get("title", ""),
+               "book_key": _proposal_book_key(result)[0],
                "status": "pending"}
         uid = CONFIG.get("proposer_user_id")
         if uid:
@@ -23036,7 +23064,7 @@ def _proposal_state(result):
                              "?select=id,name_key")
     if all_rows is None:
         return None, None
-    book_key = result.get("isbn") or result.get("title", "")
+    book_key = _proposal_book_key(result)[0]
     if not book_key:
         return {r["name_key"] for r in all_rows}, []
     own = _sb_fetch_all(
@@ -23072,7 +23100,9 @@ def write_claims(work_id, result, trope_mappings=None):
         reprocessing.
     trope_proposals is scoped by book_key + status='pending' +
     _proposal_scope() (it has no source_type, so proposed_by is the
-    structural own-rows boundary). works.spice_detected is already an overwrite; book_meta
+    structural own-rows boundary), and its replace-DELETE only ever
+    fires under an ISBN key: a title-only book deletes nothing there,
+    because its title can also be another work's title. works.spice_detected is already an overwrite; book_meta
     is a shared merge store with no source marker and is NOT replaced.
     Returns the number of failed operations.
     """
@@ -23148,23 +23178,44 @@ def write_claims(work_id, result, trope_mappings=None):
     # trope now maps (unmatched empty) must still replace away this
     # work's own pending proposals from earlier runs — zero new rows is
     # a valid insert set. Human-reviewed and foreign-proposer rows are
-    # outside the delete scope and survive exactly.
+    # outside the delete scope and survive exactly. The one exception
+    # is a title-only book (handled in the section below): its key
+    # cannot prove which pending rows are its own, so it deletes
+    # nothing and only adds.
     _all_keys, _own = _proposal_state(result)
     if _all_keys is None:
         errors += 1
     else:
+        _prop_key, _prop_isbn_keyed = _proposal_book_key(result)
         _own_pending = {r["name_key"] for r in _own
                         if (r.get("status") or "pending") == "pending"}
         preserved_rej += sum(1 for r in _own
                              if (r.get("status") or "") == "rejected")
+        if not _prop_isbn_keyed:
+            # A title can name another work's rows, so rows fetched
+            # under it cannot be told apart from a stranger's — there
+            # is no set here that is provably this book's to delete.
+            # Keeping every row and adding the new ones is the safe
+            # failure: the worst case is pending proposals piling up
+            # for a book until it gains an ISBN, never another book's
+            # proposals vanishing. The surviving pending rows stay in
+            # the dedupe set below so a re-detected trope is not
+            # inserted as a duplicate beside the row already there.
+            print(f"  Proposal replacement skipped for "
+                  f"'{result.get('title', '')}': title-only identity "
+                  f"(no ISBN), so no proposals were deleted; pending "
+                  f"proposals for this book may accumulate until it "
+                  f"gains an ISBN")
         prop_rows = _build_proposal_rows(
-            result, unmatched, _all_keys - _own_pending)
+            result, unmatched,
+            _all_keys if not _prop_isbn_keyed
+            else _all_keys - _own_pending)
         _ok = True
         _gone_rows = []
-        if _own_pending:
+        if _own_pending and _prop_isbn_keyed:
             _gone_rows = sb(
                 "trope_proposals", method="DELETE",
-                params=f"?book_key=eq.{quote(str(result.get('isbn') or result.get('title', '')), safe='')}"
+                params=f"?book_key=eq.{quote(str(_prop_key), safe='')}"
                        f"&status=eq.pending&{_proposal_scope()}")
             if _gone_rows is None:
                 errors += 1
@@ -23476,18 +23527,24 @@ def plan_replace(work_id, result, trope_mappings=None):
 
     # Mirrors write_claims: the proposals replace is unconditional,
     # so the plan counts own pending proposals even when this run's
-    # unmatched list is empty.
+    # unmatched list is empty. A title-only book is the exception in
+    # both places: it would delete nothing, and its surviving pending
+    # rows stay in the dedupe set so the plan does not count a
+    # re-detected trope as a fresh insert beside its existing row.
     _all_keys, _own = _proposal_state(result)
     if _all_keys is None:
         return {}
     _own_pending = {r["name_key"] for r in _own
                     if (r.get("status") or "pending") == "pending"}
-    plan["would_delete"]["trope_proposals"] = len(_own_pending)
+    _prop_isbn_keyed = _proposal_book_key(result)[1]
+    plan["would_delete"]["trope_proposals"] = (
+        len(_own_pending) if _prop_isbn_keyed else 0)
     plan["existing"] += len(_own)
     plan["rejections_preserved"] += sum(
         1 for r in _own if (r.get("status") or "") == "rejected")
     plan["would_insert"]["proposals"] = len(_build_proposal_rows(
-        result, unmatched, _all_keys - _own_pending))
+        result, unmatched,
+        _all_keys if not _prop_isbn_keyed else _all_keys - _own_pending))
 
     _gstate = _claim_rows("book_trigger_claims", work_id)
     if _gstate is None:
