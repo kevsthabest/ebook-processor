@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.50"
+PORTABLE_VERSION = "2.13.51"
 
 
 import argparse
@@ -6747,9 +6747,18 @@ def corpus_servable_fingerprint(db, fpath):
     skipping the book for this scan."""
     try:
         source_hash = _corpus_sha256(Path(fpath).read_bytes())
+        # One source_hash can name several works: a metadata
+        # correction forks the fingerprint while the file bytes —
+        # and so the hash — stay the same. The later ingest is
+        # the superseding work, so the newest ingested_at wins;
+        # without the ordering the pick was whatever order the
+        # store happened to return, and could flip between runs.
+        # updated_at and the fingerprint itself break any
+        # remaining ties so the order is total.
         rows = db.query(
             "SELECT fingerprint FROM corpus_works "
-            "WHERE source_hash=?", (source_hash,))
+            "WHERE source_hash=? ORDER BY ingested_at DESC, "
+            "updated_at DESC, fingerprint", (source_hash,))
         if not rows:
             return None
         fingerprint = rows[0][0]
@@ -20432,9 +20441,17 @@ class _RunHistoryRecorder:
         db = self._corpus()
         if db is not None and source_hash:
             try:
+                # Same fork as corpus_servable_fingerprint: one
+                # source_hash can name several works, and the
+                # superseding (most recently ingested) one is the
+                # book's identity — newest ingested_at first,
+                # with updated_at and the fingerprint making the
+                # order total so the pick cannot flip between
+                # runs.
                 rows = db.query(
                     "SELECT fingerprint FROM corpus_works "
-                    "WHERE source_hash=?", (source_hash,))
+                    "WHERE source_hash=? ORDER BY ingested_at DESC, "
+                    "updated_at DESC, fingerprint", (source_hash,))
             except Exception:
                 rows = None
             if rows:
@@ -20763,7 +20780,14 @@ def _history_book_claims(result):
     for t in result.get("triggers") or []:
         if not isinstance(t, dict):
             continue
-        warn = (t.get("warning") or "").lower()
+        # The identity is the one inside the staging key, derived
+        # through staging_claim_key itself rather than a second
+        # copy of its strip-and-case-fold: the two writers must
+        # agree on what the same trigger is called, or one claim
+        # hashes as two across runs and history reports churn
+        # that never happened.
+        warn = staging_claim_key(
+            "trigger", warning=t.get("warning"))[len("trigger:"):]
         if not warn:
             continue
         trig_final[warn] = {"identity": warn}
@@ -20821,8 +20845,14 @@ def _history_book_claims(result):
         _prov = rel.get("endpoint_provenance")
         if not _prov:
             continue
-        _frm, _to, _typ = (rel.get("from"), rel.get("to"),
-                          rel.get("type"))
+        # Identity is the pipeline's own normalized pair plus
+        # the type under the same strip-and-case-fold, never the
+        # raw display strings: the same relationship printed with
+        # different endpoint casing or padding across runs must
+        # hash as one claim, or cross-run history splits it into
+        # a disappearance and an appearance that never happened.
+        _frm, _to = _rel_pair_key(rel)
+        _typ = str(rel.get("type") or "").strip().lower()
         if not (_frm and _to and _typ):
             continue
         # One claim can be reachable from more than one list (the

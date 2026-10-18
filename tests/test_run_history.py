@@ -1600,17 +1600,19 @@ class MinorSourcedHistoryTests(_Base):
             self.assertEqual(r["run_book_id"], BOOK_ID)
             self.assertIsNotNone(r["endpoint_provenance"])
         # Keys come from the existing relationship key path:
-        # catalogue-style identity here is the canonical pair and
-        # type, hashed with axis and book fingerprint — never a
-        # second, earner-specific derivation.
+        # catalogue-style identity here is the normalized
+        # canonical pair and type (the pipeline's own pair key,
+        # stripped and case-folded), hashed with axis and book
+        # fingerprint — never a second, earner-specific
+        # derivation.
         expect = {
             hashlib.sha256(
                 f"relationships|{self.book_key}|"
-                "Laura Sebeck\x1fPeter Sebeck\x1fspouse"
+                "laura sebeck\x1fpeter sebeck\x1fspouse"
                 .encode()).hexdigest(),
             hashlib.sha256(
                 f"relationships|{self.book_key}|"
-                "Chris Sebeck\x1fPeter Sebeck\x1fother"
+                "chris sebeck\x1fpeter sebeck\x1fother"
                 .encode()).hexdigest(),
         }
         self.assertEqual({r["claim_key"] for r in rel_rows}, expect)
