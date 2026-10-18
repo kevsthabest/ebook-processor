@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.34"
+PORTABLE_VERSION = "2.13.35"
 
 
 import argparse
@@ -19935,14 +19935,21 @@ def _history_thresholds():
         "rel_validation": _REL_VALIDATION_THRESHOLD,
         "rel_drop": _REL_DROP_THRESHOLD,
         "merge_tier3_cap": _MERGE_TIER3_CAP,
-        # The pool armed for the book in progress when this stamp
-        # is taken (v2.13.33): the per-book pool beside the floor
-        # constant above, so a run's records carry the scaled size
-        # and not only the floor it was scaled from. The artefact's
-        # own stamp (the reduce result's decision_pool) is the
-        # per-book record of record; this key rides the same dict
-        # for any reader that only sees the thresholds stamp.
-        "decision_pool": _DM_BUDGET_POOL,
+        # No decision_pool key here (v2.13.35, Advisor R2 on
+        # v2.13.33): this dict is the config fingerprint's input,
+        # and the armed pool is per-book runtime state, not run
+        # configuration. The stamp is also taken once, before any
+        # book arms its pool, so the value it carried was the
+        # floor for a whole fresh-process run — and in a warm
+        # process the same configuration could fingerprint
+        # differently depending on which book armed last. The
+        # pool's per-book record of record stays the reduce
+        # artefact's own decision_pool stamp (unchanged); a
+        # run-history book-row stamp awaits a schema decision,
+        # because the book payload's keys are the live table's
+        # columns and processor_run_books has no decision_pool
+        # column. The floor the pool scales from is the constant
+        # above.
         # The budget-governance scheme in effect (spec §1.2/§1.3/
         # §1.6): which validation order produced this run's
         # results, the reserve slices that bounded its budget, and

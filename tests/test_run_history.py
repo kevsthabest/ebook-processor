@@ -424,6 +424,49 @@ class BudgetAccountingHistoryTests(_Base):
         self.assertIsNone(chars["principal_rel_total"])
 
 
+class PoolFingerprintTests(_Base):
+    """v2.13.35 (Advisor R2 on v2.13.33): the armed decision pool
+    is per-book runtime state, not run configuration, so it leaves
+    the thresholds dict — that dict is the config fingerprint's
+    input, and a runtime pool made the same configuration
+    fingerprint differently in a warm process (and read the floor
+    for a whole fresh-process run, because the stamp is taken
+    before any book arms its pool). A per-book stamp on the
+    run-history book row is NOT part of this fix: the book
+    payload's keys are the live processor_run_books columns and
+    that table has no decision_pool column, so the placement
+    (new column vs an existing jsonb carrier) is a separate
+    schema decision. The reduce artefact's own decision_pool
+    stamp is the per-book record of record meanwhile."""
+
+    def tearDown(self):
+        pp._dm_budget_reset()
+        super().tearDown()
+
+    def test_run_thresholds_carry_no_decision_pool(self):
+        self.drive_one_book(result=v2_result())
+        self.assertNotIn("decision_pool",
+                         self.run_payload()["thresholds"])
+
+    def test_thresholds_dict_has_no_decision_pool_key(self):
+        pp._dm_budget_reset(chapter_count=115)
+        self.assertNotIn("decision_pool", pp._history_thresholds())
+
+    def test_fingerprint_identical_whatever_pool_is_armed(self):
+        # Warm process: the same configuration, fingerprinted
+        # with two different pools armed, must hash identically —
+        # before the fix the thresholds stamp carried the armed
+        # pool straight into the fingerprint's input.
+        pp._dm_budget_reset(chapter_count=200)
+        rec_a = pp._RunHistoryRecorder(
+            "scan", True, False, str(self.tmp))
+        pp._dm_budget_reset(chapter_count=60)
+        rec_b = pp._RunHistoryRecorder(
+            "scan", True, False, str(self.tmp))
+        self.assertEqual(rec_a.config_fingerprint,
+                         rec_b.config_fingerprint)
+
+
 class CollisionTests(_Base):
     def test_collision_suffixes_and_warns(self):
         foreign = [{"id": "zzzz", "started_at":

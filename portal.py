@@ -147,11 +147,12 @@ def pick_port(host, start, binder=None, attempts=_PORT_SCAN_ATTEMPTS):
 def source_constant(script_path, name):
     """Read a module-level literal constant out of
     process-portable.py's source (PORTABLE_VERSION,
-    CORPUS_PARSER_VERSION, _MERGE_TIER3_CAP).
+    CORPUS_PARSER_VERSION, _MERGE_TIER3_CAP,
+    _DECISION_POOL_CEILING).
 
     The portal mirrors the CLI's read models rather than
     importing the processor (a script, not a library); these
-    three constants are the only facts it needs that live
+    constants are the only facts it needs that live
     nowhere in the stores. Parsing the assignment keeps the
     portal honest when a version bumps — a hardcoded copy
     would silently go stale. Returns None when unreadable.
@@ -621,9 +622,13 @@ def home_data(learn_dir, script_dir, backup_dir=None):
     }
     cap = source_constant(script_dir / "process-portable.py",
                           "_MERGE_TIER3_CAP")
+    ceiling = source_constant(script_dir / "process-portable.py",
+                              "_DECISION_POOL_CEILING")
     strip = {
         "jobs": [],
         "decision_cap": cap if isinstance(cap, int) else 50,
+        "decision_ceiling": ceiling if isinstance(ceiling, int)
+        else 250,
         "note": ("Runs launched from this portal appear here. "
                  "A run started in a terminal also appears — "
                  "labelled external — while it runs, when it "
@@ -2834,7 +2839,8 @@ def _render_home(home):
                    "portal.</p>")
         out.append(
             f"<p class='muted'>Decision-call budget: "
-            f"{strip['decision_cap']}–250 per book, scaled by "
+            f"{strip['decision_cap']}–{strip['decision_ceiling']} "
+            f"per book, scaled by "
             f"chapter count — live spend shows here while a "
             f"portal-launched run is active."
             f"</p>")

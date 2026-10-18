@@ -195,10 +195,18 @@ class PoolStampTests(unittest.TestCase):
         self.assertEqual(scheme["chapter_count"], 115)
         self.assertEqual(scheme["reserves"], pp._DM_BUDGET_RESERVES)
 
-    def test_history_thresholds_stamp_the_pool_beside_the_floor(self):
+    def test_history_thresholds_carry_no_pool(self):
+        # v2.13.35 (Advisor R2 on the 2.13.33 stamp below): the
+        # thresholds dict is the config fingerprint's input, and
+        # the armed pool is per-book runtime state, not config —
+        # it no longer rides this dict at all. A run-history
+        # book-row stamp awaits a schema decision (the live
+        # processor_run_books table has no decision_pool column);
+        # the artefact stamp below is unchanged and stays the
+        # per-book record of record.
         pp._dm_budget_reset(chapter_count=115)
         thresholds = pp._history_thresholds()
-        self.assertEqual(thresholds["decision_pool"], 115)
+        self.assertNotIn("decision_pool", thresholds)
         # The old constant survives as the floor it now is.
         self.assertEqual(thresholds["merge_tier3_cap"],
                          pp._MERGE_TIER3_CAP)

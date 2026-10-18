@@ -374,7 +374,27 @@ class TestHomeData(unittest.TestCase):
         strip = self._home()["strip"]
         self.assertEqual(strip["jobs"], [])
         self.assertEqual(strip["decision_cap"], pp._MERGE_TIER3_CAP)
+        self.assertEqual(strip["decision_ceiling"],
+                         pp._DECISION_POOL_CEILING)
         self.assertIn("terminal", strip["note"])
+
+    def test_strip_ceiling_comes_from_the_processor_constant(self):
+        # The idle strip's ceiling half used to be a hardcoded
+        # "250" literal while its floor half was read live from
+        # the processor source (v2.13.35, Advisor N2). Rewrite
+        # the fixture copy's constant: both the strip value and
+        # the rendered string must follow it.
+        src = self.script / "process-portable.py"
+        text = src.read_text(encoding="utf-8")
+        self.assertIn("_DECISION_POOL_CEILING = 250", text)
+        src.write_text(text.replace(
+            "_DECISION_POOL_CEILING = 250",
+            "_DECISION_POOL_CEILING = 999", 1), encoding="utf-8")
+        home = self._home()
+        self.assertEqual(home["strip"]["decision_ceiling"], 999)
+        html = portal._render_home(home)
+        self.assertIn(
+            f"{pp._MERGE_TIER3_CAP}\u2013999 per book", html)
 
     def test_absent_stores_render_empty_not_broken(self):
         with tempfile.TemporaryDirectory() as td:
