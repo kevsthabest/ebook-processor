@@ -31,7 +31,18 @@ Three tables:
                      run's vocabulary (found in the per-chapter
                      deltas — a type that appears there but in no
                      final claim list and not in the built-in
-                     vocabulary).
+                     vocabulary). One refinement on "never
+                     shipped": scored claims that shipped embedded
+                     on a STORED character's row without
+                     confirming under their claimed type —
+                     downgrades above all — are recorded too,
+                     flagged stored_source. A stored character's
+                     claims otherwise live only on his prod row,
+                     which this tool never mirrors, and a
+                     downgrade happens to a shipped claim whose
+                     source earns a stored row by construction,
+                     so without the flag the store would be blind
+                     to the run's closest family calls.
   push_ledger        the User's push decisions (work, name,
                      decided-at). This is his curation data: an
                      import NEVER modifies it, so decisions survive
@@ -49,10 +60,12 @@ writes only to the local ledger.
 results that scored below a certain score — possible but
 unconfirmed, for whatever reason they failed to confirm. It is a
 read-only view over what the store already holds: scored claim
-candidates that did not ship, merge candidates in the ambiguous
-band, and scored claims inside Tier 3 characters' recorded claim
-sets that did not ship as validated (a family claim downgraded to
-`other` on a mid-band draw is the canonical case). The floor is
+candidates (dropped claims, and the flagged stored-source claims
+that shipped only in downgraded or still-unconfirmed form),
+merge candidates in the ambiguous band, and scored claims inside
+Tier 3 characters' recorded claim sets that did not ship as
+validated (a family claim downgraded to `other` on a mid-band
+draw is the canonical case). The floor is
 configurable (default 0.30) and the digest sorts by score
 descending, closest calls first, each entry carrying the state
 or reason that left it unconfirmed. Scores are read out of the
@@ -358,8 +371,11 @@ def _resolve_stored_set(artefact, work_id, stored_names_path,
 # them reviewable, not to reinterpret them.
 # ---------------------------------------------------------------------------
 
-def _candidates(artefact):
-    """Yields (kind, state, payload) for one artefact."""
+def _candidates(artefact, stored_set=()):
+    """Yields (kind, state, payload) for one artefact. The
+    stored set matters to exactly one pass: the stored-source
+    claims below, which are identified by their source being a
+    name prod kept."""
     # Merges the judge scored but the run did not take; the
     # recorded reason ("below threshold (0.85)") is the state that
     # left the pair unconfirmed.
@@ -388,6 +404,45 @@ def _candidates(artefact):
                 state = claim.get("validation_note") or \
                     claim.get("validation_state") or "dropped"
                 yield ("claim", state, claim)
+
+    # Scored claims that shipped embedded on a STORED character's
+    # row without confirming under their claimed type — above all
+    # the downgrade, which lands in state `validated` with its
+    # note reading "downgraded" and its type rewritten to
+    # `other`. A Tier 3 character's claims are recorded on his
+    # row in this store, so his downgrades reach the alerts
+    # digest through it; a stored character's claims live only on
+    # his prod row, which this tool never mirrors. Without this
+    # pass the digest is blind to exactly the near-misses it
+    # exists for, because the blind spot is systematic: a
+    # downgrade happens to a shipped claim, and a shipped claim
+    # earns its source a stored row — family downgrades land on
+    # stored sources by construction. The payload is the claim as
+    # recorded, flagged stored_source so the surfaces can
+    # annotate it; note the record itself no longer carries the
+    # pre-downgrade type (a downgrade's type reads `other`, its
+    # origin surviving only in the note). Claims already yielded
+    # above are skipped via the shared identity set — a claim
+    # lives in one list or the other in a real artefact, but the
+    # invariant is asserted here, not assumed.
+    for key in ("relationships", "minor_sourced_relationships"):
+        for claim in artefact.get(key) or []:
+            if not isinstance(claim, dict):
+                continue
+            if claim.get("from") not in stored_set:
+                continue
+            if claim.get("validation_p") is None:
+                continue
+            if _shipped_confirmed(claim):
+                continue
+            if _claim_key(claim) in seen:
+                continue
+            seen.add(_claim_key(claim))
+            payload = dict(claim)
+            payload["stored_source"] = True
+            state = claim.get("validation_note") or \
+                claim.get("validation_state") or "unconfirmed"
+            yield ("claim", state, payload)
 
     # Unresolved mentions, from every roster character (a
     # principal's unresolved mentions are review items too — the
@@ -495,7 +550,8 @@ def import_preview(db_path, preview_path, stored_names_path=None,
                      json.dumps(by_source.get(name, [])),
                      run_key, now))
             cand_counts = {}
-            for kind, state, payload in _candidates(artefact):
+            for kind, state, payload in _candidates(
+                    artefact, stored_set):
                 conn.execute(
                     "INSERT INTO tier3_candidates (work_id, kind, "
                     "state, payload_json, run_key, imported_at) "
@@ -750,8 +806,10 @@ def cmd_report(args):
 # Alerts — the digest the User asked for (2026-10-18): results
 # below a certain score, possible but unconfirmed for whatever
 # reason they failed to confirm. Three sources already in the
-# store: scored claim candidates (they did not ship by
-# construction), merge candidates in the ambiguous band, and
+# store: scored claim candidates (dropped or rejected claims,
+# plus the flagged stored-source claims that shipped embedded
+# on a prod row without confirming under their claimed type),
+# merge candidates in the ambiguous band, and
 # scored claims inside Tier 3 characters' recorded claim sets
 # that did not ship as validated. Scores live inside the
 # recorded payloads — validation_p on a claim, p_yes on a merge
@@ -832,7 +890,8 @@ def collect_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
             work_id, title = book["work_id"], book["title"]
             found, seen = [], set()
 
-            def add(kind, label, ctype, score, reason, ident):
+            def add(kind, label, ctype, score, reason, ident,
+                    stored_source=False):
                 if ident in seen:
                     return
                 seen.add(ident)
@@ -840,11 +899,17 @@ def collect_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
                     "work_id": work_id, "title": title,
                     "kind": kind, "label": label, "type": ctype,
                     "score": score, "reason": reason,
+                    "stored_source": stored_source,
                 })
 
             # (a) Scored claim candidates: being a candidate is
             # the non-shipment — the claim was dropped or
-            # rejected, however close the judge called it.
+            # rejected, however close the judge called it. The
+            # stored-source candidates the importer records are
+            # the one refinement: those claims shipped embedded
+            # on a prod row, but only in downgraded or
+            # still-unconfirmed form, so they belong in the
+            # same band, flagged.
             for row in conn.execute(
                     "SELECT state, payload_json FROM "
                     "tier3_candidates WHERE work_id = ? "
@@ -858,7 +923,9 @@ def collect_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
                     claim.get("type"), p,
                     row["state"] or claim.get("validation_note")
                     or claim.get("validation_state") or "dropped",
-                    ("claim",) + _alert_claim_key(claim))
+                    ("claim",) + _alert_claim_key(claim),
+                    stored_source=claim.get("stored_source")
+                    is True)
 
             # (b) Merge candidates in the ambiguous band:
             # judged, scored at or above the floor, but below
@@ -934,6 +1001,10 @@ def build_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
         if alert["kind"] == "claim":
             detail += f" — type {alert['type']}"
         detail += f" — {alert['reason']}"
+        if alert.get("stored_source"):
+            # The claim shipped on a stored character's prod
+            # row; the alert is the only local trace of it.
+            detail += "  [stored source]"
         lines.append(detail)
     books = {a["work_id"] for a in alerts}
     lines.append("")

@@ -511,5 +511,165 @@ class AlertsTests(Tier3Case):
             store.collect_alerts(str(self.dir / "nope.db"))
 
 
+def _stored_source_artefact():
+    """A book whose stored set (supplied by file) includes a
+    minor whose shipped claims exercise the stored-source pass:
+    a downgrade and a scored review_required claim must be
+    recorded as candidates; a clean keep and an unscored claim
+    must not. A Tier 3 minor carries a downgrade of his own,
+    which must keep flowing through his character row only."""
+    return {
+        "title": "Stored Source Book", "author": "An Author",
+        "work_id": "work-stored-1",
+        "characters": [_char("Principal A", appearances=40),
+                       _char("Principal B", appearances=30)],
+        "minor_characters": [
+            _char("Stored Spouse", appearances=8),
+            _char("Tier3 Minor", appearances=4),
+        ],
+        "relationships": [],
+        "minor_sourced_relationships": [
+            # The canonical stored-source downgrade: shipped,
+            # state validated, type rewritten to `other` — the
+            # claimed type never confirmed.
+            {"from": "Stored Spouse", "to": "Principal A",
+             "type": "other", "evidence": "A quote.",
+             "chapter": "Chapter 5", "source": "extracted",
+             "validation_state": "validated",
+             "validation_p": 0.58,
+             "validation_note": "downgraded"},
+            # A stored source's review_required claim WITH a
+            # probability: scored, unconfirmed — same class.
+            _claim("Stored Spouse", "Principal B", "sibling",
+                   state="review_required", p=0.47,
+                   chapter="Chapter 6"),
+            # A clean validated keep under its claimed type:
+            # never recorded, however high the score.
+            _claim("Stored Spouse", "Principal A", "spouse",
+                   state="validated", p=0.93, note="kept",
+                   chapter="Chapter 7"),
+            # Unscored: no probability, nothing to record.
+            _claim("Stored Spouse", "Principal B", "friend",
+                   state="review_required", chapter="Chapter 8"),
+            # A Tier 3 source's downgrade: recorded on his
+            # character row, never as a candidate.
+            {"from": "Tier3 Minor", "to": "Principal A",
+             "type": "other", "evidence": "A quote.",
+             "chapter": "Chapter 9", "source": "extracted",
+             "validation_state": "validated",
+             "validation_p": 0.66,
+             "validation_note": "downgraded"},
+        ],
+        "dropped_relationships": [],
+        "possible_merges": [],
+    }
+
+
+class StoredSourceCandidateTests(Tier3Case):
+    def import_stored_book(self, art=None):
+        names_file = self.dir / "stored-source-names.txt"
+        names_file.write_text(
+            "Principal A\nPrincipal B\nStored Spouse\n",
+            encoding="utf-8")
+        path = self.write_artefact(
+            art or _stored_source_artefact(), name="stored.json")
+        return store.import_preview(
+            self.db, path, stored_names_path=str(names_file),
+            config_path=self.missing_config)
+
+    def claim_candidate_payloads(self, work_id="work-stored-1"):
+        conn = sqlite3.connect(self.db)
+        try:
+            return [json.loads(r[0]) for r in conn.execute(
+                "SELECT payload_json FROM tier3_candidates "
+                "WHERE work_id = ? AND kind = 'claim'",
+                (work_id,))]
+        finally:
+            conn.close()
+
+    def test_stored_source_downgrade_is_recorded_and_flagged(self):
+        self.import_stored_book()
+        payloads = self.claim_candidate_payloads()
+        # Exactly the downgrade and the scored review_required
+        # claim — the keep and the unscored claim stay out.
+        self.assertEqual(len(payloads), 2)
+        self.assertTrue(all(p.get("stored_source") is True
+                            for p in payloads))
+        by_p = {p["validation_p"]: p for p in payloads}
+        self.assertEqual(by_p[0.58]["validation_note"],
+                         "downgraded")
+        self.assertEqual(by_p[0.47]["validation_state"],
+                         "review_required")
+
+    def test_stored_source_alerts_carry_the_marker(self):
+        self.import_stored_book()
+        alerts = store.collect_alerts(self.db)
+        # Closest calls first: the Tier 3 downgrade (via his
+        # claim set), then the two stored-source candidates.
+        self.assertEqual([a["score"] for a in alerts],
+                         [0.66, 0.58, 0.47])
+        flagged = {a["score"] for a in alerts
+                   if a.get("stored_source")}
+        self.assertEqual(flagged, {0.58, 0.47})
+        text = store.build_alerts(self.db)
+        self.assertEqual(text.count("[stored source]"), 2)
+
+    def test_stored_source_keep_and_unscored_never_recorded(self):
+        self.import_stored_book()
+        pairs = {(p["from"], p.get("type"))
+                 for p in self.claim_candidate_payloads()}
+        # The 0.93 spouse keep confirmed under its claimed type.
+        self.assertNotIn(("Stored Spouse", "spouse"), pairs)
+        # The unscored friend claim carries no probability.
+        self.assertNotIn(("Stored Spouse", "friend"), pairs)
+
+    def test_tier3_source_downgrade_stays_on_the_character_row(self):
+        self.import_stored_book()
+        self.assertEqual(self.tier3_names("work-stored-1"),
+                         {"Tier3 Minor"})
+        self.assertFalse(any(
+            p["from"] == "Tier3 Minor"
+            for p in self.claim_candidate_payloads()))
+        conn = sqlite3.connect(self.db)
+        try:
+            row = conn.execute(
+                "SELECT claims_json FROM tier3_characters "
+                "WHERE name = 'Tier3 Minor'").fetchone()
+        finally:
+            conn.close()
+        claims = json.loads(row[0])
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0]["validation_note"],
+                         "downgraded")
+        # The roster reconciliation is untouched by the new
+        # candidates: they are not characters.
+        report = store.build_report(self.db)
+        self.assertIn("roster 4 == stored 3 + Tier 3 1 = 4 — "
+                      "PASS", report)
+
+    def test_stored_source_claim_in_two_lists_recorded_once(self):
+        art = _stored_source_artefact()
+        # The downgrade's identity ALSO recorded in the dropped
+        # list. A claim lives in one list or the other in a real
+        # artefact — the dedupe invariant is asserted, not
+        # assumed from that.
+        art["dropped_relationships"] = [
+            {"from": "Stored Spouse", "to": "Principal A",
+             "type": "other", "evidence": "A quote.",
+             "chapter": "Chapter 5", "source": "extracted",
+             "validation_state": "rejected",
+             "validation_p": 0.58,
+             "validation_note": "dropped"}]
+        self.import_stored_book(art)
+        same = [p for p in self.claim_candidate_payloads()
+                if p["from"] == "Stored Spouse"
+                and p["to"] == "Principal A"
+                and p.get("chapter") == "Chapter 5"]
+        self.assertEqual(len(same), 1)
+        alerts = store.collect_alerts(self.db)
+        self.assertEqual(
+            sum(1 for a in alerts if a["score"] == 0.58), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
