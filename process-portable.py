@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.28"
+PORTABLE_VERSION = "2.13.29"
 
 
 import argparse
@@ -21858,19 +21858,23 @@ def _roster_canonical_names(result):
         "canonical_names") or {}
 
 
-# Judged claim states for the claim-earner storage rule (Decision,
-# 2026-10-18). "validated" is a claim the validator scored and kept
-# or downgraded. "review_required" is the residual curation state
-# (spec §1.5): it holds claims the judge drew into the middle —
-# direction-guard demotions of validated claims among them — AND
-# claims nobody judged: an exempt "other", a claim with nothing to
-# judge, a run with no validator configured. The storage rule
-# counts both states as judged anyway: a stored row is a curation
-# surface, and a minor whose claim awaits a human decision needs
-# the row for that decision to land on. The states that dispose of
-# a claim without any judgment landing — "budget_exhausted",
-# "validator_error", "rejected" — earn nothing.
-_JUDGED_CLAIM_STATES = frozenset({"validated", "review_required"})
+# Claim-earner qualification (Decision, 2026-10-18): "validated"
+# alone qualifies, because reaching that state means a judge
+# scored the claim and kept or downgraded it. "review_required"
+# qualifies only alongside a recorded validation_p, because the
+# state name overclaims on its own: it is the residual curation
+# bucket (spec §1.5), so claims land in it that nobody ever
+# judged — an exempt "other", a claim with nothing to judge, a
+# run with no validator configured. The recorded probability is
+# the proof a judge draw actually happened; without one there
+# was no draw, and an unscored claim must not earn a row its
+# source would not otherwise get. Direction-guard demotions are
+# why the scored half of the bucket stays in: they move from
+# validated into review_required carrying the p from the draw
+# that scored them, so cutting the whole state would un-earn
+# claims a judge really did weigh. The states that dispose of a
+# claim without any judgment landing — "budget_exhausted",
+# "validator_error", "rejected" — earn nothing either way.
 
 
 def _claim_earner_chars(result):
@@ -21887,12 +21891,14 @@ def _claim_earner_chars(result):
 
     The candidates are the surviving claims the filter removed
     solely for their source (result["minor_sourced_relationships"],
-    retained where the filter runs). A claim was judged when its
-    effective validation_state is a judged state; the effective
-    state is the recorded state, derived from the note when the
-    claim carries none — the same expression _build_rel_map stamps
-    into stored claims, so the row decision and the stored state
-    cannot disagree about whether a claim was judged. Returns the
+    retained where the filter runs). A claim counts as scored
+    when its effective validation_state is "validated", or when
+    it is "review_required" and carries a recorded validation_p
+    (see the qualification comment above this function); the
+    effective state is the recorded state, derived from the note
+    when the claim carries none — the same expression
+    _build_rel_map stamps into stored claims, so the row decision
+    and the stored state cannot disagree. Returns the
     roster entries from result["minor_characters"], in roster
     order; empty when the retention never ran (principal filter
     off, a pipeline that does not retain, hand-built fixtures)."""
@@ -21909,7 +21915,9 @@ def _claim_earner_chars(result):
             # own, so the two decisions cannot disagree.
             continue
         state = r.get("validation_state") or _rel_validation_state(r)
-        if state in _JUDGED_CLAIM_STATES:
+        if state == "validated" or (
+                state == "review_required"
+                and r.get("validation_p") is not None):
             judged_sources.add(norm_name(r.get("from", "")))
     if not judged_sources:
         return []

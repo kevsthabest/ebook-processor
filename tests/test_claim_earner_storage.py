@@ -10,9 +10,16 @@ the judge kept at 0.94 and two child claims downgraded to "other", all
 sourced by non-principals, none stored.)
 
 The rule: the stored character set is the principals plus any character
-who sources at least one shipping claim the validator actually judged
-(validation_state validated or review_required). Never-judged claims
-(budget_exhausted / validator_error) earn no row.
+who sources at least one shipping claim the validator actually scored.
+A validated claim qualifies on its state alone; a review_required
+claim qualifies only when it carries a recorded validation_p, because
+that state is a residual bucket that also holds claims nobody judged
+(an exempt "other", a run with no validator configured) — the recorded
+probability is the proof a judge draw happened, and direction-guard
+demotions land in review_required carrying theirs. Never-judged claims
+(budget_exhausted / validator_error, or review_required with no
+recorded p) earn no row. (Narrowed 2026-10-18 after Daemon run 21
+stored rows for sources whose qualifying claims carry no validation_p.)
 
 Fixtures are built in the post-filter shape the v2 pipeline hands
 write_claims: characters = principals, minor_characters = the rest of
@@ -43,6 +50,8 @@ _CHRIS = {"name": "Chris Sebeck", "role": "supporting",
 _MARILYN = {"name": "Marilyn Sebeck", "role": "minor", "status": "dead"}
 _WAYNE = {"name": "Wayne Sebeck", "role": "minor", "status": "dead"}
 _JOSEPH = {"name": "Joseph Sebeck", "role": "minor", "status": "alive"}
+_CHARLES = {"name": "Charles Mosely", "role": "minor", "status": "alive"}
+_LIONEL = {"name": "Lionel Crawly", "role": "minor", "status": "alive"}
 
 
 def _claim(frm, to, typ, state, note, p=0.9, evidence="A binding sentence."):
@@ -162,6 +171,68 @@ class TestReviewRequiredEarnsRow(_ReplaceBase):
         fake = self.install(_StatefulSB({}))
         claim = _claim("Joseph Sebeck", "Detective Peter Sebeck", "parent",
                        "review_required", "", p=0.5)
+        errors = pp.write_claims(1, _daemon_result(
+            minor_characters=[_JOSEPH],
+            minor_sourced_relationships=[claim]))
+        self.assertEqual(errors, 0)
+        rows = _stored_rows(fake)
+        self.assertIn("Joseph Sebeck", rows)
+        rels = rows["Joseph Sebeck"]["relationships"]
+        self.assertEqual(len(rels), 1)
+        self.assertEqual(rels[0]["validation_state"], "review_required")
+
+
+class TestReviewRequiredWithoutScoreEarnsNoRow(_ReplaceBase):
+    # "review_required" is a residual bucket, not proof of a
+    # judgment: it also holds claims nobody scored. A claim in
+    # that state with no recorded probability was never drawn on
+    # by a judge, so it earns its source no row. (Live case,
+    # Daemon run 21: rows were stored for sources whose qualifying
+    # claims carry no validation_p at all.)
+    def test_review_required_with_null_p_earns_no_row(self):
+        fake = self.install(_StatefulSB({}))
+        claim = _claim("Charles Mosely", "Detective Peter Sebeck",
+                       "other", "review_required", "", p=None)
+        errors = pp.write_claims(1, _daemon_result(
+            minor_characters=[_CHARLES],
+            minor_sourced_relationships=[claim]))
+        self.assertEqual(errors, 0)
+        rows = _stored_rows(fake)
+        self.assertNotIn("Charles Mosely", rows)
+        self.assertEqual(sorted(rows), ["Detective Peter Sebeck"])
+
+
+class TestNoValidatorRunEarnsNoRow(_ReplaceBase):
+    # A run with no validator configured is constructible at this
+    # seam in its exact post-reduce shape: validation stamps the
+    # claim review_required (the state derived from an empty
+    # note), and the validation_p key is never written at all —
+    # no draw happened, so there is no probability to record.
+    # That shape must earn nothing via review_required.
+    def test_review_required_with_no_p_key_earns_no_row(self):
+        fake = self.install(_StatefulSB({}))
+        claim = _claim("Lionel Crawly", "Detective Peter Sebeck",
+                       "colleague", "review_required", "", p=0.5)
+        del claim["validation_p"]
+        errors = pp.write_claims(1, _daemon_result(
+            minor_characters=[_LIONEL],
+            minor_sourced_relationships=[claim]))
+        self.assertEqual(errors, 0)
+        rows = _stored_rows(fake)
+        self.assertNotIn("Lionel Crawly", rows)
+        self.assertEqual(sorted(rows), ["Detective Peter Sebeck"])
+
+
+class TestDirectionGuardDemotionStillEarnsRow(_ReplaceBase):
+    # Pin: a direction-guard demotion lands in review_required
+    # carrying the probability from the draw that scored it — the
+    # judge DID draw on this claim, so the recorded p keeps it
+    # earning its source a row under the narrowed rule.
+    def test_review_required_with_recorded_p_earns_row(self):
+        fake = self.install(_StatefulSB({}))
+        claim = _claim("Joseph Sebeck", "Detective Peter Sebeck",
+                       "parent", "review_required", "kept", p=0.87)
+        claim["direction_contradiction"] = {"types": ["parent", "child"]}
         errors = pp.write_claims(1, _daemon_result(
             minor_characters=[_JOSEPH],
             minor_sourced_relationships=[claim]))
