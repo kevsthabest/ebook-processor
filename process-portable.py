@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.43"
+PORTABLE_VERSION = "2.13.44"
 
 
 import argparse
@@ -370,16 +370,87 @@ def _natural_key(s):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
 
+# An EPUB in the import folder is untrusted input: a zip entry whose
+# compressed form is tiny can decompress to gigabytes, so reading an
+# entry without a bound lets one crafted file exhaust memory or disk
+# during a folder scan. Every zip entry the EPUB parse paths read is
+# therefore capped per entry class, with the same numbers the portal
+# already uses where the classes match (container 1 MiB, OPF 5 MiB).
+# Spine documents get far more headroom than metadata because a
+# legitimate book may carry a whole novel — or an omnibus — in a
+# single XHTML file: the test corpus's biggest synthetic chapter is
+# ~50 KB, real single-file books run to a few MiB, and 32 MiB leaves
+# generous room above both while still bounding one entry's cost.
+# An entry over its cap fails the book with EpubEntryTooLargeError:
+# truncating an entry and processing what survives as if it were the
+# whole text would write claims from a partial book as complete.
+EPUB_CONTAINER_MAX_BYTES = 1 << 20
+EPUB_OPF_MAX_BYTES = 5 << 20
+EPUB_DOCUMENT_MAX_BYTES = 32 << 20
+
+
+class EpubEntryTooLargeError(Exception):
+    """One EPUB entry exceeds its decompression cap (see the caps
+    above). Raised instead of returning partial content, and never
+    swallowed by the parse paths' per-file fallbacks: the scan loop
+    catches it per book, so the book fails loudly and the folder
+    scan moves on."""
+
+
+def _read_zip_entry_capped(z, name, cap):
+    """Read one zip entry as bytes, enforcing `cap` twice.
+
+    The declared-size check comes first because it is free — the
+    header states the decompressed size, so an honest bomb is
+    rejected before a single byte is inflated. The streamed read is
+    capped too because the header can lie: a header that declares a
+    small size while the deflate stream yields more must not be able
+    to pull an unbounded read out of the second check's absence.
+    Reading stops one byte past the cap, which is enough to know the
+    entry is over without materialising the rest of it.
+    """
+    info = z.getinfo(name)
+    if info.file_size > cap:
+        raise EpubEntryTooLargeError(
+            f"EPUB entry {name} declares {info.file_size} bytes, over "
+            f"the {cap}-byte cap for its entry class; refusing the book "
+            f"rather than reading an unbounded entry")
+    chunks = []
+    total = 0
+    with z.open(name) as fh:
+        while True:
+            chunk = fh.read(min(1 << 16, cap + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > cap:
+                raise EpubEntryTooLargeError(
+                    f"EPUB entry {name} decompressed past the "
+                    f"{cap}-byte cap for its entry class despite "
+                    f"declaring {info.file_size} bytes; refusing the "
+                    f"book rather than reading an unbounded entry")
+    return b"".join(chunks)
+
+
 def read_opf(z):
     """Return (ordered_content_names or None, title, author) using the OPF spine."""
     try:
-        container = ET.fromstring(z.read("META-INF/container.xml"))
+        container = ET.fromstring(_read_zip_entry_capped(
+            z, "META-INF/container.xml", EPUB_CONTAINER_MAX_BYTES))
         opf_path = next(
             (e.attrib["full-path"] for e in container.iter()
              if _local(e.tag) == "rootfile" and "full-path" in e.attrib), None)
         if not opf_path:
             return None, None, None, {"raw": []}
-        root = ET.fromstring(z.read(opf_path))
+        root = ET.fromstring(_read_zip_entry_capped(
+            z, opf_path, EPUB_OPF_MAX_BYTES))
+    except EpubEntryTooLargeError:
+        # An over-cap container or OPF is not a parse hiccup to fall
+        # back from: falling back to filename order would still read
+        # the book's documents and quietly process a book whose
+        # metadata was refused, so the cap error fails the book.
+        raise
     except Exception as e:
         print(f"  Warning: could not parse OPF ({e}); falling back to filename order")
         return None, None, None, {"raw": []}
@@ -850,13 +921,22 @@ def extract_epub_units(epub_path):
             if fname not in available:
                 continue
             try:
-                content = _decode_book_document(z.read(fname), fname)
+                content = _decode_book_document(
+                    _read_zip_entry_capped(z, fname,
+                                            EPUB_DOCUMENT_MAX_BYTES),
+                    fname)
                 text = html_to_text(content)
                 if len(text) > 100:
                     heads = extract_headings(content)
                     label = heads[0][:80] if heads else posixpath.splitext(
                         posixpath.basename(fname))[0]
                     units.append({"spine": fname, "label": label, "text": text})
+            except EpubEntryTooLargeError:
+                # Skipping an over-cap chapter and keeping the rest
+                # would hand the pipeline a book with a hole in it
+                # that looks complete, so the cap error fails the
+                # whole book instead of joining the per-file warnings.
+                raise
             except Exception as e:
                 print(f"  Warning: {fname}: {e}")
     return units, title, author, _pick_identifiers(opf_ids["raw"],

@@ -120,6 +120,49 @@ class LabError(Exception):
     """A user-facing failure: message is safe to print as-is."""
 
 
+# The lab opens EPUBs the operator points it at, and those files get
+# the same suspicion as the processor's import folder: a zip entry
+# can decompress far beyond its compressed size, so every entry read
+# below is capped per entry class, using the processor's numbers
+# (container 1 MiB, OPF 5 MiB, spine documents 32 MiB — documents get
+# the headroom because a legitimate book may carry a whole novel in
+# a single XHTML file). An over-cap entry raises LabError instead of
+# being truncated or skipped, because chapters measured from partial
+# text would silently corrupt the experiment's numbers.
+EPUB_CONTAINER_MAX_BYTES = 1 << 20
+EPUB_OPF_MAX_BYTES = 5 << 20
+EPUB_DOCUMENT_MAX_BYTES = 32 << 20
+
+
+def _read_zip_entry_capped(zf, name, cap):
+    """Read one zip entry as bytes, enforcing `cap` twice: the
+    declared-size check rejects an honestly labelled bomb before any
+    inflation, and the streamed read is capped as well because a
+    header can declare a small size while its stream yields more.
+    Reading stops one byte past the cap — enough to know the entry
+    is over without materialising the rest of it."""
+    info = zf.getinfo(name)
+    if info.file_size > cap:
+        raise LabError(
+            f"EPUB entry {name} declares {info.file_size} bytes, over "
+            f"the {cap}-byte cap for its entry class; refusing the book")
+    chunks = []
+    total = 0
+    with zf.open(name) as fh:
+        while True:
+            chunk = fh.read(min(1 << 16, cap + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > cap:
+                raise LabError(
+                    f"EPUB entry {name} decompressed past the "
+                    f"{cap}-byte cap for its entry class despite "
+                    f"declaring {info.file_size} bytes; refusing the book")
+    return b"".join(chunks)
+
+
 # ---------------------------------------------------------------------------
 # Small shared helpers.
 # ---------------------------------------------------------------------------
@@ -799,7 +842,8 @@ def epub_chapters(epub_path, min_chars=800):
         names = set(zf.namelist())
         if "META-INF/container.xml" not in names:
             raise LabError("not an EPUB: META-INF/container.xml missing")
-        container = ElementTree.fromstring(zf.read("META-INF/container.xml"))
+        container = ElementTree.fromstring(_read_zip_entry_capped(
+            zf, "META-INF/container.xml", EPUB_CONTAINER_MAX_BYTES))
         opf_path = None
         for el in container.iter():
             if _local(el.tag) == "rootfile" and el.get("full-path"):
@@ -807,7 +851,8 @@ def epub_chapters(epub_path, min_chars=800):
                 break
         if not opf_path:
             raise LabError("EPUB container names no rootfile")
-        opf = ElementTree.fromstring(zf.read(opf_path))
+        opf = ElementTree.fromstring(_read_zip_entry_capped(
+            zf, opf_path, EPUB_OPF_MAX_BYTES))
         manifest = {}
         spine = []
         for el in opf.iter():
@@ -826,9 +871,16 @@ def epub_chapters(epub_path, min_chars=800):
             full = posixpath.normpath(posixpath.join(opf_dir, href))
             if full not in names:
                 continue
+            # The capped read sits outside the per-chapter try on
+            # purpose: that try skips a chapter it cannot parse, but
+            # an over-cap chapter must fail the book — skipping it
+            # would measure the remaining chapters as if they were
+            # the whole book.
+            raw = _read_zip_entry_capped(zf, full,
+                                         EPUB_DOCUMENT_MAX_BYTES)
             try:
                 parser = _TextExtractor()
-                parser.feed(zf.read(full).decode("utf-8", errors="replace"))
+                parser.feed(raw.decode("utf-8", errors="replace"))
                 text = parser.text()
             except Exception:
                 continue
