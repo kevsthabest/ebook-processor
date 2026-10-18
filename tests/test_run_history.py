@@ -47,6 +47,8 @@ class FakeSB:
         self.get_runs = []            # rows for the collision GET
         self.get_runs_queue = None    # per-call GET responses
         self.fail_run_post = False
+        self.fail_books_post = False  # books POST returns None
+        self.omit_book_keys = set()   # books POST "loses" these rows
 
     def __call__(self, table, method="GET", data=None, params="",
                  prefer=None, schema=None):
@@ -62,8 +64,11 @@ class FakeSB:
                 return None
             return [{"id": RUN_ID}]
         if table == "processor_run_books" and method == "POST":
+            if self.fail_books_post:
+                return None
             return [{"id": BOOK_ID, "book_key": row["book_key"]}
-                    for row in data]
+                    for row in data
+                    if row["book_key"] not in self.omit_book_keys]
         if table == "processor_run_claim_outcomes" and method == "POST":
             return [{} for _ in data]
         return []
@@ -123,6 +128,13 @@ class _Base(unittest.TestCase):
             "corpus_only": False, "use_corpus": False,
             "evidence_retrieval": False,
         })
+        # Arm the budget, then spend seven calls on it: every
+        # drive in this file models a book the pipeline armed.
+        # The setup used to write the counter bare, which pinned
+        # capture-without-arming — the sticky-stamp shape issue
+        # #14 removes (v2.13.49): an unarmed counter is no longer
+        # capturable, so the harness arms like production does.
+        pp._dm_budget_reset()
         pp._DM_BUDGET_USED = 7
         self.tmp = Path(self.id().replace(".", "_"))
         import tempfile
@@ -1643,6 +1655,173 @@ class MinorSourcedHistoryTests(_Base):
         self.assertEqual(len(earner), 1)
         self.assertEqual(earner[0]["confidence"], 0.5)
         self.assertIsNotNone(earner[0]["endpoint_provenance"])
+
+
+class ShippedTotalsHistoryTests(_Base):
+    """Issues #7 + the v2.13.38 gate WARN: the run row's totals
+    must describe exactly the books that shipped — the post-
+    collapse survivors whose book rows the mirror actually holds
+    — with counts either authoritative or honestly absent, never
+    inherited from entries that ship no row. The run row is
+    posted before its book rows (they key off its uuid), so a
+    books POST that fails or returns only some rows must end
+    with the stored totals corrected to the shipped set."""
+
+    def tearDown(self):
+        pp._dm_budget_reset()
+        super().tearDown()
+
+    def _book_file(self, name, payload):
+        path = self.tmp / name
+        path.write_bytes(payload)
+        return path, hashlib.sha256(payload).hexdigest()
+
+    def _drive_books(self, specs):
+        """specs: [(path, result)] processed in order."""
+        pp._history_begin("scan", preview=True,
+                          learn_dir=str(self.tmp),
+                          files_seen=len(specs))
+        for path, result in specs:
+            pp._history_book_start(path)
+            if result is not None:
+                pp._history_note_result(path, result)
+            pp._history_book_end(path)
+            pp._history_book_outcome(path, True)
+        pp._history_finish(failures=0)
+
+    def _final_run_payload(self):
+        posts = self.fake.posts("processor_runs")
+        self.assertTrue(posts)
+        return posts[-1]["data"][0]
+
+    def test_totals_describe_only_shipped_books_on_partial_books_post(
+            self):
+        other, other_key = self._book_file(
+            "other.epub", b"different fake epub bytes for history")
+        self.fake.omit_book_keys = {other_key}
+        self._drive_books([(self.book, v2_result()),
+                           (other, v2_result())])
+        totals = self._final_run_payload()["totals"]
+        self.assertEqual(totals["processed"], 1)
+        self.assertEqual(totals["succeeded"], 1)
+        # The shipped book's claims still ship; the unshipped
+        # book's never do (one book = three claim rows here).
+        claim_posts = self.fake.posts("processor_run_claim_outcomes")
+        self.assertEqual(len(claim_posts), 1)
+        self.assertEqual(len(claim_posts[0]["data"]), 3)
+
+    def test_outcomeless_middle_entry_dilutes_nothing(self):
+        # Three real books; the middle one's row never comes back
+        # from the books POST. Both neighbours' claims must ship
+        # and the totals must count the two shipped books only —
+        # claim shipping is decided per book against its own row,
+        # immune to other entries' presence or order.
+        mid, mid_key = self._book_file(
+            "mid.epub", b"middle fake epub bytes for history tests")
+        last, _last_key = self._book_file(
+            "last.epub", b"last fake epub bytes for history tests!")
+        self.fake.omit_book_keys = {mid_key}
+        self._drive_books([(self.book, v2_result()),
+                           (mid, v2_result()),
+                           (last, v2_result())])
+        totals = self._final_run_payload()["totals"]
+        self.assertEqual(totals["processed"], 2)
+        self.assertEqual(totals["succeeded"], 2)
+        claim_posts = self.fake.posts("processor_run_claim_outcomes")
+        self.assertEqual(len(claim_posts), 1)
+        self.assertEqual(len(claim_posts[0]["data"]), 6)
+
+    def test_books_post_failure_leaves_no_orphan_totals(self):
+        # The stored run row must not claim processed/claims
+        # totals for book rows that do not exist: with nothing
+        # shipped, the totals are honestly absent, and the flush
+        # still warns exactly once.
+        self.fake.fail_books_post = True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.drive_one_book(result=v2_result())
+        self.assertEqual(
+            out.getvalue().count("Run history: upload failed"), 1)
+        totals = self._final_run_payload()["totals"]
+        self.assertIsNone(totals["processed"])
+        self.assertIsNone(totals["succeeded"])
+        self.assertIsNone(totals["claims_derived"])
+        self.assertEqual(len(self.fake.posts("processor_run_books")), 1)
+        self.assertEqual(
+            self.fake.posts("processor_run_claim_outcomes"), [])
+
+    def test_duplicate_budget_pooled_from_surviving_entry_once(self):
+        # WARN: two recorder entries share one book_key and
+        # collapse to one shipped row. Pooling the run's
+        # decision_budget from every recorder entry keyed by that
+        # book_key counts the collapsed copy's spend a second
+        # time; the pool must come from the surviving entry only.
+        copy_path = self.tmp / "copy.epub"
+        copy_path.write_bytes(BOOK_BYTES)
+        pp._history_begin("scan", preview=True,
+                          learn_dir=str(self.tmp), files_seen=2)
+        pp._history_book_start(self.book)
+        pp._dm_budget_reset(chapter_count=30)
+        pp._dm_budget_claim(1, consumer="rel_family")
+        pp._history_note_result(self.book, v2_result())
+        pp._history_book_end(self.book)
+        pp._history_book_outcome(self.book, True)
+        pp._history_book_start(copy_path)
+        pp._dm_budget_reset(chapter_count=30)
+        pp._dm_budget_claim(1, consumer="rel_family")
+        pp._dm_budget_claim(1, consumer="rel_family")
+        pp._history_note_result(copy_path, v2_result())
+        pp._history_book_end(copy_path)
+        pp._history_book_outcome(copy_path, True)
+        pp._history_finish(failures=0)
+        totals = self.run_payload()["totals"]
+        self.assertEqual(totals["decision_budget"], {
+            "rel_family": {"granted": 2, "denied": 0, "spent": 2}})
+
+
+class StickyBudgetStampTests(_Base):
+    """Issue #14: the decision-budget globals are armed per book
+    but were never disarmed between books, so a book that exits
+    before arming (no-ISBN skip, unreadable file, ingest
+    exception) inherited its predecessor's pool / calls / budget
+    snapshot in its history stamps. Captures may only be taken
+    from state armed FOR THAT BOOK; a skipped book stamps NULL
+    for pool and calls — not 0, not the predecessor's numbers."""
+
+    def tearDown(self):
+        pp._dm_budget_reset()
+        super().tearDown()
+
+    def test_book_exiting_before_arming_stamps_null(self):
+        book2 = self.tmp / "book2.epub"
+        book2.write_bytes(b"second fake epub bytes for history tests")
+        key2 = hashlib.sha256(book2.read_bytes()).hexdigest()
+        pp._history_begin("scan", preview=True,
+                          learn_dir=str(self.tmp), files_seen=2)
+        # Book A arms a pool of 120 (one per chapter) and spends
+        # three calls on it.
+        pp._history_book_start(self.book)
+        pp._dm_budget_reset(chapter_count=120)
+        pp._dm_budget_claim(3, consumer="rel_family")
+        pp._history_note_result(self.book, v2_result())
+        pp._history_book_outcome(self.book, True)
+        # Book B exits before arming — no reset intervenes, which
+        # is exactly a pre-arming exit's state.
+        pp._history_book_start(book2)
+        pp._history_book_outcome(book2, False)
+        pp._history_finish(failures=1)
+        posts = self.fake.posts("processor_run_books")
+        self.assertEqual(len(posts), 1)
+        rows = {r["book_key"]: r for r in posts[0]["data"]}
+        self.assertEqual(rows[self.book_key]["decision_pool"], 120)
+        self.assertEqual(rows[self.book_key]["decision_calls"], 3)
+        self.assertIsNone(rows[key2]["decision_pool"])
+        self.assertIsNone(rows[key2]["decision_calls"])
+        # B must not re-pool A's snapshot into the run totals
+        # either: the pooled budget is A's spend, counted once.
+        totals = self.run_payload()["totals"]
+        self.assertEqual(totals["decision_budget"], {
+            "rel_family": {"granted": 1, "denied": 0, "spent": 3}})
 
 
 if __name__ == "__main__":

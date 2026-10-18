@@ -586,5 +586,80 @@ class TestHistoryBreakerPayload(unittest.TestCase):
             1.0)
 
 
+class TestBookEndDecisionAttribution(_SinkCase):
+    """Issue #13: book_end's decision_calls was an unguarded read
+    of the shared counter, while the decision_budget field beside
+    it carried the attribution guard. Under --jobs>1 the counter
+    is interim, parallel-shared state, so the stamp was whatever
+    another book had spent; on the legacy path, where the counter
+    is never armed per book, it stamped a plausible fake zero. A
+    count is stamped only when it is this book's authoritative
+    count (v2 pipeline, single job, budget armed for this book);
+    otherwise the field is None — never a borrowed or defaulted
+    number."""
+
+    def setUp(self):
+        super().setUp()
+        self._config = dict(pp.CONFIG)
+        self._used = pp._DM_BUDGET_USED
+        pp.CONFIG["pipeline"] = "v2"
+        pp.CONFIG["jobs"] = 1
+
+    def tearDown(self):
+        pp.CONFIG.clear()
+        pp.CONFIG.update(self._config)
+        pp._DM_BUDGET_USED = self._used
+        pp._dm_budget_reset()
+        super().tearDown()
+
+    def _book_end(self, book, inside=None):
+        with pp._run_events_book(Path(book)):
+            if inside is not None:
+                inside()
+        ends = [e for e in self.events()
+                if e["event"] == "book_end" and e["book"] == book]
+        self.assertEqual(len(ends), 1)
+        return ends[0]
+
+    def test_parallel_book_end_stamps_no_decision_calls(self):
+        pp.CONFIG["jobs"] = 2
+        pp._DM_BUDGET_USED = 5  # interim, shared across book threads
+        end = self._book_end("Parallel Book.epub")
+        self.assertIsNone(end["decision_calls"])
+        self.assertIsNone(end["decision_budget"])
+
+    def test_legacy_book_end_stamps_no_fake_zero(self):
+        pp.CONFIG["pipeline"] = "legacy"
+        pp._DM_BUDGET_USED = 0  # never armed: unmeasured, not zero
+        end = self._book_end("Legacy Book.epub")
+        self.assertIsNone(end["decision_calls"])
+        self.assertIsNone(end["decision_budget"])
+
+    def test_v2_single_job_book_end_stamps_its_real_count(self):
+        def process():
+            pp._dm_budget_reset()
+            pp._dm_budget_claim(1)
+            pp._dm_budget_claim(1)
+
+        end = self._book_end("Counted Book.epub", inside=process)
+        self.assertEqual(end["decision_calls"], 2)
+        self.assertIsNotNone(end["decision_budget"])
+
+    def test_unarmed_book_end_after_armed_book_stamps_null(self):
+        def process():
+            pp._dm_budget_reset()
+            pp._dm_budget_claim(1)
+            pp._dm_budget_claim(1)
+
+        first = self._book_end("Armed Book.epub", inside=process)
+        self.assertEqual(first["decision_calls"], 2)
+        # The next book exits before arming: the shared counter
+        # still holds the first book's 2, and stamping it would
+        # attribute that spend to a book that made no calls.
+        second = self._book_end("Unarmed Book.epub")
+        self.assertIsNone(second["decision_calls"])
+        self.assertIsNone(second["decision_budget"])
+
+
 if __name__ == "__main__":
     unittest.main()

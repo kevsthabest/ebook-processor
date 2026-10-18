@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.48"
+PORTABLE_VERSION = "2.13.49"
 
 
 import argparse
@@ -19811,6 +19811,13 @@ _VALIDATOR_ERROR_MIN_SAMPLE = 8
 _RUN_EVENTS_SCHEMA = 1
 _RUN_EVENTS_DIRNAME = "run-events"
 _RUN_SINK = None  # _RunEventSink while a flagged run is live, else None
+# The budget arming sequence the events recorder last stamped a
+# book_end from — the events side of the history recorder's
+# attribution discipline (issues #13/#14): book_end may stamp a
+# decision count only for a book the budget was armed for since
+# the last stamp, so a book that exited before arming never
+# inherits its predecessor's count in the artifact either.
+_RUN_EVENTS_BUDGET_STAMPED_SEQ = None
 
 
 class _RunEventSink:
@@ -19980,17 +19987,31 @@ class _run_events_book:
 
     def __exit__(self, *exc):
         if self._sink is not None:
+            # Both budget fields stand or fall on the history
+            # recorder's attribution discipline: a count is this
+            # book's only when the pipeline is v2, the run is
+            # single-job (in parallel mode the shared counter is
+            # interim state another book may already have moved),
+            # and the budget was armed for this book since the
+            # last stamp (the legacy path never arms it, so its
+            # books would otherwise stamp a plausible fake zero,
+            # and a book that exited before arming would inherit
+            # its predecessor's count). Anything else stamps
+            # None — the field is honestly absent, never a
+            # borrowed or defaulted number.
+            global _RUN_EVENTS_BUDGET_STAMPED_SEQ
+            _arm_seq = _dm_budget_arm_seq()
+            _attributable = CONFIG.get("pipeline") == "v2" \
+                and int(CONFIG.get("jobs", 1) or 1) <= 1 \
+                and bool(_arm_seq) \
+                and _arm_seq != _RUN_EVENTS_BUDGET_STAMPED_SEQ
+            if _attributable:
+                _RUN_EVENTS_BUDGET_STAMPED_SEQ = _arm_seq
             _run_event({"event": "book_end", "book": self._book,
-                        "decision_calls": _DM_BUDGET_USED,
-                        # Per-consumer split, under the recorder's
-                        # own attribution guard (v2, single-job):
-                        # in parallel mode the shared counters
-                        # cannot be attributed to one book, so the
-                        # field is None rather than a guess.
+                        "decision_calls": _DM_BUDGET_USED
+                        if _attributable else None,
                         "decision_budget": _dm_budget_snapshot()
-                        if CONFIG.get("pipeline") == "v2"
-                        and int(CONFIG.get("jobs", 1) or 1) <= 1
-                        else None})
+                        if _attributable else None})
             self._sink.set_book(self._prev)
         _history_book_end(self._fpath, exc[1] if len(exc) > 1 else None)
         return False
@@ -20320,6 +20341,13 @@ class _RunHistoryRecorder:
                         + f"-{os.getpid()}")
         self.books = {}
         self._outcome_seq = 0
+        # The budget arming sequence this recorder last stamped
+        # from (see _DM_BUDGET_ARM_SEQ): a book captures budget
+        # stamps only when arming has advanced past it, so the
+        # stamps provably belong to a book armed since the last
+        # capture — never to a predecessor whose state simply
+        # lingered on the shared globals.
+        self._budget_stamped_seq = None
         self.lock = threading.Lock()
         self.corpus_filter_ran = bool(CONFIG.get("corpus_only")) \
             and mode in ("scan", "watch_cycle")
@@ -20439,15 +20467,29 @@ class _RunHistoryRecorder:
             # true last completion, not the last start.
             self._outcome_seq += 1
             rec["outcome_seq"] = self._outcome_seq
+            _arm_seq = _dm_budget_arm_seq()
             if CONFIG.get("pipeline") == "v2" \
-                    and int(CONFIG.get("jobs", 1) or 1) <= 1:
+                    and int(CONFIG.get("jobs", 1) or 1) <= 1 \
+                    and _arm_seq \
+                    and _arm_seq != self._budget_stamped_seq:
                 # The decision-call counter is reset per book by the
                 # v2 pipeline and is read here on the thread that
                 # processed the book. In parallel mode the counter
                 # is shared across books, so a per-book value would
                 # be an attribution the run cannot support — None
                 # there, and for the legacy pipeline (which never
-                # resets it per book).
+                # resets it per book). The arming-sequence term is
+                # the per-book term (issue #14): the globals are
+                # sticky and never cleared between books, so a book
+                # that exited before the pipeline armed it — a
+                # no-ISBN skip, an unreadable file, an ingest
+                # exception — would otherwise stamp its
+                # predecessor's calls, snapshot and pool. Only
+                # state armed since this recorder's last capture
+                # can be this book's, so all three captures stand
+                # or fall together on that proof; without it the
+                # stamps stay None (not 0, not inherited numbers).
+                self._budget_stamped_seq = _arm_seq
                 rec["decision_calls"] = _DM_BUDGET_USED
                 # The per-consumer split of those calls (spec §1.1),
                 # captured under the same attribution guard: an
@@ -20955,10 +20997,16 @@ def _history_book_payload(rec, run_id):
     }, _rows
 
 
-def _history_totals(rec, book_rows, claim_rows_by_book):
+def _history_totals(rec, book_rows, claim_rows_by_book,
+                      entries=None):
     """Run totals from the same per-book payloads being shipped, so
     the run row can never disagree with its own book rows. A total
-    no book measured stays None (see the header note)."""
+    no book measured stays None (see the header note). `entries`
+    is the post-collapse recorder entries those payloads were
+    built from: the decision-budget pool reads its snapshots from
+    them, so a collapsed duplicate's spend — recorded on an entry
+    that ships no row — cannot be counted a second time through
+    the book_key the survivor shares with it."""
     totals = {k: None for k in _HISTORY_TOTAL_KEYS}
     totals["files_seen"] = rec.files_seen
     measured_books = [b for b in book_rows if b["outcome"] is not None]
@@ -21008,9 +21056,13 @@ def _history_totals(rec, book_rows, claim_rows_by_book):
     # book rows. No shipped book carrying a snapshot means the
     # run measured no consumer split, and the total stays None —
     # never a fabricated all-zero breakdown.
-    _shipped = {b["book_key"] for b in book_rows}
-    _snaps = [r.get("decision_budget") for r in rec.books.values()
-              if r.get("book_key") in _shipped]
+    if entries is not None:
+        _pool_from = entries
+    else:
+        _shipped = {b["book_key"] for b in book_rows}
+        _pool_from = [r for r in rec.books.values()
+                      if r.get("book_key") in _shipped]
+    _snaps = [r.get("decision_budget") for r in _pool_from]
     _snaps = [s for s in _snaps if isinstance(s, dict) and s]
     if _snaps:
         _pooled = {}
@@ -21141,6 +21193,26 @@ def _history_collapse_duplicate_book_keys(entries):
     return kept, collapsed
 
 
+def _history_repost_totals(rec, run_payload, book_rows,
+                           claim_rows_by_book, entries):
+    """Re-post the run row with its totals recomputed from the
+    book rows that actually shipped. The run row must post before
+    its book rows exist (they key off its uuid), so its first
+    totals are computed from payloads the mirror has not yet
+    accepted; when the books POST then fails or answers for only
+    some rows, this correction is what keeps the stored run row
+    honest — totals describe exactly the shipped books, or go
+    absent when none shipped. Best-effort like everything here:
+    a failed correction changes nothing else, and the caller's
+    warning still fires."""
+    run_payload["totals"] = _history_totals(
+        rec, book_rows, claim_rows_by_book, entries)
+    sb("processor_runs", method="POST", data=[run_payload],
+       params="?on_conflict=run_key",
+       prefer="resolution=merge-duplicates",
+       schema=_HISTORY_SCHEMA)
+
+
 def _history_flush(rec, status, failures=None, error=None):
     """Build this run's payloads and ship them, in dependency
     order: the run row first (its returned uuid keys the book
@@ -21207,7 +21279,7 @@ def _history_flush(rec, status, failures=None, error=None):
     built = [_history_book_payload(r, None) for r in entries]
     book_rows = [b for b, _ in built]
     run_payload["totals"] = _history_totals(
-        rec, book_rows, [rows for _, rows in built])
+        rec, book_rows, [rows for _, rows in built], entries)
     run_payload["corpus_generation"] = _history_corpus_generation(
         rec, book_rows)
     if error:
@@ -21278,10 +21350,29 @@ def _history_flush(rec, status, failures=None, error=None):
                prefer="resolution=merge-duplicates",
                schema=_HISTORY_SCHEMA)
     if brows is None:
+        # No book row shipped, but the run row posted above already
+        # carries totals computed from the local payloads — left
+        # standing, it would permanently claim processed and claim
+        # totals for book rows the mirror does not hold. Correct
+        # it to the shipped set (empty: the totals go honestly
+        # absent) before warning, so the stored run row describes
+        # exactly the books that shipped even on this path.
+        _history_repost_totals(rec, run_payload, [], [], [])
         _history_warn_no_response()
         return
     id_by_key = {b["book_key"]: b["id"] for b in brows
                  if b.get("id") and b.get("book_key")}
+    if set(id_by_key) != {b["book_key"] for b in book_rows}:
+        # The books POST answered for only some rows: the stored
+        # totals must shrink to the shipped subset the same way,
+        # recomputed from those books' own payloads and entries.
+        _keep = [i for i, e in enumerate(entries)
+                 if e["book_key"] in id_by_key]
+        _history_repost_totals(
+            rec, run_payload,
+            [book_rows[i] for i in _keep],
+            [built[i][1] for i in _keep],
+            [entries[i] for i in _keep])
     claim_rows = []
     for (_payload, rows_for_book), entry in zip(built, entries):
         book_row_id = id_by_key.get(entry["book_key"])
@@ -21450,6 +21541,15 @@ def _history_scan_mode():
 _DM_BUDGET_LOCK = threading.Lock()
 _DM_BUDGET_USED = 0
 _DM_BUDGET_BY_CONSUMER = {}
+# Arming sequence: bumped by every _dm_budget_reset, the one seam
+# that arms the budget for a book. The globals above are shared
+# and sticky — nothing clears them between books — so on their
+# own they cannot say WHICH book they describe. The recorders
+# (run history, run events) compare this sequence against the
+# last one they stamped: a book whose processing never advanced
+# it was never armed, and its stamps must stay NULL rather than
+# inherit a predecessor's pool, calls and snapshot (issue #14).
+_DM_BUDGET_ARM_SEQ = 0
 # The pool armed for the book currently being processed, and the
 # chapter count it was computed from (None until a book arms it).
 # Before any arming — a direct reduce / merge call in a test or an
@@ -21551,7 +21651,9 @@ def _dm_budget_reset(chapter_count=None):
     armed — the safe default for any caller that draws before a
     count exists."""
     global _DM_BUDGET_USED, _DM_BUDGET_POOL, _DM_BUDGET_CHAPTER_COUNT
+    global _DM_BUDGET_ARM_SEQ
     with _DM_BUDGET_LOCK:
+        _DM_BUDGET_ARM_SEQ += 1
         _DM_BUDGET_USED = 0
         _DM_BUDGET_BY_CONSUMER.clear()
         _DM_BUDGET_FINISHED.clear()
@@ -21561,6 +21663,18 @@ def _dm_budget_reset(chapter_count=None):
                 if chapter_count is not None else None
         except (TypeError, ValueError):
             _DM_BUDGET_CHAPTER_COUNT = None
+
+
+def _dm_budget_arm_seq():
+    """The current arming sequence: how many times the budget has
+    been armed in this process. Zero means no book has ever armed
+    it, so any capture taken at zero would be a default, not a
+    measurement. Recorders stamp a book's budget figures only
+    when the sequence has advanced past the last one they stamped
+    — the proof that the state on the globals was armed for a
+    book they have not already recorded."""
+    with _DM_BUDGET_LOCK:
+        return _DM_BUDGET_ARM_SEQ
 
 
 def _dm_budget_finish(consumer):
