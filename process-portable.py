@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.30"
+PORTABLE_VERSION = "2.13.31"
 
 
 import argparse
@@ -2267,6 +2267,16 @@ def _rel_vocab():
     return _REL_VOCAB
 
 
+def _rel_vocabulary_ids():
+    """The active vocabulary's type ids, in vocabulary order.
+
+    Read from the same single vocabulary object every consumer
+    reads (see _rel_vocab), so a record stamped with this list —
+    the preview artefact's relationship_type_vocabulary — cannot
+    drift from the vocabulary that actually produced the run."""
+    return [e["id"] for e in _rel_vocab()["types"]]
+
+
 def _rel_gloss(rtype):
     """The active vocabulary's gloss for one type, or "" when the
     type is unknown — an unknown type gets no invented definition."""
@@ -3682,7 +3692,7 @@ def _resolution_context_lines(provenance):
     return lines
 
 
-def _history_provenance_mirror(provenance):
+def _history_provenance_mirror(provenance, claimed_type=None):
     """The run-history mirror of a claim's provenance record: the
     structured facts only — each endpoint's matched form (the
     fixed enum), the basis kinds, and the resolving mention's
@@ -3691,7 +3701,15 @@ def _history_provenance_mirror(provenance):
     text and evidence strings are on its never-transfer list),
     so the verbatim record lives on the claim, and the mirror
     carries enough to count, group, and locate resolutions
-    without carrying the text."""
+    without carrying the text.
+
+    claimed_type — the type a downgraded claim was judged under
+    before its stored type was rewritten to "other" — rides
+    along when the claim carries it: it is a registry vocabulary
+    token, not evidence or free text, so it crosses on the same
+    metadata-only terms, and a later comparison can group
+    downgrades by what was claimed instead of seeing only the
+    "other" they all landed as."""
     out = {}
     for key in ("from", "to"):
         ep = (provenance or {}).get(key) or {}
@@ -3702,6 +3720,8 @@ def _history_provenance_mirror(provenance):
             "basis_chapter": basis.get("chapter"),
             "basis_position": basis.get("position"),
         }
+    if claimed_type:
+        out["claimed_type"] = claimed_type
     return out
 
 
@@ -16547,6 +16567,18 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         elif _p >= _REL_DROP_THRESHOLD:
             rel["validation_note"] = "downgraded"
             if not preview:
+                # Provenance stamp: the rewrite below erases the
+                # only record of the type this claim was judged
+                # under, and every later reader (the alerts digest,
+                # curation, the stored row) would see a bare
+                # "other" indistinguishable from a claim that was
+                # always vague. Record the pre-rewrite type on the
+                # claim itself first — only when the rewrite
+                # actually changes it, so an already-"other" claim
+                # gains no key and undowngraded claims stay
+                # byte-identical to before.
+                if rel.get("type") not in (None, "other"):
+                    rel["claimed_type"] = rel["type"]
                 rel["type"] = "other"
         else:
             # Very low P: likely hallucinated. Drop (audit in preview).
@@ -17093,6 +17125,13 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # stale vocabulary must not compare silently against one that
         # was not.
         "rel_registry": dict(_REL_REGISTRY_STATUS),
+        # The vocabulary itself, not only its source and size:
+        # the artefact records the exact type list this run
+        # judged against, so a later reader need not reconstruct
+        # which types existed from a count and a source label —
+        # and a registry that changed between runs shows the
+        # difference on the face of the two artefacts.
+        "relationship_type_vocabulary": _rel_vocabulary_ids(),
         "validator_circuit_breaker": _validator_breaker,
         "self_pairs_dropped": {"extracted": _self_pairs_extracted,
                                "remapped": _self_pairs_remapped},
@@ -20215,7 +20254,8 @@ def _history_book_claims(result):
             "verdict": (rel.get("validation_state")
                         or _rel_validation_state(rel)),
             "confidence": rel.get("validation_p"),
-            "endpoint_provenance": _history_provenance_mirror(_prov)})
+            "endpoint_provenance": _history_provenance_mirror(
+                _prov, rel.get("claimed_type"))})
     # Final guard in the terms the table enforces: no
     # (axis, claim_key) pair is posted twice for one book. The
     # per-axis constructions above already make keys unique, so
@@ -24458,6 +24498,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "dropped_relationships": red.get("dropped_relationships", []),
         "validation_order": red.get("validation_order"),
         "rel_registry": red.get("rel_registry"),
+        "relationship_type_vocabulary": red.get(
+            "relationship_type_vocabulary"),
         "validator_circuit_breaker": red.get(
             "validator_circuit_breaker"),
         "self_pairs_dropped": red.get("self_pairs_dropped",
@@ -25052,6 +25094,10 @@ def process_file(fpath, dry_run=False, preview=False):
         "tropes": tropes, "trope_confidence": trope_conf,
         "triggers": triggers, "characters": characters,
         "relationships": relationships, "dropped_relationships": [],
+        # The vocabulary this run judged against (see
+        # _rel_vocabulary_ids): stamped on the legacy artefact
+        # too, so both pipelines' previews are self-describing.
+        "relationship_type_vocabulary": _rel_vocabulary_ids(),
         "spice_level": spice_level,
         "povs": sorted(povs), "quotes": _spread_quotes(quotes, 10),
         "is_anthology": is_anth, "stories": stories,

@@ -891,7 +891,7 @@ def collect_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
             found, seen = [], set()
 
             def add(kind, label, ctype, score, reason, ident,
-                    stored_source=False):
+                    stored_source=False, claimed_type=None):
                 if ident in seen:
                     return
                 seen.add(ident)
@@ -900,6 +900,7 @@ def collect_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
                     "kind": kind, "label": label, "type": ctype,
                     "score": score, "reason": reason,
                     "stored_source": stored_source,
+                    "claimed_type": claimed_type,
                 })
 
             # (a) Scored claim candidates: being a candidate is
@@ -925,7 +926,8 @@ def collect_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
                     or claim.get("validation_state") or "dropped",
                     ("claim",) + _alert_claim_key(claim),
                     stored_source=claim.get("stored_source")
-                    is True)
+                    is True,
+                    claimed_type=claim.get("claimed_type"))
 
             # (b) Merge candidates in the ambiguous band:
             # judged, scored at or above the floor, but below
@@ -969,7 +971,8 @@ def collect_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
                         claim.get("validation_note")
                         or claim.get("validation_state")
                         or "unconfirmed",
-                        ("claim",) + _alert_claim_key(claim))
+                        ("claim",) + _alert_claim_key(claim),
+                        claimed_type=claim.get("claimed_type"))
 
             found.sort(key=lambda a: (-a["score"], a["label"]))
             alerts.extend(found)
@@ -999,7 +1002,15 @@ def build_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
         detail = f"  {alert['score']:.2f}  {alert['kind']:<5}  " \
                  f"{alert['label']}"
         if alert["kind"] == "claim":
-            detail += f" — type {alert['type']}"
+            if alert.get("claimed_type"):
+                # A downgrade's recorded type is "other" for
+                # every claim alike; the stamped claimed type is
+                # the only place what was actually claimed
+                # survives, so the line names the pair of them.
+                detail += (f" — claimed {alert['claimed_type']}"
+                           f" → other")
+            else:
+                detail += f" — type {alert['type']}"
         detail += f" — {alert['reason']}"
         if alert.get("stored_source"):
             # The claim shipped on a stored character's prod

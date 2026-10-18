@@ -614,6 +614,24 @@ class StoredSourceCandidateTests(Tier3Case):
         text = store.build_alerts(self.db)
         self.assertEqual(text.count("[stored source]"), 2)
 
+    def test_downgrade_alert_names_the_claimed_type_when_stamped(self):
+        # Artefacts from 2.13.31 on stamp the pre-downgrade type
+        # on the claim (claimed_type): the digest line renders
+        # the downgrade as "claimed spouse → other" instead of
+        # the bare "type other" every downgrade used to share.
+        art = _stored_source_artefact()
+        for rel in art["minor_sourced_relationships"]:
+            if rel.get("validation_note") == "downgraded" \
+                    and rel["from"] == "Stored Spouse":
+                rel["claimed_type"] = "spouse"
+        self.import_stored_book(art)
+        text = store.build_alerts(self.db)
+        self.assertIn("claimed spouse → other", text)
+        # The Tier 3 minor's own downgrade carries no stamp (his
+        # artefact predates it, in story terms): the fallback
+        # rendering still shows the recorded type plainly.
+        self.assertIn("type other", text)
+
     def test_stored_source_keep_and_unscored_never_recorded(self):
         self.import_stored_book()
         pairs = {(p["from"], p.get("type"))
