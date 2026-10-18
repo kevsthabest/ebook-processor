@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.25"
+PORTABLE_VERSION = "2.13.26"
 
 
 import argparse
@@ -20428,8 +20428,19 @@ def _history_same_run(existing, rec):
         == (rec.machine_label or None)
 
 
-def _history_warn(error_class):
-    print(f" Run history: upload failed ({error_class}); "
+def _history_warn(error_class, detail=None):
+    # The class alone once hid a whole lost run behind
+    # "(AttributeError)" with no way to tell WHICH attribute — the
+    # detail (the exception's message) rides along so the next
+    # failure is diagnosable from the console alone. It passes
+    # through the same sanitizer the payloads use, so paths, URLs
+    # and key-shaped text never reach the log either.
+    label = str(error_class)
+    if detail:
+        cleaned = _history_sanitize(str(detail), limit=200)
+        if cleaned:
+            label = f"{label}: {cleaned}"
+    print(f" Run history: upload failed ({label}); "
           "run unaffected")
 
 
@@ -20441,9 +20452,14 @@ def _history_flush(rec, status, failures=None, error=None):
     a half-mirrored run is still queryable, and the JSONL on the
     machine remains the ground truth either way."""
     sink = _RUN_SINK
-    if sink is not None and sink.run_id:
-        rec.run_key = Path(sink.path).stem if sink.path \
-            else sink.run_id
+    if sink is not None and sink.path:
+        # The sink's identity is its artifact's stem — the run id
+        # exists only as the filename (and in the run_start event's
+        # payload); the sink object carries no run_id attribute, so
+        # asking it for one raised AttributeError here and the whole
+        # flush died before any payload was built. The stem is what
+        # names the run (spec §3), so derive the key from the path.
+        rec.run_key = Path(sink.path).stem
     for r in list(rec.books.values()):
         if r["book_key"] is None and r["fpath"] is not None:
             rec._resolve_book_identity(r)
@@ -20637,7 +20653,7 @@ def _history_finish(failures=None, interrupted=False, status=None,
     try:
         _history_flush(rec, status, failures=failures, error=error)
     except Exception as e:  # best-effort: never take the run down
-        _history_warn(type(e).__name__)
+        _history_warn(type(e).__name__, str(e))
 
 
 def _history_book_start(fpath):

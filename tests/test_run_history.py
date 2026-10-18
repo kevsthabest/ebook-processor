@@ -1043,5 +1043,147 @@ class ReplaceResultTests(_Base):
             "book_trope_claims"]), 4)
 
 
+def _provenance(endpoint, form):
+    """One endpoint's provenance record in the shape §2.2 stamps:
+    the endpoint, the form that matched, and — for a resolved
+    surname — the basis that resolved it (whose verbatim text the
+    history mirror must NOT carry)."""
+    return {"endpoint": endpoint, "matched_form": form,
+            "mention_text": "Sebeck",
+            "basis": {"kinds": ["antecedent"], "chapter": 22,
+                      "position": 3,
+                      "text": "Sebeck's son, Chris, stood next "
+                              "to him."} if form == "resolved_surname"
+            else None}
+
+
+def rel_result():
+    """A v2 result whose relationships carry endpoint provenance —
+    the shape process_file_v2 hands the recorder since §2.2."""
+    result = v2_result()
+    result["relationships"] = [
+        {"from": "Chris Sebeck", "to": "Peter Sebeck",
+         "type": "child", "validation_state": "validated",
+         "validation_p": 0.46,
+         "endpoint_provenance": {
+             "from": _provenance("Chris Sebeck", "resolved_surname"),
+             "to": _provenance("Peter Sebeck", "full")}},
+        {"from": "Laura Sebeck", "to": "Peter Sebeck",
+         "type": "spouse", "validation_state": "validated",
+         "validation_p": 0.88,
+         "endpoint_provenance": {
+             "from": _provenance("Laura Sebeck", "full"),
+             "to": _provenance("Peter Sebeck", "full")}},
+    ]
+    result["dropped_relationships"] = [
+        {"from": "Jon Ross", "to": "Peter Sebeck",
+         "type": "friend", "validation_state": "rejected",
+         "validation_p": 0.05,
+         "endpoint_provenance": {
+             "from": _provenance("Jon Ross", "full"),
+             "to": _provenance("Peter Sebeck", "full")}},
+    ]
+    return result
+
+
+class LiveSinkFlushTests(_Base):
+    """Regression (2.13.26): a run launched with BOTH
+    --emit-run-events and --run-history lost its entire history
+    upload — the flush read a run_id attribute the event sink has
+    never carried (its identity is the artifact's filename stem),
+    raised AttributeError before building any payload, and the
+    warn-only catch reduced the evidence to the class name. These
+    tests pin the combination: sink live at flush time, a preview
+    book, relationship outcomes with provenance."""
+
+    def drive_with_live_sink(self, result):
+        path = pp._run_events_begin(str(self.tmp), preview=True)
+        self.assertIsNotNone(path)
+        self.addCleanup(pp._run_events_finish)
+        pp._history_begin("scan", preview=True,
+                          learn_dir=str(self.tmp), files_seen=1)
+        pp._history_book_start(self.book)
+        pp._history_note_result(self.book, result)
+        pp._history_book_outcome(self.book, True)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pp._history_finish(failures=0)
+        return path, out.getvalue()
+
+    def test_preview_flush_with_live_sink_ships_everything(self):
+        path, console = self.drive_with_live_sink(rel_result())
+        self.assertNotIn("upload failed", console)
+        # The history row names the run after the event artifact
+        # (spec §3): the artifact's stem IS the run key.
+        payload = self.run_payload()
+        self.assertEqual(payload["run_key"], path.stem)
+        self.assertTrue(payload["preview"])
+        self.book_payload()
+        # Relationship outcomes — kept AND dropped — arrive as
+        # their own rows, provenance mirror attached, the verbatim
+        # basis text left behind on the claim where it belongs.
+        posts = self.fake.posts("processor_run_claim_outcomes")
+        self.assertEqual(len(posts), 1)
+        rows = posts[0]["data"]
+        rel_rows = [r for r in rows if r["axis"] == "relationships"]
+        self.assertEqual(len(rel_rows), 3)
+        for row in rel_rows:
+            self.assertEqual(row["run_book_id"], BOOK_ID)
+            mirror = row["endpoint_provenance"]
+            self.assertEqual(
+                set(mirror), {"from", "to"})
+            self.assertNotIn("text", json.dumps(mirror))
+        verdicts = {r["verdict"] for r in rel_rows}
+        self.assertEqual(verdicts, {"validated", "rejected"})
+        # The other axes' rows are exactly as before: no
+        # provenance key rides along on them.
+        for row in rows:
+            if row["axis"] != "relationships":
+                self.assertNotIn("endpoint_provenance", row)
+
+    def test_sink_stem_wins_even_when_suffixed(self):
+        # A second artifact in the same second takes a -2 suffix;
+        # the history key must follow the ACTUAL filename, not the
+        # unsuffixed guess a run_id attribute would have held.
+        first = pp._run_events_begin(str(self.tmp), preview=True)
+        pp._run_events_finish()
+        second = pp._run_events_begin(str(self.tmp), preview=True)
+        self.addCleanup(pp._run_events_finish)
+        self.assertNotEqual(first.stem, second.stem)
+        pp._history_begin("scan", preview=True,
+                          learn_dir=str(self.tmp), files_seen=1)
+        pp._history_book_start(self.book)
+        pp._history_note_result(self.book, rel_result())
+        pp._history_book_outcome(self.book, True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            pp._history_finish(failures=0)
+        self.assertEqual(self.run_payload()["run_key"], second.stem)
+
+
+class ExplodingSB(FakeSB):
+    """The transport dies on first contact — the shape a real
+    upload failure takes from the flush's point of view."""
+
+    def __call__(self, table, method="GET", **kw):
+        raise RuntimeError("mirror exploded — marker-731")
+
+
+class WarnDetailTests(_Base):
+    def test_upload_failure_warn_names_type_and_detail(self):
+        # The class alone is not a diagnosis: the console line must
+        # carry the exception's message too, so the next failure is
+        # diagnosable from the console alone — while staying
+        # warn-only (finish never raises, the run is unaffected).
+        pp.sb = ExplodingSB()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.drive_one_book(result=v2_result())
+        text = out.getvalue()
+        self.assertEqual(text.count("Run history: upload failed"), 1)
+        self.assertIn("RuntimeError", text)
+        self.assertIn("marker-731", text)
+        self.assertIn("run unaffected", text)
+
+
 if __name__ == "__main__":
     unittest.main()
