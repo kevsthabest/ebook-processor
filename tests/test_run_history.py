@@ -128,14 +128,15 @@ class _Base(unittest.TestCase):
             "corpus_only": False, "use_corpus": False,
             "evidence_retrieval": False,
         })
-        # Arm the budget, then spend seven calls on it: every
-        # drive in this file models a book the pipeline armed.
-        # The setup used to write the counter bare, which pinned
-        # capture-without-arming — the sticky-stamp shape issue
-        # #14 removes (v2.13.49): an unarmed counter is no longer
-        # capturable, so the harness arms like production does.
-        pp._dm_budget_reset()
-        pp._DM_BUDGET_USED = 7
+        # No budget is armed here. Since v2.13.50 the recorder
+        # snapshots the arm sequence at construction, so state
+        # armed before _history_begin belongs to a predecessor
+        # and can never stamp — the harness arms after begin, in
+        # drive_one_book, the order production runs in (begin ->
+        # the pipeline arms the book -> the outcome stamps it).
+        # (v2.13.49's setup armed here, before begin, which the
+        # construction snapshot correctly reads as a previous
+        # run's arming.)
         self.tmp = Path(self.id().replace(".", "_"))
         import tempfile
         self._tmpd = tempfile.TemporaryDirectory()
@@ -159,6 +160,12 @@ class _Base(unittest.TestCase):
         pp._history_begin("scan", preview=True,
                           learn_dir=str(self.tmp), files_seen=1)
         pp._history_book_start(self.book)
+        # Arm the budget, then spend seven calls on it: every
+        # drive in this file models a book the pipeline armed,
+        # and the arming must postdate the recorder (see setUp)
+        # for the outcome below to stamp it.
+        pp._dm_budget_reset()
+        pp._DM_BUDGET_USED = 7
         if result is not None:
             pp._history_note_result(self.book, result)
         pp._history_book_outcome(self.book, ok)
@@ -406,11 +413,23 @@ class BudgetAccountingHistoryTests(_Base):
         super().tearDown()
 
     def test_totals_carry_pooled_decision_budget(self):
+        # Driven manually rather than via drive_one_book: this
+        # test's claims are the book's spend, so they must be
+        # armed after _history_begin — the recorder snapshots
+        # the arm sequence at construction (v2.13.50), and claims
+        # made before it exists are a predecessor's, not this
+        # book's. (Before v2.13.50 the arming sat above a
+        # drive_one_book call, ahead of the recorder entirely.)
+        pp._history_begin("scan", preview=True,
+                          learn_dir=str(self.tmp), files_seen=1)
+        pp._history_book_start(self.book)
         pp._dm_budget_reset()
         pp._dm_budget_claim(2, consumer="rel_family")
         pp._dm_budget_claim(1, consumer="trigger_gate")
         pp._dm_budget_claim(1, consumer="rel_family")
-        self.drive_one_book(result=v2_result())
+        pp._history_note_result(self.book, v2_result())
+        pp._history_book_outcome(self.book, True)
+        pp._history_finish(failures=0)
         totals = self.run_payload()["totals"]
         self.assertEqual(totals["decision_budget"], {
             "rel_family": {"granted": 2, "denied": 0, "spent": 3},
@@ -1822,6 +1841,131 @@ class StickyBudgetStampTests(_Base):
         totals = self.run_payload()["totals"]
         self.assertEqual(totals["decision_budget"], {
             "rel_family": {"granted": 1, "denied": 0, "spent": 3}})
+
+
+class CrossRecorderBudgetStampTests(_Base):
+    """Gate completion for issue #14 (v2.13.50): v2.13.49's
+    armed-marker discipline kept the marker on the recorder
+    instance, initialised to None, while the arm sequence is
+    process-global and only grows — so a FRESH recorder (watch
+    mode builds one per cycle) treated a previous run's final
+    arming as its own first stamp, and its first book that exited
+    before arming inherited that predecessor run's calls, pool
+    and snapshot. The marker must be born at the sequence as of
+    the recorder's construction: only armings during the
+    recorder's own run can stamp its books."""
+
+    def tearDown(self):
+        pp._dm_budget_reset()
+        super().tearDown()
+
+    def test_second_recorder_first_book_inherits_nothing(self):
+        book2 = self.tmp / "book2.epub"
+        book2.write_bytes(b"second fake epub bytes for history tests")
+        key2 = hashlib.sha256(book2.read_bytes()).hexdigest()
+        # Run 1: its book arms a pool of 50 and spends three calls.
+        pp._history_begin("scan", preview=True,
+                          learn_dir=str(self.tmp), files_seen=1)
+        pp._history_book_start(self.book)
+        pp._dm_budget_reset(chapter_count=50)
+        pp._dm_budget_claim(3, consumer="rel_family")
+        pp._history_note_result(self.book, v2_result())
+        pp._history_book_outcome(self.book, True)
+        pp._history_finish(failures=0)
+        posts = self.fake.posts("processor_run_books")
+        self.assertEqual(len(posts), 1)
+        rows1 = {r["book_key"]: r for r in posts[0]["data"]}
+        self.assertEqual(rows1[self.book_key]["decision_calls"], 3)
+        self.assertEqual(rows1[self.book_key]["decision_pool"], 50)
+        # Run 2, same process, a brand-new recorder: its first
+        # book exits before arming — the no-ISBN / unreadable
+        # shapes. Nothing of run 1's budget state is this book's.
+        pp._history_begin("scan", preview=True,
+                          learn_dir=str(self.tmp), files_seen=1)
+        pp._history_book_start(book2)
+        pp._history_book_outcome(book2, False)
+        pp._history_finish(failures=1)
+        posts = self.fake.posts("processor_run_books")
+        self.assertEqual(len(posts), 2)
+        rows2 = {r["book_key"]: r for r in posts[1]["data"]}
+        self.assertIsNone(rows2[key2]["decision_calls"])
+        self.assertIsNone(rows2[key2]["decision_pool"])
+        # And no pooled budget is inherited into run 2's totals.
+        run_posts = self.fake.posts("processor_runs")
+        self.assertEqual(len(run_posts), 2)
+        self.assertIsNone(run_posts[1]["data"][0]["totals"]
+                          ["decision_budget"])
+
+
+class RepostRefusingSB(FakeSB):
+    """The run POST that creates the run row succeeds; every
+    later run POST — the corrective totals repost is the only
+    other one the flush makes — is refused, in the transport's
+    failure shape (None)."""
+
+    def __init__(self):
+        super().__init__()
+        self.run_posts_seen = 0
+
+    def __call__(self, table, method="GET", data=None, params="",
+                 prefer=None, schema=None):
+        if table == "processor_runs" and method == "POST":
+            self.run_posts_seen += 1
+            if self.run_posts_seen > 1:
+                self.calls.append({"table": table, "method": method,
+                                   "data": data, "params": params,
+                                   "prefer": prefer, "schema": schema})
+                return None
+        return super().__call__(table, method=method, data=data,
+                                params=params, prefer=prefer,
+                                schema=schema)
+
+
+class RepostWarningTests(_Base):
+    """Gate WARN (v2.13.50): when the books POST answered for
+    only some rows, the flush corrects the stored run totals via
+    _history_repost_totals — but if THAT call failed, no history
+    warning fired at all, so the run row kept its inflated totals
+    in silence. The repost must warn on its own failure; the
+    books-refused branch (where the repost succeeds) keeps its
+    exactly-one-warning shape."""
+
+    def test_partial_books_repost_failure_warns(self):
+        self.fake = RepostRefusingSB()
+        pp.sb = self.fake
+        other = self.tmp / "other.epub"
+        other.write_bytes(b"different fake epub bytes for history")
+        other_key = hashlib.sha256(other.read_bytes()).hexdigest()
+        # The books POST answers for the first book only, so the
+        # flush takes the partial branch and reposts corrected
+        # totals — and the repost is the call this fake refuses.
+        self.fake.omit_book_keys = {other_key}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pp._history_begin("scan", preview=True,
+                              learn_dir=str(self.tmp), files_seen=2)
+            for path in (self.book, other):
+                pp._history_book_start(path)
+                pp._history_note_result(path, v2_result())
+                pp._history_book_end(path)
+                pp._history_book_outcome(path, True)
+            pp._history_finish(failures=0)
+        # The corrective repost was attempted exactly once (the
+        # second run POST) ...
+        self.assertEqual(self.fake.run_posts_seen, 2)
+        # ... and its failure produced a history warning: before
+        # the fix this branch warned zero times and the stored
+        # run row silently kept its inflated totals.
+        self.assertEqual(
+            out.getvalue().count("Run history: upload failed"), 1)
+
+    def test_none_books_branch_still_warns_exactly_once(self):
+        self.fake.fail_books_post = True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.drive_one_book(result=v2_result())
+        self.assertEqual(
+            out.getvalue().count("Run history: upload failed"), 1)
 
 
 if __name__ == "__main__":

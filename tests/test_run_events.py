@@ -645,6 +645,25 @@ class TestBookEndDecisionAttribution(_SinkCase):
         self.assertEqual(end["decision_calls"], 2)
         self.assertIsNotNone(end["decision_budget"])
 
+    def test_arming_before_the_sink_began_stamps_null(self):
+        # Gate completion for issue #14 (v2.13.50): the events
+        # marker is module-global and started as None, so budget
+        # arming that happened while NO sink was live — an earlier
+        # run in the same process — made the first book of the
+        # next sink "attributable" even though it never armed.
+        # The marker must be born at the arm sequence as of the
+        # sink's begin, the same construction snapshot the history
+        # recorder takes: only armings after the sink exists can
+        # stamp its books.
+        pp._run_events_finish()
+        pp._dm_budget_reset()
+        pp._dm_budget_claim(3)
+        self.path = pp._run_events_begin(self.learn_dir, preview=True)
+        self.assertIsNotNone(self.path)
+        end = self._book_end("Late Book.epub")
+        self.assertIsNone(end["decision_calls"])
+        self.assertIsNone(end["decision_budget"])
+
     def test_unarmed_book_end_after_armed_book_stamps_null(self):
         def process():
             pp._dm_budget_reset()

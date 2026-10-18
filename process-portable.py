@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.49"
+PORTABLE_VERSION = "2.13.50"
 
 
 import argparse
@@ -19816,7 +19816,12 @@ _RUN_SINK = None  # _RunEventSink while a flagged run is live, else None
 # attribution discipline (issues #13/#14): book_end may stamp a
 # decision count only for a book the budget was armed for since
 # the last stamp, so a book that exited before arming never
-# inherits its predecessor's count in the artifact either.
+# inherits its predecessor's count in the artifact either. The
+# marker is (re)born at every sink begin, initialised to the
+# sequence as of that moment (see _run_events_begin): starting
+# from None would leave the FIRST stamp exposed to arming that
+# happened earlier in the process while no sink was live — a
+# previous run's spend, stamped onto this run's first book.
 _RUN_EVENTS_BUDGET_STAMPED_SEQ = None
 
 
@@ -19912,7 +19917,7 @@ def _run_events_begin(learn_dir, preview=False, dry_run=False):
     added if that exact name is somehow taken), inside run-events/
     under the learn dir, so the portal finds runs by listing one
     directory and reading the newest file's header."""
-    global _RUN_SINK
+    global _RUN_SINK, _RUN_EVENTS_BUDGET_STAMPED_SEQ
     if _RUN_SINK is not None:
         _run_events_finish(interrupted=True)
     run_id = "run-" + time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
@@ -19930,6 +19935,12 @@ def _run_events_begin(learn_dir, preview=False, dry_run=False):
               f"continuing without the artifact")
         return None
     _RUN_SINK = _RunEventSink(fh, path)
+    # The stamped-marker starts at the arm sequence as of this
+    # sink's begin — the events side of the history recorder's
+    # construction snapshot: arming from before this sink existed
+    # (an earlier run in the same process) can never be stamped
+    # onto this run's books.
+    _RUN_EVENTS_BUDGET_STAMPED_SEQ = _dm_budget_arm_seq()
     _run_event({"v": _RUN_EVENTS_SCHEMA, "kind": "run-events",
                 "event": "run_start", "run_id": path.stem,
                 "preview": bool(preview), "dry_run": bool(dry_run)})
@@ -20346,8 +20357,18 @@ class _RunHistoryRecorder:
         # stamps only when arming has advanced past it, so the
         # stamps provably belong to a book armed since the last
         # capture — never to a predecessor whose state simply
-        # lingered on the shared globals.
-        self._budget_stamped_seq = None
+        # lingered on the shared globals. The marker is born at
+        # the sequence as of THIS recorder's construction, not
+        # at None: the sequence is process-global and only grows,
+        # so a fresh recorder starting from None would treat a
+        # PREVIOUS run's final arming as its own first stamp —
+        # watch mode builds a new recorder every cycle, and cycle
+        # two's first book that exits before arming would inherit
+        # cycle one's last book's stamps, the issue-#14 defect at
+        # the recorder-construction boundary. Snapshotting here
+        # means only armings during this recorder's own run can
+        # ever stamp its books.
+        self._budget_stamped_seq = _dm_budget_arm_seq()
         self.lock = threading.Lock()
         self.corpus_filter_ran = bool(CONFIG.get("corpus_only")) \
             and mode in ("scan", "watch_cycle")
@@ -21203,14 +21224,26 @@ def _history_repost_totals(rec, run_payload, book_rows,
     some rows, this correction is what keeps the stored run row
     honest — totals describe exactly the shipped books, or go
     absent when none shipped. Best-effort like everything here:
-    a failed correction changes nothing else, and the caller's
-    warning still fires."""
+    a failed correction changes nothing else. It does speak for
+    itself, though: when the correction is refused, the stored
+    run row keeps totals that describe books the mirror does not
+    hold, and that must not pass in silence — the partial-books
+    caller has no warning of its own pending, so without this
+    one the only trace would be the transport's stdout line.
+    Returns whether the correction shipped, so a caller that
+    DOES have a warning pending (the no-books branch) can keep
+    the flush at exactly one warning. A single call, never a
+    retry: a refused correction is reported, not chased."""
     run_payload["totals"] = _history_totals(
         rec, book_rows, claim_rows_by_book, entries)
-    sb("processor_runs", method="POST", data=[run_payload],
-       params="?on_conflict=run_key",
-       prefer="resolution=merge-duplicates",
-       schema=_HISTORY_SCHEMA)
+    rows = sb("processor_runs", method="POST", data=[run_payload],
+              params="?on_conflict=run_key",
+              prefer="resolution=merge-duplicates",
+              schema=_HISTORY_SCHEMA)
+    if not rows:
+        _history_warn_no_response()
+        return False
+    return True
 
 
 def _history_flush(rec, status, failures=None, error=None):
@@ -21357,8 +21390,13 @@ def _history_flush(rec, status, failures=None, error=None):
         # it to the shipped set (empty: the totals go honestly
         # absent) before warning, so the stored run row describes
         # exactly the books that shipped even on this path.
-        _history_repost_totals(rec, run_payload, [], [], [])
-        _history_warn_no_response()
+        # Exactly one warning leaves this branch: when the
+        # repost shipped, the warning below speaks for the
+        # refused books POST; when the repost itself was refused
+        # it has already warned, and a second line here would
+        # double-report a single failed flush.
+        if _history_repost_totals(rec, run_payload, [], [], []):
+            _history_warn_no_response()
         return
     id_by_key = {b["book_key"]: b["id"] for b in brows
                  if b.get("id") and b.get("book_key")}
