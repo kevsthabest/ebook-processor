@@ -355,5 +355,161 @@ class ReportTests(Tier3Case):
         self.assertIn("verdict: NOT RECONCILED", report)
 
 
+def _alerts_artefact():
+    """A book built to exercise every alert source class (the
+    alert band: scored but unconfirmed, User 2026-10-18). The
+    stored set is supplied by file in the tests below, so
+    claim-earner derivation never moves a claim's source out of
+    Tier 3 behind the test's back."""
+    return {
+        "title": "Alerts Book", "author": "An Author",
+        "work_id": "work-alerts-1",
+        "characters": [_char("Principal A", appearances=40),
+                       _char("Principal B", appearances=30)],
+        "minor_characters": [
+            _char("Stored Minor", appearances=6),
+            _char("Drop Source", appearances=5),
+            _char("Down Source", appearances=5),
+            _char("Kept Source", appearances=5),
+            _char("Quiet Source", appearances=3),
+        ],
+        "relationships": [],
+        "minor_sourced_relationships": [
+            # A scored downgrade inside a Tier 3 character's
+            # recorded claim set: it shipped, but as `other` —
+            # the claimed type never confirmed. An alert.
+            {"from": "Down Source", "to": "Principal A",
+             "type": "other", "evidence": "A quote.",
+             "chapter": "Chapter 2", "source": "extracted",
+             "validation_state": "validated", "validation_p": 0.55,
+             "validation_note": "downgraded"},
+            # Validated and kept under its claimed type: shipped
+            # confirmed, never an alert however high the score.
+            _claim("Kept Source", "Principal B", "friend",
+                   state="validated", p=0.91, note="kept"),
+            # Unscored: no probability, so nothing to band.
+            _claim("Quiet Source", "Principal A", "ally",
+                   state="review_required"),
+        ],
+        "dropped_relationships": [
+            # A scored drop: an alert. The same claim also sits
+            # in Drop Source's recorded claim set — the digest
+            # must show it exactly once.
+            _claim("Drop Source", "Principal B", "sibling",
+                   state="rejected", p=0.42, note="dropped"),
+            # An unscored drop: no alert.
+            _claim("Quiet Source", "Principal B", "spouse",
+                   state="rejected", note="no_evidence"),
+        ],
+        "possible_merges": [
+            {"name_a": "Drop Source", "name_b": "Drop S.",
+             "p_yes": 0.72, "reason": "below threshold (0.85)"},
+            # At/above the auto-merge threshold the pair is not
+            # in the ambiguous band: not an alert.
+            {"name_a": "Kept Source", "name_b": "Kept S.",
+             "p_yes": 0.9, "reason": "held above threshold"},
+            # Unjudged name candidates carry no score at all.
+            {"name_a": "Quiet Source", "name_b": "Quiet S.",
+             "p_yes": None,
+             "reason": "name candidate — not judged, not merged"},
+            # Scored, but below the default floor.
+            {"name_a": "Down Source", "name_b": "Down S.",
+             "p_yes": 0.26, "reason": "below threshold (0.85)"},
+        ],
+    }
+
+
+class AlertsTests(Tier3Case):
+    def import_alerts_book(self):
+        names_file = self.dir / "alerts-stored.txt"
+        names_file.write_text(
+            "Principal A\nPrincipal B\nStored Minor\n",
+            encoding="utf-8")
+        path = self.write_artefact(_alerts_artefact(),
+                                   name="alerts.json")
+        return store.import_preview(
+            self.db, path, stored_names_path=str(names_file),
+            config_path=self.missing_config)
+
+    def test_alerts_cover_each_source_class_once(self):
+        self.import_alerts_book()
+        alerts = store.collect_alerts(self.db)
+        # 0.72 merge + 0.55 downgrade + 0.42 scored drop. The
+        # 0.42 claim lives both in the candidates table and in
+        # Drop Source's claim set; identity dedupe shows it once.
+        self.assertEqual([a["score"] for a in alerts],
+                         [0.72, 0.55, 0.42])
+        by_score = {a["score"]: a for a in alerts}
+        self.assertEqual(by_score[0.72]["kind"], "merge")
+        self.assertEqual(by_score[0.55]["kind"], "claim")
+        self.assertEqual(by_score[0.55]["reason"], "downgraded")
+        self.assertEqual(by_score[0.42]["kind"], "claim")
+        self.assertEqual(by_score[0.42]["type"], "sibling")
+        self.assertEqual(
+            sum(1 for a in alerts if a["score"] == 0.42), 1)
+
+    def test_unscored_and_confirmed_claims_never_alert(self):
+        self.import_alerts_book()
+        alerts = store.collect_alerts(self.db)
+        labels = " ".join(a["label"] for a in alerts)
+        # Quiet Source: unscored drop, unscored review_required
+        # claim, unjudged merge — nothing to band anywhere.
+        self.assertNotIn("Quiet Source", labels)
+        # Kept Source's 0.91 friend claim shipped validated under
+        # its claimed type, and his 0.9 merge sits above the band.
+        self.assertNotIn("Kept Source", labels)
+        self.assertFalse(any(a["type"] == "friend"
+                             for a in alerts))
+
+    def test_floor_is_respected(self):
+        self.import_alerts_book()
+        self.assertEqual(
+            [a["score"] for a in
+             store.collect_alerts(self.db, floor=0.5)],
+            [0.72, 0.55])
+        self.assertEqual(
+            [a["score"] for a in
+             store.collect_alerts(self.db, floor=0.2)],
+            [0.72, 0.55, 0.42, 0.26])
+
+    def test_alerts_text_groups_sorts_and_explains(self):
+        self.import_alerts_book()
+        text = store.build_alerts(self.db)
+        self.assertIn("Alerts Book", text)
+        self.assertIn("downgraded", text)
+        self.assertLess(text.index("0.72"), text.index("0.55"))
+        self.assertLess(text.index("0.55"), text.index("0.42"))
+        code, out = self.run_cli(
+            ["alerts", "--db", self.db, "--floor", "0.5"])
+        self.assertEqual(code, 0)
+        self.assertIn("0.55", out)
+        self.assertNotIn("0.42", out)
+
+    def test_work_filter_and_unknown_work(self):
+        self.import_alerts_book()
+        self.import_it()  # the standard Test Book as a second book
+        only = store.collect_alerts(self.db, work="Alerts Book")
+        self.assertEqual(len(only), 3)
+        self.assertTrue(all(a["title"] == "Alerts Book"
+                            for a in only))
+        other = store.collect_alerts(self.db, work="Test Book")
+        # Test Book's sole alert: its 0.72 possible merge (its
+        # dropped claim is unscored, its Tier 3 claims unscored).
+        self.assertEqual([a["score"] for a in other], [0.72])
+        with self.assertRaises(store.Tier3Error):
+            store.collect_alerts(self.db, work="No Such Book")
+
+    def test_alerts_are_read_only(self):
+        self.import_alerts_book()
+        before = Path(self.db).read_bytes()
+        store.collect_alerts(self.db)
+        store.build_alerts(self.db)
+        self.assertEqual(Path(self.db).read_bytes(), before)
+
+    def test_alerts_without_a_store_fail_loudly(self):
+        with self.assertRaises(store.Tier3Error):
+            store.collect_alerts(str(self.dir / "nope.db"))
+
+
 if __name__ == "__main__":
     unittest.main()

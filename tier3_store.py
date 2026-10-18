@@ -45,6 +45,19 @@ approval). This tool records the decisions the moment he makes
 them; the console build executes them later. `approve` therefore
 writes only to the local ledger.
 
+`alerts` is the digest the User asked for on 2026-10-18: the
+results that scored below a certain score — possible but
+unconfirmed, for whatever reason they failed to confirm. It is a
+read-only view over what the store already holds: scored claim
+candidates that did not ship, merge candidates in the ambiguous
+band, and scored claims inside Tier 3 characters' recorded claim
+sets that did not ship as validated (a family claim downgraded to
+`other` on a mid-band draw is the canonical case). The floor is
+configurable (default 0.30) and the digest sorts by score
+descending, closest calls first, each entry carrying the state
+or reason that left it unconfirmed. Scores are read out of the
+recorded payloads at alert time; the digest never writes.
+
 The stored prod set for a work — the names excluded from Tier 3 —
 is resolved in this order:
 
@@ -67,6 +80,8 @@ is resolved in this order:
 Usage:
     python3 tier3_store.py import --preview "preview/<book>.json"
     python3 tier3_store.py list [--work <id-or-title>]
+    python3 tier3_store.py alerts [--work <id-or-title>]
+                                  [--floor 0.30]
     python3 tier3_store.py approve --work <w> --name <n>
     python3 tier3_store.py unapprove --work <w> --name <n>
     python3 tier3_store.py report
@@ -731,6 +746,207 @@ def cmd_report(args):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Alerts — the digest the User asked for (2026-10-18): results
+# below a certain score, possible but unconfirmed for whatever
+# reason they failed to confirm. Three sources already in the
+# store: scored claim candidates (they did not ship by
+# construction), merge candidates in the ambiguous band, and
+# scored claims inside Tier 3 characters' recorded claim sets
+# that did not ship as validated. Scores live inside the
+# recorded payloads — validation_p on a claim, p_yes on a merge
+# — and are read out at alert time; the candidates table
+# deliberately grows no score column for this. The digest opens
+# the database read-only and never writes.
+# ---------------------------------------------------------------------------
+
+# The processor's auto-merge threshold: a scored pair at or
+# above it merges, so the ambiguous band for merges is the
+# stretch between the floor and this. (Artefact merge reasons
+# name the same number, "below threshold (0.85)".)
+MERGE_AUTO_THRESHOLD = 0.85
+
+DEFAULT_ALERT_FLOOR = 0.30
+
+
+def _connect_readonly(db_path):
+    path = Path(db_path)
+    if not path.is_file():
+        raise Tier3Error(
+            "no Tier 3 store at that path — import a preview "
+            "first")
+    conn = sqlite3.connect(
+        path.resolve().as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _alert_claim_key(claim):
+    """Claim identity for dedupe — the same fields the importer
+    dedupes candidates on, so a claim recorded both as a
+    candidate and inside its source's claim set alerts once."""
+    return (claim.get("from"), claim.get("to"), claim.get("type"),
+            claim.get("chapter"))
+
+
+def _shipped_confirmed(claim):
+    """True when a recorded claim shipped as validated under its
+    claimed type. A downgrade also lands in state `validated`,
+    but with its note reading "downgraded" and its type
+    rewritten to `other` — the claimed type never confirmed, so
+    it does not count as shipped. A claim recorded as type
+    `other` with no "kept" note is read the same way: nothing
+    in the record shows it confirming as anything specific."""
+    if claim.get("validation_state") != "validated":
+        return False
+    if claim.get("validation_note") == "downgraded":
+        return False
+    if claim.get("type") == "other" and \
+            claim.get("validation_note") != "kept":
+        return False
+    return True
+
+
+def collect_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
+    """The alert digest as data: one dict per alert, grouped by
+    book (title order), each book's alerts sorted by score
+    descending — closest calls first. Read-only."""
+    if not 0.0 <= floor <= 1.0:
+        raise Tier3Error(
+            f"--floor must be between 0 and 1 (got {floor})")
+    conn = _connect_readonly(db_path)
+    try:
+        try:
+            books = conn.execute(
+                "SELECT work_id, title FROM tier3_books "
+                "ORDER BY title, work_id").fetchall()
+        except sqlite3.OperationalError:
+            raise Tier3Error(
+                "that file is not a Tier 3 store — import a "
+                "preview first")
+        if work:
+            wanted = _resolve_work(conn, work)
+            books = [b for b in books if b["work_id"] == wanted]
+        alerts = []
+        for book in books:
+            work_id, title = book["work_id"], book["title"]
+            found, seen = [], set()
+
+            def add(kind, label, ctype, score, reason, ident):
+                if ident in seen:
+                    return
+                seen.add(ident)
+                found.append({
+                    "work_id": work_id, "title": title,
+                    "kind": kind, "label": label, "type": ctype,
+                    "score": score, "reason": reason,
+                })
+
+            # (a) Scored claim candidates: being a candidate is
+            # the non-shipment — the claim was dropped or
+            # rejected, however close the judge called it.
+            for row in conn.execute(
+                    "SELECT state, payload_json FROM "
+                    "tier3_candidates WHERE work_id = ? "
+                    "AND kind = 'claim'", (work_id,)):
+                claim = json.loads(row["payload_json"])
+                p = claim.get("validation_p")
+                if p is None or p < floor:
+                    continue
+                add("claim",
+                    f"{claim.get('from')} → {claim.get('to')}",
+                    claim.get("type"), p,
+                    row["state"] or claim.get("validation_note")
+                    or claim.get("validation_state") or "dropped",
+                    ("claim",) + _alert_claim_key(claim))
+
+            # (b) Merge candidates in the ambiguous band:
+            # judged, scored at or above the floor, but below
+            # the threshold that would have merged the pair.
+            # Unjudged name candidates carry no score and so
+            # have nothing to band.
+            for row in conn.execute(
+                    "SELECT state, payload_json FROM "
+                    "tier3_candidates WHERE work_id = ? "
+                    "AND kind = 'merge'", (work_id,)):
+                entry = json.loads(row["payload_json"])
+                p = entry.get("p_yes")
+                if p is None or p < floor or \
+                        p >= MERGE_AUTO_THRESHOLD:
+                    continue
+                pair = tuple(sorted(
+                    (entry.get("name_a"), entry.get("name_b")),
+                    key=lambda n: n or ""))
+                add("merge", f"{pair[0]} ↔ {pair[1]}", "merge",
+                    p, row["state"] or entry.get("reason")
+                    or "left for review", ("merge",) + pair)
+
+            # (c) Scored claims inside Tier 3 characters'
+            # recorded claim sets that did not ship as
+            # validated — downgrades to `other`, scored claims
+            # left in review_required, dropped claims already
+            # seen as candidates (deduped by identity above).
+            for row in conn.execute(
+                    "SELECT claims_json FROM tier3_characters "
+                    "WHERE work_id = ?", (work_id,)):
+                for claim in json.loads(row["claims_json"]
+                                        or "[]"):
+                    p = claim.get("validation_p")
+                    if p is None or p < floor:
+                        continue
+                    if _shipped_confirmed(claim):
+                        continue
+                    add("claim",
+                        f"{claim.get('from')} → {claim.get('to')}",
+                        claim.get("type"), p,
+                        claim.get("validation_note")
+                        or claim.get("validation_state")
+                        or "unconfirmed",
+                        ("claim",) + _alert_claim_key(claim))
+
+            found.sort(key=lambda a: (-a["score"], a["label"]))
+            alerts.extend(found)
+        return alerts
+    finally:
+        conn.close()
+
+
+def build_alerts(db_path, work=None, floor=DEFAULT_ALERT_FLOOR):
+    alerts = collect_alerts(db_path, work=work, floor=floor)
+    lines = [f"Tier 3 alerts — possible but unconfirmed "
+             f"(floor {floor:.2f})"]
+    if not alerts:
+        lines.append(
+            "  no alerts — nothing scored at or above the floor "
+            "stayed unconfirmed")
+        return "\n".join(lines)
+    current = None
+    for alert in alerts:
+        if alert["work_id"] != current:
+            current = alert["work_id"]
+            n = sum(1 for a in alerts
+                    if a["work_id"] == current)
+            lines.append("")
+            lines.append(f"{alert['title']} ({current}) — "
+                         f"{n} alert(s)")
+        detail = f"  {alert['score']:.2f}  {alert['kind']:<5}  " \
+                 f"{alert['label']}"
+        if alert["kind"] == "claim":
+            detail += f" — type {alert['type']}"
+        detail += f" — {alert['reason']}"
+        lines.append(detail)
+    books = {a["work_id"] for a in alerts}
+    lines.append("")
+    lines.append(f"{len(alerts)} alert(s) across "
+                 f"{len(books)} book(s)")
+    return "\n".join(lines)
+
+
+def cmd_alerts(args):
+    print(build_alerts(args.db, work=args.work, floor=args.floor))
+    return 0
+
+
 def _add_db(ap):
     ap.add_argument("--db", default=str(DEFAULT_DB),
                     help=f"Tier 3 database (default {DEFAULT_DB})")
@@ -773,6 +989,20 @@ def main(argv=None):
                         help="work id or title substring "
                              "(default: every book)")
     p_list.set_defaults(fn=cmd_list)
+
+    p_alerts = sub.add_parser(
+        "alerts", help="digest of scored-but-unconfirmed "
+                       "results at or above a floor "
+                       "(read-only)")
+    _add_db(p_alerts)
+    p_alerts.add_argument("--work", default=None,
+                          help="work id or title substring "
+                               "(default: every book)")
+    p_alerts.add_argument(
+        "--floor", type=float, default=DEFAULT_ALERT_FLOOR,
+        help="lowest score that counts as a possible "
+             f"(default {DEFAULT_ALERT_FLOOR})")
+    p_alerts.set_defaults(fn=cmd_alerts)
 
     p_approve = sub.add_parser(
         "approve", help="record a push decision in the ledger "
