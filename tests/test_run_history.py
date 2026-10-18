@@ -676,6 +676,33 @@ class TransportTests(unittest.TestCase):
         self.assertIsNone(req.get_header("Content-profile"))
         self.assertIn("/rest/v1/book_meta", req.full_url)
 
+    def test_http_error_leaves_a_note_for_callers(self):
+        # sb() returns None on failure and prints the server's line
+        # itself; a caller reporting the failure in its own words
+        # (the history flush's warning) reads this note instead of
+        # guessing — without it, the live PGRST102 rejection
+        # surfaced as a bare "(no-response)". A later success
+        # clears the note, so a stale error is never reported
+        # against a healthy call.
+        def refusing_urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 400, "Bad Request", {},
+                io.BytesIO(b'{"code":"PGRST102",'
+                           b'"message":"All object keys must match"}'))
+
+        with mock.patch.object(urllib.request, "urlopen",
+                               refusing_urlopen):
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = pp.sb("processor_run_claim_outcomes",
+                               method="POST", data=[{"a": 1}],
+                               schema="processor")
+        self.assertIsNone(result)
+        note = pp._SB_LAST_ERROR
+        self.assertIn("400", note)
+        self.assertIn("PGRST102", note)
+        pp.sb("processor_runs", method="GET", params="?select=id")
+        self.assertIsNone(pp._SB_LAST_ERROR)
+
 
 class CharacterMergeShapeTests(unittest.TestCase):
     """merges_applied counts each merge source in the shape it
@@ -1135,11 +1162,16 @@ class LiveSinkFlushTests(_Base):
             self.assertNotIn("text", json.dumps(mirror))
         verdicts = {r["verdict"] for r in rel_rows}
         self.assertEqual(verdicts, {"validated", "rejected"})
-        # The other axes' rows are exactly as before: no
-        # provenance key rides along on them.
+        # The other axes' rows carry the provenance key as an
+        # explicit null (2.13.27): PostgREST bulk insert refuses a
+        # batch whose rows do not all share one key set
+        # (PGRST102), so the key cannot simply be absent on the
+        # axes that have no provenance — null is the honest shape
+        # for "this axis has none" (see UniformOutcomeShapeTests).
         for row in rows:
             if row["axis"] != "relationships":
-                self.assertNotIn("endpoint_provenance", row)
+                self.assertIn("endpoint_provenance", row)
+                self.assertIsNone(row["endpoint_provenance"])
 
     def test_sink_stem_wins_even_when_suffixed(self):
         # A second artifact in the same second takes a -2 suffix;
@@ -1158,6 +1190,92 @@ class LiveSinkFlushTests(_Base):
         with contextlib.redirect_stdout(io.StringIO()):
             pp._history_finish(failures=0)
         self.assertEqual(self.run_payload()["run_key"], second.stem)
+
+
+class OutcomesRefusingSB(FakeSB):
+    """The outcomes POST is refused the way PostgREST refused the
+    live 2.13.26 run: the transport returns None and leaves the
+    server's own words in its last-error note (the real sb()'s
+    contract, pinned in TransportTests)."""
+
+    REFUSAL = ('HTTP 400: {"code":"PGRST102","details":null,'
+               '"hint":null,"message":"All object keys must match"}')
+
+    def __call__(self, table, method="GET", data=None, params="",
+                 prefer=None, schema=None):
+        if table == "processor_run_claim_outcomes" and method == "POST":
+            pp._SB_LAST_ERROR = self.REFUSAL
+            self.calls.append({"table": table, "method": method,
+                               "data": data, "params": params,
+                               "prefer": prefer, "schema": schema})
+            return None
+        return super().__call__(table, method=method, data=data,
+                                params=params, prefer=prefer,
+                                schema=schema)
+
+
+class UniformOutcomeShapeTests(_Base):
+    """Regression (2.13.27): the 2.13.26 Daemon write's run row and
+    book rows reached SQL, but its claim outcomes were refused
+    wholesale — PostgREST bulk insert demands that every object in
+    a posted array carry the SAME keys (PGRST102, "All object keys
+    must match"), and the flush appended endpoint_provenance only
+    to relationship rows, so a batch mixing axes shipped two key
+    sets and lost every row. These tests pin the uniform shape and
+    the diagnostic warning its failure produced."""
+
+    def setUp(self):
+        super().setUp()
+        self._sb_err = getattr(pp, "_SB_LAST_ERROR", None)
+
+    def tearDown(self):
+        pp._SB_LAST_ERROR = self._sb_err
+        super().tearDown()
+
+    def test_mixed_axis_batch_posts_one_uniform_key_set(self):
+        self.drive_one_book(result=rel_result())
+        posts = self.fake.posts("processor_run_claim_outcomes")
+        self.assertEqual(len(posts), 1)
+        rows = posts[0]["data"]
+        self.assertTrue(rows)
+        # One key set across the whole batch — the property
+        # PostgREST refused the live batch for lacking.
+        key_sets = {tuple(sorted(r)) for r in rows}
+        self.assertEqual(len(key_sets), 1)
+        self.assertEqual(
+            key_sets.pop(),
+            ("axis", "claim_key", "confidence",
+             "endpoint_provenance", "run_book_id", "verdict"))
+        # The batch really is mixed: relationship rows carry the
+        # provenance mirror, the other axes carry an explicit
+        # null — present, because absent is what was rejected.
+        rel_rows = [r for r in rows if r["axis"] == "relationships"]
+        other_rows = [r for r in rows if r["axis"] != "relationships"]
+        self.assertTrue(rel_rows)
+        self.assertTrue(other_rows)
+        for row in rel_rows:
+            self.assertIsNotNone(row["endpoint_provenance"])
+            self.assertEqual(set(row["endpoint_provenance"]),
+                             {"from", "to"})
+        for row in other_rows:
+            self.assertIn("endpoint_provenance", row)
+            self.assertIsNone(row["endpoint_provenance"])
+
+    def test_outcomes_refusal_warn_names_status_and_message(self):
+        # Tonight's live failure reached the console as a bare
+        # "(no-response)" while the transport's own line above it
+        # carried the actual PostgREST error. The warning is the
+        # line a paste keeps, so it must name the status and the
+        # server's message — and stay warn-only.
+        pp.sb = OutcomesRefusingSB()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.drive_one_book(result=rel_result())
+        text = out.getvalue()
+        self.assertEqual(text.count("Run history: upload failed"), 1)
+        self.assertIn("400", text)
+        self.assertIn("All object keys must match", text)
+        self.assertIn("run unaffected", text)
 
 
 class ExplodingSB(FakeSB):

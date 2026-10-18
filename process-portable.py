@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.26"
+PORTABLE_VERSION = "2.13.27"
 
 
 import argparse
@@ -19050,6 +19050,17 @@ def cmd_trope_map(preview_path):
     print(f"  {len(mappings)} mapped, {len(proposals)} proposals -> {out_path}")
 
 
+# The most recent transport failure, in one short line, for a
+# caller whose own failure message would otherwise have to guess:
+# sb() prints the server's line itself and returns None, but a
+# caller reporting the failure in its own words (the run-history
+# flush's warning, whose line is the one a console paste keeps)
+# reads this note to name what the server actually said. Cleared
+# on every success, and read by the caller immediately after the
+# failed call, so it never describes anything but that call.
+_SB_LAST_ERROR = None
+
+
 def sb(table, method="GET", data=None, params="", prefer=None,
        schema=None):
     """Returns a list on success (possibly empty) or None on any error.
@@ -19061,6 +19072,7 @@ def sb(table, method="GET", data=None, params="", prefer=None,
     run history is the first tenant of the dedicated processor
     schema, and claim writes must not grow new headers as a side
     effect of sharing this helper."""
+    global _SB_LAST_ERROR
     url = f"{CONFIG['supabase_url']}/rest/v1/{table}{params}"
     _prefer = "return=representation"
     if prefer:
@@ -19080,11 +19092,15 @@ def sb(table, method="GET", data=None, params="", prefer=None,
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
+            _SB_LAST_ERROR = None
             return json.loads(r.read().decode("utf-8") or "[]")
     except urllib.error.HTTPError as e:
-        print(f"  Supabase {table} {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}")
+        detail = e.read().decode('utf-8', 'ignore')[:200]
+        print(f"  Supabase {table} {e.code}: {detail}")
+        _SB_LAST_ERROR = f"HTTP {e.code}: {detail}"
     except Exception as e:
         print(f"  Supabase {table} error: {e}")
+        _SB_LAST_ERROR = str(e)
     return None
 
 
@@ -19541,6 +19557,21 @@ _HISTORY_TOTAL_KEYS = (
     "claims_abstained", "claims_failed", "claims_supported_strong",
     "claims_supported_single", "claims_adjacent_only",
     "quotes_verified", "quotes_rejected", "decision_budget")
+
+# The claim-outcome row's column set, in full, in ONE place.
+# PostgREST bulk insert refuses a batch whose objects do not all
+# carry the same keys (PGRST102, "All object keys must match"),
+# and the axes build their claim rows independently — the
+# endpoint_provenance mirror exists only on relationship rows —
+# so the row the flush posts is assembled from this list alone,
+# every missing value an explicit None (the run_book_id is
+# stamped by the flush itself). A future column joins HERE, never
+# at a per-axis call site: the night this rule was learned, a
+# mixed-axis batch shipped two key sets and PostgREST dropped
+# every outcome row in it.
+_HISTORY_OUTCOME_KEYS = (
+    "axis", "claim_key", "verdict", "confidence",
+    "endpoint_provenance")
 
 # Marker hashed in place of a catalogue identity for a claim the run
 # could not map. The hash input is this marker plus the book
@@ -20444,6 +20475,22 @@ def _history_warn(error_class, detail=None):
           "run unaffected")
 
 
+def _history_warn_no_response():
+    # sb() has already printed the transport's own line, but the
+    # warning is the line a console paste keeps: the night the
+    # outcomes batch was refused, the paste showed a bare
+    # "(no-response)" while the actual PostgREST message (HTTP
+    # 400, PGRST102) sat on the line above it — which the paste
+    # happened to include and a shorter one would have lost.
+    # Name what the transport saw, through the same sanitizer the
+    # detail path above uses; when the transport left no note,
+    # the bare label stands, exactly as before.
+    if _SB_LAST_ERROR:
+        _history_warn("no-response", _SB_LAST_ERROR)
+    else:
+        _history_warn("no-response")
+
+
 def _history_flush(rec, status, failures=None, error=None):
     """Build this run's payloads and ship them, in dependency
     order: the run row first (its returned uuid keys the book
@@ -20521,7 +20568,7 @@ def _history_flush(rec, status, failures=None, error=None):
                           "&select=id,started_at,machine_label"),
                   schema=_HISTORY_SCHEMA)
     if existing is None:
-        _history_warn("no-response")
+        _history_warn_no_response()
         return
     if existing:
         row0 = existing[0]
@@ -20536,7 +20583,7 @@ def _history_flush(rec, status, failures=None, error=None):
                             "&select=id,started_at,machine_label"),
                     schema=_HISTORY_SCHEMA)
                 if probe is None:
-                    _history_warn("no-response")
+                    _history_warn_no_response()
                     return
                 if not probe:
                     rec.run_key = candidate
@@ -20555,7 +20602,7 @@ def _history_flush(rec, status, failures=None, error=None):
               prefer="resolution=merge-duplicates",
               schema=_HISTORY_SCHEMA)
     if not rows or not rows[0].get("id"):
-        _history_warn("no-response")
+        _history_warn_no_response()
         return
     run_id = rows[0]["id"]
     if not book_rows:
@@ -20567,7 +20614,7 @@ def _history_flush(rec, status, failures=None, error=None):
                prefer="resolution=merge-duplicates",
                schema=_HISTORY_SCHEMA)
     if brows is None:
-        _history_warn("no-response")
+        _history_warn_no_response()
         return
     id_by_key = {b["book_key"]: b["id"] for b in brows
                  if b.get("id") and b.get("book_key")}
@@ -20577,18 +20624,20 @@ def _history_flush(rec, status, failures=None, error=None):
         if book_row_id is None:
             continue
         for cr in rows_for_book:
-            _row = {
-                "run_book_id": book_row_id,
-                "axis": cr["axis"],
-                "claim_key": cr["claim_key"],
-                "verdict": cr["verdict"],
-                "confidence": cr["confidence"]}
-            # Relationship rows carry their endpoint provenance
-            # mirror (spec §2.2) under its own key; the other axes
-            # never set it, so their rows are exactly as before.
-            if cr.get("endpoint_provenance") is not None:
-                _row["endpoint_provenance"] = \
-                    cr["endpoint_provenance"]
+            # Every posted row is built from the one column list
+            # (_HISTORY_OUTCOME_KEYS), missing values as explicit
+            # nulls: PostgREST bulk insert rejects a batch whose
+            # objects differ in key set (PGRST102), and the
+            # relationship axis carrying endpoint_provenance
+            # while the other axes omitted the key entirely cost
+            # a live run its whole outcomes upload. Relationship
+            # rows carry their provenance mirror (spec §2.2) as
+            # before; the other axes carry the key as None, which
+            # is the same "no provenance" fact in the only shape
+            # a mixed batch may take.
+            _row = {"run_book_id": book_row_id}
+            for key in _HISTORY_OUTCOME_KEYS:
+                _row[key] = cr.get(key)
             claim_rows.append(_row)
     if claim_rows:
         crows = sb("processor_run_claim_outcomes", method="POST",
@@ -20597,7 +20646,7 @@ def _history_flush(rec, status, failures=None, error=None):
                    prefer="resolution=merge-duplicates",
                    schema=_HISTORY_SCHEMA)
         if crows is None:
-            _history_warn("no-response")
+            _history_warn_no_response()
 
 
 def _history_begin(mode, preview=False, dry_run=False, learn_dir=None,
