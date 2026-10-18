@@ -483,6 +483,41 @@ def _resolve_stored_set(artefact, work_id, stored_names_path,
 # them reviewable, not to reinterpret them.
 # ---------------------------------------------------------------------------
 
+def _chapter_map(artefact):
+    """The artefact's chapter map (chapter number -> chapter
+    entry), validated on the way out. Every consumer of
+    chapter_data goes through here because the shape is nested
+    hand-adjacent data: a level arriving as a list instead of an
+    object used to crash the import with an AttributeError,
+    which escapes main's Tier3Error handling as a traceback.
+    A malformed level is a named, one-line error instead, and
+    because candidate generation runs inside the import
+    transaction, the store is left untouched."""
+    chapter_data = artefact.get("chapter_data")
+    if chapter_data is None:
+        return {}
+    if not isinstance(chapter_data, dict):
+        raise Tier3Error(
+            f"artefact's chapter_data is a "
+            f"{type(chapter_data).__name__}, not an object — the "
+            f"per-chapter deltas cannot be read from it")
+    chapters = chapter_data.get("chapters")
+    if chapters is None:
+        return {}
+    if not isinstance(chapters, dict):
+        raise Tier3Error(
+            f"artefact's chapter_data.chapters is a "
+            f"{type(chapters).__name__}, not an object — the "
+            f"per-chapter deltas cannot be read from it")
+    for chnum, chapter in chapters.items():
+        if not isinstance(chapter, dict):
+            raise Tier3Error(
+                f"artefact's chapter_data.chapters[{chnum!r}] is "
+                f"a {type(chapter).__name__}, not an object — "
+                f"that chapter's deltas cannot be read from it")
+    return chapters
+
+
 def _candidates(artefact, stored_set=()):
     """Yields (kind, state, payload) for one artefact. The
     stored set matters to exactly one pass: the stored-source
@@ -490,9 +525,23 @@ def _candidates(artefact, stored_set=()):
     name prod kept."""
     # Merges the judge scored but the run did not take; the
     # recorded reason ("below threshold (0.85)") is the state that
-    # left the pair unconfirmed.
+    # left the pair unconfirmed. Deduped on the sorted pair —
+    # the same key the alerts digest groups by — because the
+    # artefact can record a pair in both orders, and two rows
+    # for one pair would make the candidate counts disagree
+    # with the alerts that read them. First occurrence wins, the
+    # claim passes' convention below. An entry missing either
+    # name cannot form the key, so it yields as recorded: no
+    # rejection is invented for a shape nothing asked about.
+    seen_merges = set()
     for entry in artefact.get("possible_merges") or []:
         if isinstance(entry, dict):
+            if entry.get("name_a") and entry.get("name_b"):
+                pair = tuple(sorted(
+                    (entry["name_a"], entry["name_b"])))
+                if pair in seen_merges:
+                    continue
+                seen_merges.add(pair)
             yield ("merge", entry.get("reason") or "left_for_review",
                    entry)
 
@@ -566,8 +615,38 @@ def _candidates(artefact, stored_set=()):
         for entry in artefact.get(key) or []:
             if isinstance(entry, dict) and entry.get("name"):
                 roster.setdefault(entry["name"], entry)
+    # A list, not a set: a mention is free text as recorded, and
+    # the dedupe must never fail on a value it cannot hash.
+    seen_mentions = []
     for name, entry in roster.items():
-        for mention in entry.get("unresolved_mentions") or []:
+        mentions = entry.get("unresolved_mentions") or []
+        # The pipeline writes this field as a list of free-text
+        # mention strings, but a bare string is one mention, not
+        # a sequence of them: iterating it would yield one
+        # candidate per character, each a single letter. A list
+        # is used as recorded; mentions are never comma-joined
+        # by the pipeline, so a string is never split either —
+        # splitting would invent mentions nobody recorded. Any
+        # other shape is named and refused, for the same reason
+        # malformed chapter_data is: a guess here becomes
+        # plausible-looking review rows.
+        if isinstance(mentions, str):
+            mentions = [mentions]
+        elif not isinstance(mentions, list):
+            raise Tier3Error(
+                f"artefact's unresolved_mentions for character "
+                f"{name!r} is a {type(mentions).__name__}, not a "
+                f"list or a single mention string — its mentions "
+                f"cannot be read from it")
+        for mention in mentions:
+            # The same mention recorded twice for one character
+            # is one review item, not two: dedupe on the
+            # (character, mention) pair, first occurrence wins,
+            # so the candidate counts match what a reader sees.
+            ident = (name, mention)
+            if ident in seen_mentions:
+                continue
+            seen_mentions.append(ident)
             yield ("mention", "unresolved", {
                 "character": name,
                 "mention": mention,
@@ -580,8 +659,7 @@ def _candidates(artefact, stored_set=()):
     # final claim list and is outside the built-in vocabulary.
     # Without chapter_data there is no record to draw from, and
     # the import says so rather than emitting none in silence.
-    chapters = ((artefact.get("chapter_data") or {})
-                .get("chapters") or {})
+    chapters = _chapter_map(artefact)
     if not chapters:
         return
     final_types = set()
@@ -590,10 +668,30 @@ def _candidates(artefact, stored_set=()):
             if isinstance(claim, dict) and claim.get("type"):
                 final_types.add(claim["type"])
     registered = BUILTIN_REL_TYPES | final_types
-    seen = set()
+    # Proposals are gathered before yielding because recurrence
+    # is part of the record: a type proposed for the same pair
+    # in chapters 3 and 7 is one proposal, but its payload must
+    # say it recurred — occurrence is signal, the same doctrine
+    # the rejected-types handling at insert applies when it
+    # keeps a re-proposed string's row. Collapsing to the first
+    # chapter alone threw that signal away. chapter_number keeps
+    # its first-occurrence meaning for existing readers;
+    # occurrences and chapters are always present alongside it
+    # (1 and [first chapter] for a lone proposal), so a reader
+    # never has to guess whether their absence means "once".
+    proposals = {}
     for chnum, chapter in chapters.items():
-        deltas = ((chapter or {}).get("a") or {}) \
-            .get("relationships") or []
+        delta_block = chapter.get("a")
+        if delta_block is None:
+            deltas = []
+        elif not isinstance(delta_block, dict):
+            raise Tier3Error(
+                f"artefact's chapter_data.chapters[{chnum!r}].a "
+                f"is a {type(delta_block).__name__}, not an "
+                f"object — that chapter's deltas cannot be read "
+                f"from it")
+        else:
+            deltas = delta_block.get("relationships") or []
         for claim in deltas:
             if not isinstance(claim, dict):
                 continue
@@ -601,16 +699,23 @@ def _candidates(artefact, stored_set=()):
             if not ctype or ctype in registered:
                 continue
             ident = (claim.get("from"), claim.get("to"), ctype)
-            if ident in seen:
+            if ident in proposals:
+                payload = proposals[ident]
+                payload["occurrences"] += 1
+                if chnum not in payload["chapters"]:
+                    payload["chapters"].append(chnum)
                 continue
-            seen.add(ident)
             payload = dict(claim)
             payload["chapter_number"] = chnum
+            payload["occurrences"] = 1
+            payload["chapters"] = [chnum]
             payload["detection"] = (
                 "type appears in the run's chapter deltas but in "
                 "none of its final claim lists, and is outside "
                 "the built-in relationship vocabulary")
-            yield ("type_proposal", "unknown_type", payload)
+            proposals[ident] = payload
+    for payload in proposals.values():
+        yield ("type_proposal", "unknown_type", payload)
 
 
 # ---------------------------------------------------------------------------
@@ -851,8 +956,11 @@ def import_preview(db_path, preview_path, stored_names_path=None,
         "candidates": cand_counts,
         "previously_rejected_types": sorted(
             set(previously_rejected)),
-        "has_chapter_data": bool(
-            (artefact.get("chapter_data") or {}).get("chapters")),
+        # Through the validated chapter map, not a raw nested
+        # .get chain: this line runs after candidate generation,
+        # but it must not be a second, unguarded reading of the
+        # same malformed shape.
+        "has_chapter_data": bool(_chapter_map(artefact)),
         "stored_set_note": stored_note,
         "adopted_from": adopt_from,
     }
