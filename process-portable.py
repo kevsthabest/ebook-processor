@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.37"
+PORTABLE_VERSION = "2.13.38"
 
 
 import argparse
@@ -20046,6 +20046,7 @@ class _RunHistoryRecorder:
         self.run_key = ("run-" + time.strftime("%Y%m%d-%H%M%S")
                         + f"-{os.getpid()}")
         self.books = {}
+        self._outcome_seq = 0
         self.lock = threading.Lock()
         self.corpus_filter_ran = bool(CONFIG.get("corpus_only")) \
             and mode in ("scan", "watch_cycle")
@@ -20071,6 +20072,7 @@ class _RunHistoryRecorder:
                    "error_class": None, "error_message": None,
                    "decision_calls": None, "decision_pool": None,
                    "decision_budget": None,
+                   "outcome_seq": None,
                    "book_key": None,
                    "source": None, "chapters": None,
                    "ingest_title": None, "replace_result": None}
@@ -20156,6 +20158,14 @@ class _RunHistoryRecorder:
             if rec is None:
                 return
             rec["outcome"] = "processed" if ok else "failed"
+            # Completion order, stamped here because this is the
+            # moment a processing finishes: the recorder's dict is
+            # in start order, which parallel processing can make
+            # differ from the order books actually completed in,
+            # and the flush's duplicate-book collapse needs the
+            # true last completion, not the last start.
+            self._outcome_seq += 1
+            rec["outcome_seq"] = self._outcome_seq
             if CONFIG.get("pipeline") == "v2" \
                     and int(CONFIG.get("jobs", 1) or 1) <= 1:
                 # The decision-call counter is reset per book by the
@@ -20811,6 +20821,53 @@ def _history_warn_no_response():
         _history_warn("no-response")
 
 
+def _history_collapse_duplicate_book_keys(entries):
+    """Collapse recorder entries that share a payload book_key to
+    the one entry per key the books upsert may ship.
+
+    The recorder keys books locally by file path while the mirror
+    keys them by source hash, so two byte-identical files in one
+    scan are two local entries carrying one book_key. Posting
+    both rows in a single upsert on (run_id, book_key) names the
+    same conflict key twice inside one batch, which Postgres
+    refuses (error 21000), and the flush's early return on that
+    refusal would take the run's claim rows down with its book
+    rows. This is the book side's counterpart to the claim side's
+    per-axis disambiguation: the claim side suffixes a repeated
+    identity because each claim is its own row, but a book_key
+    names one book, so the duplicate entries collapse instead of
+    multiplying rows.
+
+    The winner is the last completed processing for the key: the
+    two processings read byte-identical input, so the later
+    outcome is simply the run's final state for that book, and
+    keeping the whole entry — never mixing one copy's payload
+    with the other's — is what lets the payload and its claim
+    rows ship as the pair they were built as. Entries that never
+    stamped a completion (a skip, an ingest record) fall back to
+    recorder order, last one winning there too.
+
+    Returns (kept, collapsed): kept holds one entry per book_key
+    in winning-entry order; collapsed lists each duplicated
+    (book_key, file count) so the flush can say out loud that a
+    collapse happened instead of letting it pass silently."""
+    counts = {}
+    winners = {}
+    for index, entry in enumerate(entries):
+        key = entry.get("book_key")
+        counts[key] = counts.get(key, 0) + 1
+        seq = entry.get("outcome_seq")
+        rank = (seq if isinstance(seq, int) else -1, index)
+        if key not in winners or rank > winners[key][0]:
+            winners[key] = (rank, index, entry)
+    ordered = sorted(winners.values(), key=lambda w: w[1])
+    kept = [entry for _rank, _index, entry in ordered]
+    collapsed = [(entry["book_key"], counts[entry["book_key"]])
+                 for _rank, _index, entry in ordered
+                 if counts[entry["book_key"]] > 1]
+    return kept, collapsed
+
+
 def _history_flush(rec, status, failures=None, error=None):
     """Build this run's payloads and ship them, in dependency
     order: the run row first (its returned uuid keys the book
@@ -20831,6 +20888,20 @@ def _history_flush(rec, status, failures=None, error=None):
         if r["book_key"] is None and r["fpath"] is not None:
             rec._resolve_book_identity(r)
     entries = [r for r in rec.books.values() if r["book_key"]]
+    # Collapse before any payload is built, so the totals, the
+    # book batch and the claim rows are all derived from the same
+    # surviving entries — collapsing the built rows afterwards
+    # would leave totals counting books that never ship and could
+    # pair a surviving book row with a dropped copy's claims.
+    entries, collapsed_keys = _history_collapse_duplicate_book_keys(
+        entries)
+    for dup_key, dup_count in collapsed_keys:
+        covers = "both files" if dup_count == 2 \
+            else f"all {dup_count} files"
+        print(f" Run history: duplicate book_key {dup_key} in this "
+              f"run ({dup_count} files) — one book row covers "
+              f"{covers}; the last completed processing is the "
+              "one recorded.")
     finished_wall = time.time()
     if status is None:
         status = "completed"

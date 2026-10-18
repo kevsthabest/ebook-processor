@@ -542,6 +542,103 @@ class DecisionPoolHistoryTests(_Base):
             "replace_result", "error_class", "error_message"})
 
 
+class DuplicateBookKeyTests(_Base):
+    """Issue #3: two byte-identical files in one scan are two
+    recorder entries (the recorder keys books locally by file
+    path) carrying the SAME payload book_key (the file's source
+    hash). The flush used to post both book rows in one bulk
+    upsert on (run_id, book_key), which Postgres refuses when a
+    key repeats inside the batch (error 21000) — sb() returned
+    None, the flush returned early, and the claims POST never
+    ran, so one duplicated file silently cost the run every
+    book and claim row behind a single warning line."""
+
+    def drive_duplicate_files(self):
+        """Two different paths, one set of bytes, processed one
+        after the other. The copies are told apart on purpose —
+        a different title and a different derived-claim
+        confidence on the second processing — so the assertions
+        can prove WHICH copy shipped, and that its book row and
+        its claim rows shipped as one pair."""
+        copy_path = self.tmp / "copy.epub"
+        copy_path.write_bytes(BOOK_BYTES)
+        self.assertEqual(
+            hashlib.sha256(copy_path.read_bytes()).hexdigest(),
+            self.book_key)
+        first = v2_result()
+        first["title"] = "First Copy Title"
+        second = v2_result()
+        second["title"] = "Last Copy Title"
+        second["trope_confidence"] = {"enemies to lovers": 0.8,
+                                      "found family": 0.33}
+        pp._history_begin("scan", preview=True,
+                          learn_dir=str(self.tmp), files_seen=2)
+        for path, result in ((self.book, first),
+                             (copy_path, second)):
+            pp._history_book_start(path)
+            pp._history_note_result(path, result)
+            pp._history_book_end(path)
+            pp._history_book_outcome(path, True)
+        pp._history_finish(failures=0)
+
+    def test_duplicate_book_key_ships_one_book_row_and_its_claims(self):
+        self.drive_duplicate_files()
+        posts = self.fake.posts("processor_run_books")
+        self.assertEqual(len(posts), 1)
+        rows = posts[0]["data"]
+        # At most one row per (run_id, book_key): the batch that
+        # ships can no longer name the shared key twice.
+        pairs = [(r["run_id"], r["book_key"]) for r in rows]
+        self.assertEqual(len(pairs), len(set(pairs)))
+        self.assertEqual(pairs, [(RUN_ID, self.book_key)])
+        # The last completed processing is the run's final state
+        # for this book, so its book row is the one that ships.
+        self.assertEqual(rows[0]["title"], "Last Copy Title")
+        # And its claim rows ship with it — paired with that same
+        # processing, not the first copy's: the derived Found
+        # Family claim carries the second copy's confidence.
+        claim_posts = self.fake.posts("processor_run_claim_outcomes")
+        self.assertEqual(len(claim_posts), 1)
+        claim_rows = claim_posts[0]["data"]
+        self.assertEqual(len(claim_rows), 3)
+        for row in claim_rows:
+            self.assertEqual(row["run_book_id"], BOOK_ID)
+        confidences = {r["confidence"] for r in claim_rows}
+        self.assertIn(0.33, confidences)
+        self.assertNotIn(0.7, confidences)
+
+    def test_collapse_prints_a_note_naming_the_book_key(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.drive_duplicate_files()
+        text = out.getvalue()
+        self.assertIn(self.book_key, text)
+        self.assertIn("one book row covers both files", text)
+
+    def test_two_different_books_are_unaffected(self):
+        other = self.tmp / "other.epub"
+        other.write_bytes(b"different fake epub bytes for history")
+        other_key = hashlib.sha256(other.read_bytes()).hexdigest()
+        self.assertNotEqual(other_key, self.book_key)
+        pp._history_begin("scan", preview=True,
+                          learn_dir=str(self.tmp), files_seen=2)
+        for path in (self.book, other):
+            pp._history_book_start(path)
+            pp._history_note_result(path, v2_result())
+            pp._history_book_end(path)
+            pp._history_book_outcome(path, True)
+        pp._history_finish(failures=0)
+        posts = self.fake.posts("processor_run_books")
+        self.assertEqual(len(posts), 1)
+        rows = posts[0]["data"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r["book_key"] for r in rows},
+                         {self.book_key, other_key})
+        claim_posts = self.fake.posts("processor_run_claim_outcomes")
+        self.assertEqual(len(claim_posts), 1)
+        self.assertEqual(len(claim_posts[0]["data"]), 6)
+
+
 class CollisionTests(_Base):
     def test_collision_suffixes_and_warns(self):
         foreign = [{"id": "zzzz", "started_at":
