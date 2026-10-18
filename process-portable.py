@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.45"
+PORTABLE_VERSION = "2.13.46"
 
 
 import argparse
@@ -22340,13 +22340,83 @@ def _claim_rows(table, work_id):
                f"&select={cols}")
 
 
+def _char_name_key(name):
+    """The one canonical key for character identity in the write path.
+
+    Every site that decides whether a run character is the character
+    a stored book_characters row names — the partition of existing
+    rows, the insert builder's skip test, the relationship map, and
+    the backfill membership test — computes this key, and no other.
+    Those sites used to key three different name strings (the stored
+    name, the roster canonical name, the raw extracted name) with a
+    bare .lower(), so any form divergence — a canonical rename, a
+    trailing space in a stored name, a stray full stop — split one
+    person into a duplicate candidate row beside the curated row they
+    should have deduped against, or silently lost their backfill.
+
+    The key is the roster's own norm_name — casefold, leading-article
+    drop, whitespace tidied — because character identity everywhere
+    upstream (dedupe buckets, the LearnedState and surname machinery)
+    already speaks norm_name, and the write path inventing a second
+    article or casing convention would split identities those systems
+    consider one. The one step added on top folds punctuation runs
+    to a single space first (the work-identity norm's convention that
+    punctuation is a separator, not identity): stored names come from
+    humans, the app, and earlier LLM runs, and "Bob Smith." is the
+    same name form as "Bob Smith" in a way the roster, which only
+    ever sees extracted forms, never has to decide. Nothing wider is
+    folded: titles, middle initials, nicknames and spelling variants
+    are matching rules, not name forms — equating them here would let
+    the write path suppress a genuinely different character's row —
+    so they stay upstream in the merge machinery that owns them."""
+    return norm_name(re.sub(r"[\W_]+", " ", name or ""))
+
+
+def _character_keys(c, canon):
+    """Every canonical key a run character may already be stored
+    under, canonical form first: its roster canonical name (the form
+    recent runs write) and its raw extracted name (the form runs
+    before the rename, and preserved human rows, may carry). A
+    character is already present when EITHER form's key is — testing
+    only one is what let a rename insert a duplicate beside the
+    surviving row, or skip that row's backfill, depending on which
+    form the surviving row happened to carry."""
+    keys = []
+    for form in (canon.get(c.get("entity_id")) if c.get("entity_id")
+                 else None, c.get("name")):
+        k = _char_name_key(form)
+        if k and k not in keys:
+            keys.append(k)
+    return keys
+
+
 def _claim_key(table, row):
     """Dedupe identity for an existing claim row, matching the key the
     insert builders use for new-run items."""
     v = row.get(_CLAIM_TABLES[table]["id_col"], "")
     if table == "book_quotes":
         return (v or "")[:100]
+    if table == "book_characters":
+        return _char_name_key(v)
     return str(v if v is not None else "").lower()
+
+
+def _row_is_preserved(table, row):
+    """True when one existing row survives the replace: a contributor
+    row, a human-curated (rejected or confirmed) row, or a processor
+    row the scoped DELETE cannot actually remove (NULL/empty status
+    on a claims table — see _partition_claims). The partition counts
+    with this and the character backfill finds its target rows with
+    it, so the two can never disagree about which rows survived."""
+    src = _CLAIM_TABLES[table]["source"]
+    if table == "book_quotes":
+        return (row.get("source_type") or "") != src
+    status = row.get("status") or ""
+    if status in ("rejected", "confirmed"):
+        return True
+    if (row.get("source_type") or "") == src:
+        return not status
+    return True
 
 
 def _partition_claims(table, rows):
@@ -22365,23 +22435,15 @@ def _partition_claims(table, rows):
     and a re-proposed claim would insert a duplicate beside it.
     (book_quotes has no status column; partition == delete there.)
     """
-    src = _CLAIM_TABLES[table]["source"]
     preserved, rejected, ndel = set(), set(), 0
     for r in rows:
         k = _claim_key(table, r)
-        status = r.get("status") or ""
-        if status == "rejected":
+        if (r.get("status") or "") == "rejected":
             rejected.add(k)
+        if _row_is_preserved(table, r):
             preserved.add(k)
-        elif status == "confirmed":
-            preserved.add(k)
-        elif (r.get("source_type") or "") == src:
-            if table != "book_quotes" and not status:
-                preserved.add(k)
-            else:
-                ndel += 1
         else:
-            preserved.add(k)
+            ndel += 1
     return preserved, rejected, ndel
 
 
@@ -22770,13 +22832,20 @@ def _build_rel_map(result):
         _entry["validation_state"] = (
             r.get("validation_state") or _rel_validation_state(r))
         _entry["source"] = r.get("source") or "extracted"
-        rel_map.setdefault(_from.lower(), []).append(_entry)
+        # Keyed by the write path's one canonical character key, the
+        # same key _build_character_rows looks up: keying this map by
+        # a plainer form left relationships embedded on no row
+        # whenever the source's name form diverged (trailing space,
+        # punctuation) from the character's.
+        rel_map.setdefault(_char_name_key(_from), []).append(_entry)
     return rel_map, evidenceless
 
 
 def _build_character_rows(work_id, result, rel_map, skip_names):
     """Build book_characters rows (relationships embedded per character),
-    skipping names that survive in the DB (contributor/rejected rows)."""
+    skipping names that survive in the DB (contributor/rejected rows).
+    skip_names holds canonical character keys — the set
+    _partition_claims returns for book_characters — never raw names."""
     _canon = _roster_canonical_names(result)
     _suppressed = set((result.get("roster_persistence") or {}).get(
         "suppressed_entities") or ())
@@ -22794,9 +22863,16 @@ def _build_character_rows(work_id, result, rel_map, skip_names):
         if c.get("entity_id") and c["entity_id"] in _suppressed:
             continue
         _name = _canon.get(c.get("entity_id")) or c["name"]
-        if _name.lower() in seen:
+        # A character is already accounted for when ANY form it is
+        # known by — canonical or raw — keys into the seen set: the
+        # preserved rows in the DB may carry either form, and a
+        # rename must not mint a second row for the same person
+        # beside the surviving one. Every form is then recorded, so
+        # a later run entry under the other form dedupes too.
+        _keys = _character_keys(c, _canon)
+        if any(k in seen for k in _keys):
             continue
-        seen.add(_name.lower())
+        seen.update(_keys)
         rows.append({"work_id": work_id, "name": _name, "role": c["role"],
                      "description": c.get("description", ""),
                      "appearance": c.get("appearance", ""),
@@ -22804,7 +22880,7 @@ def _build_character_rows(work_id, result, rel_map, skip_names):
                      "status": "candidate",
                      "aliases": c.get("aliases", []),
                      "first_appearance_chapter": c.get("first_appearance_chapter"),
-                     "relationships": rel_map.get(_name.lower(), []),
+                     "relationships": rel_map.get(_char_name_key(_name), []),
                      "source_type": "ai",
                      "confidence": c.get("confidence", 0.7)})
     return rows
@@ -23105,7 +23181,17 @@ def write_claims(work_id, result, trope_mappings=None):
         preserved_rej += len(_rejected)
         preserved_conf += sum(1 for r in _cstate
                               if (r.get("status") or "") == "confirmed")
-        pre_existing = set(_preserved)  # surviving rows: backfill targets
+        # Surviving rows are the backfill targets, addressed by the
+        # name they are actually stored under: a run character finds
+        # its surviving row by canonical key (either of its forms),
+        # but the row fetch below must name the stored string, not a
+        # form of the run's — an ilike on the run's form misses a row
+        # stored under the other form or a variant of it.
+        _preserved_stored = {}
+        for r in _cstate:
+            if _row_is_preserved("book_characters", r):
+                _preserved_stored.setdefault(
+                    _claim_key("book_characters", r), r.get("name") or "")
         _earners = _claim_earner_chars(result)
         if _earners:
             print(f"  Claim-earner rows: {len(_earners)} non-principal "
@@ -23141,12 +23227,23 @@ def write_claims(work_id, result, trope_mappings=None):
         # overwrite. (Processor rows were replaced above with full data.)
         if _ok:
             _backfilled = 0
+            _canon_bf = _roster_canonical_names(result)
             # Earners are stored identically to principals, so a
             # surviving row of theirs backfills on the same terms.
             for c in (list(result["characters"])
                       + _claim_earner_chars(result)):
-                if c["name"].lower() not in pre_existing:
-                    continue  # only backfill rows that survived the replace
+                # Only backfill rows that survived the replace. The
+                # membership test is the write path's canonical key
+                # over BOTH forms the character carries: testing the
+                # raw run name alone silently skipped the backfill
+                # whenever the roster had renamed the character, or
+                # the stored name carried a form variant.
+                _stored_name = next(
+                    (_preserved_stored[k]
+                     for k in _character_keys(c, _canon_bf)
+                     if k in _preserved_stored), None)
+                if _stored_name is None:
+                    continue
                 patch = {}
                 if c.get("appearance"):
                     patch["appearance"] = c["appearance"]
@@ -23158,9 +23255,10 @@ def write_claims(work_id, result, trope_mappings=None):
                     patch["first_appearance_chapter"] = c["first_appearance_chapter"]
                 if not patch:
                     continue
-                # Only fill NULLs: fetch current values first
+                # Only fill NULLs: fetch current values first, by the
+                # row's own stored name (see _preserved_stored above).
                 existing = sb("book_characters",
-                              params=f"?work_id=eq.{work_id}&name=ilike.{quote(c['name'], safe='')}"
+                              params=f"?work_id=eq.{work_id}&name=ilike.{quote(_stored_name, safe='')}"
                                      f"&select=id,appearance,vitality,aliases,first_appearance_chapter"
                                      f"&limit=1")
                 if not existing:
