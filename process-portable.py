@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.39"
+PORTABLE_VERSION = "2.13.40"
 
 
 import argparse
@@ -13172,10 +13172,10 @@ def _roster_fetch_anchors(work_id):
     manual --alias pairs from learned state. Returns a list of
     {name, kind, source, aliases, lock_canonical}, or None on DB
     error — the seam applies A8's failure discipline to None."""
-    rows = sb("book_characters",
-              params=f"?work_id=eq.{quote(str(work_id), safe='')}"
-                     f"&select=id,name,status,source_type,aliases"
-                     f"&limit=1000")
+    rows = _sb_fetch_all(
+        "book_characters",
+        f"?work_id=eq.{quote(str(work_id), safe='')}"
+        f"&select=id,name,status,source_type,aliases")
     if rows is None:
         return None
     preserved, _rejected, _ndel = _partition_claims(
@@ -19352,6 +19352,47 @@ def sb(table, method="GET", data=None, params="", prefer=None,
     return None
 
 
+_SB_PAGE_SIZE = 1000
+
+
+def _sb_fetch_all(table, params, order="id.asc"):
+    """Fetch EVERY row matching params, paging past the single-response
+    cap a bare limit=1000 leaves in place.
+
+    Why this exists: a fetch that feeds a decision about which rows
+    already exist must see the whole set. A capped fetch returns a
+    result indistinguishable from a complete one, so the caller
+    partitions a subset and treats the rows it never saw as absent —
+    for replace-wholesale that meant human curation past row 1000 was
+    neither preserved nor deduped against (issue #40). Every fetch
+    whose completeness is load-bearing goes through here, so the
+    pattern is fixed in one place instead of per call site.
+
+    params is the base query string (starting with "?") WITHOUT
+    limit / offset / order; this helper owns all three. Pages are
+    ordered on a stable unique key (id by default): without a total
+    order, rows can drift across page boundaries between requests
+    and be skipped or fetched twice. The first page carries no
+    offset, so a result under the page size is a single request and
+    the same rows the old capped call returned. Returns the full
+    list, or None when any page fails — sb()'s error contract, so
+    callers keep treating None as "the read failed, trust nothing".
+    """
+    rows_all = []
+    offset = 0
+    while True:
+        page_params = f"{params}&order={order}&limit={_SB_PAGE_SIZE}"
+        if offset:
+            page_params += f"&offset={offset}"
+        page = sb(table, params=page_params)
+        if page is None:
+            return None
+        rows_all.extend(page)
+        if len(page) < _SB_PAGE_SIZE:
+            return rows_all
+        offset += _SB_PAGE_SIZE
+
+
 def norm(s):
     """Lowercase, strip accents and punctuation, collapse whitespace to single
     spaces. Matches the app's tropeNormIdent: "Fourth Wing" -> "fourth wing"."""
@@ -22069,8 +22110,9 @@ def _claim_rows(table, work_id):
     cols = f"id,{spec['id_col']},source_type"
     if table != "book_quotes":
         cols += ",status"
-    return sb(table, params=f"?work_id=eq.{quote(str(work_id), safe='')}"
-                            f"&select={cols}&limit=1000")
+    return _sb_fetch_all(
+        table, f"?work_id=eq.{quote(str(work_id), safe='')}"
+               f"&select={cols}")
 
 
 def _claim_key(table, row):
@@ -22616,16 +22658,22 @@ def _proposal_state(result):
     'own' rows, even if key formats align. Human-reviewed rows carry
     other statuses and are preserved. Returns (all_name_keys, own_rows)
     or (None, None) on DB error."""
-    all_rows = sb("trope_proposals", params="?select=name_key&limit=1000")
+    # The global fetch selects id as well as name_key because the
+    # paged fetch orders on id: a column ordered on must be readable
+    # for the order to be the total order pagination relies on, and
+    # name_key alone is not unique across books.
+    all_rows = _sb_fetch_all("trope_proposals",
+                             "?select=id,name_key")
     if all_rows is None:
         return None, None
     book_key = result.get("isbn") or result.get("title", "")
     if not book_key:
         return {r["name_key"] for r in all_rows}, []
-    own = sb("trope_proposals",
-             params=f"?book_key=eq.{quote(str(book_key), safe='')}"
-                    f"&{_proposal_scope()}"
-                    f"&select=id,name_key,status,proposed_by&limit=1000")
+    own = _sb_fetch_all(
+        "trope_proposals",
+        f"?book_key=eq.{quote(str(book_key), safe='')}"
+        f"&{_proposal_scope()}"
+        f"&select=id,name_key,status,proposed_by")
     if own is None:
         return None, None
     return {r["name_key"] for r in all_rows}, own
