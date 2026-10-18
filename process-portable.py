@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.46"
+PORTABLE_VERSION = "2.13.47"
 
 
 import argparse
@@ -16484,6 +16484,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             _sup = _scored[0]
             _sup_rel = {k: v for k, v in _sup[7].items()
                         if not k.startswith("_")}
+            # The candidate's chapter index rides along (see the
+            # winner below): a suppressed claim can revive, and a
+            # revived claim must still resolve to its own chapter.
+            _sup_rel["_idx"] = _sup[7]["_idx"]
             _sup_rel["confidence"] = _sup[4]
             _sup_rel["evidence_count"] = _sup[5]
             _sup_rel["cooccurrence_count"] = _sup[6]
@@ -16496,6 +16500,14 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             _scored = _fam
         _, _, _, _, _conf, _nq, _co, _w = _scored[0]
         _rel = {k: v for k, v in _w.items() if not k.startswith("_")}
+        # The candidate's chapter index is the one piece of its
+        # internal shape that must survive materialisation:
+        # validation resolves a claim's chapter through it, because
+        # the stored label repeats across a book's volumes and a
+        # label-only resolution lands on the wrong volume's text.
+        # It is stripped again before the claims leave the reduce,
+        # so no shipped claim shape changes.
+        _rel["_idx"] = _w["_idx"]
         _rel["confidence"] = _conf
         _rel["evidence_count"] = _nq
         _rel["cooccurrence_count"] = _co
@@ -16531,6 +16543,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             _r = _pool[1]
             _rc = {k: v for k, v in _r[7].items()
                    if not k.startswith("_")}
+            # Chapter index rides along, as on the winner: if this
+            # candidate revives it is validated as a claim in its
+            # own right, against its own chapter.
+            _rc["_idx"] = _r[7]["_idx"]
             _rc["confidence"] = _r[4]
             _rc["evidence_count"] = _r[5]
             _rc["cooccurrence_count"] = _r[6]
@@ -16606,6 +16622,29 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     _chapters_by_label = {c.get("label"): c for c in chapters}
     _chapters_by_index = {c.get("index"): c for c in chapters}
 
+    def _claim_chapter(rel, chapter_index=None):
+        """The chapter a claim's judged evidence lives in.
+
+        An explicit chapter index wins: mined evidence is judged
+        in the chapter it was mined from, not the one the claim
+        was extracted in. Next, the claim's own chapter index —
+        the identity its candidate carried from extraction —
+        because chapter labels are heading-derived and repeat
+        across a book's volumes, so resolving by label alone
+        silently lands on the LAST chapter carrying that label
+        and windows (or stamps provenance from) another volume's
+        passage. The label lookup remains only as the fallback
+        for a claim that carries no index at all."""
+        if chapter_index is not None:
+            _ch = _chapters_by_index.get(chapter_index)
+            if _ch is not None:
+                return _ch
+        if rel.get("_idx") is not None:
+            _ch = _chapters_by_index.get(rel["_idx"])
+            if _ch is not None:
+                return _ch
+        return _chapters_by_label.get(rel.get("chapter") or "")
+
     def _validation_context(ev_quote, rel, mined_idx=None):
         """Context for the validator: the sentences around the
         evidence quote in its own chapter (see _evidence_window).
@@ -16613,11 +16652,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         the judged text lives there, not where the claim was
         extracted. Empty when the quote cannot be located, which
         leaves the validation call exactly as it was."""
-        _ch = None
-        if mined_idx is not None:
-            _ch = _chapters_by_index.get(mined_idx)
-        if _ch is None:
-            _ch = _chapters_by_label.get(rel.get("chapter") or "")
+        _ch = _claim_chapter(rel, mined_idx)
         if _ch is None:
             return ""
         _w = _evidence_window(ev_quote, _ch.get("text", ""))
@@ -16652,11 +16687,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         replaces the judged quote, the provenance must describe
         the quote the validator actually sees, not the one
         extraction happened to offer."""
-        _ch = None
-        if chapter_index is not None:
-            _ch = _chapters_by_index.get(chapter_index)
-        if _ch is None:
-            _ch = _chapters_by_label.get(rel.get("chapter") or "")
+        _ch = _claim_chapter(rel, chapter_index)
         if _ch is None or not (ev_quote or "").strip():
             return
         _ci = _ch.get("index")
@@ -17066,6 +17097,16 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # The claim's evidence just changed hands, so its
         # provenance record follows it (see _stamp_provenance).
         _stamp_provenance(rel, _mined["sentence"], _mined["chapter"])
+
+    # The internal chapter identity has served its purpose: every
+    # validation window and provenance stamp above is taken by
+    # now. It was never part of a shipped claim, and leaving it on
+    # would grow every artefact the reduce feeds (preview, write
+    # payload, run history) with plumbing no reader can use — so
+    # it comes off here, at the last point where only this
+    # function's own stages can still see it.
+    for rel in relationships + _dropped_relationships:
+        rel.pop("_idx", None)
 
     # Curation state + provenance (spec §1.5): every surviving and
     # dropped claim is stamped with its internal state name, so
