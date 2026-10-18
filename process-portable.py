@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.36"
+PORTABLE_VERSION = "2.13.37"
 
 
 import argparse
@@ -21311,10 +21311,29 @@ def _dm_budget_claim(n=1, consumer=None):
     return granted
 
 
-def _strip_merge_noise(nkey):
+def _strip_merge_noise_detail(nkey):
     """Strip titles, contextual prefixes, and middle initials from a
-    normalized name key. Returns a token list for merge comparison."""
+    normalized name key. Returns (tokens, learned_stripped): the token
+    list for merge comparison, plus the learned-only title strings
+    that were stripped from the front, in the order they came off.
+
+    Built-in titles are a closed class (Dr, Mr, Herr, ...) and strip
+    exactly as they always have. A LEARNED title is different: it was
+    trusted only because some token kept appearing in front of other
+    names, and ordinary given names do exactly that — "James Robert
+    Smith" + "James William Doe" mint "james" as a trusted title even
+    though James is a person, not an honorific. Stripping on that
+    trust therefore carries a floor: a learned-only title may never
+    reduce a name below 2 tokens, because the bare-surname result is
+    precisely the false-merge shape — "james smith" and "john smith"
+    both collapsing to ["smith"] erases the only token that
+    distinguishes two brothers, and at 1 token the surname trap
+    cannot fire to stop the merge. Keeping the given name in the key
+    lets the trap and the same-chapter cannot-link do their jobs.
+    `learned_stripped` exists so _merge_tier can apply the matching
+    rule above the floor (see the both-sides guard there)."""
     toks = (nkey or "").split()
+    learned_stripped = []
     # Leading contextual prefixes ("the late", "official").
     for pref in ("the late", "late", "official"):
         pp = pref.split()
@@ -21324,13 +21343,24 @@ def _strip_merge_noise(nkey):
     # Leading titles (longest match first for multi-word titles like
     # "special agent"). Repeats: "special agent" then "agent" can't stack.
     titles = _effective_titles() | _PROFESSIONAL_TITLES
+    # A title that is ONLY learned (not also in a built-in set) is the
+    # unproven kind the floor and the caller-side guard govern.
+    learned_only = titles - _TITLES - _PROFESSIONAL_TITLES
     changed = True
     while changed and toks:
         changed = False
         for t in sorted(titles, key=len, reverse=True):
             tp = t.split()
             if toks[:len(tp)] == tp:
+                if t in learned_only and len(toks) - len(tp) < 2:
+                    # The floor: this strip would leave a bare
+                    # surname (or nothing). Skip it and let a shorter
+                    # title that still respects the floor — or no
+                    # strip at all — win instead.
+                    continue
                 toks = toks[len(tp):]
+                if t in learned_only:
+                    learned_stripped.append(t)
                 changed = True
                 break
     # Middle initials ("matthew a. sobol" -> ["matthew", "sobol"]). Never
@@ -21338,7 +21368,14 @@ def _strip_merge_noise(nkey):
     if len(toks) > 1:
         toks = [t for t in toks
                 if not (len(t.rstrip(".")) == 1 and t.rstrip(".").isalpha())]
-    return toks
+    return toks, learned_stripped
+
+
+def _strip_merge_noise(nkey):
+    """Strip titles, contextual prefixes, and middle initials from a
+    normalized name key. Returns a token list for merge comparison.
+    (The learned-title floor lives in _strip_merge_noise_detail.)"""
+    return _strip_merge_noise_detail(nkey)[0]
 
 
 def _levenshtein(a, b):
@@ -21477,11 +21514,25 @@ def _merge_tier(a_key, b_key, chapter_keys=None, a_chapters=None,
     if a_key == b_key:
         return "yes"
     # Tier 2: deterministic YES rules (beat Tier 1).
-    sa = _strip_merge_noise(a_key)
-    sb = _strip_merge_noise(b_key)
-    if sa and sa == sb:
+    sa, _learned_a = _strip_merge_noise_detail(a_key)
+    sb, _learned_b = _strip_merge_noise_detail(b_key)
+    # Both-sides learned-strip guard: when each name only became
+    # comparable because it lost a DIFFERENT learned-only title token
+    # ("james robert smith" / "john robert smith" both shedding their
+    # given name to leave ["robert", "smith"]), the identical
+    # remainder proves nothing — those tokens were trusted as titles
+    # on pattern alone and may be the very given names that
+    # distinguish two people. No deterministic YES may be built on
+    # such a pair: it falls through to Tier 1 and the surname trap
+    # below, and from there to the Tier 3 judge. One-sided stripping
+    # (a title form against the bare name — the case title learning
+    # exists for), stripping the SAME learned title from both sides,
+    # and built-in titles on either side are unaffected.
+    _learned_clash = bool(_learned_a and _learned_b
+                          and _learned_a != _learned_b)
+    if sa and sa == sb and not _learned_clash:
         return "yes"
-    if len(sa) == len(sb) and len(sa) >= 2:
+    if len(sa) == len(sb) and len(sa) >= 2 and not _learned_clash:
         # Spelling variant: one differing token pair ("joseph"/"josef").
         _diffs = [(x, y) for x, y in zip(sa, sb) if x != y]
         if len(_diffs) == 1 and _is_spelling_variant(*_diffs[0]):
