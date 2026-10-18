@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.58"
+PORTABLE_VERSION = "2.13.59"
 
 
 import argparse
@@ -18007,8 +18007,15 @@ def llm_openrouter(prompt, chunk, i, n):
              "Authorization": f"Bearer {CONFIG['openrouter_key']}",
              "HTTP-Referer": "https://cozylibram.pages.dev"}, 120)
         # Telemetry usage stash (spec §6): OpenRouter speaks the
-        # OpenAI usage shape; an absent block stays None.
+        # OpenAI usage shape; an absent block stays None. A truthy
+        # non-dict block (a string, from a malformed or merely
+        # eccentric endpoint) degrades to the same null fields —
+        # calling .get on it would raise AttributeError into the
+        # broad except below and discard a valid response, which
+        # accounting must never do.
         _or_usage = resp.get("usage") or {}
+        if not isinstance(_or_usage, dict):
+            _or_usage = {}
         _DIAG.telemetry_usage = {
             "prompt_tokens": _or_usage.get("prompt_tokens"),
             "completion_tokens": _or_usage.get("completion_tokens")}
@@ -22510,10 +22517,20 @@ _telemetry_arm()
 
 def _telemetry_token(value):
     """A server-reported token count, or None when the value is
-    not a usable measurement (absent, boolean, negative, or not a
-    number at all — a malformed usage block must degrade to
-    'unreported', never to a fabricated count)."""
+    not a usable measurement (absent, boolean, negative,
+    non-finite, or not a number at all — a malformed usage block
+    must degrade to 'unreported', never to a fabricated count).
+    The non-finite case is reachable from the wire: _post_json
+    parses with json.loads, which accepts the NaN / Infinity
+    literals, and int() raises on those floats (ValueError for
+    NaN, OverflowError for the infinities) — in the recorder,
+    which runs in _run_task's finally, that raise would destroy
+    a successful result. Ints are finite by construction, so the
+    isfinite check applies to floats only (it would also spare
+    an arbitrarily large int a float-conversion overflow)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
         return None
     if value < 0:
         return None
@@ -26761,8 +26778,15 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         # _dm_budget_reset above — the snapshot is taken here,
         # after every stage (merge, validation, trigger gate,
         # quote poll) has run, so it carries the book's whole
-        # measured work and nothing from any other book.
-        "telemetry": _telemetry_snapshot(),
+        # measured work and nothing from any other book. Under
+        # parallel jobs (--jobs > 1) that attribution cannot be
+        # made: the counters are process-global, so another book's
+        # arm and records can interleave before this stamp. The
+        # book-end and history stamps already refuse that snapshot
+        # under the same jobs condition; the preview stamp carries
+        # the same guard and stamps None there instead.
+        "telemetry": _telemetry_snapshot()
+        if int(CONFIG.get("jobs", 1) or 1) <= 1 else None,
         "verification": red["verification"],
         "roster_size": len(roster),
         # Saved for future remapping (--trope-map can retry these later).

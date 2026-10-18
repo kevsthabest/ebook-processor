@@ -122,6 +122,59 @@ class TestCallAccounting(unittest.TestCase):
         self.assertEqual(snap["call_a"]["requests"], 0)
         self.assertEqual(snap["call_b"]["requests"], 0)
 
+    def test_nonfinite_tokens_recorded_as_unreported(self):
+        # _post_json parses with json.loads, which accepts the
+        # NaN / Infinity literals, so non-finite floats can arrive
+        # from the wire in a usage block. int() raises on them
+        # (ValueError for NaN, OverflowError for the infinities),
+        # and the recorder runs in _run_task's finally — a raise
+        # there destroys a successful result. A non-finite value
+        # must degrade to "unreported": its token field stays
+        # null and (for prompt tokens) the character estimate is
+        # populated, exactly as if no usage had been reported.
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            for field in ("prompt_tokens", "completion_tokens"):
+                with self.subTest(bad=bad, field=field):
+                    pp._dm_budget_reset()
+                    pp._DIAG.telemetry_usage = None
+                    usage = {"prompt_tokens": 120,
+                             "completion_tokens": 30}
+                    usage[field] = bad
+
+                    def fake(prompt, chunk, i, n, usage=usage):
+                        pp._DIAG.telemetry_usage = usage
+                        return '{"ok": true}'
+
+                    _run_task_json(fake, "prompt", "chunk text",
+                                   "v2-ch1-content")
+                    b = pp._telemetry_snapshot()["call_b"]
+                    self.assertEqual(b["requests"], 1)
+                    if field == "prompt_tokens":
+                        self.assertIsNone(b["prompt_tokens"])
+                        self.assertEqual(
+                            b["prompt_chars_estimate"],
+                            len("prompt") + len("chunk text"))
+                        self.assertEqual(b["completion_tokens"], 30)
+                    else:
+                        self.assertEqual(b["prompt_tokens"], 120)
+                        self.assertIsNone(b["prompt_chars_estimate"])
+                        self.assertIsNone(b["completion_tokens"])
+
+    def test_run_task_result_survives_nonfinite_usage(self):
+        # End to end: the backend call succeeds and its content
+        # parses, so _run_task must return that content intact
+        # even though the stashed usage is non-finite — the
+        # recorder's finally must never mask a good result.
+        def fake(prompt, chunk, i, n):
+            pp._DIAG.telemetry_usage = {
+                "prompt_tokens": float("nan"),
+                "completion_tokens": float("inf")}
+            return '{"ok": true}'
+
+        result = _run_task_json(fake, "prompt", "chunk",
+                                "v2-ch1-content")
+        self.assertEqual(result, {"ok": True})
+
     def test_stale_usage_from_a_prior_call_never_leaks(self):
         # A backend that reported usage once must not have that
         # usage stamped onto the NEXT call, whose endpoint
@@ -217,6 +270,26 @@ class TestBackendUsageStash(unittest.TestCase):
         self.assertEqual(pp._DIAG.telemetry_usage,
                          {"prompt_tokens": 90,
                           "completion_tokens": 12})
+
+    def test_openrouter_non_dict_usage_returns_content(self):
+        # A truthy non-dict usage block (a string, from a
+        # malformed or merely eccentric endpoint) must not cost
+        # the response: the stash degrades to null token fields
+        # and the content comes back exactly as the pre-telemetry
+        # code returned it. Before the isinstance guard, .get on
+        # the string raised AttributeError into the function's
+        # broad except and the valid response was discarded.
+        resp = {"choices": [{"message": {"content": "{}"}}],
+                "usage": "not-a-dict"}
+        with mock.patch.dict(pp.CONFIG, {
+                "openrouter_model": "m", "openrouter_key": "k"}), \
+                mock.patch.object(pp, "_post_json",
+                                  return_value=resp):
+            out = pp.llm_openrouter("PROMPT", "chunk", 1, 2)
+        self.assertEqual(out, "{}")
+        self.assertEqual(pp._DIAG.telemetry_usage,
+                         {"prompt_tokens": None,
+                          "completion_tokens": None})
 
     def test_ollama_stashes_eval_counts(self):
         resp = {"message": {"content": "{}"},
@@ -405,7 +478,7 @@ class TestTwoBookRun(unittest.TestCase):
                     root / f"{s}.epub")), ignore_errors=True))
         self.learn_dir = root / "learned"
 
-    def _run_books(self):
+    def _run_books(self, jobs=1):
         backend = _FakeBackend()
         with mock.patch.object(pp, "llm_ollama", backend), \
                 mock.patch.object(
@@ -415,7 +488,7 @@ class TestTwoBookRun(unittest.TestCase):
                     pp, "resolve_work",
                     lambda *a, **k: (None, "test")), \
                 mock.patch.dict(pp.CONFIG, {
-                    "llm": "ollama", "pipeline": "v2", "jobs": 1}):
+                    "llm": "ollama", "pipeline": "v2", "jobs": jobs}):
             path = pp._run_events_begin(self.learn_dir,
                                          preview=True)
             self.assertIsNotNone(path)
@@ -465,6 +538,22 @@ class TestTwoBookRun(unittest.TestCase):
         # anywhere on the preview's face.
         for stem in ("bookone", "booktwo"):
             self.assertNotIn("corpus_routing", self._preview(stem))
+
+    def test_preview_telemetry_is_null_under_parallel_jobs(self):
+        # The counters are process-global, so under --jobs > 1
+        # the interleave the book-end and history stamps already
+        # guard against applies to the preview stamp too: book 1
+        # arms and records, book 2's arm clears those totals and
+        # book 2's own records land in the same counters, and only
+        # then does book 1 stamp its preview — the snapshot would
+        # carry another book's work under book 1's name. Driven
+        # sequentially here with jobs=2 set, the guard condition
+        # itself is what is pinned: the stamp must be null rather
+        # than a racy snapshot, while the jobs<=1 tests above pin
+        # that sequential behaviour is untouched.
+        self._run_books(jobs=2)
+        for stem in ("bookone", "booktwo"):
+            self.assertIsNone(self._preview(stem)["telemetry"])
 
     def test_book_end_payload_telemetry_is_per_book(self):
         path = self._run_books()
