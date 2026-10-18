@@ -107,6 +107,34 @@ is resolved in this order:
      derivation needs, the import fails loudly rather than
      guessing.
 
+Two stored-set refinements keep that order honest. A Supabase
+answer of ZERO rows falls through to derivation, with a note on
+the import: principals earn a stored row whenever a book is
+written at all, so an empty answer means the work has no prod
+rows yet, not that the whole roster is unstored — and taking it
+literally would make every principal Tier 3 and approvable. And
+a config that is present but unparseable (or carries only half
+the Supabase credentials) is a loud error naming the file, for
+the same reason a failed query is: the mistake is the
+operator's to fix, not the store's to derive around.
+
+Book identity is the artefact's work_id when it carries one.
+Without one, every import derives the same fallback — the
+normalized `title:{title}|{author}` shape the staging gate
+uses — and before minting it the importer checks the store for
+a book whose normalized title (and, when both sides name one,
+author) already matches, and adopts that book's identity
+instead; an explicit work_id arriving after a fallback import
+renames the fallback book onto it, push-ledger decisions
+included. One book therefore keeps one store identity across
+artefact variants, and curation recorded under either form
+stays attached to it.
+
+`list` and `report` are read-only: they never create the
+database file, and a store holding no books reports NOT
+IMPORTED rather than RECONCILED — an empty reconciliation is
+not a pass.
+
 Usage:
     python3 tier3_store.py import --preview "preview/<book>.json"
     python3 tier3_store.py list [--work <id-or-title>]
@@ -125,6 +153,7 @@ artefacts and his config live. The database defaults to
 """
 import argparse
 import json
+import re
 import sqlite3
 import sys
 import urllib.error
@@ -251,7 +280,11 @@ def _load_artefact(preview_path):
     if not path.is_file():
         raise Tier3Error(f"preview artefact not found: {path}")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig for the same reason as the stored-names file:
+        # an editor-saved BOM is not part of the JSON, and a
+        # principal-bearing artefact should not fail (or worse,
+        # misread) over an invisible prefix.
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except ValueError as e:
         raise Tier3Error(f"preview artefact is not valid JSON: "
                          f"{path} ({e})")
@@ -305,16 +338,40 @@ def _supabase_stored_names(config_path, work_id):
     None when no usable config exists. A present-but-failing
     query raises: falling back silently would derive a stored set
     that may not match prod, and the review list is only worth
-    anything if its exclusions are true."""
+    anything if its exclusions are true. The same rule covers a
+    config that is present but cannot be read, and one that names
+    only half the Supabase credentials: both are operator errors
+    in a hand-edited file, and silently deriving around them
+    would hide the mistake behind a plausible-looking list. A
+    config carrying neither credential is a different case — it
+    makes no claim about Supabase at all — so it alone falls
+    through to derivation."""
     path = Path(config_path)
     if not path.exists():
         return None
     try:
-        cfg = json.loads(path.read_text(encoding="utf-8"))
-    except ValueError:
-        return None
+        # utf-8-sig: an editor-written BOM must not turn a valid
+        # config into a spurious parse failure.
+        cfg = json.loads(path.read_text(encoding="utf-8-sig"))
+    except ValueError as e:
+        raise Tier3Error(
+            f"processor config is not valid JSON: {path} ({e}) — "
+            f"refusing to derive a stored set around a config "
+            f"that cannot be read. Fix the config or pass "
+            f"--stored-names.")
+    if not isinstance(cfg, dict):
+        raise Tier3Error(
+            f"processor config is not a JSON object: {path} — "
+            f"refusing to derive a stored set around it. Fix the "
+            f"config or pass --stored-names.")
     url = (cfg.get("supabase_url") or "").rstrip("/")
     key = cfg.get("supabase_key") or ""
+    if bool(url) != bool(key):
+        raise Tier3Error(
+            f"processor config {path} carries only one of "
+            f"supabase_url / supabase_key — refusing to guess "
+            f"whether the stored set should come from prod. "
+            f"Complete the config or pass --stored-names.")
     if not url or not key:
         return None
     req = urllib.request.Request(
@@ -368,26 +425,55 @@ def _derive_stored_names(artefact):
     return sorted(stored)
 
 
-def _resolve_stored_set(artefact, work_id, stored_names_path,
-                        config_path):
-    """Returns (names, source) — source is 'stored-names',
+def _resolve_stored_set_detailed(artefact, work_id,
+                                 stored_names_path, config_path):
+    """Returns (names, source, note) — source is 'stored-names',
     'supabase' or 'derived', and is recorded on the book row so a
-    later reader knows how much authority the exclusion set has."""
+    later reader knows how much authority the exclusion set has.
+    The note is set when the resolution had to say something out
+    loud (today: the empty-Supabase fallback below)."""
     if stored_names_path:
         path = Path(stored_names_path)
         if not path.is_file():
             raise Tier3Error(f"stored-names file not found: {path}")
         names = sorted({
             line.strip() for line in
-            path.read_text(encoding="utf-8").splitlines()
+            # utf-8-sig: Windows editors save UTF-8 with a BOM,
+            # and under plain utf-8 the BOM would glue itself to
+            # the first name, which would then match no roster
+            # entry and silently land a stored principal in
+            # Tier 3.
+            path.read_text(encoding="utf-8-sig").splitlines()
             if line.strip() and not line.strip().startswith("#")})
         if not names:
             raise Tier3Error(f"stored-names file is empty: {path}")
-        return names, "stored-names"
+        return names, "stored-names", None
     names = _supabase_stored_names(config_path, work_id)
     if names is not None:
-        return names, "supabase"
-    return _derive_stored_names(artefact), "derived"
+        if names:
+            return names, "supabase", None
+        # An empty prod answer cannot be the whole truth for a
+        # book with principals: principals earn a stored row
+        # whenever the book is written at all, so an empty result
+        # means the work has no prod rows yet (a preview-only run
+        # is the normal posture), not that the whole roster is
+        # unstored. Taking it literally would put every principal
+        # in Tier 3 and make them approvable for push. Derivation
+        # from the artefact is the verified floor instead; if the
+        # artefact cannot support derivation it fails loudly
+        # there, which is the fail-closed outcome.
+        return _derive_stored_names(artefact), "derived", (
+            "Supabase returned no stored rows for this work, so "
+            "the stored set was derived from the artefact "
+            "instead of treating the whole roster as unstored")
+    return _derive_stored_names(artefact), "derived", None
+
+
+def _resolve_stored_set(artefact, work_id, stored_names_path,
+                        config_path):
+    names, source, _note = _resolve_stored_set_detailed(
+        artefact, work_id, stored_names_path, config_path)
+    return names, source
 
 
 # ---------------------------------------------------------------------------
@@ -556,16 +642,131 @@ def _rejected_types_map(conn):
 # the report can reconcile against it later.
 # ---------------------------------------------------------------------------
 
+def _tnorm(text):
+    """The pipeline's title/author normalization (the same shape
+    process-portable's _tnorm and staging_work_key use): lower-
+    case, underscores become spaces, whitespace tidied. Book
+    identity has to fold case and spacing variants of the same
+    title onto one key, or each variant mints its own book."""
+    return re.sub(r"\s+", " ", (text or "").lower()
+                  .replace("_", " ")).strip()
+
+
+def _fallback_work_id(artefact, preview_path):
+    """The ONE fallback identity for an artefact with no work_id,
+    shared by every import: the staging shape, normalized
+    title|author. When the artefact carries no title its file
+    stem stands in for the title — the stem is an input to this
+    one derivation, never a separate identity of its own."""
+    title = artefact.get("title") or Path(preview_path).stem
+    return f"title:{_tnorm(title)}|{_tnorm(artefact.get('author'))}"
+
+
+def _matching_store_book(rows, title, author):
+    """The work_id of an existing store book for this title, or
+    None. Matching is on the normalized title, with the author
+    as a guard: two genuinely different books can share a title,
+    so an author that is present on both sides and differs
+    blocks the match, while a missing author on either side
+    cannot prove a difference. An explicit work_id is preferred
+    over a fallback identity when both somehow exist — the
+    explicit id is the identity prod knows."""
+    wanted = _tnorm(title)
+    if not wanted:
+        return None
+    matches = []
+    for row in rows:
+        if _tnorm(row["title"]) != wanted:
+            continue
+        have, given = _tnorm(row["author"]), _tnorm(author)
+        if have and given and have != given:
+            continue
+        matches.append(row["work_id"])
+    if not matches:
+        return None
+    matches.sort(key=lambda w: (w.startswith("title:"), w))
+    return matches[0]
+
+
+def _resolve_import_identity(db_path, candidate, explicit, title,
+                             author):
+    """Returns (work_id, adopt_from) for an import, checking the
+    store BEFORE anything is written. A work_id-less artefact
+    whose book is already in the store adopts that book's
+    identity, so a re-import replaces the same book instead of
+    minting a second one whose rows never reconcile with the
+    first. An explicit work_id that arrives after a fallback
+    import renames the fallback book onto it (adopt_from), so
+    the push ledger decisions recorded under the fallback key
+    move with the book instead of being stranded. The peek is
+    read-only: resolving identity must never create the store,
+    because the stored-set resolution that follows is allowed to
+    fail and must fail with nothing written."""
+    if not Path(db_path).is_file():
+        return candidate, None
+    try:
+        conn = _connect_readonly(db_path)
+    except sqlite3.Error:
+        return candidate, None
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT work_id, title, author "
+                "FROM tier3_books").fetchall()
+        except sqlite3.Error:
+            return candidate, None
+    finally:
+        conn.close()
+    if any(r["work_id"] == candidate for r in rows):
+        return candidate, None
+    match = _matching_store_book(rows, title, author)
+    if match is None:
+        return candidate, None
+    if explicit:
+        # Two explicit identities for one title are not merged:
+        # they may be genuinely different works. Only a fallback
+        # identity folds into the explicit one.
+        if match.startswith("title:"):
+            return candidate, match
+        return candidate, None
+    return match, None
+
+
+def _rename_work_identity(conn, old, new):
+    """Move every row keyed by a fallback identity onto the
+    explicit work_id that supersedes it. The push ledger is the
+    load-bearing table here — its decisions are the User's
+    curation data — but characters, candidates and the book row
+    move too, so no surface keeps a ghost of the old identity.
+    A ledger row already recorded under the new id wins a
+    collision; the stale copy under the old id is then dropped."""
+    for table in ("tier3_books", "tier3_characters",
+                  "tier3_candidates"):
+        conn.execute(
+            f"UPDATE {table} SET work_id = ? WHERE work_id = ?",
+            (new, old))
+    conn.execute(
+        "UPDATE OR IGNORE push_ledger SET work_id = ? "
+        "WHERE work_id = ?", (new, old))
+    conn.execute("DELETE FROM push_ledger WHERE work_id = ?",
+                 (old,))
+
+
 def import_preview(db_path, preview_path, stored_names_path=None,
                    run_key=None, config_path=DEFAULT_CONFIG):
     artefact = _load_artefact(preview_path)
     roster = _roster(artefact)
-    work_id = artefact.get("work_id") or \
-        f"title:{artefact.get('title') or Path(preview_path).stem}"
     title = artefact.get("title") or Path(preview_path).stem
     run_key = run_key or Path(preview_path).stem
-    stored_names, source = _resolve_stored_set(
-        artefact, work_id, stored_names_path, config_path)
+    explicit_id = artefact.get("work_id")
+    candidate = explicit_id or _fallback_work_id(
+        artefact, preview_path)
+    work_id, adopt_from = _resolve_import_identity(
+        db_path, candidate, bool(explicit_id), title,
+        artefact.get("author"))
+    stored_names, source, stored_note = \
+        _resolve_stored_set_detailed(
+            artefact, work_id, stored_names_path, config_path)
     stored_set = set(stored_names)
     tier3_names = sorted(set(roster) - stored_set)
     absent = sorted(stored_set - set(roster))
@@ -575,6 +776,8 @@ def import_preview(db_path, preview_path, stored_names_path=None,
     conn = _connect(db_path)
     try:
         with conn:
+            if adopt_from is not None:
+                _rename_work_identity(conn, adopt_from, work_id)
             conn.execute("DELETE FROM tier3_characters "
                          "WHERE work_id = ?", (work_id,))
             conn.execute("DELETE FROM tier3_candidates "
@@ -650,6 +853,8 @@ def import_preview(db_path, preview_path, stored_names_path=None,
             set(previously_rejected)),
         "has_chapter_data": bool(
             (artefact.get("chapter_data") or {}).get("chapters")),
+        "stored_set_note": stored_note,
+        "adopted_from": adopt_from,
     }
 
 
@@ -745,6 +950,13 @@ def cmd_import(args):
     print(f"  roster: {result['roster_count']}  ·  stored set: "
           f"{result['stored_count']} via {result['stored_source']}  "
           f"·  Tier 3: {result['tier3_count']}")
+    if result.get("stored_set_note"):
+        print(f"  note: {result['stored_set_note']}")
+    if result.get("adopted_from"):
+        print(f"  note: this book was in the store under the "
+              f"fallback identity {result['adopted_from']} — its "
+              f"rows and push decisions were moved onto "
+              f"{result['work_id']}")
     if result["stored_absent_from_roster"]:
         print(f"  WARNING: {len(result['stored_absent_from_roster'])} "
               f"stored name(s) absent from the roster: "
@@ -769,13 +981,27 @@ def cmd_import(args):
 
 
 def cmd_list(args):
-    conn = _connect(args.db)
+    # Read-only: listing a store that does not exist must say so
+    # without creating one — a mistyped --db path that silently
+    # materializes an empty store reads as an empty library, and
+    # the file then lingers as if it were the real store.
+    if not Path(args.db).is_file():
+        print(f"no Tier 3 store at {args.db} — "
+              f"import a preview first")
+        return 0
+    conn = _connect_readonly(args.db)
     try:
-        if args.work:
-            work_ids = [_resolve_work(conn, args.work)]
-        else:
-            work_ids = [r["work_id"] for r in conn.execute(
-                "SELECT work_id FROM tier3_books ORDER BY title")]
+        try:
+            if args.work:
+                work_ids = [_resolve_work(conn, args.work)]
+            else:
+                work_ids = [r["work_id"] for r in conn.execute(
+                    "SELECT work_id FROM tier3_books "
+                    "ORDER BY title")]
+        except sqlite3.OperationalError:
+            raise Tier3Error(
+                "that file is not a Tier 3 store — import a "
+                "preview first")
         if not work_ids:
             print("the store is empty — import a preview first")
             return 0
@@ -897,10 +1123,31 @@ def cmd_unreject_type(args):
 
 
 def build_report(db_path):
-    conn = _connect(db_path)
+    # Read-only, like the alerts digest: a report must never
+    # create the store it describes, because a mistyped --db
+    # path would otherwise materialize an empty store and the
+    # empty verdict below used to read as a clean bill of
+    # health for a library that was never checked.
+    if not Path(db_path).is_file():
+        return "\n".join([
+            "Tier 3 local store — report",
+            "  books: 0  ·  Tier 3 characters: 0  ·  "
+            "push ledger: 0 decision(s)",
+            "  candidates: none",
+            "  rejected types: 0",
+            "verdict: NOT IMPORTED — no store at that path, "
+            "so no book has been imported",
+        ])
+    conn = _connect_readonly(db_path)
     try:
-        books = conn.execute(
-            "SELECT * FROM tier3_books ORDER BY title").fetchall()
+        try:
+            books = conn.execute(
+                "SELECT * FROM tier3_books ORDER BY title") \
+                .fetchall()
+        except sqlite3.OperationalError:
+            raise Tier3Error(
+                "that file is not a Tier 3 store — import a "
+                "preview first")
         total_chars = conn.execute(
             "SELECT COUNT(*) AS n FROM tier3_characters") \
             .fetchone()["n"]
@@ -941,9 +1188,18 @@ def build_report(db_path):
                 f"{book['roster_count']} == stored "
                 f"{len(stored)} + Tier 3 {tier3_n} = {rhs} — "
                 f"{'PASS' if ok else 'FAIL'}")
-        lines.append(
-            "verdict: " + ("RECONCILED" if all(verdicts)
-                           else "NOT RECONCILED"))
+        if not books:
+            # An empty store has nothing to reconcile: all() of
+            # no verdicts is vacuously true, and printing
+            # RECONCILED for a book that was never imported
+            # would turn a missing import into a pass.
+            lines.append(
+                "verdict: NOT IMPORTED — the store holds no "
+                "books, so there is nothing to reconcile")
+        else:
+            lines.append(
+                "verdict: " + ("RECONCILED" if all(verdicts)
+                               else "NOT RECONCILED"))
         return "\n".join(lines)
     finally:
         conn.close()
