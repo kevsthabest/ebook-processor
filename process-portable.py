@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.52"
+PORTABLE_VERSION = "2.13.53"
 
 
 import argparse
@@ -5886,11 +5886,24 @@ def cmd_ingest(paths, learn_dir=None, reason="", force=False):
         _close_corpus_dbs()
         pdb = CorpusDB.open(d, mode="processor")
         if pdb is not None:
+            by_fp = {r["fingerprint"]: r for r in results}
             for fp in fps:
+                # A failed opening-line stage must be VISIBLE, not
+                # swallowed: the book's text is ingested, so no later
+                # ingest of it re-runs this stage — a silent failure
+                # here means the opening line never lands and nobody
+                # can tell that apart from a book with no usable text.
+                # Name the book and the error, record it on the book's
+                # ingest result, and keep going: one bad book must
+                # not abort the stage for the rest.
                 try:
                     corpus_generate_opening_line(pdb, fp)
-                except Exception:
-                    pass
+                except Exception as e:
+                    detail = f"{type(e).__name__}: {e}"
+                    print(f"  [{fp[:8]}] opening line FAILED — "
+                          f"{detail}")
+                    if fp in by_fp:
+                        by_fp[fp]["opening_line_error"] = detail
     # A standalone ingest dispatch arms the run-history capture in
     # main(); watch-cycle ingests do not (their scan owns the run).
     if _HISTORY_INGEST_CAPTURE:
@@ -6342,10 +6355,28 @@ def cmd_corpus_reembed(learn_dir=None, work=None):
             "IN ('failed', 'ingesting') ORDER BY title, fingerprint")]
     embed_fn, model = emb
     results = []
+    failed = 0
     for fp in fps:
-        outcome = corpus_embed_work(db, fp, embed_fn, model)
+        # Per-work isolation: one work's DB-layer or corrupt-row
+        # failure must not abort the batch and strand every later
+        # work (embedder errors already come back as a "partial"
+        # outcome from inside corpus_embed_work; what escapes is
+        # the non-embedder class). Name the work and its error,
+        # count it, and continue with the rest.
+        try:
+            outcome = corpus_embed_work(db, fp, embed_fn, model)
+        except Exception as e:
+            failed += 1
+            print(f"  [{fp[:8]}] re-embed: FAILED — "
+                  f"{type(e).__name__}: {e}")
+            results.append({"fingerprint": fp, "outcome": "failed",
+                            "detail": f"{type(e).__name__}: {e}"})
+            continue
         print(f"  [{fp[:8]}] re-embed: {outcome} (model {model})")
         results.append({"fingerprint": fp, "outcome": outcome})
+    if failed:
+        print(f"  Re-embed summary: {len(results) - failed} done, "
+              f"{failed} failed (of {len(results)} works)")
     return results
 
 
@@ -19317,8 +19348,34 @@ def cmd_retry_failed(preview_path):
         print(f"  Could not find book file '{fname}' "
               f"(checked cwd and {IMPORT_DIR})")
         return
-    # Seed checkpoints from the successful chapters so --resume skips them.
+    # Refuse to seed over a checkpoint directory a real run owns.
+    # A processing run stamps its checkpoint meta with the book
+    # fingerprint when the run starts, and a finished run clears the
+    # directory when it completes — so a fingerprinted directory
+    # still on disk is an unfinished run's resumable state, exactly
+    # what --resume exists to continue. Clearing it here would
+    # destroy that state to make room for this retry's seeds.
+    # Retry seeds (and pre-fingerprint legacy checkpoints) carry no
+    # fingerprint: nothing live owns them, so they stay retryable
+    # exactly as before.
     book_key = _checkpoint_book_key(fpath)
+    _live_fp = None
+    _meta_path = _checkpoint_dir(book_key) / "meta.json"
+    try:
+        if _meta_path.is_file():
+            with open(_meta_path, encoding="utf-8") as _mf:
+                _live_fp = json.load(_mf).get("fingerprint")
+    except Exception:
+        _live_fp = None
+    if _live_fp:
+        print(f"  Refusing to retry: the checkpoints for '{book_key}' "
+              f"belong to an unfinished run (fingerprint {_live_fp}) "
+              f"and can still be resumed — the live checkpoint was "
+              f"left untouched. Resume that run, or clear "
+              f"preview/.checkpoints/{book_key} once it is finished, "
+              f"then retry.")
+        return
+    # Seed checkpoints from the successful chapters so --resume skips them.
     _checkpoint_clear(book_key)  # start clean
     n_total = len(chapters)
     _checkpoint_save_meta(book_key, n_total)
@@ -27560,6 +27617,15 @@ def _flag_conflicts(args, defaults):
     modes = _present(_RUN_MODE_FLAGS)
     if shots == ["--replay"]:
         modes = [m for m in modes if m != "--file"]
+    if shots == ["--save-profile"]:
+        # --save-profile's whole job is capturing run-shaping
+        # settings, and preview/dry_run are persistable settings it
+        # honours (both are in _PROFILE_PERSISTABLE and _save_profile
+        # writes them): the pairing was never a dropped mode, only a
+        # captured setting, so it is exempt. Every other run-mode
+        # flag beside --save-profile still refuses as before.
+        modes = [m for m in modes
+                 if m not in ("--preview", "--dry-run")]
     if len(shots) == 1 and not modes:
         return None
     parts = []

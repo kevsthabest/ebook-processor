@@ -13,9 +13,20 @@ Needs OPENROUTER_API_KEY (or openrouter_api_key / openrouter_key) in the
 environment for provider=openrouter. Costs fractions of a cent per run
 (Jev: $0.042/MTok input, output free).
 
-Batch size 1 uses the exact single-question production code path and serves
-as the baseline; larger sizes pack N pairs into one request as N questions
-sharing one state block. Agreement is measured against the baseline.
+Batch size 1 is the single-question baseline; larger sizes pack N pairs
+into one request as N questions sharing one state block. Agreement is
+measured against the baseline — and only when batch size 1 was actually
+requested: without it there is no baseline, the run says so, and no
+agreement column is printed.
+
+Baseline honesty: the baseline judges with the production instruction
+text (PRODUCTION_INSTRUCTIONS, copied verbatim from evaluate-merges.py,
+which pins it against production) and the production state shape
+(names + descriptions + evidence, build_same_person_state). Label
+entries that carry no descriptions/evidence therefore run NAME-ONLY,
+and the report names that mode plainly: name-only scores measure a
+judge production never runs, because production's judge always
+receives descriptions and evidence when the book provides them.
 """
 
 import argparse
@@ -30,15 +41,67 @@ OPENROUTER_SYSTEMONE_BASE = "https://openrouter.ai/api/v1"
 OPENROUTER_DECISION_MODEL = "typesafe/jev-1.13"
 OPENROUTER_ATTRIBUTION_TITLE = "ebook-processor"
 
-YES_NO_CRITERIA = (
-    "Are these two names referring to the same person? "
-    "Answer YES when: the names are variants of each other "
-    "(nickname, shortened form, title + surname matching full name, "
-    "same first name with compatible details). "
-    "Answer NO when: different first names, different people with "
-    "similar surnames (siblings, parent/child), or insufficient "
-    "evidence they are the same individual."
+# The production judge instructions, copied verbatim from
+# evaluate-merges.py's PRODUCTION_INSTRUCTIONS (which is itself pinned
+# against DecisionValidator.ask_same_person in process-portable.py by
+# tests/test_jev_eval_harness.py). This script is a standalone artefact
+# and cannot import either file, so the text is duplicated here — if
+# the production text changes, evaluate-merges.py's pin fails and this
+# copy must be updated in the same commit. The previous YES_NO_CRITERIA
+# text (name-variant -> YES, different first names -> NO, insufficient
+# evidence -> NO) was a different judge production never runs, which
+# made every "agreement vs baseline" number a comparison against a
+# name-only judge; it is gone.
+PRODUCTION_INSTRUCTIONS = (
+    "Are these two character entries referring to the same person? "
+    "Answer YES only when there is positive evidence of one identity: "
+    "a supported alias or nickname linking the two names, a reliable "
+    "name variant (shortened form, title change, minor spelling "
+    "difference) with compatible attributes, or contextual evidence "
+    "that both entries describe the same individual. "
+    "Answer NO when the book supports two distinct identities, when "
+    "the descriptions meaningfully contradict each other (roles, "
+    "relationships, or histories one person could not hold), or when "
+    "a deterministic constraint rules the pair out. "
+    "Similar descriptions alone never establish identity: different "
+    "people can share a surname, a role, and a description. "
+    "If the evidence is insufficient either way, score near the "
+    "middle of the scale rather than guessing — an unresolved pair "
+    "stays separate and is reviewed; it is not merged on a guess."
 )
+
+
+def build_same_person_state(name_a, desc_a, ev_a, name_b, desc_b, ev_b):
+    """Assemble the judge state exactly as production does: same
+    parts, same order, same truncation (descriptions 600 chars,
+    evidence 300), empty fields omitted. Mirrors evaluate-merges.py's
+    build_same_person_state; with no descriptions/evidence the state
+    is names only — the name-only mode the report names."""
+    parts = [f"Character A: {name_a}"]
+    if desc_a:
+        parts.append(f"Description A: {desc_a[:600]}")
+    if ev_a:
+        parts.append(f"Evidence A: {ev_a[:300]}")
+    parts.append(f"Character B: {name_b}")
+    if desc_b:
+        parts.append(f"Description B: {desc_b[:600]}")
+    if ev_b:
+        parts.append(f"Evidence B: {ev_b[:300]}")
+    return "\n".join(parts)
+
+
+def _pair_state(lbl):
+    """Production-shape state for one label entry. Legacy label
+    entries may carry desc_a/desc_b/evidence_a/evidence_b; entries
+    without them are name-only."""
+    return build_same_person_state(
+        lbl["a"], lbl.get("desc_a") or "", lbl.get("evidence_a") or "",
+        lbl["b"], lbl.get("desc_b") or "", lbl.get("evidence_b") or "")
+
+
+def _pair_is_name_only(lbl):
+    return not (lbl.get("desc_a") or lbl.get("desc_b")
+                or lbl.get("evidence_a") or lbl.get("evidence_b"))
 
 
 def resolve_provider(provider, base_url, model):
@@ -91,13 +154,19 @@ def _extract_pyes(ans):
     return float(p_yes)
 
 
-def ask_single(base_url, model, api_key, name_a, name_b, extra_headers):
-    """One pair, one question: the production code path (baseline)."""
+def ask_single(base_url, model, api_key, name_a, name_b, extra_headers,
+               desc_a="", ev_a="", desc_b="", ev_b=""):
+    """One pair, one question: the baseline. The state is the
+    production shape (build_same_person_state) and the instructions
+    are the production text — a caller with only names gets a
+    name-only state, which the run report names as such."""
     payload = {
         "model": model or "default",
-        "state": f"Character A: {name_a}\nCharacter B: {name_b}",
+        "state": build_same_person_state(name_a, desc_a, ev_a,
+                                         name_b, desc_b, ev_b),
         "questions": {
-            "same_person": {"type": "noul", "instructions": YES_NO_CRITERIA},
+            "same_person": {"type": "noul",
+                            "instructions": PRODUCTION_INSTRUCTIONS},
         },
     }
     try:
@@ -120,11 +189,11 @@ def ask_batched(base_url, model, api_key, pairs, extra_headers):
     for i, (key, lbl) in enumerate(pairs):
         tag = f"pair_{i}"
         keys.append((tag, key))
-        state_parts.append(
-            f"Pair {i + 1}:\nCharacter A: {lbl['a']}\nCharacter B: {lbl['b']}")
+        state_parts.append(f"Pair {i + 1}:\n{_pair_state(lbl)}")
         questions[tag] = {
             "type": "noul",
-            "instructions": f"For Pair {i + 1} in the state above. {YES_NO_CRITERIA}",
+            "instructions": f"For Pair {i + 1} in the state above. "
+                            f"{PRODUCTION_INSTRUCTIONS}",
         }
     payload = {
         "model": model or "default",
@@ -168,7 +237,9 @@ def main():
     ap.add_argument('--model', default='')
     ap.add_argument('--threshold', type=float, default=0.85)
     ap.add_argument('--batch-sizes', default='1,5,10',
-                    help='comma-separated batch sizes; 1 = single-question baseline')
+                    help='comma-separated batch sizes; 1 = single-question '
+                         'baseline (optional — without it, no agreement '
+                         'against a baseline is reported)')
     ap.add_argument('--max-pairs', type=int, default=0,
                     help='limit pairs for a quick probe (0 = all)')
     args = ap.parse_args()
@@ -181,11 +252,43 @@ def main():
         sys.exit(2)
 
     labels = json.load(open(args.labels, encoding='utf-8'))
-    pairs = [(k, v) for k, v in labels.items() if not v.get('uncertain')]
+    # A malformed entry (missing a/b/same_person, or not an object at
+    # all) is reported by key and skipped BEFORE any API spend —
+    # never discovered as a KeyError traceback after every requested
+    # batch has already been paid for.
+    pairs = []
+    malformed = []
+    for k, v in labels.items():
+        if not isinstance(v, dict):
+            malformed.append((k, "entry is not an object"))
+            continue
+        if v.get('uncertain'):
+            continue
+        missing = [f for f in ('a', 'b', 'same_person') if f not in v]
+        if missing:
+            malformed.append((k, f"missing {', '.join(missing)}"))
+            continue
+        pairs.append((k, v))
+    for k, why in malformed:
+        print(f"  MALFORMED pair {k!r}: {why} — skipped")
+    if malformed:
+        print(f"{len(malformed)} malformed pair(s) skipped")
     if args.max_pairs:
         pairs = pairs[:args.max_pairs]
     print(f"{len(pairs)} labeled pairs, threshold={args.threshold}, "
-          f"provider={args.provider} model={model or 'default'}\n")
+          f"provider={args.provider} model={model or 'default'}")
+    # Name the judge mode honestly, the way evaluate-merges.py does:
+    # pairs without descriptions/evidence are judged name-only, and
+    # name-only scores measure a judge production never runs.
+    n_name_only = sum(1 for _k, lbl in pairs if _pair_is_name_only(lbl))
+    print(f"Pair modes: {len(pairs) - n_name_only} with "
+          f"descriptions/evidence (production shape), "
+          f"{n_name_only} name-only")
+    if n_name_only and n_name_only == len(pairs):
+        print("WARNING: every pair is name-only — these scores measure "
+              "a name-only judge, NOT production, which receives "
+              "descriptions + evidence.")
+    print()
 
     batch_sizes = [int(s) for s in args.batch_sizes.split(',')]
     all_scores = {}  # batch_size -> {pair_key: p_yes}
@@ -196,7 +299,11 @@ def main():
             for i, (key, lbl) in enumerate(pairs):
                 scores[key] = ask_single(
                     base_url, model, api_key,
-                    lbl['a'], lbl['b'], extra_headers)
+                    lbl['a'], lbl['b'], extra_headers,
+                    desc_a=lbl.get("desc_a") or "",
+                    ev_a=lbl.get("evidence_a") or "",
+                    desc_b=lbl.get("desc_b") or "",
+                    ev_b=lbl.get("evidence_b") or "")
                 if (i + 1) % 20 == 0:
                     print(f"  [bs=1] {i + 1}/{len(pairs)}")
         else:
@@ -207,8 +314,21 @@ def main():
                 print(f"  [bs={bs}] {min(i + bs, len(pairs))}/{len(pairs)}")
         all_scores[bs] = scores
 
-    baseline = all_scores[1]
+    # The baseline exists only if batch size 1 was requested. The old
+    # code indexed all_scores[1] unconditionally and died with a
+    # KeyError after every requested batch had completed — all the
+    # API spend done, no results printed.
+    baseline = all_scores.get(1)
     print(f"\n=== RESULTS (threshold={args.threshold}) ===")
+    if baseline is None:
+        print("No single-question baseline: batch size 1 was not "
+              "requested, so agreement against a baseline is not "
+              "reported (pass --batch-sizes including 1 to measure it).")
+    else:
+        print("Baseline: batch size 1 (single-question), production "
+              "instructions + production state shape"
+              + (" — name-only pairs, see the pair-modes warning above"
+                 if n_name_only else ""))
     for bs in batch_sizes:
         scored = [(labels[k]['same_person'], s)
                   for k, s in all_scores[bs].items() if s is not None]
@@ -216,7 +336,7 @@ def main():
         line = (f"batch={bs:<3} n={total:<4} acc={acc:.2%} "
                 f"prec={prec:.2%} rec={rec:.2%} "
                 f"(TP={tp} TN={tn} FP={fp} FN={fn})")
-        if bs != 1:
+        if bs != 1 and baseline is not None:
             agree = sum(1 for k in all_scores[bs]
                         if all_scores[bs][k] is not None
                         and baseline.get(k) is not None
@@ -239,9 +359,12 @@ def main():
                     line += f"\n    {k}: single={sb:.2f} batch={bb:.2f}"
         print(line)
 
-    n_calls = {1: len(pairs)}
-    for bs in batch_sizes[1:]:
-        n_calls[bs] = (len(pairs) + bs - 1) // bs
+    # Only batches that actually ran get a tally — the old seed entry
+    # for batch 1 fabricated a call count for a batch that may never
+    # have been requested.
+    n_calls = {bs: len(pairs) if bs == 1
+               else (len(pairs) + bs - 1) // bs
+               for bs in batch_sizes}
     print(f"\nAPI calls used: "
           + ", ".join(f"batch={bs}: {n_calls[bs]}" for bs in batch_sizes))
 
