@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.31"
+PORTABLE_VERSION = "2.13.32"
 
 
 import argparse
@@ -16263,6 +16263,17 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     relationships = []
     _guard_suppressed = []  # non-family claims suppressed by the family guard
     _direction_contradictions = []  # pairs flagged by the direction guard
+    # Runner-up revival bookkeeping (F-24-1): every candidate that
+    # passes the unknown-type filter but loses its pair's
+    # competition is recorded in _pair_losers for the artefact —
+    # the reduce used to discard them silently, so when the winner
+    # later died in validation the pair's whole relationship
+    # vanished without a trace. _pair_revival holds, per pair, the
+    # ONE claim eligible to revive if the winner is rejected: the
+    # family-guard suppressed claim when the guard fired (it was
+    # the would-be winner), else the highest-ranked loser.
+    _pair_losers = []
+    _pair_revival = {}
     _CONF_RANK = {"high": 0, "medium": 1, "low": 2}
     _TYPE_SPEC_RANK = {"specific": 0, "moderate": 1, "vague": 2}
     for _pair_key, cands in _pair_cands.items():
@@ -16286,6 +16297,12 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # Best: highest confidence, then most specific type, then evidence,
         # then earliest chapter.
         _scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        # The full ranked pool, snapshotted before the family
+        # guard narrows _scored: the loser record and the revival
+        # candidate are facts about the whole competition, not
+        # about whichever subset the guard leaves standing.
+        _pool = _scored
+        _sup = None
         # Direction guard: computed over ALL the pair's candidates,
         # before the family guard narrows the pool — a contradiction
         # is a fact about everything extraction claimed for the
@@ -16334,6 +16351,46 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 "from": _rel["from"], "to": _rel["to"],
                 "types": _contra["types"]})
         relationships.append(_rel)
+        # Losers + revival candidate (F-24-1). Every candidate
+        # that passed the unknown-type filter but lost is recorded
+        # for the artefact — except the guard-suppressed claim,
+        # which already has its own audit record (it lands in
+        # dropped_relationships via _guard_suppressed) and so is
+        # excluded here to keep that record canonical. The revival
+        # candidate is the suppressed claim when the guard fired,
+        # else the highest-ranked loser, built into a full claim
+        # exactly as the winner was; validation decides later
+        # whether it is ever used.
+        _winner_type = _w["type"]
+        if _sup is not None:
+            if _contra:
+                _sup_rel["direction_contradiction"] = _contra
+            _pair_revival[_pair_key] = _sup_rel
+        elif len(_pool) > 1:
+            _r = _pool[1]
+            _rc = {k: v for k, v in _r[7].items()
+                   if not k.startswith("_")}
+            _rc["confidence"] = _r[4]
+            _rc["evidence_count"] = _r[5]
+            _rc["cooccurrence_count"] = _r[6]
+            if _contra:
+                _rc["direction_contradiction"] = _contra
+            _pair_revival[_pair_key] = _rc
+        if len(_pool) > 1:
+            for _s in _pool:
+                _lc = _s[7]
+                if _lc is _w or (_sup is not None
+                                 and _lc is _sup[7]):
+                    continue
+                _pair_losers.append({
+                    "from": _lc["from"], "to": _lc["to"],
+                    "type": _lc["type"],
+                    "confidence": _s[4],
+                    "evidence_count": _s[5],
+                    "cooccurrence_count": _s[6],
+                    "chapter": _lc.get("chapter", ""),
+                    "lost_to_type": _winner_type,
+                })
 
     # --- Relationship importance: 1-5 from chapter co-occurrence ---
     # More chapters together = more important. Scaled to book length.
@@ -16356,6 +16413,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     # In preview mode scores/notes are recorded but nothing is changed.
     # Draws from the shared per-book decision-model budget (merges first).
     _dropped_relationships = []
+    # Winners rejected in validation (evidence-stage fail-closed
+    # or a judge draw below the drop threshold), in pass order:
+    # the revival phase after both passes gives each such pair's
+    # runner-up its one chance (F-24-1).
+    _dead_winners = []
     # Pair-evidence mining: a family claim's single extracted quote is
     # often topical rather than establishing, and the validator can
     # only judge what it is shown (FW -13: Fen->Xaden parent dropped
@@ -16505,10 +16567,17 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         _val_stats["errors"] += 1
         return None, "error"
 
-    for rel in _ordered_rels:
+    def _validate_family_claim(rel):
+        """Validate ONE family claim through the family stage's
+        rules (mining, fail-closed evidence bar, judging, the
+        keep / downgrade / drop tiers) and return its fate:
+        "kept", "downgraded", "budget", "error", "unvalidated"
+        (no validator configured), or the two rejections —
+        "no_evidence" and "dropped". The family pass below and
+        the runner-up revival phase both call this, so a revived
+        family claim is judged by exactly the rules a winning
+        family claim was judged by, never by a parallel copy."""
         _rt = rel.get("type", "")
-        if _rt not in _REL_FAMILY_TYPES:
-            continue
         _ev = (rel.get("evidence") or "").strip()
         _mined = _mine(rel["from"], rel["to"])
         if _mined:
@@ -16538,9 +16607,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             rel["validation_note"] = "no_evidence"
             if not preview:
                 _dropped_relationships.append(rel)
-            continue
+            return "no_evidence"
         if _DECISION_VALIDATOR is None:
-            continue  # no validator configured; leave as-is
+            return "unvalidated"  # no validator configured; as-is
         _stamp_provenance(
             rel, _ev,
             _mined["chapter"] if (rel.get("evidence_mined")
@@ -16553,18 +16622,19 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             rel, _rt, _ev, _ctx, "rel_family")
         if _outcome == "budget":
             rel["validation_note"] = "budget_exhausted"
-            continue
+            return "budget"
         if _p is None:
             # Validator error (after its one retry): fail open,
             # keep the original type, and record the failure as a
             # failure — never as a successful judgment.
             rel["validation_note"] = "validator_error"
-            continue
+            return "error"
         rel["validation_p"] = round(_p, 4)
         rel["validation_model"] = _DECISION_VALIDATOR.model
         if _p >= _REL_VALIDATION_THRESHOLD:
             rel["validation_note"] = "kept"
-        elif _p >= _REL_DROP_THRESHOLD:
+            return "kept"
+        if _p >= _REL_DROP_THRESHOLD:
             rel["validation_note"] = "downgraded"
             if not preview:
                 # Provenance stamp: the rewrite below erases the
@@ -16580,11 +16650,22 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 if rel.get("type") not in (None, "other"):
                     rel["claimed_type"] = rel["type"]
                 rel["type"] = "other"
-        else:
-            # Very low P: likely hallucinated. Drop (audit in preview).
-            rel["validation_note"] = "dropped" if not preview else "would_drop"
-            if not preview:
-                _dropped_relationships.append(rel)
+            return "downgraded"
+        # Very low P: likely hallucinated. Drop (audit in preview).
+        rel["validation_note"] = "dropped" if not preview else "would_drop"
+        if not preview:
+            _dropped_relationships.append(rel)
+        return "dropped"
+
+    for rel in _ordered_rels:
+        if rel.get("type", "") not in _REL_FAMILY_TYPES:
+            continue
+        _fate = _validate_family_claim(rel)
+        if _fate in ("no_evidence", "dropped"):
+            _dead_winners.append({
+                "pair_key": tuple(sorted(
+                    [rel["from"].lower(), rel["to"].lower()])),
+                "type": rel.get("type", ""), "fate": _fate})
     # The family stage is done: its unused reserve becomes
     # borrowable by the non-family pass and everything after it
     # (spec §1.3).
@@ -16609,48 +16690,141 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     # too, already judged). Evidence-less, unmineable claims are
     # left untouched: with nothing to judge, the write pass's
     # mined-evidence rules decide them, as before.
+    def _validate_nonfamily_claim(rel):
+        """Validate ONE non-family claim through the non-family
+        stage's rules and return its fate: "kept", "budget",
+        "error", "dropped", "skipped" (family / "other" — not
+        this stage's business), or "unvalidated" (nothing to
+        judge: no quote and no mineable sentence — the claim is
+        left untouched, exactly as the pass below leaves it).
+        The pass and the runner-up revival phase share this, so
+        a revived non-family claim is judged by the same rules
+        as a winning one. Callers gate on a configured validator,
+        as the pass itself does."""
+        _rt = rel.get("type", "")
+        if _rt in _REL_FAMILY_TYPES or _rt == "other":
+            return "skipped"
+        _ev = (rel.get("evidence") or "").strip()
+        _mined = None
+        if not _ev:
+            _mined = _mine(rel["from"], rel["to"])
+            if _mined:
+                _ev = _mined["sentence"]
+                rel["evidence_grade"] = _mined["grade"]
+        if not _ev:
+            return "unvalidated"
+        if _mined:
+            _stamp_provenance(rel, _ev, _mined["chapter"])
+        _ctx = _validation_context(
+            _ev, rel, _mined["chapter"] if _mined else None)
+        _p, _outcome = _judge_relationship(
+            rel, _rt, _ev, _ctx, "rel_nonfamily")
+        if _outcome == "budget":
+            rel["validation_note"] = "budget_exhausted"
+            return "budget"
+        if _p is None:
+            # Validator error (after its one retry): fail
+            # open, as for family claims.
+            rel["validation_note"] = "validator_error"
+            return "error"
+        rel["validation_p"] = round(_p, 4)
+        rel["validation_model"] = _DECISION_VALIDATOR.model
+        if _p >= _REL_DROP_THRESHOLD:
+            rel["validation_note"] = "kept"
+            return "kept"
+        rel["validation_note"] = ("dropped" if not preview
+                                  else "would_drop")
+        if not preview:
+            _dropped_relationships.append(rel)
+        return "dropped"
+
     if _DECISION_VALIDATOR is not None:
         for rel in _ordered_rels:
-            _rt = rel.get("type", "")
-            if _rt in _REL_FAMILY_TYPES or _rt == "other":
-                continue
-            _ev = (rel.get("evidence") or "").strip()
-            _mined = None
-            if not _ev:
-                _mined = _mine(rel["from"], rel["to"])
-                if _mined:
-                    _ev = _mined["sentence"]
-                    rel["evidence_grade"] = _mined["grade"]
-            if not _ev:
-                continue
-            if _mined:
-                _stamp_provenance(rel, _ev, _mined["chapter"])
-            _ctx = _validation_context(
-                _ev, rel, _mined["chapter"] if _mined else None)
-            _p, _outcome = _judge_relationship(
-                rel, _rt, _ev, _ctx, "rel_nonfamily")
-            if _outcome == "budget":
-                rel["validation_note"] = "budget_exhausted"
-                continue
-            if _p is None:
-                # Validator error (after its one retry): fail
-                # open, as for family claims.
-                rel["validation_note"] = "validator_error"
-                continue
-            rel["validation_p"] = round(_p, 4)
-            rel["validation_model"] = _DECISION_VALIDATOR.model
-            if _p >= _REL_DROP_THRESHOLD:
-                rel["validation_note"] = "kept"
-            else:
-                rel["validation_note"] = ("dropped" if not preview
-                                          else "would_drop")
-                if not preview:
-                    _dropped_relationships.append(rel)
+            _fate = _validate_nonfamily_claim(rel)
+            if _fate == "dropped":
+                _dead_winners.append({
+                    "pair_key": tuple(sorted(
+                        [rel["from"].lower(), rel["to"].lower()])),
+                    "type": rel.get("type", ""), "fate": "dropped"})
     if _dropped_relationships:
         _drop_ids = {id(r) for r in _dropped_relationships}
         relationships = [r for r in relationships if id(r) not in _drop_ids]
         print(f"  Relationship validation: dropped "
               f"{len(_dropped_relationships)} hallucinated relationship(s)")
+    # --- Runner-up revival (F-24-1) ---
+    # A pair whose winning claim was rejected — fail-closed at
+    # the evidence stage or drawn and dropped — used to ship
+    # nothing at all: the reduce had already discarded every
+    # other claim for the pair, so one bad winner annihilated
+    # the pair's whole relationship (Fourth Wing run 24: an
+    # evidence-free "parent" hallucination outranked 17
+    # evidence-bearing "romantic" claims for the central pair,
+    # then died with no evidence of its own). Each dead winner's
+    # pair now gets ONE revival: its best losing candidate (the
+    # guard-suppressed claim when the guard fired, else the
+    # highest-ranked loser) re-enters validation through the
+    # normal path for its class, drawing on the budget exactly
+    # as the stages left it. If the budget cannot pay, the
+    # revived claim ships unjudged as review_required instead
+    # of vanishing. A revived claim that is itself rejected
+    # ends the pair — there is no second revival.
+    # Revival is a validation-stage mechanism, so it exists
+    # only when a validator is configured: in an unjudged run
+    # nothing was rejected BY validation, the fail-closed
+    # evidence drop stands as the pair's whole outcome (the
+    # family guard's pinned contract), and the run's output is
+    # unchanged from before this phase existed.
+    for _dead in (_dead_winners
+                  if _DECISION_VALIDATOR is not None else ()):
+        _cand = _pair_revival.get(_dead["pair_key"])
+        if _cand is None:
+            continue
+        # A guard-suppressed candidate that revives ships as a
+        # claim, so it must not ALSO land in dropped_relationships
+        # as the guard's audit record — take it out of the guard
+        # list before the extension below. (Identity, not
+        # equality: the list holds the very dict registered as
+        # this pair's revival candidate.)
+        _guard_suppressed = [g for g in _guard_suppressed
+                             if g is not _cand]
+        _cand["revived_runner_up"] = True
+        _cand["revived_over_type"] = _dead["type"]
+        _cand["revived_over_fate"] = _dead["fate"]
+        # Importance was computed for the winners right after
+        # the competition; a revived claim is a survivor too and
+        # gets the same stamp from the same formula.
+        _cand["importance"] = max(
+            1, min(5, round(1 + 4 * len(
+                _pair_chapters.get(_dead["pair_key"], set()))
+                / max(1, _n_chapters * 0.2))))
+        # Provenance from its own evidence, as the pre-validation
+        # pass stamped every winning claim; the class validators
+        # re-stamp from the judged evidence where they replace it.
+        _stamp_provenance(_cand, (_cand.get("evidence") or "").strip())
+        _cand_type = _cand.get("type", "")
+        if _cand_type in _REL_FAMILY_TYPES:
+            _fate = _validate_family_claim(_cand)
+        else:
+            _fate = _validate_nonfamily_claim(_cand)
+        if _fate == "budget":
+            # The draw was denied. The claim ships unjudged as
+            # review_required (the ruled floor for a revival),
+            # not with the budget_exhausted state a winning claim
+            # carries: clearing the note is what makes the state
+            # derivation say so, and the revival stamp above plus
+            # this console line carry the budget fact.
+            _cand.pop("validation_note", None)
+            _fate = "review_required"
+        if preview or _fate not in ("no_evidence", "dropped"):
+            # Write mode + rejected: the class validator already
+            # placed the claim in dropped_relationships; it must
+            # not also ship. Preview changes nothing: the claim
+            # stays visible with its recorded outcome, exactly as
+            # a winning claim's preview outcome stays visible.
+            relationships.append(_cand)
+        print(f"  Runner-up revival: {_cand['from']} / {_cand['to']} "
+              f"'{_cand_type}' revived over '{_dead['type']}' "
+              f"({_dead['fate']}); outcome: {_fate}")
     if _guard_suppressed:
         # Audit trail only: these claims lost to a family claim for the
         # same pair (family guard above); they were never emitted.
@@ -17112,6 +17286,16 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         "characters": characters,
         "relationships": relationships,
         "dropped_relationships": _dropped_relationships,
+        # Per-pair competition losers (F-24-1): every candidate
+        # that passed the type filter but lost its pair's
+        # competition, recorded so a pair whose winner later died
+        # in validation is auditable instead of inexplicable.
+        # Deliberately NOT part of dropped_relationships: losers
+        # were never validated, and that list's semantics feed
+        # history outcomes and the Tier 3 importer — a loser must
+        # fabricate neither an outcome row nor a curation
+        # candidate.
+        "pair_losers": _pair_losers,
         # The validation order in effect and the circuit-breaker
         # outcome (spec §1.2 / §1.6): recorded on the result so
         # the preview, the write gate, and run history all carry
@@ -24496,6 +24680,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         "triggers": red["triggers"], "characters": red["characters"],
         "relationships": red["relationships"],
         "dropped_relationships": red.get("dropped_relationships", []),
+        "pair_losers": red.get("pair_losers", []),
         "validation_order": red.get("validation_order"),
         "rel_registry": red.get("rel_registry"),
         "relationship_type_vocabulary": red.get(
