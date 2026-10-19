@@ -190,6 +190,7 @@ class ConsoleStore:
         self.books = {}
         self.book_order = []
         self.run_state = "pending"
+        self.run_log = deque(maxlen=1000)
         self.stale_books = set()
         self.last_seq = 0
 
@@ -221,6 +222,13 @@ class ConsoleStore:
         if kind == "run_state":
             self.run_state = payload.get("state", self.run_state)
             return
+        if kind == "log":
+            # Run-level log lines (the pipeline's printed output,
+            # routed by the console) often carry no book context;
+            # they still belong in the run log view.
+            self.run_log.append(payload.get("text", ""))
+            if book_id is None:
+                return
         if book_id is None:
             return
         book = self._book(book_id)

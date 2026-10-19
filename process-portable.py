@@ -48,7 +48,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.66"
+PORTABLE_VERSION = "2.13.67"
 
 
 import argparse
@@ -18303,6 +18303,9 @@ class PipelineUI:
         # attached only when a console consumer exists. None means
         # every console hook below is a no-op.
         self._console_observer = None
+        # Cumulative per-book character sightings for the console's
+        # Characters table (book_key -> {name: chapter count}).
+        self._console_char_counts = {}
 
     def set_viz_enabled(self, enabled):
         """Enable/disable the chapter visualizer panel (--no-viz)."""
@@ -18463,7 +18466,8 @@ class PipelineUI:
                               payload={"pass_id": "identity",
                                        "index": chap_idx,
                                        "label": chapter_label or "",
-                                       "state": "started"})
+                                       "state": "started",
+                                       "excerpt": (text or "")[:1100]})
         if not self._viz_usable():
             return
         with self._lock:
@@ -18508,6 +18512,23 @@ class PipelineUI:
 
     def viz_characters(self, book_key, characters):
         """Highlight identified names after Call A returns."""
+        # Console hook: each chapter's identified names become
+        # candidate rows, counted by the chapters they appear in.
+        # Fires regardless of the Rich visualizer, like viz_chapter.
+        if self._console_observer is not None:
+            counts = self._console_char_counts.setdefault(book_key, {})
+            seen = set()
+            for c in (characters or []):
+                n = (c.get("name") or "").strip()
+                if n and n not in seen:
+                    seen.add(n)
+                    counts[n] = counts.get(n, 0) + 1
+                    self._console_publish(
+                        "candidate_upsert", book_key,
+                        payload={"table": "characters", "key": n,
+                                 "record": {"name": n,
+                                            "chapters": counts[n],
+                                            "status": "candidate"}})
         if not self._viz_usable():
             return
         names = []
@@ -28243,6 +28264,67 @@ def _corpus_only_filter(files):
     return kept
 
 
+def _tui_unavailable_reason():
+    """Why the Textual console cannot start here, or None if it can.
+
+    Selection follows the console spec §8.1: the console needs an
+    interactive terminal and the optional textual package. Every
+    failure degrades to the standard console with one warning, never
+    to a failed run.
+    """
+    import importlib.util
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return "not an interactive terminal"
+    if importlib.util.find_spec("textual") is None:
+        return "textual is not installed (pip install textual)"
+    if importlib.util.find_spec("console_events") is None:
+        return "the console_events module is not alongside this script"
+    if importlib.util.find_spec("console_app") is None:
+        return "the console_app module is not alongside this script"
+    return None
+
+
+def _run_with_tui(args):
+    """Run the processing pass under the Textual console.
+
+    Returns True/False for the run's success once the run has been
+    handed to the console's worker, or None when the console cannot
+    start — the caller then runs the standard path, so a console
+    problem never becomes a run problem.
+    """
+    reason = _tui_unavailable_reason()
+    if reason is not None:
+        print(f"  --tui: {reason}; using the standard console")
+        return None
+    try:
+        import console_app
+        import console_events
+    except Exception:
+        print("  --tui: console modules failed to load; "
+              "using the standard console")
+        return None
+    observer = console_events.ConsoleObserver()
+    store = console_events.ConsoleStore()
+    UI.attach_console(observer)
+    mode = ("Preview" if args.preview else
+            "Dry run" if args.dry_run else "Live write")
+    observer.publish("run_state", payload={"state": "running",
+                                           "mode": mode})
+    try:
+        outcome = console_app.run_console(
+            observer, store,
+            lambda: run_once(args.dry_run, args.preview,
+                             args.max_books, args.file))
+    finally:
+        observer.publish("run_state", payload={"state": "finished"})
+        UI.attach_console(None)
+    if outcome is None:
+        print("  --tui: console failed to start; "
+              "using the standard console")
+        return None
+    return bool(outcome.get("ok"))
+
+
 def run_once(dry_run, preview, max_books=None, file=None):
     if file:
         p = Path(file)
@@ -28421,7 +28503,7 @@ _PROFILE_PERSISTABLE = frozenset({
     "preview", "preview_summary", "principals_only", "prompt_cache",
     "rename_no_isbn", "roster_reconcile", "run_history", "sample",
     "shared_system", "show_matrices", "staging_gate", "task_last",
-    "use_corpus",
+    "tui", "use_corpus",
 })
 
 # Dests that --save-profile never persists and --profile never
@@ -28846,6 +28928,9 @@ def _build_parser():
                          "reprocessing; exits without processing books")
     g_out.add_argument("--no-viz", action="store_true",
                     help="disable the chapter visualizer panel in the Rich TUI")
+    g_out.add_argument("--tui", action="store_true",
+                    help="open the Textual inspection console for the run "
+                         "(read-only; requires textual — pip install textual)")
     g_out.add_argument("--push-preview", metavar="PREVIEW_JSON",
                     help="push a preview JSON to Supabase without re-running the LLM")
     g_out.add_argument("--verify", metavar="PREVIEW_JSON",
@@ -29585,6 +29670,9 @@ def main():
         sys.exit(_code)
 
     if args.watch:
+        if getattr(args, "tui", False):
+            print("  --tui: the console covers single runs, not "
+                  "--watch; using the standard console")
         print(f"Watching {IMPORT_DIR}... (Ctrl+C to stop)")
         try:
             while True:
@@ -29598,7 +29686,11 @@ def main():
         except KeyboardInterrupt:
             print("\nStopped.")
     else:
-        sys.exit(1 if run_once(args.dry_run, args.preview, args.max_books, args.file) else 0)
+        _ok = _run_with_tui(args) if getattr(args, "tui", False) else None
+        if _ok is None:
+            _ok = run_once(args.dry_run, args.preview,
+                           args.max_books, args.file)
+        sys.exit(1 if _ok else 0)
 
 
 if __name__ == "__main__":
