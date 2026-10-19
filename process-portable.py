@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.61"
+PORTABLE_VERSION = "2.13.62"
 
 
 import argparse
@@ -15280,7 +15280,15 @@ def _roster_update(roster, characters, chapter_idx):
                         break
                 else:
                     found = None
-            if _generic_keys:
+            # Rule 4 is a fallback, not a trump: it runs only when the
+            # primary, learned, and tiered rules above all missed. A
+            # generic alias is weak evidence — chapters tag properly
+            # named characters with "I" in quoted narration and frame
+            # narration — so it must never override a deterministic
+            # match. Letting it overwrite `found` folds the character
+            # into the narrator entry, and the fold then persists that
+            # wrong mapping into the learned store for later books.
+            if found is None and _generic_keys:
                 for k, e in roster.items():
                     _e_generic = ({k} | e["alias_keys"]) & _GENERIC_ALIASES
                     # Also check stored generic keys from when entry was created
