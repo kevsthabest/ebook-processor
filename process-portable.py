@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.63"
+PORTABLE_VERSION = "2.13.64"
 
 
 import argparse
@@ -23344,8 +23344,25 @@ def _merge_tier(a_key, b_key, chapter_keys=None, a_chapters=None,
         return "yes"
     if len(sa) == len(sb) and len(sa) >= 2 and not _learned_clash:
         # Spelling variant: one differing token pair ("joseph"/"josef").
-        _diffs = [(x, y) for x, y in zip(sa, sb) if x != y]
-        if len(_diffs) == 1 and _is_spelling_variant(*_diffs[0]):
+        _diff_at = [i for i, (x, y) in enumerate(zip(sa, sb)) if x != y]
+        if len(_diff_at) == 1 and _is_spelling_variant(
+                sa[_diff_at[0]], sb[_diff_at[0]]):
+            # Where the differing token sits decides whether this
+            # shape can be trusted. A differing surname (or later
+            # token) is anchored by the identical given name, so the
+            # pair is one person spelled two ways. A differing GIVEN
+            # name has no such anchor: "sara smith"/"sarah smith"
+            # (two standard names, often two different people) and
+            # "joseph pavlos"/"josef pavlos" (one person, spelled
+            # inconsistently) are formally the same shape, and no
+            # deterministic rule can tell them apart — merging them
+            # here was a standing false-merge source. Given-name
+            # variant pairs are deferred to the Tier 3 judge as
+            # ambiguous. Nickname pairs are exempt from the demotion:
+            # a curated nickname link is a different, stronger signal
+            # than a spelling resemblance, and it keeps its YES.
+            if _diff_at[0] == 0 and not _nick_pair(sa[0], sb[0]):
+                return "ambiguous"
             return "yes"
         # Nickname: known pair on the first token, rest identical.
         if sa[1:] == sb[1:] and _nick_pair(sa[0], sb[0]):
@@ -23364,9 +23381,16 @@ def _merge_tier(a_key, b_key, chapter_keys=None, a_chapters=None,
             return "no"
     # Surname-family trap: same surname, incompatible first names -> hard NO.
     # (The prototype's #1 false-merge source; the decision model still gets
-    # these wrong sometimes, so they never reach Tier 3.)
+    # these wrong sometimes, so they never reach Tier 3.) One blocked shape
+    # is excepted, below: a given name that is a spelling variant of the
+    # other is genuinely undecidable at this tier, so it is deferred to
+    # the judge rather than hard-blocked.
     _blocked, _ = _surname_trap_blocked(a_key, b_key)
     if _blocked:
+        _ta = _strip_merge_noise(a_key)
+        _tb = _strip_merge_noise(b_key)
+        if _ta and _tb and _is_spelling_variant(_ta[0], _tb[0]):
+            return "ambiguous"
         return "no"
     return "ambiguous"
 
@@ -25196,7 +25220,15 @@ def _surname_trap_blocked(a_key, b_key):
 
     Same surname with incompatible first names (e.g. 'chris sebeck' vs
     'peter sebeck') are family members, not the same person. Extracted
-    from _merge_tier(); the condition is unchanged.
+    from _merge_tier().
+
+    A spelling-variant first name ('sara' vs 'sarah') counts as
+    incompatible here: this function's job is only to flag the shape.
+    It used to exempt variant pairs outright, so they slipped past the
+    trap unexamined. _merge_tier defers exactly this blocked shape to
+    the Tier 3 judge instead of letting the trap hard-block it,
+    because a variant given name can be either a relative or one
+    person spelled two ways, and only evidence can tell which.
     """
     sa = _strip_merge_noise(a_key)
     sb = _strip_merge_noise(b_key)
@@ -25204,7 +25236,6 @@ def _surname_trap_blocked(a_key, b_key):
         fa, fb = sa[0], sb[0]
         if (fa != fb and len(fa) >= 3 and len(fb) >= 3
                 and not _nick_pair(fa, fb)
-                and not _is_spelling_variant(fa, fb)
                 and len(fa) > 1 and len(fb) > 1):
             return True, f"surname trap (family members sharing '{sa[-1]}')"
     return False, ""

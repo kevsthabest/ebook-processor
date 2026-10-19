@@ -2080,8 +2080,14 @@ class TestHybridMerge(unittest.TestCase):
             pp._merge_tier("matthew a. sobol", "matthew sobol"), "yes")
 
     def test_tier2_spelling_variant(self):
+        # Reversed by the issue #10 Shape 3 decision: a given-name
+        # spelling variant is formally indistinguishable from a
+        # distinct standard name pair (Sara/Sarah), so it no longer
+        # earns a deterministic YES — the Tier 3 judge decides. The
+        # helper itself still reports the shape (test_spelling_variant
+        # above is unchanged).
         self.assertEqual(
-            pp._merge_tier("joseph pavlos", "josef pavlos"), "yes")
+            pp._merge_tier("joseph pavlos", "josef pavlos"), "ambiguous")
 
     def test_tier2_nickname(self):
         self.assertEqual(
@@ -2192,10 +2198,17 @@ class TestHybridMerge(unittest.TestCase):
         self.assertIn("chris sebeck", roster)
 
     def test_roster_update_spelling_merge(self):
+        # Reversed by the issue #10 Shape 3 decision: a given-name
+        # spelling variant no longer folds at roster time — Joseph
+        # and Josef Pavlos arrive as two entries, and the Tier 3
+        # judge in post_pass_merge decides whether they are one
+        # person. (This test pinned the fold until that decision.)
         roster = {}
         pp._roster_update(roster, [self._mk_char("Joseph Pavlos")], 0)
         pp._roster_update(roster, [self._mk_char("Josef Pavlos")], 1)
-        self.assertEqual(len(roster), 1)
+        self.assertEqual(len(roster), 2)
+        self.assertIn("joseph pavlos", roster)
+        self.assertIn("josef pavlos", roster)
 
     # -- _merge_roster_entries ---------------------------------------------
     def test_merge_roster_entries(self):
