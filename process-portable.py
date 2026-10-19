@@ -18268,6 +18268,17 @@ class _VizRenderable:
         yield self._ui._render_viz_panel()
 
 
+# The inspection-console seam (console_events.py) is optional in the
+# same way Rich is: this file must keep working when it is copied on
+# its own, so a missing sibling module simply means no console
+# events are published. The phase map it carries translates the
+# phase strings set_phase already receives into console stage IDs.
+try:
+    from console_events import PHASE_TO_STAGE as _CONSOLE_PHASE_STAGES
+except Exception:
+    _CONSOLE_PHASE_STAGES = {}
+
+
 class PipelineUI:
     """Terminal UI for the pipeline.
 
@@ -18288,10 +18299,56 @@ class PipelineUI:
         self._viz = None  # {book, label, text, names, events, t0}
         self._live = None
         self._layout = None
+        # Inspection-console observer (console_events.ConsoleObserver),
+        # attached only when a console consumer exists. None means
+        # every console hook below is a no-op.
+        self._console_observer = None
 
     def set_viz_enabled(self, enabled):
         """Enable/disable the chapter visualizer panel (--no-viz)."""
         self._viz_enabled = bool(enabled)
+
+    # -- Inspection-console seam -------------------------------------
+    # The console is an observer, never a participant: publishing
+    # must not raise into pipeline code or change what the existing
+    # Rich/plain rendering does, so every hook here funnels through
+    # _console_publish, which no-ops without an observer and swallows
+    # observer failures (the observer itself is also no-throw; this
+    # is the second belt on the same pair of suspenders).
+
+    def attach_console(self, observer):
+        """Attach a console_events.ConsoleObserver, or None to detach."""
+        self._console_observer = observer
+
+    def _console_publish(self, kind, book_key=None, stage=None,
+                         payload=None):
+        obs = self._console_observer
+        if obs is None:
+            return
+        try:
+            obs.publish(
+                kind,
+                book_id=(str(book_key) if book_key is not None else None),
+                stage=stage, payload=payload)
+        except Exception:
+            pass
+
+    def console_stage(self, book_key, stage_id, state, detail=None):
+        payload = {"state": state}
+        if detail:
+            payload["detail"] = detail
+        self._console_publish("stage_state", book_key, stage=stage_id,
+                              payload=payload)
+
+    def console_verdict(self, book_key, payload):
+        self._console_publish("verdict_upsert", book_key, payload=payload)
+
+    def console_counts(self, book_key, counts):
+        self._console_publish("counts_snapshot", book_key,
+                              payload={"counts": counts})
+
+    def console_final_book(self, book_key, snapshot):
+        self._console_publish("book_final", book_key, payload=snapshot)
 
     def _viz_usable(self):
         return self.rich and self._viz_enabled
@@ -18349,6 +18406,8 @@ class PipelineUI:
                 self.tasks[book_key] = tid
         else:
             print(f"\n{label} ({total} steps)")
+        self._console_publish("book_state", book_key,
+                              payload={"state": "active", "title": label})
 
     def advance(self, book_key, n=1):
         if self.progress:
@@ -18361,6 +18420,9 @@ class PipelineUI:
 
     def set_phase(self, book_key, phase):
         """Update the task description to show current phase."""
+        _stage = _CONSOLE_PHASE_STAGES.get(phase)
+        if _stage:
+            self.console_stage(book_key, _stage, "active")
         if self.progress:
             tid = self.tasks.get(book_key)
             if tid is not None:
@@ -18379,6 +18441,8 @@ class PipelineUI:
             print(msg)
 
     def book_done(self, book_key):
+        self._console_publish("book_state", book_key,
+                              payload={"state": "complete"})
         if self.progress:
             with self._lock:
                 tid = self.tasks.pop(book_key, None)
@@ -18392,6 +18456,14 @@ class PipelineUI:
     def viz_chapter(self, book_key, chapter_label, text, chap_idx=None,
                     chap_total=None):
         """Start visualizing a chapter (call at the start of Call A)."""
+        # The console hook fires even when the Rich visualizer is
+        # off: the console tracks chapter progress independently of
+        # whether the panel is being drawn.
+        self._console_publish("chapter_state", book_key, stage="identity",
+                              payload={"pass_id": "identity",
+                                       "index": chap_idx,
+                                       "label": chapter_label or "",
+                                       "state": "started"})
         if not self._viz_usable():
             return
         with self._lock:
