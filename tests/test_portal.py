@@ -8,15 +8,21 @@ recent-runs composite, the config whitelist (secrets never reach
 the browser), and the S1 acceptance shape — a browsing session
 issues no writes (both stores' logical dump hashes unchanged).
 """
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
+import socket
 import sqlite3
+import struct
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -558,6 +564,154 @@ class TestArtifactMemoBound(unittest.TestCase):
         ev2, agg2 = portal._artifact_events(p)
         self.assertEqual(ev2, sentinel[0])
         self.assertEqual(agg2, sentinel[1])
+
+
+class TestIssue71PortalCosmetics(unittest.TestCase):
+    """Issue #71, two operator-surface defects.
+
+    (1) The startup banner and the --help description still said
+    'slices S1 + S2' after S3 (the Desk) landed in this same file —
+    an operator reading them concludes the Desk is absent and goes
+    hunting for a missing build. Both strings must name the full
+    slice set the file actually serves.
+
+    (2) Browsers open speculative connections and abort them before
+    sending a request line; the read raises ConnectionAbortedError
+    (WinError 10053 on Windows) and socketserver's default
+    handle_error dumps a full traceback per abort, burying real
+    errors. The server's handle_error must swallow connection
+    aborts/resets quietly and keep the traceback for everything
+    else.
+    """
+
+    # -- (1) the slice strings -------------------------------------
+
+    def test_help_description_names_the_full_slice_set(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit):
+                portal.main(["--help"])
+        text = out.getvalue()
+        self.assertIn("S1 + S2 + S3", text)
+        self.assertIn("Desk", text)
+
+    def test_startup_banner_names_the_full_slice_set(self):
+        # main() with the server factory stubbed so serve_forever
+        # returns at once: the test walks the real entry point and
+        # captures what the operator actually sees at launch.
+        class _StubServer:
+            def serve_forever(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            learn = _fixture_learn_dir(Path(td))
+            out = io.StringIO()
+            with mock.patch.object(portal, "make_server",
+                                   return_value=_StubServer()):
+                with contextlib.redirect_stdout(out):
+                    rc = portal.main(["--learn-dir", str(learn)])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("S1 + S2 + S3", text)
+        self.assertIn("Desk", text)
+        self.assertNotIn("slices S1 + S2 —", text)
+
+    # -- (2) handle_error ------------------------------------------
+
+    def _server(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        ctx = portal.PortalContext(learn_dir=_fixture_learn_dir(root),
+                                   script_dir=_fixture_script_dir(root),
+                                   backup_dir=None)
+        return portal.make_server("127.0.0.1", 0, ctx)
+
+    def _handle_error_output(self, server, exc):
+        """handle_error is invoked by socketserver from inside an
+        except block and inspects sys.exc_info(); reproduce that
+        calling convention and capture what it prints."""
+        buf = io.StringIO()
+        try:
+            raise exc
+        except Exception:
+            with contextlib.redirect_stderr(buf):
+                server.handle_error(None, ("127.0.0.1", 0))
+        return buf.getvalue()
+
+    def test_aborted_connection_is_swallowed_quietly(self):
+        server = self._server()
+        self.assertEqual(
+            self._handle_error_output(
+                server, ConnectionAbortedError("aborted by the peer")),
+            "")
+
+    def test_reset_connection_is_swallowed_quietly(self):
+        server = self._server()
+        self.assertEqual(
+            self._handle_error_output(
+                server, ConnectionResetError("reset by the peer")),
+            "")
+
+    def test_winerror_10053_form_is_swallowed_quietly(self):
+        # The Windows shape of the abort: winsock reports it as an
+        # OSError carrying winerror 10053. The OSError constructor
+        # only honours the winerror argument on Windows, so set the
+        # attribute directly — the shape is what handle_error
+        # inspects, and this pins the winerror check itself.
+        server = self._server()
+        err = OSError(10053, "An established connection was aborted "
+                             "by the software in your host machine")
+        err.winerror = 10053
+        self.assertEqual(self._handle_error_output(server, err), "")
+
+    def test_genuine_error_keeps_its_traceback(self):
+        server = self._server()
+        out = self._handle_error_output(server, ValueError("boom"))
+        self.assertIn("Traceback", out)
+        self.assertIn("ValueError", out)
+        self.assertIn("boom", out)
+
+    def test_non_connection_oserror_keeps_its_traceback(self):
+        # The swallow is scoped to connection aborts, not to
+        # OSError generally.
+        server = self._server()
+        out = self._handle_error_output(
+            server, OSError(28, "No space left on device"))
+        self.assertIn("Traceback", out)
+        self.assertIn("OSError", out)
+
+    def test_live_aborted_connection_prints_no_traceback(self):
+        # End to end: a client that sends a partial request and
+        # then aborts (RST, via a zero linger) must cost the
+        # operator nothing on stderr.
+        server = self._server()
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever,
+                                  daemon=True)
+        thread.start()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                raw = socket.create_connection(("127.0.0.1", port),
+                                               timeout=5)
+                raw.sendall(b"GET / HTTP/1.1\r\n"
+                            b"Host: 127.0.0.1\r\n")
+                raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                               struct.pack("ii", 1, 0))
+                raw.close()
+                time.sleep(1.5)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        captured = buf.getvalue()
+        self.assertNotIn("Traceback", captured)
+        self.assertNotIn("ConnectionResetError", captured)
+        self.assertNotIn("ConnectionAbortedError", captured)
 
 
 if __name__ == "__main__":

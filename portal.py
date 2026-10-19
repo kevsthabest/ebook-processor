@@ -4404,6 +4404,35 @@ def _host_allowed(host_header, port):
     return port_part.isdigit() and int(port_part) == port
 
 
+class _PortalHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that stays quiet about dead connections.
+
+    Browsers open speculative connections and abort them before
+    sending a request line; the read then raises
+    ConnectionAbortedError (WinError 10053) or ConnectionResetError,
+    and socketserver's default handle_error dumps a full traceback
+    per abort — dozens per page load, burying the real errors in
+    the operator's console. A connection the peer abandoned is not
+    a server fault, so those are swallowed; every other exception
+    keeps the default traceback.
+    """
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionAbortedError,
+                            ConnectionResetError)):
+            return
+        # The same aborts in their raw Windows shape: an OSError
+        # whose winerror is 10053 (aborted) or 10054 (reset). The
+        # subclasses above usually carry them on Windows, but the
+        # bare form is the same peer behaviour and gets the same
+        # quiet.
+        if isinstance(exc, OSError) \
+                and getattr(exc, "winerror", None) in (10053, 10054):
+            return
+        super().handle_error(request, client_address)
+
+
 def make_server(host, port, ctx):
     """Build (but do not start) the portal server. The bind host
     passes validate_bind_host here as well as in main(), so the
@@ -4789,7 +4818,7 @@ def make_server(host, port, ctx):
                 except Exception:
                     pass
 
-    server = ThreadingHTTPServer((bind_host, port), Handler)
+    server = _PortalHTTPServer((bind_host, port), Handler)
     server.daemon_threads = True
     return server
 
@@ -4820,8 +4849,8 @@ def main(argv=None):
     config = load_portal_config(script_dir)
     parser = argparse.ArgumentParser(
         description="Operator portal for the ebook processor "
-                    "(slices S1 + S2: Control Room, launching, "
-                    "run pages).")
+                    "(slices S1 + S2 + S3: Control Room, launching, "
+                    "run pages, the Desk).")
     parser.add_argument("--port", type=int, default=None,
                         help=f"port to bind (default {DEFAULT_PORT}, "
                              f"or portal-config.json; the next free "
@@ -4846,8 +4875,8 @@ def main(argv=None):
     # stdout (a redirected launch) must not sit on it.
     print(f"Portal: http://{LOOPBACK}:{port}/", flush=True)
     print(f"  learn dir: {ctx.learn_dir}", flush=True)
-    print("  slices S1 + S2 — Home, launching, run pages; "
-          "Ctrl+C stops the portal.", flush=True)
+    print("  slices S1 + S2 + S3 — Home, launching, run pages, "
+          "the Desk; Ctrl+C stops the portal.", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
