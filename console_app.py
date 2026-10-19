@@ -14,7 +14,9 @@ runner callable it is handed.
 """
 
 import ctypes
+import re
 import threading
+import time
 
 from console_events import STAGES
 
@@ -27,6 +29,45 @@ _STAGE_MARKS = {
     "skipped": "–",
     "not_applicable": "–",
 }
+
+# One colour per character, assigned in first-appearance order (the
+# store hands out ordinals; this palette maps them onto colours
+# chosen to stay distinguishable on the console's dark ground).
+# Past the palette's end the colours repeat — with a large cast,
+# colour is a tracing aid, not an identity.
+_PALETTE = (
+    "#c39bff", "#f0a840", "#8fc1e9", "#4fd1a5", "#ff7a66",
+    "#f78fb3", "#a3d977", "#ffd76a", "#6ec3df", "#e08fd0",
+    "#9be15d", "#f2f0a1",
+)
+_DEFAULT_NAME_COLOUR = "#f0bc4e"
+
+
+def _name_spans(text, styles):
+    """Style spans for whole-word name occurrences in `text`.
+
+    `styles` maps each display name to its Rich style string. The
+    matching rule is the chapter visualizer's: case-insensitive,
+    word boundaries, longest names first so a full name wins over
+    its own first name at the same position. Returns a list of
+    (start, end, style) tuples; the regex's leftmost-longest
+    alternation makes overlaps impossible.
+    """
+    names = sorted((n for n in styles if n), key=len, reverse=True)
+    if not names or not text:
+        return []
+    pat = re.compile(r"\b(%s)\b" % "|".join(re.escape(n)
+                                             for n in names),
+                     re.IGNORECASE)
+    canon = {n.lower(): n for n in names}
+    return [(m.start(), m.end(), styles[canon[m.group(1).lower()]])
+            for m in pat.finditer(text)]
+
+
+def _stylize(text_obj, body, offset, styles):
+    """Apply name spans found in `body` to `text_obj` at `offset`."""
+    for start, end, style in _name_spans(body, styles):
+        text_obj.stylize(style, offset + start, offset + end)
 
 
 def _deliver_interrupt(thread):
@@ -88,10 +129,11 @@ def _build_app_class():
     stays importable on machines without Textual."""
     from rich.text import Text
     from textual.app import App, ComposeResult
-    from textual.containers import Horizontal, Vertical
+    from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.screen import ModalScreen
     from textual.widgets import (Button, DataTable, Footer, Log,
-                                 Static, TabbedContent, TabPane)
+                                 ProgressBar, Static, TabbedContent,
+                                 TabPane)
 
     class QuitScreen(ModalScreen):
         def compose(self):
@@ -133,8 +175,10 @@ def _build_app_class():
         CSS = """
         #hdr {height: 3; border-bottom: solid $accent;}
         #rail {height: 2; color: $text-muted;}
+        #prog {height: 1;}
         #main {height: 1fr;}
-        #reader {width: 58%; border-right: solid $accent; padding: 0 1;}
+        #reader-scroll {width: 58%; border-right: solid $accent;}
+        #reader {padding: 0 1; height: auto;}
         #right {width: 42%;}
         #tabs {height: 1fr;}
         #detail {height: 9; border-top: solid $accent; padding: 0 1;}
@@ -145,6 +189,8 @@ def _build_app_class():
         BINDINGS = [
             ("[", "prev_book", ""), ("]", "next_book", ""),
             ("l", "follow_live", "Follow live"),
+            ("pageup", "reader_page(-1)", ""),
+            ("pagedown", "reader_page(1)", ""),
             ("o", "open_log", "Log"),
             ("q", "quit_flow", "Quit"),
             ("ctrl+c", "cancel_run", ""),
@@ -160,12 +206,24 @@ def _build_app_class():
             self._seq_seen = -1
             self._selected = None  # (table_id, row_key) in the store
             self._merges_shown = False
+            # Reader paging state: which chapter the pager is
+            # walking, when it started, how long recent chapters
+            # took, and whether the user has taken the page over.
+            self._reader_sig = None
+            self._pg_chapter = None
+            self._pg_open_since = {}
+            self._pg_durations = []
+            self._pg_manual = False
+            self._pg_last_target = None
 
         def compose(self) -> ComposeResult:
             yield Static(id="hdr")
             yield Static(id="rail")
+            yield ProgressBar(id="prog", total=1000,
+                              show_percentage=False, show_eta=False)
             with Horizontal(id="main"):
-                yield Static(id="reader")
+                with VerticalScroll(id="reader-scroll"):
+                    yield Static(id="reader")
                 with Vertical(id="right"):
                     with TabbedContent(id="tabs"):
                         with TabPane("Characters", id="t-chars"):
@@ -222,9 +280,14 @@ def _build_app_class():
         def _refresh(self):
             for event in self._observer.drain():
                 self._store.apply(event)
-            if self._store.last_seq == self._seq_seen:
-                return
-            self._seq_seen = self._store.last_seq
+            if self._store.last_seq != self._seq_seen:
+                self._seq_seen = self._store.last_seq
+                self._render_all()
+            # The pager runs on every tick, event or not: page
+            # turns are paced by elapsed time, not by events.
+            self._auto_page()
+
+        def _render_all(self):
             live = self._store.live_book_id()
             if self.viewed is None or (self.follow and live is not None):
                 self.viewed = live
@@ -239,6 +302,7 @@ def _build_app_class():
             if book is None:
                 hdr.update("Waiting for the first book…")
                 rail.update("")
+                self._render_progress(None)
                 self.query_one("#reader", Static).update("")
                 self.query_one("#detail", Static).update("")
                 op.update("")
@@ -246,12 +310,22 @@ def _build_app_class():
             live_id = store.live_book_id()
             is_live = self.viewed == live_id and book.state == "active"
             title = book.title or self.viewed
+            frac = self._progress_fraction(book)
+            self._render_progress(frac)
+            pct = (f"  ·  {round(frac * 100)}%"
+                   if frac is not None else "")
             hdr.update(Text(
                 f"{title}  ·  {'LIVE' if is_live else book.state.upper()}"
-                f"  ·  run {store.run_state}"))
-            rail.update(" › ".join(
+                f"{pct}  ·  run {store.run_state}"))
+            rail_text = " › ".join(
                 f"{_STAGE_MARKS.get(book.stages[sid], '○')} {label}"
-                for sid, label in STAGES))
+                for sid, label in STAGES)
+            if book.counts.get("work_total") \
+                    and book.state != "complete":
+                rail_text += (f"  ·  steps "
+                              f"{book.counts.get('work_done') or 0}"
+                              f"/{book.counts['work_total']}")
+            rail.update(rail_text)
             self._render_chars(book)
             self._render_rels(book)
             self._render_tt(book)
@@ -276,6 +350,30 @@ def _build_app_class():
                 f"Follow {'on' if self.follow else 'off'} · "
                 f"[ ] books · L follow live{extra}")
 
+        def _progress_fraction(self, book):
+            """Work done over work total, in the pipeline's own
+            units — one per chapter per pass, counted as each
+            unit completes. The units cover extraction; once the
+            bar fills, the stage rail carries the reduce tail, and
+            a complete book reads a full bar."""
+            if book.state == "complete":
+                return 1.0
+            total = book.counts.get("work_total")
+            if not total:
+                return None
+            return min(1.0, (book.counts.get("work_done") or 0)
+                       / total)
+
+        def _render_progress(self, frac):
+            bar = self.query_one("#prog", ProgressBar)
+            if frac is None:
+                # No yardstick yet: an indeterminate bar says
+                # "working, unmeasured" rather than inventing a
+                # percentage.
+                bar.total = None
+            else:
+                bar.update(total=1000, progress=round(frac * 1000))
+
         # -- table fills ----------------------------------------------
         def _render_chars(self, book):
             rows = sorted(book.rows["characters"].items(),
@@ -284,9 +382,18 @@ def _build_app_class():
             table = self.query_one("#chars", DataTable)
             table.clear()
             for key, r in rows:
-                table.add_row(r.get("name") or "",
-                              str(r.get("chapters") or ""),
-                              r.get("status") or "candidate", key=key)
+                name = r.get("name") or ""
+                # The dot carries the character's colour — the same
+                # colour their name wears in the reader — so a row
+                # and its mentions can be matched at a glance. Text
+                # cells, not strings: book text is never parsed as
+                # markup anywhere in this console.
+                table.add_row(
+                    Text.assemble(
+                        ("● ", self._colour_for(book, key)),
+                        (name, "")),
+                    str(r.get("chapters") or ""),
+                    r.get("status") or "candidate", key=key)
 
         def _render_rels(self, book):
             items = list(book.rows["relationships"].items())
@@ -400,40 +507,184 @@ def _build_app_class():
                 return None, None
             return table_id, book.rows[table].get(key)
 
+        def _colour_for(self, book, name):
+            """The hex colour for a character name in this book.
+
+            The store assigns ordinals in first-appearance order;
+            endpoint and chapter names occasionally differ in case
+            or form from the row key, so fall back to a case-folded
+            match, then to the default gold.
+            """
+            idx = book.char_colors.get(name)
+            if idx is None and name:
+                folded = name.lower()
+                for key, val in book.char_colors.items():
+                    if key.lower() == folded:
+                        idx = val
+                        break
+            if idx is None:
+                return _DEFAULT_NAME_COLOUR
+            return _PALETTE[idx % len(_PALETTE)]
+
+        def _name_style(self, book, name, new=False):
+            # First appearance pops: the character's own colour,
+            # brighter weight and underlined, for the one chapter
+            # that introduces them; later chapters wear the plain
+            # colour.
+            style = f"bold {self._colour_for(book, name)}"
+            return style + " underline" if new else style
+
+        def _reader_chapter(self, book):
+            chapters = [((book.book_id, k[0], k[1]), c)
+                        for k, c in sorted(
+                            book.chapters.items(),
+                            key=lambda kv: kv[0][1] or 0)]
+            return chapters[-1] if chapters else (None, None)
+
+        def _reader_update(self, text):
+            """Update the reader only when its rendering changed.
+
+            Rebuilding the Static on every refresh would reset the
+            scroll position the pager (or the user) is holding; the
+            signature is the plain text plus every span, so a name
+            landing mid-chapter still redraws exactly once.
+            """
+            sig = (text.plain,
+                   tuple((s.start, s.end, str(s.style))
+                         for s in text.spans))
+            if sig != self._reader_sig:
+                self._reader_sig = sig
+                self.query_one("#reader", Static).update(text)
+
         def _render_reader(self, book, is_live=False):
-            reader = self.query_one("#reader", Static)
             _tid, row = self._selected_row(book)
             if row is not None:
                 ev = row.get("evidence")
                 if isinstance(ev, dict) and ev.get("quote"):
-                    reader.update(Text(
+                    text = Text(
                         f"Evidence — {row.get('from', '')} → "
                         f"{row.get('to', '')}\n\n“{ev['quote']}”\n\n"
                         f"{ev.get('chapter') or ''} · source "
                         f"{ev.get('source') or ''} · grade "
-                        f"{ev.get('grade') or '—'}"))
+                        f"{ev.get('grade') or '—'}")
+                    # The two endpoints light up in their own
+                    # colours wherever they appear in the quote —
+                    # the selected relationship made visible.
+                    styles = {}
+                    for nm in (row.get("from"), row.get("to")):
+                        if nm:
+                            styles[nm] = self._name_style(book, nm)
+                    _stylize(text, text.plain, 0, styles)
+                    self._reader_update(text)
                     return
                 if isinstance(ev, list) and ev and ev[0].get("quote"):
-                    reader.update(Text(
+                    self._reader_update(Text(
                         f"Evidence — {row.get('warning', '')}\n\n"
                         f"“{ev[0]['quote']}”"))
                     return
-            chapters = [c for (p, _i), c in sorted(
-                book.chapters.items(), key=lambda kv: kv[0][1] or 0)]
-            if chapters:
-                last = chapters[-1]
-                body = (f"{last.get('label') or 'Chapter'} — Identity "
-                        f"extraction\n\n{last.get('excerpt') or ''}")
-                if is_live and book.stages.get("identity") == "active":
-                    body += ("\n\nEstimated input position · timing "
-                             "based — not a reading cursor")
-                # Text, not str: the label and excerpt are book text,
-                # and Static parses plain strings as markup — a
-                # bracketed passage would restyle or raise instead
-                # of rendering literally.
-                reader.update(Text(body))
-            else:
-                reader.update("No chapter has started yet.")
+            key, last = self._reader_chapter(book)
+            if last is None:
+                self._reader_update(Text("No chapter has started yet."))
+                return
+            self._track_chapter(book, key, last)
+            names = last.get("names") or []
+            new_names = set(last.get("new_names") or [])
+            header = (f"{last.get('label') or 'Chapter'} — Identity "
+                      f"extraction")
+            if new_names:
+                header += (f" · {len(new_names)} new this chapter")
+            if is_live and not names:
+                header += (" · auto-paging — PgUp/PgDn or scroll to "
+                           "take over" if not self._pg_manual
+                           else " · auto-page paused")
+            body = last.get("excerpt") or ""
+            # Text, not str: the label and excerpt are book text,
+            # and Static parses plain strings as markup — a
+            # bracketed passage would restyle or raise instead of
+            # rendering literally.
+            text = Text(f"{header}\n\n{body}")
+            if names:
+                styles = {n: self._name_style(book, n,
+                                              new=n in new_names)
+                          for n in names}
+                _stylize(text, body, len(header) + 2, styles)
+            if is_live and book.stages.get("identity") == "active":
+                text.append("\n\nEstimated input position · timing "
+                            "based — not a reading cursor")
+            self._reader_update(text)
+
+        def _track_chapter(self, book, key, chapter):
+            """Pager bookkeeping for the displayed chapter.
+
+            A chapter the reader has never shown starts the clock
+            and returns the view to its first page; a chapter whose
+            names have landed closes the clock, and its duration
+            joins the rolling average the pager paces against.
+            """
+            now = time.monotonic()
+            if key != self._pg_chapter:
+                self._pg_chapter = key
+                self._pg_manual = False
+                self._pg_last_target = None
+                self.query_one("#reader-scroll",
+                               VerticalScroll).scroll_home(
+                                   animate=False)
+                if not chapter.get("names"):
+                    self._pg_open_since[key] = now
+            elif chapter.get("names") and key in self._pg_open_since:
+                started = self._pg_open_since.pop(key)
+                self._pg_durations.append(now - started)
+                self._pg_durations = self._pg_durations[-10:]
+
+        def _auto_page(self):
+            """Turn the displayed chapter's pages as it is worked on.
+
+            The page position tracks elapsed time against the
+            rolling average chapter duration — a timing estimate of
+            where the extraction has reached, never a reading
+            cursor. Any scroll position the pager did not set means
+            the user took the page over; paging then pauses for the
+            rest of the chapter.
+            """
+            book = (self._store.books.get(self.viewed)
+                    if self.viewed else None)
+            if (book is None or book.state != "active"
+                    or self.viewed != self._store.live_book_id()
+                    or self._selected_row(book)[1] is not None):
+                return
+            key, chapter = self._reader_chapter(book)
+            if (chapter is None or key != self._pg_chapter
+                    or chapter.get("names") or self._pg_manual):
+                return
+            started = self._pg_open_since.get(key)
+            if started is None:
+                return
+            scroller = self.query_one("#reader-scroll", VerticalScroll)
+            max_y = scroller.max_scroll_y
+            if max_y <= 0:
+                return
+            if (self._pg_last_target is not None
+                    and abs(scroller.scroll_y - self._pg_last_target)
+                    > 2):
+                self._pg_manual = True
+                return
+            durations = self._pg_durations
+            avg = (sum(durations) / len(durations)) if durations \
+                else 20.0
+            frac = min(1.0, (time.monotonic() - started) / avg)
+            target = int(frac * max_y)
+            if target > scroller.scroll_y:
+                scroller.scroll_to(y=target, animate=False)
+                self._pg_last_target = target
+
+        def action_reader_page(self, delta):
+            scroller = self.query_one("#reader-scroll", VerticalScroll)
+            step = max(1, scroller.size.height - 2)
+            y = min(max(scroller.scroll_y + int(delta) * step, 0),
+                    scroller.max_scroll_y)
+            scroller.scroll_to(y=y, animate=False)
+            self._pg_manual = True
+            self._pg_last_target = y
 
         def _render_detail(self, book):
             detail = self.query_one("#detail", Static)

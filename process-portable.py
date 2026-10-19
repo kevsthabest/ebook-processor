@@ -48,7 +48,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.68"
+PORTABLE_VERSION = "2.13.69"
 
 
 import argparse
@@ -18567,6 +18567,14 @@ except Exception:
     _CONSOLE_PHASE_STAGES = {}
 
 
+# The inspection console receives each chapter's full text so its
+# reader can page through the whole chapter, not just an opening
+# excerpt. The cap only guards against a pathological single
+# "chapter" (a whole-book file with no chapter breaks); real
+# chapters sit far below it.
+_CONSOLE_CHAPTER_TEXT_CAP = 120_000
+
+
 class PipelineUI:
     """Terminal UI for the pipeline.
 
@@ -18594,6 +18602,14 @@ class PipelineUI:
         # Cumulative per-book character sightings for the console's
         # Characters table (book_key -> {name: chapter count}).
         self._console_char_counts = {}
+        # The chapter most recently started per book, so the names
+        # a chapter's extraction returns can be published against
+        # that chapter (book_key -> chapter index).
+        self._console_chapter_idx = {}
+        # Work-unit progress per book for the console's progress
+        # bar: the same units the progress bars count (book_key ->
+        # [done, total]).
+        self._console_work = {}
 
     def set_viz_enabled(self, enabled):
         """Enable/disable the chapter visualizer panel (--no-viz)."""
@@ -18704,8 +18720,23 @@ class PipelineUI:
             print(f"\n{label} ({total} steps)")
         self._console_publish("book_state", book_key,
                               payload={"state": "active", "title": label})
+        if self._console_observer is not None:
+            self._console_work[book_key] = [0, total]
+            self._console_publish(
+                "counts_snapshot", book_key,
+                payload={"counts": {"work_done": 0,
+                                    "work_total": total}})
 
     def advance(self, book_key, n=1):
+        # The console's progress bar counts the same work units
+        # the progress bars do: one per chapter per pass.
+        if self._console_observer is not None:
+            work = self._console_work.get(book_key)
+            if work is not None:
+                work[0] += n
+                self._console_publish(
+                    "counts_snapshot", book_key,
+                    payload={"counts": {"work_done": work[0]}})
         if self.progress:
             tid = self.tasks.get(book_key)
             if tid is not None:
@@ -18737,6 +18768,7 @@ class PipelineUI:
             print(msg)
 
     def book_done(self, book_key):
+        self._console_work.pop(book_key, None)
         self._console_publish("book_state", book_key,
                               payload={"state": "complete"})
         if self.progress:
@@ -18760,7 +18792,10 @@ class PipelineUI:
                                        "index": chap_idx,
                                        "label": chapter_label or "",
                                        "state": "started",
-                                       "excerpt": (text or "")[:1100]})
+                                       "excerpt": (text or "")
+                                       [:_CONSOLE_CHAPTER_TEXT_CAP]})
+        if self._console_observer is not None:
+            self._console_chapter_idx[book_key] = chap_idx
         if not self._viz_usable():
             return
         with self._lock:
@@ -18811,10 +18846,12 @@ class PipelineUI:
         if self._console_observer is not None:
             counts = self._console_char_counts.setdefault(book_key, {})
             seen = set()
+            ordered = []
             for c in (characters or []):
                 n = (c.get("name") or "").strip()
                 if n and n not in seen:
                     seen.add(n)
+                    ordered.append(n)
                     counts[n] = counts.get(n, 0) + 1
                     self._console_publish(
                         "candidate_upsert", book_key,
@@ -18822,6 +18859,16 @@ class PipelineUI:
                                  "record": {"name": n,
                                             "chapters": counts[n],
                                             "status": "candidate"}})
+            # The chapter's identified names ride its chapter record
+            # so the console reader can light them up in the text.
+            # They exist only now, once this chapter's extraction
+            # has returned — never at chapter start.
+            idx = self._console_chapter_idx.get(book_key)
+            if idx is not None and ordered:
+                self._console_publish(
+                    "chapter_state", book_key, stage="identity",
+                    payload={"pass_id": "identity", "index": idx,
+                             "state": "identified", "names": ordered})
         if not self._viz_usable():
             return
         names = []

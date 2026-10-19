@@ -158,6 +158,15 @@ class _BookState:
         self.title = None
         self.stages = {sid: "not_started" for sid, _ in STAGES}
         self.chapters = {}  # (pass_id, index) -> chapter record
+        # Display colours: each character name takes the next
+        # ordinal the first time a row for it appears, and keeps it
+        # for the whole book — the app maps ordinals onto its
+        # palette, so a name's colour is stable without the store
+        # knowing anything about rendering.
+        self.char_colors = {}  # character row key -> colour ordinal
+        # First identity chapter each name was identified in; the
+        # reader uses it to mark first appearances.
+        self.char_first_chapter = {}
         self.rows = {kind: {} for kind in ROW_CAPS}
         self.row_counts = {kind: 0 for kind in ROW_CAPS}
         self.capped = set()
@@ -172,6 +181,8 @@ class _BookState:
             if len(rows) >= ROW_CAPS[table]:
                 self.capped.add(table)
                 return
+            if table == "characters" and key not in self.char_colors:
+                self.char_colors[key] = len(self.char_colors)
         rows[key] = record
 
 
@@ -243,7 +254,23 @@ class ConsoleStore:
                 book.stages[stage] = payload["state"]
         elif kind == "chapter_state":
             key = (payload.get("pass_id"), payload.get("index"))
-            book.chapters[key] = dict(payload)
+            # Merge, not replace: a chapter's record is built by
+            # more than one event (started with its text, identified
+            # with its names), and neither may erase the other.
+            merged = dict(book.chapters.get(key) or {})
+            merged.update(payload)
+            book.chapters[key] = merged
+            names = payload.get("names")
+            if payload.get("pass_id") == "identity" and names:
+                idx = payload.get("index")
+                for n in names:
+                    first = book.char_first_chapter.get(n)
+                    if first is None or (idx is not None
+                                         and idx < first):
+                        book.char_first_chapter[n] = idx
+                merged["new_names"] = [
+                    n for n in names
+                    if book.char_first_chapter.get(n) == idx]
         elif kind == "candidate_upsert":
             table = payload.get("table")
             if table in ROW_CAPS and payload.get("key") is not None:
