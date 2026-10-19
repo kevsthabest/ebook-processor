@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.59"
+PORTABLE_VERSION = "2.13.60"
 
 
 import argparse
@@ -21421,7 +21421,14 @@ def _history_totals(rec, book_rows, claim_rows_by_book,
             1 for b in book_rows if b["outcome"] == "skipped")
     succeeded = sum(1 for b in book_rows if b["outcome"] == "processed")
     failed = sum(1 for b in book_rows if b["outcome"] == "failed")
-    if book_rows or rec.admitted is not None:
+    # Only books that carry an outcome measured these counts. A
+    # backfilled book's outcome is unrecorded, so a run whose
+    # shipped books all lack outcomes measured nothing here —
+    # stamping 0 would claim a measurement the run never made,
+    # against the "unknown is NULL, never 0" rule. The live
+    # writer's books always carry an outcome, so its totals are
+    # computed exactly as before.
+    if measured_books:
         totals["processed"] = succeeded + failed
         totals["succeeded"] = succeeded
         totals["failed"] = failed
@@ -21904,9 +21911,13 @@ def _history_finish(failures=None, interrupted=False, status=None,
 #   (default now()) lands at backfill time, long after the run's
 #   finished_at, where a live row's lands at run end.
 # - Idempotent on the run's natural key. A run already in the
-#   mirror under its run_key is reported and skipped, never
-#   overwritten and never duplicated under a suffix; the suffix
-#   path is reserved for a key a genuinely different run owns.
+#   mirror under its run_key is never duplicated under a suffix;
+#   the suffix path is reserved for a key a genuinely different
+#   run owns. A complete prior ship is reported and skipped with
+#   zero writes; an earlier backfill's PARTIAL ship (its run row
+#   landed, some book/claim rows did not) is completed in place
+#   by the resume path — the remedy the tool exists to be — while
+#   a live writer's row is reported and never touched.
 # ---------------------------------------------------------------------------
 
 class _BackfillCorrupt(Exception):
@@ -22042,6 +22053,18 @@ def _history_backfill_resolve(entry, learn_dir):
            "decision_budget": entry["decision_budget"],
            "replace_result": None, "error_class": None,
            "error_message": None, "outcome_seq": None}
+    # The name is only ever a locator inside the import dir, so
+    # it must be a plain basename: a name carrying directory
+    # parts ("../x", an absolute path) would make the join below
+    # read a file outside the import dir and ship that file's
+    # hash as a book_key. The real sink only ever emits
+    # basenames, so a non-basename name means a hand-fed artifact
+    # — reject the book (the caller reports it not backfilled)
+    # rather than following the path wherever it points.
+    name = entry.get("name")
+    if not isinstance(name, str) or Path(name).name != name:
+        rec["backfill_reject"] = "book name is not a basename"
+        return rec
     if isinstance(entry["start_ts"], (int, float)) \
             and isinstance(entry["end_ts"], (int, float)):
         rec["duration_ms"] = int(
@@ -22106,22 +22129,27 @@ def _history_backfill_resolve(entry, learn_dir):
 
 def _history_backfill_existing(run_key, started_ts):
     """Probe the mirror for this run's row, the backfill form of
-    the live writer's collision guard. Returns (state, key):
-    ("own", key) when a row under key is this run's (a live row or
-    an earlier backfill's — started_at within the window), ("free",
-    key) with the first key no row owns, or (None, None) when a
-    probe failed and nothing may be written on a guess."""
+    the live writer's collision guard. Returns (state, key, row):
+    ("own", key, row) when a row under key is this run's (a live
+    row or an earlier backfill's — started_at within the window),
+    ("free", key, None) with the first key no row owns, or
+    (None, None, None) when a probe failed and nothing may be
+    written on a guess. The stored row rides along on "own"
+    because the resume path needs its id (the book rows key off
+    it) and its processor_version stamp (the mark that tells a
+    backfill's own row from a live writer's — see the ship)."""
     candidate = run_key
     suffix = 1
     while True:
         rows = sb("processor_runs", method="GET",
                   params=(f"?run_key=eq.{candidate}"
-                          "&select=id,started_at,machine_label"),
+                          "&select=id,started_at,machine_label,"
+                          "processor_version"),
                   schema=_HISTORY_SCHEMA)
         if rows is None:
-            return None, None
+            return None, None, None
         if not rows:
-            return "free", candidate
+            return "free", candidate, None
         theirs = str(rows[0].get("started_at") or "")
         m = re.match(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})",
                      theirs)
@@ -22131,11 +22159,131 @@ def _history_backfill_existing(run_key, started_ts):
                                     + (0, 0, 0))
             if abs(stored_ts - started_ts) \
                     <= _BACKFILL_SAME_RUN_WINDOW_S:
-                return "own", candidate
+                return "own", candidate, rows[0]
         suffix += 1
         if suffix > 99:
-            return None, None
+            return None, None, None
         candidate = f"{run_key}-{suffix}"
+
+
+def _history_backfill_resume(stored, key, run_payload, totals_rec,
+                             entries, built, book_rows, counts):
+    """Complete an earlier backfill's partial ship (issue #66).
+
+    A ship that fails partway leaves the run row landed and its
+    book or claim rows missing, and the stored totals were
+    corrected at failure time to describe that partial set. The
+    plain skip path would call that state "already in history"
+    forever, so the only remedy would be deleting the row by
+    hand. Instead, verify the stored rows against the artifact's
+    book set and ship exactly what is missing: book rows that
+    never landed (with their claims), and claim rows missing for
+    books that did land — a claims failure is the same partial
+    ship one step later. Present rows are never re-posted, and a
+    complete prior ship still earns the zero-write skip.
+
+    Claim re-posts are safe by construction: the outcomes table
+    upserts on (run_book_id, axis, claim_key), so a row that did
+    land answers as a merge, never a duplicate.
+
+    When missing books ship, the run totals are reposted over
+    the FULL shipped set (stored books plus the newly landed
+    ones): the totals stored at failure time describe the
+    partial set, and leaving them would make the run row
+    disagree with its book rows in the opposite direction."""
+    run_id = stored.get("id")
+    if not run_id:
+        raise _BackfillCorrupt(
+            "the stored run row carries no id; nothing shipped")
+    run_payload["run_key"] = key
+    stored_books = sb("processor_run_books", method="GET",
+                      params=(f"?run_id=eq.{run_id}"
+                              "&select=id,book_key"),
+                      schema=_HISTORY_SCHEMA)
+    if stored_books is None:
+        raise _BackfillCorrupt(
+            "the stored book rows could not be probed; "
+            "nothing shipped")
+    stored_by_key = {b["book_key"]: b["id"] for b in stored_books
+                     if b.get("book_key") and b.get("id")}
+    missing_idx = [i for i, e in enumerate(entries)
+                   if e["book_key"] not in stored_by_key]
+    # Claims seam: for each book that DID land, which of its
+    # claim rows are missing? Probed per book because the
+    # outcomes table keys off the book row's id, not the run's.
+    missing_claims = []
+    for i, entry in enumerate(entries):
+        book_id = stored_by_key.get(entry["book_key"])
+        if book_id is None:
+            continue
+        stored_claims = sb(
+            "processor_run_claim_outcomes", method="GET",
+            params=(f"?run_book_id=eq.{book_id}"
+                    "&select=run_book_id,axis,claim_key"),
+            schema=_HISTORY_SCHEMA)
+        if stored_claims is None:
+            raise _BackfillCorrupt(
+                "the stored claim rows could not be probed; "
+                "nothing shipped")
+        have = {(r.get("axis"), r.get("claim_key"))
+                for r in stored_claims}
+        for cr in built[i][1]:
+            if (cr.get("axis"), cr.get("claim_key")) in have:
+                continue
+            row = {"run_book_id": book_id}
+            for k in _HISTORY_OUTCOME_KEYS:
+                row[k] = cr.get(k)
+            missing_claims.append(row)
+    if not missing_idx and not missing_claims:
+        counts["already"] = True
+        return counts
+    counts["runs"] = 1
+    new_id_by_key = {}
+    if missing_idx:
+        missing_rows = []
+        for i in missing_idx:
+            book_rows[i]["run_id"] = run_id
+            missing_rows.append(book_rows[i])
+        brows = sb("processor_run_books", method="POST",
+                   data=missing_rows,
+                   params="?on_conflict=run_id,book_key",
+                   prefer="resolution=merge-duplicates",
+                   schema=_HISTORY_SCHEMA)
+        if brows is None:
+            raise _BackfillCorrupt("the book rows upload failed")
+        new_id_by_key = {b["book_key"]: b["id"] for b in brows
+                         if b.get("id") and b.get("book_key")}
+        counts["books"] = len(new_id_by_key)
+        shipped_keys = ({e["book_key"] for e in entries}
+                        & set(stored_by_key)) | set(new_id_by_key)
+        keep = [i for i, e in enumerate(entries)
+                if e["book_key"] in shipped_keys]
+        _history_repost_totals(
+            totals_rec, run_payload,
+            [book_rows[i] for i in keep],
+            [built[i][1] for i in keep],
+            [entries[i] for i in keep])
+    claims_to_ship = list(missing_claims)
+    for i in missing_idx:
+        book_id = new_id_by_key.get(entries[i]["book_key"])
+        if book_id is None:
+            continue
+        for cr in built[i][1]:
+            row = {"run_book_id": book_id}
+            for k in _HISTORY_OUTCOME_KEYS:
+                row[k] = cr.get(k)
+            claims_to_ship.append(row)
+    if claims_to_ship:
+        crows = sb("processor_run_claim_outcomes", method="POST",
+                   data=claims_to_ship,
+                   params="?on_conflict=run_book_id,axis,claim_key",
+                   prefer="resolution=merge-duplicates",
+                   schema=_HISTORY_SCHEMA)
+        if crows is None:
+            raise _BackfillCorrupt(
+                "the claim outcome rows upload failed")
+        counts["claims"] = len(claims_to_ship)
+    return counts
 
 
 def _history_backfill_ship(parsed, path, learn_dir, dry_run=False):
@@ -22148,9 +22296,19 @@ def _history_backfill_ship(parsed, path, learn_dir, dry_run=False):
     from types import SimpleNamespace
     entries = []
     unkeyed = 0
+    rejected = 0
     for entry in parsed["books"]:
         rec = _history_backfill_resolve(entry, learn_dir)
-        if rec["book_key"]:
+        if rec.get("backfill_reject"):
+            # Rejected on its name alone (not a basename): it is
+            # reported with its reason, separately from books
+            # whose files simply were not found, because the
+            # remedy differs — the artifact must be fixed, not
+            # the library.
+            rejected += 1
+            print(f" Run history backfill: {entry['name']}: not "
+                  f"backfilled ({rec['backfill_reject']}).")
+        elif rec["book_key"]:
             rec["outcome_seq"] = len(entries)
             entries.append(rec)
         else:
@@ -22209,20 +22367,32 @@ def _history_backfill_ship(parsed, path, learn_dir, dry_run=False):
                     f"denylist scan tripped ({', '.join(hits)}); "
                     "nothing shipped for this run")
     counts = {"runs": 0, "books": 0, "claims": 0, "unkeyed": unkeyed,
-              "already": False}
+              "rejected": rejected, "already": False}
     if dry_run:
         counts["runs"] = 1
         counts["books"] = len(book_rows)
         counts["claims"] = len(claim_rows)
         return counts
-    state, key = _history_backfill_existing(
+    state, key, stored = _history_backfill_existing(
         parsed["run_key"], parsed["started_ts"])
     if state is None:
         raise _BackfillCorrupt(
             "the mirror could not be probed; nothing shipped")
     if state == "own":
-        counts["already"] = True
-        return counts
+        # A live writer's row always carries its processor
+        # version; a backfill's row never does (the payload above
+        # stamps None, because the artifact never recorded one).
+        # That stamp is what tells the two apart here: a live row
+        # is reported and left entirely alone, while a backfill's
+        # own row may be the remnant of a partial ship — the one
+        # state this tool exists to remedy — so it goes through
+        # the resume verification instead of the plain skip.
+        if stored.get("processor_version") is not None:
+            counts["already"] = True
+            return counts
+        return _history_backfill_resume(
+            stored, key, run_payload, totals_rec, entries, built,
+            book_rows, counts)
     if key != parsed["run_key"]:
         print(f" Run history backfill: WARNING — run key "
               f"{parsed['run_key']} already belongs to another run; "

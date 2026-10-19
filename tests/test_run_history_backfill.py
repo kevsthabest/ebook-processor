@@ -30,6 +30,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 _PP_PATH = Path(__file__).resolve().parent.parent / "process-portable.py"
@@ -76,6 +77,15 @@ class StatefulSB:
                 self.runs[stored["run_key"]] = stored
                 out.append({"id": stored["id"]})
             return out
+        if table == "processor_run_books" and method == "GET":
+            run_id = params.split("run_id=eq.", 1)[1].split("&", 1)[0]
+            return [dict(r) for r in self.books.values()
+                    if r.get("run_id") == run_id]
+        if table == "processor_run_claim_outcomes" and method == "GET":
+            rbid = params.split("run_book_id=eq.", 1)[1] \
+                .split("&", 1)[0]
+            return [dict(r) for r in self.claims.values()
+                    if r.get("run_book_id") == rbid]
         if table == "processor_run_books" and method == "POST":
             out = []
             for row in data:
@@ -101,6 +111,52 @@ class StatefulSB:
     def posts(self, table=None):
         return [c for c in self.calls if c["method"] == "POST"
                 and (table is None or c["table"] == table)]
+
+
+class FailOnceSB:
+    """Wrapper around a StatefulSB: the first POST to one table
+    fails the way a refused PostgREST call reads to the writer
+    (None, nothing stored), every later call delegates. The failed
+    attempt is recorded on the inner fake's call log, so a test
+    can still see that the write was attempted exactly once."""
+
+    def __init__(self, inner, table):
+        self.inner = inner
+        self.table = table
+        self.armed = True
+
+    def __call__(self, table, method="GET", data=None, params="",
+                 prefer=None, schema=None):
+        if self.armed and method == "POST" and table == self.table:
+            self.armed = False
+            self.inner.calls.append(
+                {"table": table, "method": method, "data": data,
+                 "params": params, "prefer": prefer, "schema": schema})
+            return None
+        return self.inner(table, method=method, data=data,
+                          params=params, prefer=prefer, schema=schema)
+
+
+class PartialFirstBooksSB:
+    """Wrapper around a StatefulSB: the first books POST ships
+    only its first row and answers for only that row — a partial
+    success, not a refusal — and every later call delegates."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.armed = True
+
+    def __call__(self, table, method="GET", data=None, params="",
+                 prefer=None, schema=None):
+        if self.armed and method == "POST" \
+                and table == "processor_run_books" \
+                and data and len(data) > 1:
+            self.armed = False
+            return self.inner(table, method=method, data=data[:1],
+                              params=params, prefer=prefer,
+                              schema=schema)
+        return self.inner(table, method=method, data=data,
+                          params=params, prefer=prefer, schema=schema)
 
 
 class _Base(unittest.TestCase):
@@ -172,6 +228,20 @@ class _Base(unittest.TestCase):
             rc = pp.cmd_run_history_backfill(
                 [str(p) for p in paths], dry_run=dry_run)
         return rc, out.getvalue()
+
+    def rewrite_book_name(self, path, old, new):
+        """Rename one book throughout an artifact's events (book
+        brackets and impulses alike), as a hand-edited or crafted
+        artifact would carry the name."""
+        lines = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            ev = json.loads(line)
+            if ev.get("book") == old:
+                ev["book"] = new
+            lines.append(json.dumps(ev))
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 class BackfillShipTests(_Base):
@@ -381,6 +451,169 @@ class BackfillIsolationTests(_Base):
         rc, text = self.backfill(path)
         self.assertEqual(rc, 2, text)
         self.assertEqual(self.fake.calls, [])
+
+
+class BackfillResumeTests(_Base):
+    """Issue #66: a partial ship must be retryable. The first
+    invocation fails partway and reports failure; the second
+    ships exactly what is missing (present rows untouched); the
+    third is the zero-write skip a complete ship earns."""
+
+    def test_books_failure_then_retry_completes_the_ship(self):
+        path = self.make_artifact()
+        pp.sb = FailOnceSB(self.fake, "processor_run_books")
+        rc, text = self.backfill(path)
+        self.assertEqual(rc, 1, text)
+        self.assertEqual(len(self.fake.runs), 1)
+        self.assertEqual(self.fake.books, {})
+        self.assertEqual(self.fake.claims, {})
+        # The failed ship corrected the run row's totals to the
+        # empty shipped set — they describe no books at all.
+        run = next(iter(self.fake.runs.values()))
+        self.assertIsNone(run["totals"]["claims_derived"])
+        # Retry: the missing books and their claims land, and the
+        # run totals are reposted over the full shipped set.
+        rc, text = self.backfill(path)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(len(self.fake.books), 1)
+        self.assertEqual(len(self.fake.claims), 1)
+        run = next(iter(self.fake.runs.values()))
+        self.assertEqual(run["totals"]["claims_derived"], 1)
+        # Third invocation: complete — a zero-write skip.
+        self.fake.calls.clear()
+        rc, text = self.backfill(path)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.fake.posts(), [])
+        self.assertIn("already in history", text)
+
+    def test_claims_failure_then_retry_ships_only_missing_claims(self):
+        path = self.make_artifact()
+        pp.sb = FailOnceSB(self.fake,
+                           "processor_run_claim_outcomes")
+        rc, text = self.backfill(path)
+        self.assertEqual(rc, 1, text)
+        self.assertEqual(len(self.fake.runs), 1)
+        self.assertEqual(len(self.fake.books), 1)
+        self.assertEqual(self.fake.claims, {})
+        # Retry: only the missing claim rows ship. The book row
+        # that already landed is untouched, and the run row needs
+        # no totals correction when no book was missing.
+        self.fake.calls.clear()
+        rc, text = self.backfill(path)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.fake.posts("processor_run_books"), [])
+        self.assertEqual(self.fake.posts("processor_runs"), [])
+        self.assertEqual(
+            len(self.fake.posts("processor_run_claim_outcomes")), 1)
+        self.assertEqual(len(self.fake.books), 1)
+        self.assertEqual(len(self.fake.claims), 1)
+        # Third invocation: complete — a zero-write skip.
+        self.fake.calls.clear()
+        rc, text = self.backfill(path)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.fake.posts(), [])
+        self.assertIn("already in history", text)
+
+    def test_partial_books_ship_then_retry_ships_only_missing_book(self):
+        path = self.make_artifact(books=("one", "two"))
+        pp.sb = PartialFirstBooksSB(self.fake)
+        rc, text = self.backfill(path)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(len(self.fake.books), 1)
+        self.assertEqual(len(self.fake.claims), 1)
+        # Retry: exactly the missing book ships (one books POST
+        # carrying one row, for the second book), its claims
+        # land, and totals are reposted over the full set.
+        self.fake.calls.clear()
+        rc, text = self.backfill(path)
+        self.assertEqual(rc, 0, text)
+        book_posts = self.fake.posts("processor_run_books")
+        self.assertEqual(len(book_posts), 1)
+        self.assertEqual(len(book_posts[0]["data"]), 1)
+        self.assertEqual(book_posts[0]["data"][0]["book_key"],
+                         self.book2_key)
+        self.assertEqual(len(self.fake.books), 2)
+        self.assertEqual(len(self.fake.claims), 2)
+        run = next(iter(self.fake.runs.values()))
+        self.assertEqual(run["totals"]["claims_derived"], 2)
+        # Third invocation: complete — a zero-write skip.
+        self.fake.calls.clear()
+        rc, text = self.backfill(path)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.fake.posts(), [])
+        self.assertIn("already in history", text)
+
+
+class BackfillBasenameTests(_Base):
+    """Issue #67 R2: an artifact book name that is not a basename
+    must never be resolved against the filesystem — the book is
+    reported not backfilled, the rest of the file still lands."""
+
+    def test_dotdot_book_name_is_rejected_not_read(self):
+        path = self.make_artifact(books=("one", "two"))
+        # The file ../ would reach from the import dir: without
+        # the basename guard its hash would ship as a book_key.
+        (self.tmp / "Second Book.epub").write_bytes(BOOK2_BYTES)
+        self.rewrite_book_name(path, "Second Book.epub",
+                               "../Second Book.epub")
+        rc, text = self.backfill(path)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(len(self.fake.books), 1)
+        book = next(iter(self.fake.books.values()))
+        self.assertEqual(book["book_key"], self.book_key)
+        self.assertIn("basename", text)
+
+    def test_absolute_book_name_is_rejected_not_read(self):
+        path = self.make_artifact(books=("one", "two"))
+        self.rewrite_book_name(path, "Second Book.epub",
+                               str(self.book2))
+        rc, text = self.backfill(path)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(len(self.fake.books), 1)
+        book = next(iter(self.fake.books.values()))
+        self.assertEqual(book["book_key"], self.book_key)
+        self.assertIn("basename", text)
+
+
+class BackfillTotalsTests(_Base):
+    """Issue #67 R3: totals must not claim measured zeros for
+    counts no shipped book measured."""
+
+    def test_backfilled_totals_leave_unmeasured_counts_none(self):
+        path = self.make_artifact()
+        rc, text = self.backfill(path)
+        self.assertEqual(rc, 0, text)
+        run = next(iter(self.fake.runs.values()))
+        # A backfilled book's outcome is unrecorded (None), so
+        # processed/succeeded/failed were never measured.
+        self.assertIsNone(run["totals"]["processed"])
+        self.assertIsNone(run["totals"]["succeeded"])
+        self.assertIsNone(run["totals"]["failed"])
+
+    def test_history_totals_counts_only_measured_books(self):
+        rec = SimpleNamespace(files_seen=None, admitted=None,
+                              corpus_filter_ran=False, books={})
+
+        def row(outcome, key):
+            return {"book_key": key, "outcome": outcome,
+                    "claims": {"tropes": {}, "triggers": {}},
+                    "quotes": {"verified": None, "rejected": None}}
+
+        # No shipped book carries an outcome: the three counts
+        # stay None instead of measured-looking zeros.
+        totals = pp._history_totals(
+            rec, [row(None, "k1")], [[]], entries=[])
+        self.assertIsNone(totals["processed"])
+        self.assertIsNone(totals["succeeded"])
+        self.assertIsNone(totals["failed"])
+        # The live-writer arm (outcomes always present) counts
+        # exactly as before.
+        totals = pp._history_totals(
+            rec, [row("processed", "k1"), row("failed", "k2")],
+            [[], []], entries=[])
+        self.assertEqual(totals["processed"], 2)
+        self.assertEqual(totals["succeeded"], 1)
+        self.assertEqual(totals["failed"], 1)
 
 
 class BackfillCliTests(_Base):
