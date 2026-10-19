@@ -169,12 +169,22 @@ class TestRevivalBudgetBorrowing(unittest.TestCase):
     def test_revival_still_denied_when_nonfamily_reserve_was_consumed(self):
         # Pin: the fix releases only reserve that is provably
         # unused. Here the non-family stage genuinely spends its
-        # reserve — after the same 29 family draws, five friend
-        # winners are judged, bringing the book to 34 spent, the
-        # post-finish family limit itself. The revived sibling
-        # is therefore still denied, exactly as before the fix,
-        # and ships unjudged as review_required.
-        red, out = self._reduce(_chapter_as(28, 5))
+        # reserve — after the family draws, five friend winners
+        # are judged, bringing the book to the post-finish family
+        # limit itself. The revived sibling is therefore still
+        # denied, exactly as before the fix, and ships unjudged
+        # as review_required.
+        # Amended 2026-10-19 (2.13.66, candidate-aware sizing —
+        # Decision 2026-10-19): the scenario is rebuilt at the
+        # sizing ceiling, because at the old floor scale the
+        # resize now funds exactly this census (235 candidates
+        # size the pool to 250, where the original 35 sized it
+        # past the denial point). The geometry is the original
+        # one, scaled: 229 family draws saturate the family
+        # limit (250 - 21 protected), five friend draws bring
+        # the book to 234 spent — the post-finish family limit
+        # (250 - 16) — and the revival claim is the one denied.
+        red, out = self._reduce(_chapter_as(228, 5))
         rels = _pair_rels(red, "Anna", "Ben")
         self.assertEqual(len(rels), 1)
         rel = rels[0]
@@ -184,9 +194,9 @@ class TestRevivalBudgetBorrowing(unittest.TestCase):
         self.assertTrue(rel["revived_runner_up"])
         self.assertEqual(
             [c for c in self.validator.calls if c[2] == "sibling"], [])
-        self.assertEqual(pp._DM_BUDGET_USED, 34)
+        self.assertEqual(pp._DM_BUDGET_USED, 234)
         self.assertEqual(pp._dm_budget_snapshot(), {
-            "rel_family": {"granted": 29, "denied": 1, "spent": 29},
+            "rel_family": {"granted": 229, "denied": 1, "spent": 229},
             "rel_nonfamily": {"granted": 5, "denied": 0, "spent": 5}})
         self.assertIn("outcome: review_required", out)
 

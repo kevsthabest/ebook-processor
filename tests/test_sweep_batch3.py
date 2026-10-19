@@ -599,12 +599,24 @@ class TestTriggerGateBudget(unittest.TestCase):
         # cap an untagged drain at the general pool, so leaving
         # exactly one claim first releases every reserve.
         # Assertions unchanged.
+        # Amended 2026-10-19 (2.13.66, candidate-aware sizing —
+        # Decision 2026-10-19): the reduce resizes the pool to
+        # spent + census + trigger reserve before the gate draws,
+        # so draining the old floor pool leaves the gate the whole
+        # trigger term, not one claim. This reduce carries no
+        # relationship census, so arming the ceiling pool and
+        # draining it to one unit survives the resize (249 + 0 +
+        # 15 computes past 250; the ceiling binds). The spent
+        # assertion below now reads the ceiling for the same
+        # reason; every behavioural assertion is unchanged.
+        pp._dm_budget_reset(chapter_count=pp._DECISION_POOL_CEILING)
         for _c in pp._DM_BUDGET_ORDER:
             pp._dm_budget_finish(_c)
-        self.assertTrue(pp._dm_budget_claim(pp._MERGE_TIER3_CAP - 1))
+        self.assertTrue(
+            pp._dm_budget_claim(pp._DECISION_POOL_CEILING - 1))
         red = self._reduce_two_quote_category()
         self.assertEqual(len(self.calls), 1)
-        self.assertEqual(pp._DM_BUDGET_USED, pp._MERGE_TIER3_CAP)
+        self.assertEqual(pp._DM_BUDGET_USED, pp._DECISION_POOL_CEILING)
         trig = self._child_abuse(red)
         self.assertTrue(all(e.get("decision_gate") == "fallback"
                             for e in trig["evidence"]))

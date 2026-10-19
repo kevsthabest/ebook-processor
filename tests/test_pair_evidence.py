@@ -694,9 +694,18 @@ class TestNonFamilyValidation(unittest.TestCase):
         # and draining the pool itself to one unit. The property
         # under test and the assertions below are unchanged;
         # reserve discipline is pinned in test_budget_reserves.py.
+        # Amended 2026-10-19 (2.13.66, candidate-aware sizing —
+        # Decision 2026-10-19): the pool resizes at the reduce to
+        # spent + census demand, so a drain of the old floor pool
+        # is refilled before validation draws. "One unit left" is
+        # therefore set up at the sizing ceiling instead: arm a
+        # 250 pool and drain it to one unit — the resize computes
+        # 249 + 3 + 15, the ceiling binds at 250, and exactly one
+        # unit remains. Assertions unchanged.
+        pp._dm_budget_reset(chapter_count=pp._DECISION_POOL_CEILING)
         for _c in pp._DM_BUDGET_ORDER:
             pp._dm_budget_finish(_c)
-        for _ in range(pp._MERGE_TIER3_CAP - 1):
+        for _ in range(pp._DECISION_POOL_CEILING - 1):
             self.assertTrue(pp._dm_budget_claim(1))
         red = self._reduce([
             {"from": "Alice", "to": "Bob", "type": "friend",

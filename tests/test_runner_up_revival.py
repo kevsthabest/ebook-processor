@@ -184,10 +184,20 @@ class TestRunnerUpRevival(unittest.TestCase):
                           red["dropped_relationships"]], ["spouse"])
 
     def test_revival_with_empty_pool_ships_review_required(self):
-        # Test (3): budget fully drained before the run — the
+        # Test (3): the pool is empty when revival runs — the
         # revived romantic claim cannot be drawn, so it ships
         # unjudged with state review_required (NOT
         # budget_exhausted), carrying the revival stamp.
+        # Amended 2026-10-19 (2.13.66, candidate-aware sizing —
+        # Decision 2026-10-19): draining the provisional pool
+        # before the run no longer empties the pool at revival
+        # time, because the reduce resizes it to spent + census
+        # demand. The empty pool is now manufactured honestly:
+        # the same pre-drain (50 spent), plus 250 filler family
+        # winners whose judging burns the resized pool to its
+        # 250 ceiling during the family pass — the parent winner
+        # still dies fail-closed without a draw, and by revival
+        # time there is nothing left.
         pp._DECISION_VALIDATOR = _MapValidator({"romantic": 0.9})
         for _c in pp._DM_BUDGET_ORDER:
             pp._dm_budget_finish(_c)
@@ -195,6 +205,11 @@ class TestRunnerUpRevival(unittest.TestCase):
             self.assertTrue(pp._dm_budget_claim(1))
         self.assertFalse(pp._dm_budget_claim(1))
         chapter_as, chs = self._fw_shape()
+        chapter_as[1]["relationships"].extend(
+            {"from": f"Filler{i}", "to": f"Spouse{i}",
+             "type": "spouse",
+             "evidence": "an evidenced spouse claim"}
+            for i in range(250))
         red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
         rels = _pair_rels(red, "Anna", "Ben")
         self.assertEqual(len(rels), 1)
@@ -204,7 +219,13 @@ class TestRunnerUpRevival(unittest.TestCase):
         self.assertNotEqual(rel.get("validation_note"),
                             "budget_exhausted")
         self.assertTrue(rel["revived_runner_up"])
-        self.assertEqual(pp._DECISION_VALIDATOR.calls, [])
+        # The judge was consulted for the filler winners that
+        # fit (200 of them) — but never for the revived claim:
+        # the revival draw was denied before any call.
+        self.assertEqual(len(pp._DECISION_VALIDATOR.calls), 200)
+        self.assertEqual(
+            [c for c in pp._DECISION_VALIDATOR.calls
+             if c[2] == "romantic"], [])
 
     def test_winner_kept_no_revival_losers_recorded(self):
         # Test (4): a kept winner never triggers revival, but the

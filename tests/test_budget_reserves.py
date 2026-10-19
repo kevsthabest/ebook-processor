@@ -481,24 +481,32 @@ class UnverifiedClaimsSurfacingTests(unittest.TestCase):
         self.assertEqual(dropped[0]["source"], "extracted")
 
     def test_budget_exhausted_claims_ship_uncapped_with_state(self):
-        # Drain the whole pool, then present twelve unverified
-        # claims: every one keeps its type and ships with its
-        # state — §1.5 allows NO per-book cap on them.
+        # Amended 2026-10-19 (2.13.66, candidate-aware sizing —
+        # Decision 2026-10-19): draining the provisional pool no
+        # longer manufactures exhausted claims, because the pool
+        # resizes at the reduce to spent + measured census demand.
+        # Exhaustion now requires demand above the 250 ceiling:
+        # drain first (merges claim first in a real run), then
+        # present 260 claims — 200 are judged, 60 exhaust. The
+        # §1.5 pin is unchanged: every exhausted claim keeps its
+        # type and ships with its state; there is NO per-book cap
+        # on how many ship.
         for c in pp._DM_BUDGET_ORDER:
             pp._dm_budget_finish(c)
         for _ in range(pp._MERGE_TIER3_CAP):
             self.assertTrue(pp._dm_budget_claim(1))
-        claims = _claims(12, rtype="friend")
+        claims = _claims(260, rtype="friend")
         red = _reduce(claims, self.validator)
-        self.assertEqual(len(red["relationships"]), 12)
-        for rel in red["relationships"]:
+        self.assertEqual(len(red["relationships"]), 260)
+        exhausted = [r for r in red["relationships"]
+                     if r.get("validation_note") == "budget_exhausted"]
+        self.assertEqual(len(exhausted), 60)
+        self.assertEqual(len(self.validator.calls), 200)
+        for rel in exhausted:
             self.assertEqual(rel["type"], "friend")
-            self.assertEqual(rel["validation_note"],
-                             "budget_exhausted")
             self.assertEqual(rel["validation_state"],
                              "budget_exhausted")
             self.assertEqual(rel["source"], "extracted")
-        self.assertEqual(self.validator.calls, [])
 
     def test_existing_provenance_is_preserved_not_overwritten(self):
         claims = _claims(1)
@@ -510,7 +518,12 @@ class UnverifiedClaimsSurfacingTests(unittest.TestCase):
         self.assertEqual(rel_map["alpha0"][0]["source"], "human")
 
     def test_preview_markdown_shows_unverified_state(self):
-        claims = _claims(1, rtype="friend")
+        # Amended 2026-10-19 (2.13.66): as in the ship-uncapped
+        # test above, the exhausted claim this test renders is now
+        # manufactured above the sizing ceiling (260 claims after
+        # a drain: 60 exhaust) instead of by draining the old flat
+        # pool under a single claim.
+        claims = _claims(260, rtype="friend")
         for c in pp._DM_BUDGET_ORDER:
             pp._dm_budget_finish(c)
         for _ in range(pp._MERGE_TIER3_CAP):

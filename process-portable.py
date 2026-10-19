@@ -48,7 +48,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.65"
+PORTABLE_VERSION = "2.13.66"
 
 
 import argparse
@@ -16714,6 +16714,26 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                     "lost_to_type": _winner_type,
                 })
 
+    # --- Candidate-aware pool sizing (Decision 2026-10-19) ---
+    # The pair competition is complete, so the book's relationship
+    # demand is finally measurable — and no relationship validation
+    # claim has been made yet, which makes this the one seam where
+    # the pool can be sized from the census before the tail can
+    # starve. The census counts what validation will attempt: the
+    # winners, plus the revival candidates (at most one per pair —
+    # the bound on revival draws). Minor-sourced judging
+    # candidates are not a separate set here: the principal filter
+    # splits them out of the winners only later (process_file_v2),
+    # so at this seam they are still inside `relationships` and
+    # the census's identity dedupe already holds them exactly
+    # once.
+    _pool_before = _dm_budget_pool()
+    _pool_after = _dm_budget_resize_pool(
+        _relationship_census(relationships, _pair_revival.values()))
+    if _pool_after != _pool_before:
+        print(f"  Decision pool: {_pool_before} -> {_pool_after} "
+              f"(candidate-aware sizing from the pair census)")
+
     # --- Relationship importance: 1-5 from chapter co-occurrence ---
     # More chapters together = more important. Scaled to book length.
     _n_chapters = max(1, len(chapters))
@@ -20065,8 +20085,10 @@ _MERGE_P_YES_THRESHOLD = 0.85
 # name because the portal reads it as the pool's floor and older
 # stamps record it; the armed per-book pool itself lives in
 # _DM_BUDGET_POOL, computed by _decision_pool_for_chapters at
-# budget-arming time. There is deliberately no config override:
-# none existed before, and the formula is the ruled default.
+# budget-arming time and resized to the book's measured demand
+# at the v2 reduce (_dm_budget_resize_pool). There is
+# deliberately no config override: none existed before, and the
+# formula is the ruled default.
 _MERGE_TIER3_CAP = 50
 _DECISION_POOL_CEILING = 250
 # Decision-model relationship validation threshold. Lower than the
@@ -22937,7 +22959,11 @@ _DM_BUDGET_CHAPTER_COUNT = None
 def _decision_pool_for_chapters(chapter_count):
     """The per-book decision pool for a chapter count (Decision,
     2026-10-18): one call per chapter, floored at _MERGE_TIER3_CAP
-    and capped at _DECISION_POOL_CEILING. An unknown count (None,
+    and capped at _DECISION_POOL_CEILING. This is the pool a book
+    OPENS with at budget-arming time; since the candidate-aware
+    sizing landed it is a provisional cap — at the v2 reduce the
+    pool resizes to the book's measured demand
+    (_dm_budget_resize_pool). An unknown count (None,
     or a value that is not a positive integer) gets the floor —
     scaling is earned by a count the pipeline actually knows, and
     a bad count must never shrink a book below the old flat pool
@@ -23041,6 +23067,87 @@ def _dm_budget_reset(chapter_count=None):
     # section header): one arming moment for every per-book counter
     # set, so no reader ever has to reconcile two books' boundaries.
     _telemetry_arm()
+
+
+# Retry allowance for candidate-aware pool sizing (Decision
+# 2026-10-19): judgments retry — today a failed relationship
+# judgment claims a second call (Decision K4), and under pair
+# adjudication a failed batch re-asks its whole pair — so a pool
+# sized to exactly the census would starve the tail on retries
+# alone. The factor pre-funds retries at M2's middle batch-failure
+# scenario (5%), measured across the preview corpus in
+# pair-adjudication-m2-2026-10-19.md.
+_DECISION_POOL_RETRY_ALLOWANCE = 1.05
+
+
+def _relationship_census(*candidate_groups):
+    """The size of the relationship demand a reduce is about to
+    present: the number of DISTINCT claim identities (from, to,
+    type — the identity claims are keyed by everywhere else)
+    across the given candidate groups.
+
+    The groups are the sets validation will attempt: the pair-
+    competition winners (evidence-backed or not — the validator
+    attempts both today), the revival candidates (at most one
+    runner-up per pair, so the set itself is the revival bound),
+    and any minor-sourced candidates the caller tracks separately.
+    Identity dedupe is the point: the same claim extracted in two
+    chapters is one winner and one revival candidate but a single
+    identity, and sizing counts it once — the extra call a real
+    revival spends is what the retry allowance above is for."""
+    identities = set()
+    for group in candidate_groups:
+        for cand in group or ():
+            identities.add((cand.get("from"), cand.get("to"),
+                            cand.get("type")))
+    return len(identities)
+
+
+def _dm_budget_resize_pool(relationship_census):
+    """Resize the armed pool to the book's measured total demand
+    and return the pool in force (Decision 2026-10-19, Option B —
+    candidate-aware sizing, sized for today's judging).
+
+    The budget opens at book start with the chapter formula as a
+    PROVISIONAL cap, because merge judging must draw before any
+    relationship census exists. Chapters do not price candidate
+    volume, though — M2 measured 73-chapter books asking 48 and
+    121 questions — so once the v2 reduce has run its pair
+    competition (and before any relationship validation claim),
+    the pool resizes to:
+
+        min(ceiling, max(floor, spent + ceil(1.05 * census)
+                         + trigger reserve))
+
+    spent is read from the budget itself, so early consumers are
+    funded, not starved: the resize sizes the book's TOTAL, and
+    the relationship stages draw the remainder. The trigger term
+    is the trigger gate's own K2 reserve — the gate draws after
+    the reduce's validation, so its demand is entirely unspent at
+    resize time, and the reserve is the machinery's number for it.
+
+    Grow-only: the pool never shrinks below the provisional cap it
+    opened with (early draws were made against it, and reserves
+    are absolute floors inside whatever pool is in force), and
+    the formula cannot land below what is already spent. Demand
+    past the ceiling simply keeps today's behaviour — claims
+    exhaust in stakes order and land as budget_exhausted on the
+    record, never silently narrowed."""
+    global _DM_BUDGET_POOL
+    try:
+        census = int(relationship_census)
+    except (TypeError, ValueError):
+        census = 0
+    census = max(0, census)
+    with _DM_BUDGET_LOCK:
+        sized = (_DM_BUDGET_USED
+                 + math.ceil(_DECISION_POOL_RETRY_ALLOWANCE * census)
+                 + _DM_BUDGET_RESERVES["trigger_gate"])
+        new_pool = min(_DECISION_POOL_CEILING,
+                       max(_MERGE_TIER3_CAP, sized))
+        if new_pool > _DM_BUDGET_POOL:
+            _DM_BUDGET_POOL = new_pool
+        return _DM_BUDGET_POOL
 
 
 def _dm_budget_arm_seq():

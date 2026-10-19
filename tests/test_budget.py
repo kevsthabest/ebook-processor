@@ -157,20 +157,38 @@ class TestBudgetExhaustionNote(unittest.TestCase):
         return pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
 
     def test_starved_validation_notes_budget_exhausted(self):
-        # Exhaust the shared per-book budget (merges claim first in a
-        # real run; here the pool is simply drained before reduce).
+        # Amended 2026-10-19 (2.13.66, candidate-aware sizing —
+        # Decision 2026-10-19): a drained PROVISIONAL pool no
+        # longer starves validation, because the pool resizes at
+        # the reduce to spent + measured census demand. Starvation
+        # now requires total demand above the 250 ceiling, which
+        # is what this test drives: the budget is drained first
+        # (merges claim first in a real run), then 300 claims
+        # arrive — 200 fit under the ceiling, 100 starve.
         for _ in range(pp._MERGE_TIER3_CAP):
             self.assertTrue(pp._dm_budget_claim(1))
         self.assertFalse(pp._dm_budget_claim(1))
-        red = self._reduce_spouse()
-        self.assertEqual(len(red["relationships"]), 1)
-        rel = red["relationships"][0]
-        # The note lands, the ORIGINAL type survives unvalidated, and
-        # the validator was never consulted.
-        self.assertEqual(rel["validation_note"], "budget_exhausted")
-        self.assertEqual(rel["type"], "spouse")
-        self.assertNotIn("validation_p", rel)
-        self.assertEqual(self.calls, [])
+        claims = [{"from": f"Alice{i}", "to": f"Bob{i}",
+                   "type": "spouse",
+                   "evidence": "my wife Alice"} for i in range(300)]
+        chs = [{"index": 1, "label": "A", "text": "x " * 200},
+               {"index": 2, "label": "B", "text": "x " * 200}]
+        chapter_as = {1: {"characters": [],
+                          "task_status": {"identity": "ok"},
+                          "relationships": claims}}
+        red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=False)
+        self.assertEqual(len(red["relationships"]), 300)
+        exhausted = [r for r in red["relationships"]
+                     if r.get("validation_note") == "budget_exhausted"]
+        self.assertEqual(len(exhausted), 100)
+        # The judge was consulted exactly for the claims that fit;
+        # the starved hundred were never consulted at all.
+        self.assertEqual(len(self.calls), 200)
+        for rel in exhausted:
+            # The note lands and the ORIGINAL type survives
+            # unvalidated.
+            self.assertEqual(rel["type"], "spouse")
+            self.assertNotIn("validation_p", rel)
 
     def test_available_budget_validates_normally(self):
         # Contrast: with budget available the same input validates —
