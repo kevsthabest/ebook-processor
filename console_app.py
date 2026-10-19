@@ -603,10 +603,23 @@ def _build_app_class():
             # bracketed passage would restyle or raise instead of
             # rendering literally.
             text = Text(f"{header}\n\n{body}")
-            if names:
-                styles = {n: self._name_style(book, n,
-                                              new=n in new_names)
-                          for n in names}
+            # Colour with every name the book has identified up to
+            # this chapter, not only this chapter's own names: the
+            # displayed chapter is normally the one in flight, whose
+            # names land only when its extraction returns — by
+            # which point the next chapter has already displaced
+            # it, and the colours would never be seen. Returning
+            # cast lights from the first paint; a name first
+            # identified in this very chapter pops, which is
+            # visible whenever an identified chapter is on screen.
+            idx = key[2] if key else None
+            known = {n: f for n, f in
+                     book.char_first_chapter.items()
+                     if f is not None and idx is not None
+                     and f <= idx}
+            if known:
+                styles = {n: self._name_style(book, n, new=(f == idx))
+                          for n, f in known.items()}
                 _stylize(text, body, len(header) + 2, styles)
             if is_live and book.stages.get("identity") == "active":
                 text.append("\n\nEstimated input position · timing "

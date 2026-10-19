@@ -231,6 +231,50 @@ class TestHighlightPilot(unittest.TestCase):
                 self.assertIn("Mira Sorrengail", by_text)
         asyncio.run(main())
 
+    def test_in_flight_chapter_colours_returning_cast(self):
+        # Regression: the displayed chapter is normally the one in
+        # flight, whose own names have not landed. It must still
+        # light every character identified in earlier chapters.
+        async def main():
+            obs = ce.ConsoleObserver()
+            store = ce.ConsoleStore()
+            obs.publish("book_state", book_id="b1", payload={
+                "state": "active", "title": "Fourth Wing"})
+            obs.publish("stage_state", book_id="b1",
+                        stage="identity", payload={"state": "active"})
+            for name in ("Tairn", "Mira"):
+                obs.publish("candidate_upsert", book_id="b1",
+                            payload={
+                                "table": "characters", "key": name,
+                                "record": {"name": name, "chapters": 1,
+                                           "status": "candidate"}})
+            obs.publish("chapter_state", book_id="b1", payload={
+                "pass_id": "identity", "index": 0,
+                "label": "Chapter 1", "state": "started",
+                "excerpt": "Tairn landed. Mira watched."})
+            obs.publish("chapter_state", book_id="b1", payload={
+                "pass_id": "identity", "index": 0,
+                "state": "identified", "names": ["Tairn", "Mira"]})
+            obs.publish("chapter_state", book_id="b1", payload={
+                "pass_id": "identity", "index": 1,
+                "label": "Chapter 2", "state": "started",
+                "excerpt": "Mira ran. Tairn followed Mira."})
+            app = capp._build_app_class()(obs, store, {})
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                plain, spans = app._reader_sig
+                self.assertIn("Chapter 2", plain)
+                by_text = {}
+                for s, e, st in spans:
+                    by_text.setdefault(plain[s:e], []).append(st)
+                # Both returning names are lit in the in-flight
+                # chapter; neither pops (neither is new here).
+                self.assertIn("Tairn", by_text)
+                self.assertIn("Mira", by_text)
+                for st in by_text["Tairn"] + by_text["Mira"]:
+                    self.assertNotIn("underline", st)
+        asyncio.run(main())
+
     def test_characters_tab_dot_matches_reader_colour(self):
         async def main():
             from textual.coordinate import Coordinate
