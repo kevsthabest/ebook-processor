@@ -1020,10 +1020,17 @@ class CorpusQuotesAttachTests(_Base):
     def _drive(self, history_on):
         epub = _make_epub(self.tmp / "rhcq.epub", _drive_files(),
                           title="RH Corpus Quotes")
-        preview_json = pp.SCRIPT_DIR / "preview" / "rhcq.json"
+        preview_dir = pp.SCRIPT_DIR / "preview"
+        preview_json = preview_dir / "rhcq.json"
         self.addCleanup(preview_json.unlink, missing_ok=True)
-        self.addCleanup((pp.SCRIPT_DIR / "preview" / "rhcq.md").unlink,
+        self.addCleanup((preview_dir / "rhcq.md").unlink,
                         missing_ok=True)
+        # A history-armed run names its preview after the run key
+        # (rhcq--<run-key>.json/.md — pinned in
+        # tests/test_preview_run_key.py); sweep any such artifacts
+        # this drive leaves behind too.
+        self.addCleanup(lambda: [p.unlink(missing_ok=True) for p in
+                                 preview_dir.glob("rhcq--*.*")])
         self.addCleanup(lambda: shutil.rmtree(
             pp._checkpoint_dir(pp._checkpoint_book_key(epub)),
             ignore_errors=True))
@@ -1047,15 +1054,24 @@ class CorpusQuotesAttachTests(_Base):
                                 {"llm": "ollama", "corpus_quotes": True,
                                  "run_history": history_on}), \
                 contextlib.redirect_stdout(out):
+            run_key = None
             if history_on:
                 pp._history_begin("scan", preview=True,
                                   learn_dir=str(self.tmp), files_seen=1)
+                # Capture the key before _history_finish clears the
+                # global: the armed preview is named after it.
+                run_key = pp._HISTORY.run_key
                 pp._history_book_start(epub)
             ok = pp.process_file_v2(epub, preview=True)
             if history_on:
                 pp._history_book_outcome(epub, ok)
                 pp._history_finish(failures=0 if ok else 1)
         self.assertTrue(ok)
+        if history_on:
+            # No run-events sink is live in this drive, so the
+            # recorded key is the recorder's own — the same key the
+            # preview was named with.
+            preview_json = preview_dir / f"rhcq--{run_key}.json"
         # The corpus-quotes stage really ran in both cases — the
         # flag-off assertion below is about the result record, not
         # about the stage being skipped.

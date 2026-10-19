@@ -17,7 +17,10 @@ Usage:
 
   --dry-run   Run extraction, print a summary, write nothing, move no files.
   --preview   Run extraction, save preview/<book>.json + .md, write nothing to
-              Supabase (credentials not required), move no files.
+              Supabase (credentials not required), move no files. When the
+              run has an identity (--run-history or --emit-run-events), the
+              files are preview/<book>--<run-key>.json + .md instead, so a
+              preview names the run that produced it.
   --debug     With --preview/--dry-run, save raw LLM output of failed chunks
               to preview/debug/ for diagnosis.
   --dedupe    Merge duplicate characters (name normalization + embeddings)
@@ -45,7 +48,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.64"
+PORTABLE_VERSION = "2.13.65"
 
 
 import argparse
@@ -20235,6 +20238,29 @@ def _run_events_book_name():
     return sink.book() if sink is not None else None
 
 
+def _current_run_key():
+    """The identity of the run in progress, or None when this
+    process carries no run identity.
+
+    The run-events sink comes first: its artifact's stem is the
+    identity the run is known by on disk from the moment the sink
+    opens (the name is pinned at creation, numeric suffix and all),
+    and it is the stem the history flush adopts when both are
+    armed, so an artifact named from it mid-run already carries
+    the identity the run will be recorded under. The history
+    recorder's key is the fallback for history-only runs — with no
+    sink live, nothing replaces it, so it is already final.
+    Anything that names a per-run artifact (save_preview) reads
+    the key here rather than reaching for either global itself,
+    so the precedence lives in exactly one place."""
+    sink = _RUN_SINK
+    if sink is not None and getattr(sink, "path", None):
+        return Path(sink.path).stem
+    if _HISTORY is not None:
+        return getattr(_HISTORY, "run_key", None)
+    return None
+
+
 def _run_events_begin(learn_dir, preview=False, dry_run=False):
     """Open this run's artifact and make it the live sink. Returns the
     artifact path, or None when the location is unwritable — the run
@@ -27769,6 +27795,20 @@ def save_preview(fpath, result):
     prev_dir = SCRIPT_DIR / "preview"
     prev_dir.mkdir(exist_ok=True)
     base = fpath.stem + CONFIG.get("preview_name_suffix", "")
+    # When the run has an identity, the preview is named after it:
+    # <book>--<run-key>. A per-book name alone cannot say which run
+    # produced the artifact — every run overwrote the same file,
+    # so afterwards a preview could be (and was) cited against the
+    # wrong run. The run key is the identity the run-events
+    # artifact and the run-history rows already share, so the
+    # preview joins the same chain of custody. The honest cost:
+    # armed runs stop overwriting the plain per-book file, so
+    # previews accumulate one file per (book, run) instead of one
+    # per book. With no run identity there is nothing truthful to
+    # add and the name stays exactly the historic one.
+    run_key = _current_run_key()
+    if run_key:
+        base = f"{base}--{run_key}"
 
     with open(prev_dir / f"{base}.json", "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)

@@ -473,10 +473,18 @@ class TestTwoBookRun(unittest.TestCase):
                 self.addCleanup(lambda s=stem, e=ext: (
                     pp.SCRIPT_DIR / "preview" / f"{s}.{e}"
                 ).unlink(missing_ok=True))
+                # The run-events sink is armed for this class's
+                # runs, so the previews land under run-keyed names
+                # (<stem>--<run-key>.<ext>) rather than the plain
+                # ones above; sweep those too.
+                self.addCleanup(lambda s=stem, e=ext: [
+                    p.unlink(missing_ok=True) for p in
+                    (pp.SCRIPT_DIR / "preview").glob(f"{s}--*.{e}")])
             self.addCleanup(lambda s=stem: shutil.rmtree(
                 pp._checkpoint_dir(pp._checkpoint_book_key(
                     root / f"{s}.epub")), ignore_errors=True))
         self.learn_dir = root / "learned"
+        self._run_key = None  # _run_books stamps the live sink's stem
 
     def _run_books(self, jobs=1):
         backend = _FakeBackend()
@@ -492,6 +500,7 @@ class TestTwoBookRun(unittest.TestCase):
             path = pp._run_events_begin(self.learn_dir,
                                          preview=True)
             self.assertIsNotNone(path)
+            self._run_key = path.stem
             try:
                 for epub in self.books:
                     with pp._run_events_book(epub):
@@ -502,8 +511,12 @@ class TestTwoBookRun(unittest.TestCase):
         return path
 
     def _preview(self, stem):
+        # The events sink is armed for the whole run, so each
+        # preview is named after the run key (<stem>--<run-key>):
+        # the sink's stem is the identity the previews carry (the
+        # naming itself is pinned in tests/test_preview_run_key.py).
         return json.loads((pp.SCRIPT_DIR / "preview"
-                           / f"{stem}.json").read_text(
+                           / f"{stem}--{self._run_key}.json").read_text(
                                encoding="utf-8"))
 
     def test_preview_telemetry_is_per_book(self):
