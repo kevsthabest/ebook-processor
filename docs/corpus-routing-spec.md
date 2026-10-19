@@ -393,3 +393,25 @@ to the slice that first proposes routing it.
 
 **Sequencing note.** The §6 telemetry lands after the `--run-history-backfill`
 build (v2.13.57), whose writer reads the same run-event book-end payload.
+
+---
+
+## Phase 0 outcome (2026-10-18) — ROUTING PARKED per amendment A2
+
+The telemetry shipped (v2.13.58, corrected v2.13.59). Both Phase 0 profile
+runs are recorded (Daemon run 24, Fourth Wing run 25; per-phase splits in the
+programme's Phase 0 report):
+
+- Daemon: wall 2,402s — extraction 94.3%, decision model 0.67% (16.2s);
+  decision plus the entire untimed remainder is at most 5.7% of wall.
+- Fourth Wing: wall 3,580s — extraction 96.8%, decision model 0.73% (26.1s);
+  decision plus the entire untimed remainder is at most 3.2% of wall.
+
+Decision plus evidence work is under the 15% kill bar on both books under
+every reading of the instrumentation (evidence retrieval is not separately
+timed; the bound credits it with all untimed time). Per amendment A2, corpus
+routing is PARKED: Phases 1–3 are not built. The §6 telemetry remains in the
+product — it is independently owed to the decision-budget calibration and
+reserve-sizing work. Reopening condition: a future profile, on this same
+telemetry, showing decision plus evidence work at or above 15% of wall time
+on a representative book.
