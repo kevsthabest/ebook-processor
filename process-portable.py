@@ -1615,6 +1615,90 @@ def _matrix_snapshot_data(chapter_as, chapter_bs):
     return dict(char_freq), spice_peak, spice_counts, rel_count
 
 
+def _scan_results_snapshot(chapter_as, chapter_bs, max_items=6):
+    """Build compact, cumulative extraction candidates for the live TUI.
+
+    These are intentionally labelled candidates: relationship validation and
+    final trope/trigger reduction happen later in the pipeline.
+    """
+    chars = Counter()
+    relationships = []
+    tropes = Counter()
+    triggers = {}
+    for idx in sorted(chapter_as or {}):
+        a = chapter_as[idx]
+        if not isinstance(a, dict):
+            continue
+        chapter_names = set()
+        for c in a.get("characters", []) or []:
+            name = (c.get("name") or "").strip() if isinstance(c, dict) else ""
+            if name:
+                chapter_names.add(name)
+        chars.update(chapter_names)
+        for rel in a.get("relationships", []) or []:
+            if not isinstance(rel, dict):
+                continue
+            src = rel.get("from") or rel.get("source") or "?"
+            dst = rel.get("to") or rel.get("target") or "?"
+            kind = rel.get("type") or rel.get("relationship") or "relationship"
+            evidence = rel.get("evidence") or ""
+            relationships.append({"text": "%s — %s → %s" % (kind, src, dst),
+                                  "evidence": str(evidence)})
+    for idx in sorted(chapter_bs or {}):
+        b = chapter_bs[idx]
+        if not isinstance(b, dict):
+            continue
+        for item in b.get("trope_candidates", []) or b.get("tropes", []) or []:
+            label = (item.get("name") or item.get("trope") or "") if isinstance(item, dict) else item
+            label = str(label or "").strip()
+            if label and label.lower() != "none":
+                tropes[label] += 1
+        raw = b.get("triggers") or {}
+        if isinstance(raw, dict):
+            for category, value in raw.items():
+                if isinstance(value, dict):
+                    severity = value.get("severity") or value.get("level") or "detected"
+                else:
+                    severity = value
+                severity = str(severity or "").strip()
+                if severity and severity.lower() not in ("none", "false", "0"):
+                    key = str(category).replace("_", " ")
+                    rank = {"none": 0, "mentioned": 1, "on_page": 2,
+                            "graphic": 3}
+                    previous = triggers.get(key, "")
+                    if rank.get(severity.lower(), 1) > rank.get(previous.lower(), 0):
+                        triggers[key] = severity
+    result_chapters = {idx for idx, value in (chapter_as or {}).items()
+                       if isinstance(value, dict)}
+    result_chapters.update(idx for idx, value in (chapter_bs or {}).items()
+                           if isinstance(value, dict))
+    return {"characters": chars.most_common(max_items),
+            "relationships": relationships[-max_items:],
+            "tropes": tropes.most_common(max_items),
+            "triggers": sorted(triggers.items())[:max_items],
+            "chapter_count": len(result_chapters)}
+
+
+def _viz_estimated_position(text_len, elapsed, samples):
+    """Estimate a chapter offset from prior chapter throughput, if available."""
+    rates = [(length / duration) for length, duration in (samples or [])
+             if length > 0 and duration > 0]
+    if not rates:
+        return None
+    rate = sum(rates[-10:]) / len(rates[-10:])
+    return min(max(int(max(elapsed, 0) * rate), 0), max(text_len, 0))
+
+
+def _viz_text_window(text, position, width=1600):
+    """Return a bounded excerpt centered near the estimated scan position."""
+    text = text or ""
+    if len(text) <= width:
+        return text, 0
+    start = 0 if position is None else max(0, min(position - width // 3,
+                                                  len(text) - width))
+    return text[start:start + width], start
+
+
 def _matrix_panel_lines(mx):
     """Compact Rich-markup matrix snapshot for the viz panel. Pure.
 
@@ -1647,11 +1731,15 @@ def _matrix_panel_block(mx, show):
 
 
 def _push_matrix_viz_ui(chapter_as, chapter_bs):
-    """Push running matrix aggregates to the Rich viz panel (--show-matrices).
+    """Push extraction candidates, plus optional matrix aggregates, to TUI.
 
     Module-level so the hook sites in process_file_v2 stay one-liners.
-    No-op unless --show-matrices is set.
+    Extraction candidates update whenever the visualizer is active; matrix
+    aggregates remain opt-in via --show-matrices.
     """
+    results = _scan_results_snapshot(chapter_as, chapter_bs)
+    if hasattr(UI, "update_scan_results"):
+        UI.update_scan_results(results)
     if not CONFIG.get("show_matrices"):
         return
     cf, sp, sc, rc = _matrix_snapshot_data(chapter_as, chapter_bs)
@@ -18176,18 +18264,11 @@ def _viz_revealed_text(text, t0, now, cps=_VIZ_TYPE_CPS):
 
 
 def _viz_stats_line(st, now):
-    """Plain-text stats line for the visualizer panel (no Rich markup)."""
-    elapsed_min = max((now - st.get("run_t0", now)) / 60.0, 1e-6)
-    speed = int(st.get("chars_total", 0) / elapsed_min)
-    avg_toks = speed / 60.0 / 4.0  # ~4 chars/token for English
-    # Recent speed: current chapter only.
-    chap_elapsed = max(now - st.get("chap_t0", now), 1e-6)
-    chap_speed = int(st.get("chap_chars", 0) / chap_elapsed * 60.0)
-    cur_toks = chap_speed / 60.0 / 4.0
+    """Plain-text progress stats; avoid describing character estimates as tokens."""
     ci = st.get("chap_idx") or "?"
     ct = st.get("chap_total") or "?"
-    line = "Characters: %d | Chapter %s/%s | %.1f tok/s (avg %.1f tok/s)" % (
-        st.get("new_count", 0), ci, ct, cur_toks, avg_toks)
+    line = "Characters found: %d | Chapter %s/%s" % (
+        st.get("new_count", 0), ci, ct)
     # P6: ETA from rolling per-chapter average (last 10 chapters).
     times = st.get("chapter_times") or []
     if times and isinstance(ci, int) and isinstance(ct, int) and ct > ci:
@@ -18265,7 +18346,7 @@ class _VizRenderable:
         self._ui = ui
 
     def __rich_console__(self, console, options):
-        yield self._ui._render_viz_panel()
+        yield self._ui._render_viz_panel(options.max_width)
 
 
 class PipelineUI:
@@ -18311,9 +18392,8 @@ class PipelineUI:
             # Live is never started).
             if self._viz_enabled:
                 self._layout = _RichLayout()
-                # Panel rows: base 24 + 2 for bottleneck line + 2 more when
-                # matrix viz is on (--show-matrices).
-                viz_size = 28 if getattr(self, '_show_matrices', False) else 26
+                # Keep the scan workspace compact while leaving room for bars.
+                viz_size = 24
                 self._layout.split_column(
                     _RichLayout(self.progress, name="bars"),
                     _RichLayout(_VizRenderable(self), name="viz", size=viz_size),
@@ -18408,7 +18488,7 @@ class PipelineUI:
                 times = times[-10:]
                 lens.append((_pchars, _dur))
                 lens = lens[-20:]
-            txt = (text or "")[:800]
+            txt = text or ""
             self._viz = {
                 "book": book_key,
                 "label": chapter_label or "",
@@ -18432,6 +18512,7 @@ class PipelineUI:
                 # Live matrix snapshot (--show-matrices), carried over so the
                 # panel doesn't flicker to empty between chapters.
                 "matrix": prev.get("matrix"),
+                "results": prev.get("results"),
             }
 
     def viz_characters(self, book_key, characters):
@@ -18474,7 +18555,7 @@ class PipelineUI:
             del ev[:-8]
 
     def update_matrix_data(self, char_freq, spice_peak, spice_counts,
-                           rel_count):
+                           rel_count, results=None):
         """Store a live matrix snapshot for the viz panel (--show-matrices).
 
         Called per chapter from process_file_v2; the Rich Live refresh
@@ -18491,8 +18572,19 @@ class PipelineUI:
                 "spice_counts": dict(spice_counts or {}),
                 "rel_count": rel_count or 0,
             }
+            if results is not None:
+                self._viz["results"] = dict(results)
 
-    def _render_viz_panel(self):
+    def update_scan_results(self, results):
+        """Store cumulative extraction candidates for the live results pane."""
+        if not self._viz_usable():
+            return
+        with self._lock:
+            if self._viz is None:
+                self._viz = _viz_new_state(None)
+            self._viz["results"] = dict(results or {})
+
+    def _render_chapter_panel(self):
         """Build the visualizer Panel. Called on each Live refresh."""
         with self._lock:
             st = None
@@ -18507,23 +18599,28 @@ class PipelineUI:
                               title="🔍 Chapter visualizer",
                               border_style="dim blue")
         now = time.time()
-        # Typing effect: reveal text progressively (~30 chars/sec).
-        shown = _viz_revealed_text(st["text"], st["t0"], now)
-        lines = shown.split("\n")
-        view = lines[:8]
+        # Show an excerpt near a timing-based estimate. This is not a model
+        # cursor; the model receives the chapter as one request.
+        elapsed = max(now - st.get("chap_t0", now), 0)
+        position = _viz_estimated_position(len(st["text"]), elapsed,
+                                           st.get("chapter_lens"))
+        excerpt, offset = _viz_text_window(st["text"], position, width=1100)
+        view = excerpt.splitlines()[:18]
         names = sorted(set(st.get("names", ())), key=len, reverse=True)
         pat = "|".join(re.escape(nm) for nm in names) if names else None
         out = []
-        for idx, ln in enumerate(view):
+        for ln in view:
             ln = _rich_escape(ln[:110])
             if pat:
                 ln = re.sub(r"\b(%s)\b" % pat, r"[bold yellow]\1[/]", ln,
                             flags=re.IGNORECASE)
             # Scan marker rides the last revealed line.
-            marker = "[dim]▸ [/]" if idx == len(view) - 1 else "  "
-            out.append(marker + ln)
-        body = "[bold cyan]%s[/]\n[dim]%s[/]\n" % (
-            _rich_escape(_viz_stats_line(st, now)), "─" * 40)
+            out.append(ln)
+        pos_label = ("~%d%%" % round(position / max(len(st["text"]), 1) * 100)
+                     if position is not None else "calibrating")
+        body = "[bold cyan]%s[/]\n[dim]Elapsed %s · estimated position %s · %s[/]\n" % (
+            _rich_escape(_viz_stats_line(st, now)), _format_duration(elapsed),
+            pos_label, ("excerpt near char %s" % format(offset, ",") if offset else "chapter start"))
         spot = st.get("spotlight")
         if spot and (now - spot["t"]) < _VIZ_SPOTLIGHT_SECS:
             body += "[bold bright_green]✨ New: %s[/]\n" % _rich_escape(
@@ -18541,10 +18638,6 @@ class PipelineUI:
         if ticker:
             tick = " • ".join(ticker[-_VIZ_TICKER_MAX:])
             body += "\n[dim]─[/]\n[dim]%s[/]" % _rich_escape(tick[:100])
-        # Live matrix snapshot (--show-matrices): top characters, spice,
-        # relationship count. Rendered at the panel's 4fps refresh.
-        body += _matrix_panel_block(st.get("matrix"),
-                                    CONFIG.get("show_matrices", False))
         # P11: bottleneck diagnosis from chapter length vs duration.
         _lens = st.get("chapter_lens") or []
         if len(_lens) >= 3:
@@ -18562,6 +18655,43 @@ class PipelineUI:
             title = "🔍 %s" % (st.get("label") or "chapter")
         return _RichPanel(body, title=_rich_escape(title[:58]),
                           border_style="dim blue")
+
+    def _render_viz_panel(self, width=120):
+        """Render chapter text alongside cumulative extraction candidates."""
+        chapter = self._render_chapter_panel()
+        with self._lock:
+            state = self._viz or {}
+            results = dict(state.get("results") or {})
+            matrix = dict(state.get("matrix") or {})
+        lines = ["[dim]Extracted candidates · validation pending[/]"]
+        if CONFIG.get("show_matrices") and matrix:
+            lines.extend(_matrix_panel_lines(matrix).splitlines())
+        def section(label, values, formatter):
+            lines.append("\n[bold cyan]%s[/]" % label)
+            if values:
+                lines.extend("• " + _rich_escape(formatter(item)) for item in values)
+            else:
+                lines.append("[dim]No candidates yet[/]")
+        section("Characters", results.get("characters", [])[:6],
+                lambda item: "%s · %s ch." % (item[0], item[1]))
+        section("Relationships", results.get("relationships", [])[-3:],
+                lambda item: item.get("text", "relationship") +
+                ((" · “%s”" % item.get("evidence", "")[:70])
+                 if item.get("evidence") else ""))
+        section("Tropes", results.get("tropes", [])[:5],
+                lambda item: "%s · %s ch." % (item[0], item[1]))
+        section("Triggers", results.get("triggers", [])[:5],
+                lambda item: "%s · %s" % (item[0], item[1]))
+        if results:
+            lines.append("\n[dim]%s chapters indexed[/]" % results.get("chapter_count", 0))
+        result_panel = _RichPanel("\n".join(lines), title="✦ Live results",
+                                  border_style="dim green")
+        layout = _RichLayout()
+        if width < 105:
+            layout.split_column(chapter, result_panel)
+        else:
+            layout.split_row(_RichLayout(chapter, ratio=2), result_panel)
+        return layout
 
     def summary(self, title, rows):
         """Print a summary table. rows = [(metric, value), ...]."""

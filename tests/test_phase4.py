@@ -1507,9 +1507,9 @@ class TestVisualizer(unittest.TestCase):
               "run_t0": 1000.0, "chars_total": 600,
               "chap_t0": 1000.0, "chap_chars": 600}
         line = pp._viz_stats_line(st, 1060.0)
-        self.assertIn("Characters: 7", line)
+        self.assertIn("Characters found: 7", line)
         self.assertIn("Chapter 3/73", line)
-        self.assertIn("2.5 tok/s", line)
+        self.assertNotIn("tok/s", line)
 
 
 class TestDecisionValidator(unittest.TestCase):
@@ -4339,7 +4339,7 @@ class TestTuiImprovements(unittest.TestCase):
         self.assertAlmostEqual(times[0], 5.0, places=1)
         lens = ui._viz["chapter_lens"]
         self.assertEqual(len(lens), 1)
-        self.assertEqual(lens[0][0], 800)  # text truncated to 800
+        self.assertEqual(lens[0][0], 1000)  # timing uses full chapter input
 
     def test_viz_chapter_rolling_window(self):
         ui = self._ui_rich()

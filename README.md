@@ -421,7 +421,11 @@ decision-model score: P ≥ 0.70 keeps the type, 0.30 ≤ P < 0.70 downgrades to
 evidence = downgrade without spending a decision-model call. In preview mode
 nothing changes; scores and notes land in the preview for audit.
 `--show-matrices` renders the spice/prominence matrices as ASCII during the
-run.
+run. The Rich scan workspace shows a chapter excerpt beside cumulative
+character, relationship, trope, and trigger candidates as chapters finish.
+Its chapter location is a timing-based estimate from prior chapters, not a
+model reading cursor; candidates remain subject to the pipeline's later
+validation and reduction stages. `--no-viz` disables the workspace.
 
 ## Cross-run learning
 
