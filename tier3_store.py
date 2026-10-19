@@ -863,7 +863,15 @@ def _resolve_import_identity(db_path, candidate, explicit, title,
     stored book AND an adoption was at stake, in which case it
     is {"matches": [...], "adopted": bool, "target": work_id}:
     the full match list, whether the adoption went ahead, and
-    the book it would have adopted. A multi-match adoption —
+    the book it would have adopted. One shape carries "noted":
+    True in place of an adoption outcome: an explicit candidate
+    whose sorted-first match is another explicit identity. No
+    adoption is applicable there in either mode — two explicit
+    identities for one title are never merged, so the flag has
+    nothing to enable — but the multi-match still happened, and
+    it is reported in its own terms rather than silently
+    dropped or dressed in blocked/adopted wording that would
+    promise an adoption the flag cannot perform. A multi-match adoption —
     either direction: a fallback candidate adopting a stored
     identity, or an explicit identity renaming a fallback book
     onto itself — happens only when the operator opted in with
@@ -907,7 +915,15 @@ def _resolve_import_identity(db_path, candidate, explicit, title,
         # they may be genuinely different works. Only a fallback
         # identity folds into the explicit one.
         if not match.startswith("title:"):
-            return candidate, None, None
+            if multi is not None:
+                # No adoption is applicable on this path in
+                # either mode — the flag has nothing to enable —
+                # so the multi-match is carried back as noted,
+                # not dropped (where it read as no match at all)
+                # and not dressed as an adoption outcome.
+                multi["adopted"] = False
+                multi["noted"] = True
+            return candidate, None, multi
         if multi is not None and not multi["adopted"]:
             return candidate, None, multi
         return candidate, match, multi
@@ -1047,11 +1063,15 @@ def import_preview(db_path, preview_path, stored_names_path=None,
         # The multi-match gate (#56): the matched identities
         # when an adoption was at stake among several books,
         # and the outcome as its own counts, so the import
-        # summary can report a skipped or flagged adoption
-        # separately from the ordinary book counts instead of
-        # folding it into them invisibly. All empty/zero when
-        # no multi-match arose — single-match and no-match
-        # imports report exactly what they reported before.
+        # summary can report a skipped, flagged or noted
+        # multi-match separately from the ordinary book counts
+        # instead of folding it into them invisibly. The noted
+        # count is the #70 state: a multi-match where no
+        # adoption was applicable (explicit candidate, explicit
+        # first match), carried so the match is never silent.
+        # All empty/zero when no multi-match arose —
+        # single-match and no-match imports report exactly
+        # what they reported before.
         "multi_match_matches": list(multi_match["matches"])
         if multi_match else [],
         "multi_match_count": len(multi_match["matches"])
@@ -1059,9 +1079,12 @@ def import_preview(db_path, preview_path, stored_names_path=None,
         "multi_match_target": multi_match["target"]
         if multi_match else None,
         "multi_match_blocked": 1 if multi_match
-        and not multi_match["adopted"] else 0,
+        and not multi_match["adopted"]
+        and not multi_match.get("noted") else 0,
         "multi_match_adopted": 1 if multi_match
         and multi_match["adopted"] else 0,
+        "multi_match_noted": 1 if multi_match
+        and multi_match.get("noted") else 0,
     }
 
 
@@ -1171,7 +1194,26 @@ def cmd_import(args):
         # quieter wrong book, and an adoption the flag enabled
         # is still an arbitrary pick he should see happen.
         matches = ", ".join(result["multi_match_matches"])
-        if result["multi_match_blocked"]:
+        if result["multi_match_noted"]:
+            # No adoption was applicable (#70): both sides of
+            # the first match carry explicit identities, and
+            # two explicit identities for one title are never
+            # merged — the flag could not have enabled anything
+            # here, so the wording says exactly that instead of
+            # borrowing the blocked/adopted text, which would
+            # promise a skipped or performed adoption.
+            print(f"  WARNING: {result['title']!r} matched "
+                  f"{result['multi_match_count']} stored books "
+                  f"({matches}) — no adoption applies: this "
+                  f"import and its first match both carry "
+                  f"explicit identities, and two explicit "
+                  f"identities for one title are never merged. "
+                  f"The import was recorded under its own "
+                  f"identity {result['work_id']}, and the "
+                  f"matched books were left untouched.")
+            print(f"  multi-match noted (no adoption "
+                  f"applicable): {result['multi_match_noted']}")
+        elif result["multi_match_blocked"]:
             print(f"  WARNING: {result['title']!r} matched "
                   f"{result['multi_match_count']} stored books "
                   f"({matches}) — multi-match adoption skipped "

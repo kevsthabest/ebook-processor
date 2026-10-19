@@ -337,5 +337,88 @@ class ExplicitMultiMatchTests(MultiMatchCase):
                          ["W-NEW", "title:the stand|second author"])
 
 
+class ExplicitExplicitMultiMatchTests(MultiMatchCase):
+    """Issue #70: the one multi-match shape #56's report missed.
+    An explicit candidate whose sorted-first match is another
+    explicit identity: two explicit identities for one title are
+    never merged, so no adoption is at stake in either mode and
+    the flag has nothing to enable — but the multi-match still
+    happened, and the strictest reading of the #56 ruling ('a
+    multi-match is always reported') wants it surfaced, as its
+    own 'noted' state rather than in blocked/adopted wording
+    that would promise an adoption the flag cannot perform."""
+
+    def explicit_third_book(self):
+        art = _artefact(work_id="W-NEW")
+        del art["author"]
+        return art
+
+    def test_explicit_explicit_multi_match_noted_without_flag(self):
+        self.seed_two_same_title_books()
+        result = self.import_it(self.explicit_third_book(),
+                                name="new.json")
+        # No adoption, no rename: the new book stands alongside
+        # both stored ones, whose rows are untouched.
+        self.assertEqual(result["work_id"], "W-NEW")
+        self.assertIsNone(result["adopted_from"])
+        self.assertEqual(self.books(), ["W-A", "W-B", "W-NEW"])
+        self.assertEqual(self.tier3_names("W-A"), {"Sidekick"})
+        self.assertEqual(self.tier3_names("W-B"), {"Sidekick"})
+        # Reported as its own state: counted as noted, not as
+        # a skipped or performed adoption.
+        self.assertEqual(result["multi_match_count"], 2)
+        self.assertEqual(result["multi_match_matches"],
+                         ["W-A", "W-B"])
+        self.assertEqual(result["multi_match_target"], "W-A")
+        self.assertEqual(result["multi_match_noted"], 1)
+        self.assertEqual(result["multi_match_blocked"], 0)
+        self.assertEqual(result["multi_match_adopted"], 0)
+
+    def test_explicit_explicit_multi_match_noted_with_flag(self):
+        # The flag cannot enable an adoption that does not
+        # exist on this path; the note still fires and the
+        # adoption counters stay at zero.
+        self.seed_two_same_title_books()
+        result = self.import_it(
+            self.explicit_third_book(), name="new.json",
+            allow_multi_match_adoption=True)
+        self.assertEqual(result["work_id"], "W-NEW")
+        self.assertIsNone(result["adopted_from"])
+        self.assertEqual(self.books(), ["W-A", "W-B", "W-NEW"])
+        self.assertEqual(result["multi_match_noted"], 1)
+        self.assertEqual(result["multi_match_blocked"], 0)
+        self.assertEqual(result["multi_match_adopted"], 0)
+
+    def test_explicit_explicit_multi_match_cli_notes(self):
+        self.seed_two_same_title_books()
+        path = self.write_artefact(self.explicit_third_book(),
+                                   name="new.json")
+        code, out = self.run_cli(
+            ["import", "--db", self.db, "--preview", path,
+             "--config", self.missing_config])
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING", out)
+        self.assertIn("The Stand", out)
+        self.assertIn("W-A", out)
+        self.assertIn("W-B", out)
+        self.assertIn("multi-match noted", out)
+        # The blocked wording would mislead here: nothing was
+        # skipped, and re-running with the flag adopts nothing.
+        self.assertNotIn("skipped", out)
+        self.assertNotIn(FLAG, out)
+
+    def test_explicit_explicit_multi_match_cli_notes_with_flag(self):
+        self.seed_two_same_title_books()
+        path = self.write_artefact(self.explicit_third_book(),
+                                   name="new.json")
+        code, out = self.run_cli(
+            ["import", "--db", self.db, "--preview", path,
+             "--config", self.missing_config, FLAG])
+        self.assertEqual(code, 0)
+        self.assertIn("multi-match noted", out)
+        self.assertNotIn("multi-match adoptions: 1", out)
+        self.assertEqual(self.books(), ["W-A", "W-B", "W-NEW"])
+
+
 if __name__ == "__main__":
     unittest.main()
