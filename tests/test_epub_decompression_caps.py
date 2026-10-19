@@ -230,6 +230,64 @@ class TestProcessorLegitimateBook(unittest.TestCase):
         self.assertIn("TAILSENTINEL", units[0]["text"])
 
 
+class TestAggregateBudget(unittest.TestCase):
+    """Issue #54: the per-entry caps bound one entry, but nothing
+    bounded the TOTAL decompressed bytes across all entries of one
+    book, so many just-under-cap entries could still sum to an
+    unbounded decompression. One aggregate budget must cover every
+    capped read of the book's extraction (container, OPF, and every
+    spine document), failing the whole book with the same named
+    error when the total would pass it."""
+
+    def test_aggregate_budget_constant_in_hundreds_of_mib(self):
+        self.assertTrue(hasattr(pp, "EPUB_TOTAL_MAX_BYTES"))
+        # Real books decompress to under 2 MiB (issue #54), so a
+        # budget in the hundreds of MiB cannot clip a legitimate
+        # book while still bounding a crafted one.
+        self.assertGreaterEqual(pp.EPUB_TOTAL_MAX_BYTES, 100 << 20)
+        self.assertLess(pp.EPUB_TOTAL_MAX_BYTES, 1 << 30)
+
+    def test_many_under_cap_chapters_over_total_budget_fails_book(self):
+        # Ten chapters, each far below the 32 MiB document cap and
+        # below the patched aggregate budget on its own — but their
+        # sum (with container and OPF) passes the budget, so the
+        # book must refuse rather than extract.
+        files = {f"OEBPS/ch{n:02d}.xhtml":
+                 _chapter_xhtml("word " * 120, f"Chapter {n}")
+                 for n in range(10)}
+        epub = _epub_bytes(files)
+        with mock.patch.object(pp, "EPUB_TOTAL_MAX_BYTES", 4096,
+                               create=True):
+            with self.assertRaises(CapError) as cm:
+                _extract(epub)
+        msg = str(cm.exception).lower()
+        self.assertTrue("total" in msg or "aggregate" in msg
+                        or "budget" in msg, msg)
+
+    def test_normal_epub_extracts_byte_identical(self):
+        # A normal EPUB-shaped archive under the budget extracts
+        # exactly the units its chapters carry — same texts, same
+        # order, same metadata as the uncapped-aggregate behaviour.
+        files = {
+            "OEBPS/ch01.xhtml": _chapter_xhtml("alpha beta gamma " * 40,
+                                               "One"),
+            "OEBPS/ch02.xhtml": _chapter_xhtml("delta epsilon zeta " * 40,
+                                               "Two"),
+        }
+        epub = _epub_bytes(files)
+        units, title, author, _ids = _extract(epub)
+        self.assertEqual(title, "Capped Book")
+        self.assertEqual(author, "Test Author")
+        self.assertEqual([u["label"] for u in units], ["One", "Two"])
+        self.assertIn("alpha beta gamma", units[0]["text"])
+        self.assertIn("delta epsilon zeta", units[1]["text"])
+        again = _extract(epub)
+        self.assertEqual([(u["spine"], u["label"], u["text"])
+                          for u in units],
+                         [(u["spine"], u["label"], u["text"])
+                          for u in again[0]])
+
+
 class TestScaledownLabCaps(unittest.TestCase):
     def _write(self, td, files, opf_pad=0):
         path = Path(td) / "book.epub"

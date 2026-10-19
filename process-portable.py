@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.60"
+PORTABLE_VERSION = "2.13.61"
 
 
 import argparse
@@ -387,6 +387,16 @@ def _natural_key(s):
 EPUB_CONTAINER_MAX_BYTES = 1 << 20
 EPUB_OPF_MAX_BYTES = 5 << 20
 EPUB_DOCUMENT_MAX_BYTES = 32 << 20
+# The per-entry caps bound one entry, but a book is read entry by
+# entry, so without a total the entries of one archive could still
+# sum to an unbounded decompression — many just-under-cap spine
+# documents would each pass while the book as a whole exhausts
+# memory. One aggregate budget therefore covers every capped read
+# of a single book's extraction. Whole real books decompress to
+# under 2 MiB today, so 256 MiB — eight full-size documents plus
+# metadata — is generous headroom that cannot clip a legitimate
+# book while still bounding a crafted one.
+EPUB_TOTAL_MAX_BYTES = 256 << 20
 
 
 class EpubEntryTooLargeError(Exception):
@@ -397,7 +407,31 @@ class EpubEntryTooLargeError(Exception):
     scan moves on."""
 
 
-def _read_zip_entry_capped(z, name, cap):
+class _EpubAggregateBudget:
+    """The running decompressed total for one book's extraction.
+
+    The per-entry caps alone leave the sum across entries
+    unbounded, so every capped read of the same book charges this
+    one budget; the read that would push the total past the limit
+    fails the book instead. A fresh budget per extraction keeps
+    one book's total from leaking into the next book's.
+    """
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.used = 0
+
+    def charge(self, name, size):
+        self.used += size
+        if self.used > self.limit:
+            raise EpubEntryTooLargeError(
+                f"EPUB entry {name} pushes this book's total "
+                f"decompressed size past the {self.limit}-byte "
+                f"aggregate budget; refusing the book rather than "
+                f"reading an unbounded archive")
+
+
+def _read_zip_entry_capped(z, name, cap, budget=None):
     """Read one zip entry as bytes, enforcing `cap` twice.
 
     The declared-size check comes first because it is free — the
@@ -408,6 +442,11 @@ def _read_zip_entry_capped(z, name, cap):
     to pull an unbounded read out of the second check's absence.
     Reading stops one byte past the cap, which is enough to know the
     entry is over without materialising the rest of it.
+
+    When `budget` is given, the entry also charges the book's
+    aggregate budget: the declared size is checked against the
+    budget up front, and the streamed bytes are charged as they
+    arrive, so a lying header cannot slip the total past it either.
     """
     info = z.getinfo(name)
     if info.file_size > cap:
@@ -415,6 +454,17 @@ def _read_zip_entry_capped(z, name, cap):
             f"EPUB entry {name} declares {info.file_size} bytes, over "
             f"the {cap}-byte cap for its entry class; refusing the book "
             f"rather than reading an unbounded entry")
+    if budget is not None and info.file_size > 0:
+        # A declared size that already pushes the running total
+        # past the budget fails here, before any byte of this
+        # entry is inflated.
+        if budget.used + info.file_size > budget.limit:
+            raise EpubEntryTooLargeError(
+                f"EPUB entry {name} declares {info.file_size} bytes, "
+                f"which pushes this book's total decompressed size "
+                f"past the {budget.limit}-byte aggregate budget; "
+                f"refusing the book rather than reading an "
+                f"unbounded archive")
     chunks = []
     total = 0
     with z.open(name) as fh:
@@ -430,21 +480,29 @@ def _read_zip_entry_capped(z, name, cap):
                     f"{cap}-byte cap for its entry class despite "
                     f"declaring {info.file_size} bytes; refusing the "
                     f"book rather than reading an unbounded entry")
+            if budget is not None:
+                budget.charge(name, len(chunk))
     return b"".join(chunks)
 
 
-def read_opf(z):
-    """Return (ordered_content_names or None, title, author) using the OPF spine."""
+def read_opf(z, budget=None):
+    """Return (ordered_content_names or None, title, author) using the OPF spine.
+
+    `budget`, when the caller supplies one, is the book's aggregate
+    decompression budget: the container and OPF reads charge it, so
+    the metadata bytes count toward the same total as the spine
+    documents read afterwards."""
     try:
         container = ET.fromstring(_read_zip_entry_capped(
-            z, "META-INF/container.xml", EPUB_CONTAINER_MAX_BYTES))
+            z, "META-INF/container.xml", EPUB_CONTAINER_MAX_BYTES,
+            budget))
         opf_path = next(
             (e.attrib["full-path"] for e in container.iter()
              if _local(e.tag) == "rootfile" and "full-path" in e.attrib), None)
         if not opf_path:
             return None, None, None, {"raw": []}
         root = ET.fromstring(_read_zip_entry_capped(
-            z, opf_path, EPUB_OPF_MAX_BYTES))
+            z, opf_path, EPUB_OPF_MAX_BYTES, budget))
     except EpubEntryTooLargeError:
         # An over-cap container or OPF is not a parse hiccup to fall
         # back from: falling back to filename order would still read
@@ -910,9 +968,13 @@ def extract_epub_units(epub_path):
     keeps the legacy joined-string behavior.
     """
     units = []
+    # One aggregate budget for the whole extraction: the metadata
+    # reads and every spine document charge the same total, so the
+    # book's decompressed size is bounded as a whole, not per entry.
+    budget = _EpubAggregateBudget(EPUB_TOTAL_MAX_BYTES)
     with zipfile.ZipFile(epub_path, "r") as z:
         available = set(z.namelist())
-        names, title, author, opf_ids = read_opf(z)
+        names, title, author, opf_ids = read_opf(z, budget)
         if names is None:
             names = sorted((n for n in available
                             if n.lower().endswith((".html", ".xhtml", ".htm"))),
@@ -923,7 +985,8 @@ def extract_epub_units(epub_path):
             try:
                 content = _decode_book_document(
                     _read_zip_entry_capped(z, fname,
-                                            EPUB_DOCUMENT_MAX_BYTES),
+                                            EPUB_DOCUMENT_MAX_BYTES,
+                                            budget),
                     fname)
                 text = html_to_text(content)
                 if len(text) > 100:
@@ -19810,7 +19873,7 @@ def sb(table, method="GET", data=None, params="", prefer=None,
 _SB_PAGE_SIZE = 1000
 
 
-def _sb_fetch_all(table, params, order="id.asc"):
+def _sb_fetch_all(table, params, order="id.asc", schema=None):
     """Fetch EVERY row matching params, paging past the single-response
     cap a bare limit=1000 leaves in place.
 
@@ -19832,6 +19895,11 @@ def _sb_fetch_all(table, params, order="id.asc"):
     the same rows the old capped call returned. Returns the full
     list, or None when any page fails — sb()'s error contract, so
     callers keep treating None as "the read failed, trust nothing".
+
+    `schema` rides through to sb() unchanged: the run-history
+    tables live in their own schema, and a completeness read that
+    silently dropped the schema header would page the wrong
+    schema's answer instead of failing.
     """
     rows_all = []
     offset = 0
@@ -19839,7 +19907,13 @@ def _sb_fetch_all(table, params, order="id.asc"):
         page_params = f"{params}&order={order}&limit={_SB_PAGE_SIZE}"
         if offset:
             page_params += f"&offset={offset}"
-        page = sb(table, params=page_params)
+        # The schema argument is passed only when one is named:
+        # callers on the public schema keep the exact call shape
+        # they have always made, headers and all.
+        if schema is None:
+            page = sb(table, params=page_params)
+        else:
+            page = sb(table, params=page_params, schema=schema)
         if page is None:
             return None
         rows_all.extend(page)
@@ -22196,10 +22270,15 @@ def _history_backfill_resume(stored, key, run_payload, totals_rec,
         raise _BackfillCorrupt(
             "the stored run row carries no id; nothing shipped")
     run_payload["run_key"] = key
-    stored_books = sb("processor_run_books", method="GET",
-                      params=(f"?run_id=eq.{run_id}"
-                              "&select=id,book_key"),
-                      schema=_HISTORY_SCHEMA)
+    # Both completeness reads below go through the paging helper:
+    # a bare transport call is capped by the server, so a run past
+    # the page size would read as a partial ship and its stored
+    # rows would be re-posted instead of earning the zero-write
+    # skip a complete ship is owed (issue #68).
+    stored_books = _sb_fetch_all(
+        "processor_run_books",
+        f"?run_id=eq.{run_id}&select=id,book_key",
+        schema=_HISTORY_SCHEMA)
     if stored_books is None:
         raise _BackfillCorrupt(
             "the stored book rows could not be probed; "
@@ -22216,10 +22295,10 @@ def _history_backfill_resume(stored, key, run_payload, totals_rec,
         book_id = stored_by_key.get(entry["book_key"])
         if book_id is None:
             continue
-        stored_claims = sb(
-            "processor_run_claim_outcomes", method="GET",
-            params=(f"?run_book_id=eq.{book_id}"
-                    "&select=run_book_id,axis,claim_key"),
+        stored_claims = _sb_fetch_all(
+            "processor_run_claim_outcomes",
+            f"?run_book_id=eq.{book_id}"
+            "&select=run_book_id,axis,claim_key",
             schema=_HISTORY_SCHEMA)
         if stored_claims is None:
             raise _BackfillCorrupt(

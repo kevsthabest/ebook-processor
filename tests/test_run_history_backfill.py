@@ -544,6 +544,80 @@ class BackfillResumeTests(_Base):
         self.assertIn("already in history", text)
 
 
+class PagingCapSB:
+    """Wrapper around a StatefulSB modelling the server's own
+    response cap: a GET with no explicit limit answers at most
+    1000 rows, and limit/offset in the params are honoured — the
+    behaviour a bare transport call runs into in production, which
+    the inner fake (it ignores limit entirely) cannot show."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __call__(self, table, method="GET", data=None, params="",
+                 prefer=None, schema=None):
+        rows = self.inner(table, method=method, data=data,
+                          params=params, prefer=prefer, schema=schema)
+        if method != "GET" or not isinstance(rows, list):
+            return rows
+        limit, offset = 1000, 0
+        for part in (params or "").lstrip("?").split("&"):
+            if part.startswith("limit="):
+                limit = int(part.split("=", 1)[1])
+            elif part.startswith("offset="):
+                offset = int(part.split("=", 1)[1])
+        return rows[offset:offset + limit]
+
+    def posts(self, table=None):
+        return self.inner.posts(table)
+
+
+class BackfillResumePagingTests(_Base):
+    """Issue #68: the resume path's completeness reads (stored
+    book rows; per-book claim outcomes) must go through the shared
+    paging helper, so a run past the 1000-row page size is not
+    misread as a partial ship and re-posted."""
+
+    def test_complete_ship_past_page_size_still_skips_zero_writes(self):
+        n_books = 1005
+        n_claims = 1005
+        run_id = RUN_UUID
+        entries, built, book_rows = [], [], []
+        for i in range(n_books):
+            key = f"bookkey-{i:04d}"
+            entries.append({"book_key": key})
+            book_rows.append({"book_key": key, "outcome": None,
+                              "claims": {}, "quotes": {}})
+            self.fake.books[(run_id, key)] = {
+                "id": f"book-{i}", "run_id": run_id, "book_key": key}
+            claims = []
+            if i == 0:
+                for j in range(n_claims):
+                    ck = f"ck-{j:04d}"
+                    claims.append({"axis": "tropes", "claim_key": ck,
+                                   "verdict": "derived",
+                                   "confidence": None})
+                    self.fake.claims[(f"book-{i}", "tropes", ck)] = {
+                        "run_book_id": f"book-{i}", "axis": "tropes",
+                        "claim_key": ck}
+            built.append((None, claims))
+        pp.sb = PagingCapSB(self.fake)
+        totals_rec = SimpleNamespace(files_seen=n_books, admitted=None,
+                                     corpus_filter_ran=False, books={})
+        counts = {}
+        result = pp._history_backfill_resume(
+            {"id": run_id}, "run-paging", {"run_key": "run-paging"},
+            totals_rec, entries, built, book_rows, counts)
+        self.assertTrue(result.get("already"), result)
+        self.assertEqual(self.fake.posts(), [])
+        # The completeness reads stayed in the processor schema.
+        gets = [c for c in self.fake.calls if c["method"] == "GET"
+                and c["table"] in ("processor_run_books",
+                                   "processor_run_claim_outcomes")]
+        self.assertTrue(gets)
+        self.assertTrue(all(c["schema"] == "processor" for c in gets))
+
+
 class BackfillBasenameTests(_Base):
     """Issue #67 R2: an artifact book name that is not a basename
     must never be resolved against the filesystem — the book is
