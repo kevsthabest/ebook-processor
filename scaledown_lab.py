@@ -132,20 +132,64 @@ class LabError(Exception):
 EPUB_CONTAINER_MAX_BYTES = 1 << 20
 EPUB_OPF_MAX_BYTES = 5 << 20
 EPUB_DOCUMENT_MAX_BYTES = 32 << 20
+# The per-entry caps bound one entry, but a book is read entry by
+# entry, so its entries could still sum to an unbounded total. The
+# processor's extraction charges every capped read of a book
+# against one aggregate budget; the lab holds the same line with
+# the same number — a fresh budget per book, shared by the
+# container, the OPF, and every spine document read from it.
+EPUB_TOTAL_MAX_BYTES = 256 << 20
 
 
-def _read_zip_entry_capped(zf, name, cap):
+class _EpubAggregateBudget:
+    """The running decompressed total for one book's reads.
+
+    Every capped read of the same book charges this one budget;
+    the read that would push the total past the limit fails the
+    book instead, so many under-cap entries cannot sum past the
+    bound the per-entry caps alone would leave open."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.used = 0
+
+    def charge(self, name, size):
+        self.used += size
+        if self.used > self.limit:
+            raise LabError(
+                f"EPUB entry {name} pushes this book's total "
+                f"decompressed size past the {self.limit}-byte "
+                f"aggregate budget; refusing the book")
+
+
+def _read_zip_entry_capped(zf, name, cap, budget=None):
     """Read one zip entry as bytes, enforcing `cap` twice: the
     declared-size check rejects an honestly labelled bomb before any
     inflation, and the streamed read is capped as well because a
     header can declare a small size while its stream yields more.
     Reading stops one byte past the cap — enough to know the entry
-    is over without materialising the rest of it."""
+    is over without materialising the rest of it.
+
+    When `budget` is given, the entry also charges the book's
+    aggregate budget: the declared size is checked against the
+    budget up front, and the streamed bytes are charged as they
+    arrive, so a lying header cannot slip the total past it
+    either."""
     info = zf.getinfo(name)
     if info.file_size > cap:
         raise LabError(
             f"EPUB entry {name} declares {info.file_size} bytes, over "
             f"the {cap}-byte cap for its entry class; refusing the book")
+    if budget is not None and info.file_size > 0:
+        # A declared size that already pushes the running total
+        # past the budget fails here, before any byte of this
+        # entry is inflated.
+        if budget.used + info.file_size > budget.limit:
+            raise LabError(
+                f"EPUB entry {name} declares {info.file_size} bytes, "
+                f"which pushes this book's total decompressed size "
+                f"past the {budget.limit}-byte aggregate budget; "
+                f"refusing the book")
     chunks = []
     total = 0
     with zf.open(name) as fh:
@@ -160,6 +204,8 @@ def _read_zip_entry_capped(zf, name, cap):
                     f"EPUB entry {name} decompressed past the "
                     f"{cap}-byte cap for its entry class despite "
                     f"declaring {info.file_size} bytes; refusing the book")
+            if budget is not None:
+                budget.charge(name, len(chunk))
     return b"".join(chunks)
 
 
@@ -839,11 +885,13 @@ def epub_chapters(epub_path, min_chars=800):
     except (OSError, zipfile.BadZipFile) as e:
         raise LabError(f"cannot open EPUB {epub_path}: {e.__class__.__name__}")
     with zf:
+        budget = _EpubAggregateBudget(EPUB_TOTAL_MAX_BYTES)
         names = set(zf.namelist())
         if "META-INF/container.xml" not in names:
             raise LabError("not an EPUB: META-INF/container.xml missing")
         container = ElementTree.fromstring(_read_zip_entry_capped(
-            zf, "META-INF/container.xml", EPUB_CONTAINER_MAX_BYTES))
+            zf, "META-INF/container.xml", EPUB_CONTAINER_MAX_BYTES,
+            budget))
         opf_path = None
         for el in container.iter():
             if _local(el.tag) == "rootfile" and el.get("full-path"):
@@ -852,7 +900,7 @@ def epub_chapters(epub_path, min_chars=800):
         if not opf_path:
             raise LabError("EPUB container names no rootfile")
         opf = ElementTree.fromstring(_read_zip_entry_capped(
-            zf, opf_path, EPUB_OPF_MAX_BYTES))
+            zf, opf_path, EPUB_OPF_MAX_BYTES, budget))
         manifest = {}
         spine = []
         for el in opf.iter():
@@ -877,7 +925,7 @@ def epub_chapters(epub_path, min_chars=800):
             # would measure the remaining chapters as if they were
             # the whole book.
             raw = _read_zip_entry_capped(zf, full,
-                                         EPUB_DOCUMENT_MAX_BYTES)
+                                         EPUB_DOCUMENT_MAX_BYTES, budget)
             try:
                 parser = _TextExtractor()
                 parser.feed(raw.decode("utf-8", errors="replace"))

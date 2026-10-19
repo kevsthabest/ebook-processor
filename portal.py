@@ -2599,6 +2599,31 @@ _COVER_EXTS = {"image/jpeg": ".jpg", "image/png": ".png",
                "image/gif": ".gif", "image/webp": ".webp"}
 
 
+def _read_zip_entry_streamed(z, name, cap):
+    """One zip entry's bytes, read in chunks against `cap`, or
+    None when the stream yields more than the cap.
+
+    The declared-size checks at the call sites are only a fast
+    path: a header can declare a small size while its deflate
+    stream yields far more, and a plain read() would inflate all
+    of it before anything compared the total. Charging the
+    stream as it arrives makes the cap a property of the read,
+    not of the header's honesty. Reading stops one byte past the
+    cap — enough to know the entry is over."""
+    chunks = []
+    total = 0
+    with z.open(name) as fh:
+        while True:
+            chunk = fh.read(min(1 << 16, cap + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > cap:
+                return None
+    return b"".join(chunks)
+
+
 def _zip_entry_text(z, name, cap):
     try:
         info = z.getinfo(name)
@@ -2606,7 +2631,10 @@ def _zip_entry_text(z, name, cap):
         return None
     if info.file_size > cap:
         return None
-    return z.read(name).decode("utf-8", "replace")
+    data = _read_zip_entry_streamed(z, name, cap)
+    if data is None:
+        return None
+    return data.decode("utf-8", "replace")
 
 
 def _extract_cover(path):
@@ -2664,7 +2692,10 @@ def _extract_cover(path):
                 return None
             if z.getinfo(entry).file_size > _COVER_MAX_BYTES:
                 return None
-            data = z.read(entry)
+            data = _read_zip_entry_streamed(z, entry,
+                                            _COVER_MAX_BYTES)
+            if data is None:
+                return None
             # The served type comes from a raster allowlist,
             # never verbatim from book metadata: a book that
             # declares its cover image/svg+xml would otherwise

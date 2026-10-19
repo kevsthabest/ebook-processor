@@ -19,6 +19,14 @@ import sys, zipfile, re, shutil, os
 EPUB_CONTAINER_MAX_BYTES = 1 << 20
 EPUB_OPF_MAX_BYTES = 5 << 20
 EPUB_OTHER_MAX_BYTES = 32 << 20
+# The per-entry caps bound one entry, but this tool materialises
+# EVERY entry of the archive, so the entries could still sum to an
+# unbounded total held in memory at once. The processor's
+# extraction charges every capped read of a book against one
+# aggregate budget; this tool holds the same line with the same
+# number — a fresh budget per book, shared by the container, the
+# OPF, and every pass-through entry read afterwards.
+EPUB_TOTAL_MAX_BYTES = 256 << 20
 
 
 class EpubEntryTooLargeError(Exception):
@@ -26,7 +34,29 @@ class EpubEntryTooLargeError(Exception):
     above). Raised instead of returning partial content."""
 
 
-def _read_zip_entry_capped(z, name, cap):
+class _EpubAggregateBudget:
+    """The running decompressed total for one book's reads.
+
+    Every capped read of the same book charges this one budget;
+    the read that would push the total past the limit fails the
+    book instead, so many under-cap entries cannot sum past the
+    bound the per-entry caps alone would leave open."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.used = 0
+
+    def charge(self, name, size):
+        self.used += size
+        if self.used > self.limit:
+            raise EpubEntryTooLargeError(
+                f"EPUB entry {name} pushes this book's total "
+                f"decompressed size past the {self.limit}-byte "
+                f"aggregate budget; refusing the book rather than "
+                f"reading an unbounded archive")
+
+
+def _read_zip_entry_capped(z, name, cap, budget=None):
     """Read one zip entry as bytes, enforcing `cap` twice.
 
     The declared-size check comes first because it is free — the
@@ -38,6 +68,12 @@ def _read_zip_entry_capped(z, name, cap):
     Reading stops one byte past the cap, which is enough to know the
     entry is over without materialising the rest of it. (Mirrors
     process-portable.py's reader of the same name.)
+
+    When `budget` is given, the entry also charges the book's
+    aggregate budget: the declared size is checked against the
+    budget up front, and the streamed bytes are charged as they
+    arrive, so a lying header cannot slip the total past it
+    either.
     """
     info = z.getinfo(name)
     if info.file_size > cap:
@@ -45,6 +81,17 @@ def _read_zip_entry_capped(z, name, cap):
             f"EPUB entry {name} declares {info.file_size} bytes, over "
             f"the {cap}-byte cap for its entry class; refusing the book "
             f"rather than reading an unbounded entry")
+    if budget is not None and info.file_size > 0:
+        # A declared size that already pushes the running total
+        # past the budget fails here, before any byte of this
+        # entry is inflated.
+        if budget.used + info.file_size > budget.limit:
+            raise EpubEntryTooLargeError(
+                f"EPUB entry {name} declares {info.file_size} bytes, "
+                f"which pushes this book's total decompressed size "
+                f"past the {budget.limit}-byte aggregate budget; "
+                f"refusing the book rather than reading an "
+                f"unbounded archive")
     chunks = []
     total = 0
     with z.open(name) as fh:
@@ -60,6 +107,8 @@ def _read_zip_entry_capped(z, name, cap):
                     f"{cap}-byte cap for its entry class despite "
                     f"declaring {info.file_size} bytes; refusing the "
                     f"book rather than reading an unbounded entry")
+            if budget is not None:
+                budget.charge(name, len(chunk))
     return b"".join(chunks)
 
 
@@ -185,23 +234,29 @@ def main():
         print(f"Not found: {epub_path}")
         sys.exit(1)
 
-    # Read the EPUB
+    # Read the EPUB. Every read charges one aggregate budget: the
+    # per-entry caps alone would let an archive of many mid-size
+    # entries inflate without a total bound while all of them are
+    # held in other_files at once.
     try:
         with zipfile.ZipFile(epub_path, "r") as z:
+            budget = _EpubAggregateBudget(EPUB_TOTAL_MAX_BYTES)
             names = z.namelist()
             # Find the OPF file via container.xml
             container = _read_zip_entry_capped(
                 z, "META-INF/container.xml",
-                EPUB_CONTAINER_MAX_BYTES).decode("utf-8")
+                EPUB_CONTAINER_MAX_BYTES, budget).decode("utf-8")
             m = re.search(r'full-path="([^"]+\.opf)"', container)
             if not m:
                 print("Could not find OPF file in container.xml")
                 sys.exit(1)
             opf_path = m.group(1)
             opf = _read_zip_entry_capped(
-                z, opf_path, EPUB_OPF_MAX_BYTES).decode("utf-8")
+                z, opf_path, EPUB_OPF_MAX_BYTES,
+                budget).decode("utf-8")
             other_files = {
-                n: _read_zip_entry_capped(z, n, EPUB_OTHER_MAX_BYTES)
+                n: _read_zip_entry_capped(z, n, EPUB_OTHER_MAX_BYTES,
+                                          budget)
                 for n in names if n != opf_path}
     except zipfile.BadZipFile:
         print(f"ERROR: {epub_path} is not a valid EPUB/zip file.")

@@ -45,7 +45,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.62"
+PORTABLE_VERSION = "2.13.63"
 
 
 import argparse
@@ -22306,7 +22306,7 @@ def _history_backfill_resume(stored, key, run_payload, totals_rec,
         stored_claims = _sb_fetch_all(
             "processor_run_claim_outcomes",
             f"?run_book_id=eq.{book_id}"
-            "&select=run_book_id,axis,claim_key",
+            "&select=id,run_book_id,axis,claim_key",
             schema=_HISTORY_SCHEMA)
         if stored_claims is None:
             raise _BackfillCorrupt(

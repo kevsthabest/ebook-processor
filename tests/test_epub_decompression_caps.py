@@ -24,6 +24,13 @@ runs against the real 5 MiB cap. Patching uses create=True so the
 pre-fix code — which has no caps at all — fails these tests by its
 behaviour (extraction proceeds), not by a missing attribute.
 
+Issue #69 extends the same discipline to the auxiliary readers:
+scaledown_lab and inject_isbn iterate whole archives, so they get
+the processor's aggregate budget, not just its per-entry caps;
+portal's cover path reads three known entries, but each read was a
+declared-size check followed by an uncapped read(), so its entries
+must be capped in the stream instead of on the header's word.
+
 Stdlib unittest only. No network, no real ebook files.
 Run: python -m unittest tests.test_epub_decompression_caps -v
 """
@@ -48,6 +55,8 @@ def _load(name, filename):
 
 pp = _load("process_portable_caps", "process-portable.py")
 lab = _load("scaledown_lab_caps", "scaledown_lab.py")
+ii = _load("inject_isbn_caps", "inject_isbn.py")
+portal = _load("portal_caps", "portal.py")
 
 # Pre-fix there is no named cap error; fall back to Exception so the
 # behavioural tests below fail because nothing is raised, while
@@ -128,6 +137,17 @@ class _FakeZip:
 
     def namelist(self):
         return list(self._data)
+
+
+class _FakeCoverZip(_FakeZip):
+    """_FakeZip plus the context-manager protocol portal's cover
+    path opens its archive with."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 class TestCapConstants(unittest.TestCase):
@@ -328,6 +348,169 @@ class TestScaledownLabCaps(unittest.TestCase):
                 with self.assertRaises(lab.LabError) as cm:
                     lab.epub_chapters(epub, min_chars=10)
         self.assertIn("cap", str(cm.exception).lower())
+
+
+class TestScaledownLabAggregateBudget(unittest.TestCase):
+    """Issue #69: the lab enforces the per-entry caps but not the
+    aggregate budget, so a book of many under-cap chapters still
+    decompresses without a total bound — the exact gap issue #54
+    closed in the processor's extraction path."""
+
+    def _write(self, td, files):
+        path = Path(td) / "book.epub"
+        path.write_bytes(_epub_bytes(files))
+        return str(path)
+
+    def test_lab_total_budget_constant_matches_processor(self):
+        self.assertTrue(hasattr(lab, "EPUB_TOTAL_MAX_BYTES"))
+        self.assertEqual(lab.EPUB_TOTAL_MAX_BYTES,
+                         pp.EPUB_TOTAL_MAX_BYTES)
+
+    def test_lab_many_under_cap_chapters_over_total_budget_fails_book(self):
+        import tempfile
+        files = {f"OEBPS/ch{n:02d}.xhtml":
+                 _chapter_xhtml("word " * 120, f"Chapter {n}")
+                 for n in range(10)}
+        with tempfile.TemporaryDirectory() as td:
+            epub = self._write(td, files)
+            with mock.patch.object(lab, "EPUB_TOTAL_MAX_BYTES", 4096,
+                                   create=True):
+                with self.assertRaises(lab.LabError) as cm:
+                    lab.epub_chapters(epub, min_chars=10)
+        msg = str(cm.exception).lower()
+        self.assertTrue("total" in msg or "aggregate" in msg
+                        or "budget" in msg, msg)
+
+
+class TestInjectIsbnAggregateBudget(unittest.TestCase):
+    """Issue #69: inject_isbn materialises every entry in the
+    archive (at up to the 32 MiB per-entry cap each) with no
+    aggregate, so an archive of many mid-size entries inflates
+    without a total bound while the tool holds them all."""
+
+    def _make_epub(self, path, n_extras=10, extra_bytes=600):
+        opf = ("<?xml version='1.0' encoding='utf-8'?>\n"
+               "<package xmlns='http://www.idpf.org/2007/opf' "
+               "version='3.0'>\n"
+               "  <metadata xmlns:dc='http://purl.org/dc/elements/1.1/'>\n"
+               "    <dc:title>Many Entries</dc:title>\n"
+               "  </metadata>\n"
+               "</package>")
+        container = ("<?xml version='1.0' encoding='utf-8'?>\n"
+                     "<container xmlns='urn:oasis:names:tc:opendocument:"
+                     "xmlns:container' version='1.0'>\n"
+                     "  <rootfiles><rootfile "
+                     'full-path="OEBPS/content.opf"/></rootfiles>\n'
+                     "</container>")
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("mimetype", "application/epub+zip",
+                       compress_type=zipfile.ZIP_STORED)
+            z.writestr("META-INF/container.xml", container)
+            z.writestr("OEBPS/content.opf", opf)
+            for n in range(n_extras):
+                z.writestr(f"OEBPS/extra{n:02d}.bin",
+                           bytes([n]) * extra_bytes)
+
+    def test_inject_total_budget_constant_matches_processor(self):
+        self.assertTrue(hasattr(ii, "EPUB_TOTAL_MAX_BYTES"))
+        self.assertEqual(ii.EPUB_TOTAL_MAX_BYTES,
+                         pp.EPUB_TOTAL_MAX_BYTES)
+
+    def test_inject_many_entries_over_total_budget_refused(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            epub = str(Path(td) / "book.epub")
+            self._make_epub(epub)
+            before = Path(epub).read_bytes()
+            argv = ["inject_isbn.py", epub, "9781615871100"]
+            with mock.patch.object(ii, "EPUB_TOTAL_MAX_BYTES", 4096,
+                                   create=True), \
+                    mock.patch("sys.argv", argv), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                with self.assertRaises(SystemExit) as cm:
+                    ii.main()
+            # The tool's named failure for an over-cap book is
+            # exit 3, and the refusal happens at read time: the
+            # archive is untouched and no backup was written.
+            self.assertEqual(cm.exception.code, 3)
+            self.assertIn("aggregate", out.getvalue().lower())
+            self.assertEqual(Path(epub).read_bytes(), before)
+            self.assertFalse(Path(epub + ".bak").exists())
+
+
+class TestPortalCoverStreamedCap(unittest.TestCase):
+    """Issue #69: portal's cover path checks the declared size and
+    then read()s the entry whole, so a header that declares small
+    while the stream yields more pulls an unbounded decompression
+    out of a check that looked capped. The read itself must stop
+    at the cap."""
+
+    def test_zip_entry_text_streamed_cap_rejects_lying_header(self):
+        payload = b"x" * 4096
+        fake = _FakeZip(
+            data={"OEBPS/content.opf": payload},
+            declared={"OEBPS/content.opf": 10})
+        self.assertIsNone(
+            portal._zip_entry_text(fake, "OEBPS/content.opf", 1024))
+
+    def test_cover_streamed_cap_rejects_lying_header(self):
+        container = (b"<?xml version='1.0'?>"
+                     b"<container xmlns='urn:oasis:names:tc:opendocument:"
+                     b"xmlns:container'><rootfiles>"
+                     b"<rootfile full-path='OEBPS/content.opf'/>"
+                     b"</rootfiles></container>")
+        opf = (b"<?xml version='1.0'?>"
+               b"<package xmlns='http://www.idpf.org/2007/opf'>"
+               b"<metadata>"
+               b"<meta name='cover' content='cov'/>"
+               b"</metadata><manifest>"
+               b"<item id='cov' href='cover.jpg' "
+               b"media-type='image/jpeg'/>"
+               b"</manifest></package>")
+        fake = _FakeCoverZip(
+            data={"META-INF/container.xml": container,
+                  "OEBPS/content.opf": opf,
+                  "OEBPS/cover.jpg": b"\xff\xd8" + b"c" * 4096},
+            declared={"META-INF/container.xml": len(container),
+                      "OEBPS/content.opf": len(opf),
+                      "OEBPS/cover.jpg": 10})
+        zip_ns = SimpleNamespace(ZipFile=lambda path: fake,
+                                 BadZipFile=zipfile.BadZipFile)
+        with mock.patch.object(portal, "_COVER_MAX_BYTES", 1024), \
+                mock.patch.object(portal, "zipfile", zip_ns):
+            self.assertIsNone(portal._extract_cover("ignored.epub"))
+
+    def test_cover_honest_small_cover_still_extracts(self):
+        # The streamed cap must not clip a legitimate cover: an
+        # honestly declared small image extracts as before.
+        container = (b"<?xml version='1.0'?>"
+                     b"<container xmlns='urn:oasis:names:tc:opendocument:"
+                     b"xmlns:container'><rootfiles>"
+                     b"<rootfile full-path='OEBPS/content.opf'/>"
+                     b"</rootfiles></container>")
+        opf = (b"<?xml version='1.0'?>"
+               b"<package xmlns='http://www.idpf.org/2007/opf'>"
+               b"<metadata>"
+               b"<meta name='cover' content='cov'/>"
+               b"</metadata><manifest>"
+               b"<item id='cov' href='cover.jpg' "
+               b"media-type='image/jpeg'/>"
+               b"</manifest></package>")
+        cover = b"\xff\xd8" + b"c" * 100
+        fake = _FakeCoverZip(
+            data={"META-INF/container.xml": container,
+                  "OEBPS/content.opf": opf,
+                  "OEBPS/cover.jpg": cover},
+            declared={"META-INF/container.xml": len(container),
+                      "OEBPS/content.opf": len(opf),
+                      "OEBPS/cover.jpg": len(cover)})
+        zip_ns = SimpleNamespace(ZipFile=lambda path: fake,
+                                 BadZipFile=zipfile.BadZipFile)
+        with mock.patch.object(portal, "zipfile", zip_ns):
+            found = portal._extract_cover("ignored.epub")
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], cover)
+        self.assertEqual(found[1], "image/jpeg")
 
 
 if __name__ == "__main__":

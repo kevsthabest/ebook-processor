@@ -544,12 +544,54 @@ class BackfillResumeTests(_Base):
         self.assertIn("already in history", text)
 
 
+class BackfillResumeSelectTests(_Base):
+    """Issue #69: the resume path's claim-outcomes completeness
+    read pages through the shared helper, which orders on id —
+    its select must name id like every other paging-helper
+    caller's select does. (Valid as-is in PostgREST; the nit is
+    departing from the codebase's own pattern, under which a
+    select that omits the ordered column reads as an oversight
+    the next editor has to re-derive.)"""
+
+    def test_claims_completeness_select_includes_ordered_id(self):
+        run_id = RUN_UUID
+        entries = [{"book_key": "bookkey-0"}]
+        book_rows = [{"book_key": "bookkey-0", "outcome": None,
+                      "claims": {}, "quotes": {}}]
+        self.fake.books[(run_id, "bookkey-0")] = {
+            "id": "book-0", "run_id": run_id, "book_key": "bookkey-0"}
+        built = [(None, [{"axis": "tropes", "claim_key": "ck-0",
+                          "verdict": "derived", "confidence": None}])]
+        self.fake.claims[("book-0", "tropes", "ck-0")] = {
+            "run_book_id": "book-0", "axis": "tropes",
+            "claim_key": "ck-0"}
+        totals_rec = SimpleNamespace(files_seen=1, admitted=None,
+                                     corpus_filter_ran=False, books={})
+        counts = {}
+        result = pp._history_backfill_resume(
+            {"id": run_id}, "run-select", {"run_key": "run-select"},
+            totals_rec, entries, built, book_rows, counts)
+        self.assertTrue(result.get("already"), result)
+        gets = [c for c in self.fake.calls if c["method"] == "GET"
+                and c["table"] == "processor_run_claim_outcomes"]
+        self.assertTrue(gets)
+        for c in gets:
+            select = [p for p in c["params"].lstrip("?").split("&")
+                      if p.startswith("select=")]
+            self.assertTrue(select, c["params"])
+            cols = select[0].split("=", 1)[1].split(",")
+            self.assertIn("id", cols, c["params"])
+
+
 class PagingCapSB:
     """Wrapper around a StatefulSB modelling the server's own
     response cap: a GET with no explicit limit answers at most
-    1000 rows, and limit/offset in the params are honoured — the
-    behaviour a bare transport call runs into in production, which
-    the inner fake (it ignores limit entirely) cannot show."""
+    1000 rows, and limit/offset/order in the params are honoured
+    the way PostgREST honours them — order sorts the rows first,
+    then offset and limit slice the sorted set — the behaviour a
+    bare transport call runs into in production, which the inner
+    fake (it ignores all three, answering in insertion order)
+    cannot show."""
 
     def __init__(self, inner):
         self.inner = inner
@@ -560,16 +602,58 @@ class PagingCapSB:
                           params=params, prefer=prefer, schema=schema)
         if method != "GET" or not isinstance(rows, list):
             return rows
-        limit, offset = 1000, 0
+        limit, offset, order = 1000, 0, None
         for part in (params or "").lstrip("?").split("&"):
             if part.startswith("limit="):
                 limit = int(part.split("=", 1)[1])
             elif part.startswith("offset="):
                 offset = int(part.split("=", 1)[1])
+            elif part.startswith("order="):
+                order = part.split("=", 1)[1]
+        if order:
+            # Server-side ordering, applied before the slice the
+            # way the issue-#40 fake applies it: without this the
+            # paging tests prove paging over the fake's insertion
+            # order, which no real server promises.
+            for spec in reversed([s for s in order.split(",") if s]):
+                col, _, direction = spec.partition(".")
+                rows.sort(key=lambda r, c=col: (r.get(c) is None,
+                                                r.get(c)),
+                          reverse=(direction == "desc"))
         return rows[offset:offset + limit]
 
     def posts(self, table=None):
         return self.inner.posts(table)
+
+
+class PagingCapSBOrderTests(unittest.TestCase):
+    """Issue #69: PagingCapSB must honour the order parameter the
+    way the issue-#40 fake does — sort by it before slicing — so
+    the #68 test below proves paging over the server's ordering
+    instead of over the fake's insertion order. These tests pin
+    the fake's own contract against a stub inner that answers in
+    a fixed, non-id order."""
+
+    def _sb(self, rows):
+        class _Inner:
+            def __call__(self, table, method="GET", data=None,
+                         params="", prefer=None, schema=None):
+                return [dict(r) for r in rows]
+
+            def posts(self, table=None):
+                return []
+        return PagingCapSB(_Inner())
+
+    def test_order_applied_before_limit_and_offset(self):
+        rows = [{"id": f"id-{n}"} for n in (3, 1, 4, 0, 2)]
+        page = self._sb(rows)("t", params="?order=id.asc"
+                                          "&limit=2&offset=2")
+        self.assertEqual([r["id"] for r in page], ["id-2", "id-3"])
+
+    def test_desc_order_honoured(self):
+        rows = [{"id": f"id-{n}"} for n in (3, 1, 4, 0, 2)]
+        page = self._sb(rows)("t", params="?order=id.desc&limit=2")
+        self.assertEqual([r["id"] for r in page], ["id-4", "id-3"])
 
 
 class BackfillResumePagingTests(_Base):
@@ -588,8 +672,6 @@ class BackfillResumePagingTests(_Base):
             entries.append({"book_key": key})
             book_rows.append({"book_key": key, "outcome": None,
                               "claims": {}, "quotes": {}})
-            self.fake.books[(run_id, key)] = {
-                "id": f"book-{i}", "run_id": run_id, "book_key": key}
             claims = []
             if i == 0:
                 for j in range(n_claims):
@@ -597,10 +679,22 @@ class BackfillResumePagingTests(_Base):
                     claims.append({"axis": "tropes", "claim_key": ck,
                                    "verdict": "derived",
                                    "confidence": None})
-                    self.fake.claims[(f"book-{i}", "tropes", ck)] = {
-                        "run_book_id": f"book-{i}", "axis": "tropes",
-                        "claim_key": ck}
             built.append((None, claims))
+        # Seed the fake's stores in REVERSE id order: the stored
+        # rows' insertion order is then the opposite of the order
+        # the paging helper requests, so the skip below can only
+        # be earned by paging over the server-side ordering the
+        # fake now applies — not by the rows happening to sit in
+        # the order they are read back (issue #69).
+        for i in reversed(range(n_books)):
+            key = f"bookkey-{i:04d}"
+            self.fake.books[(run_id, key)] = {
+                "id": f"book-{i}", "run_id": run_id, "book_key": key}
+        for j in reversed(range(n_claims)):
+            ck = f"ck-{j:04d}"
+            self.fake.claims[("book-0", "tropes", ck)] = {
+                "id": f"claim-{j:04d}", "run_book_id": "book-0",
+                "axis": "tropes", "claim_key": ck}
         pp.sb = PagingCapSB(self.fake)
         totals_rec = SimpleNamespace(files_seen=n_books, admitted=None,
                                      corpus_filter_ran=False, books={})
