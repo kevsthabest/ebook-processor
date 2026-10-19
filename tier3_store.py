@@ -130,6 +130,21 @@ included. One book therefore keeps one store identity across
 artefact variants, and curation recorded under either form
 stays attached to it.
 
+One exception, ruled on 2026-10-18 (issue #56): when the title
+matches MORE THAN ONE stored book the author guard cannot
+separate, there is no fact of the matter about which book the
+import means — the sorted-first pick the store used to make is
+deterministic but arbitrary, and a wrong adoption replaces
+that book's Tier 3 rows. A multi-match adoption therefore
+never happens by default: without the import command's
+--allow-multi-match-adoption flag the import mints its own
+fallback identity instead and says so loudly, with the match
+counted separately in the import summary; with the flag the
+adoption proceeds as before (sorted first, author guard
+unchanged) and the warning still prints — the flag enables
+the adoption, it does not silence it. Single-match adoption
+and the author guard itself are unchanged in both modes.
+
 `list` and `report` are read-only: they never create the
 database file, and a store holding no books reports NOT
 IMPORTED rather than RECONCILED — an empty reconciliation is
@@ -137,6 +152,7 @@ not a pass.
 
 Usage:
     python3 tier3_store.py import --preview "preview/<book>.json"
+                                  [--allow-multi-match-adoption]
     python3 tier3_store.py list [--work <id-or-title>]
     python3 tier3_store.py alerts [--work <id-or-title>]
                                   [--floor 0.30]
@@ -790,18 +806,22 @@ def _fallback_work_id(artefact, preview_path):
     return f"title:{_tnorm(title)}|{_tnorm(artefact.get('author'))}"
 
 
-def _matching_store_book(rows, title, author):
-    """The work_id of an existing store book for this title, or
-    None. Matching is on the normalized title, with the author
+def _matching_store_books(rows, title, author):
+    """Every stored work_id matching this title, in adoption
+    order. Matching is on the normalized title, with the author
     as a guard: two genuinely different books can share a title,
     so an author that is present on both sides and differs
     blocks the match, while a missing author on either side
-    cannot prove a difference. An explicit work_id is preferred
-    over a fallback identity when both somehow exist — the
-    explicit id is the identity prod knows."""
+    cannot prove a difference. An explicit work_id sorts before
+    a fallback identity when both somehow exist — the explicit
+    id is the identity prod knows. The full list, not just the
+    first entry, is what the identity resolution needs: whether
+    the list holds more than one book decides if an adoption is
+    a plain match or a multi-match the operator must opt into
+    (see _resolve_import_identity)."""
     wanted = _tnorm(title)
     if not wanted:
-        return None
+        return []
     matches = []
     for row in rows:
         if _tnorm(row["title"]) != wanted:
@@ -810,54 +830,90 @@ def _matching_store_book(rows, title, author):
         if have and given and have != given:
             continue
         matches.append(row["work_id"])
-    if not matches:
-        return None
     matches.sort(key=lambda w: (w.startswith("title:"), w))
-    return matches[0]
+    return matches
+
+
+def _matching_store_book(rows, title, author):
+    """The work_id of an existing store book for this title, or
+    None: the first of _matching_store_books, kept for callers
+    that only need the pick itself."""
+    matches = _matching_store_books(rows, title, author)
+    return matches[0] if matches else None
 
 
 def _resolve_import_identity(db_path, candidate, explicit, title,
-                             author):
-    """Returns (work_id, adopt_from) for an import, checking the
-    store BEFORE anything is written. A work_id-less artefact
-    whose book is already in the store adopts that book's
-    identity, so a re-import replaces the same book instead of
-    minting a second one whose rows never reconcile with the
-    first. An explicit work_id that arrives after a fallback
-    import renames the fallback book onto it (adopt_from), so
-    the push ledger decisions recorded under the fallback key
-    move with the book instead of being stranded. The peek is
-    read-only: resolving identity must never create the store,
-    because the stored-set resolution that follows is allowed to
-    fail and must fail with nothing written."""
+                             author,
+                             allow_multi_match_adoption=False):
+    """Returns (work_id, adopt_from, multi_match) for an import,
+    checking the store BEFORE anything is written. A
+    work_id-less artefact whose book is already in the store
+    adopts that book's identity, so a re-import replaces the
+    same book instead of minting a second one whose rows never
+    reconcile with the first. An explicit work_id that arrives
+    after a fallback import renames the fallback book onto it
+    (adopt_from), so the push ledger decisions recorded under
+    the fallback key move with the book instead of being
+    stranded. The peek is read-only: resolving identity must
+    never create the store, because the stored-set resolution
+    that follows is allowed to fail and must fail with nothing
+    written.
+
+    multi_match is None unless the title matched more than one
+    stored book AND an adoption was at stake, in which case it
+    is {"matches": [...], "adopted": bool, "target": work_id}:
+    the full match list, whether the adoption went ahead, and
+    the book it would have adopted. A multi-match adoption —
+    either direction: a fallback candidate adopting a stored
+    identity, or an explicit identity renaming a fallback book
+    onto itself — happens only when the operator opted in with
+    allow_multi_match_adoption (the import command's
+    --allow-multi-match-adoption flag), because among several
+    guard-passing books the sorted-first pick is arbitrary and
+    a wrong adoption replaces that book's Tier 3 rows. Without
+    the opt-in the candidate keeps its own identity: a fallback
+    candidate mints the canonical fallback book, an explicit
+    candidate simply starts its own book and renames nothing.
+    The author guard runs before any of this, exactly as
+    before, in both modes — the flag never overrides it."""
     if not Path(db_path).is_file():
-        return candidate, None
+        return candidate, None, None
     try:
         conn = _connect_readonly(db_path)
     except sqlite3.Error:
-        return candidate, None
+        return candidate, None, None
     try:
         try:
             rows = conn.execute(
                 "SELECT work_id, title, author "
                 "FROM tier3_books").fetchall()
         except sqlite3.Error:
-            return candidate, None
+            return candidate, None, None
     finally:
         conn.close()
     if any(r["work_id"] == candidate for r in rows):
-        return candidate, None
-    match = _matching_store_book(rows, title, author)
-    if match is None:
-        return candidate, None
+        return candidate, None, None
+    matches = _matching_store_books(rows, title, author)
+    if not matches:
+        return candidate, None, None
+    match = matches[0]
+    multi = None
+    if len(matches) > 1:
+        multi = {"matches": matches,
+                 "adopted": bool(allow_multi_match_adoption),
+                 "target": match}
     if explicit:
         # Two explicit identities for one title are not merged:
         # they may be genuinely different works. Only a fallback
         # identity folds into the explicit one.
-        if match.startswith("title:"):
-            return candidate, match
-        return candidate, None
-    return match, None
+        if not match.startswith("title:"):
+            return candidate, None, None
+        if multi is not None and not multi["adopted"]:
+            return candidate, None, multi
+        return candidate, match, multi
+    if multi is not None and not multi["adopted"]:
+        return candidate, None, multi
+    return match, None, multi
 
 
 def _rename_work_identity(conn, old, new):
@@ -881,7 +937,8 @@ def _rename_work_identity(conn, old, new):
 
 
 def import_preview(db_path, preview_path, stored_names_path=None,
-                   run_key=None, config_path=DEFAULT_CONFIG):
+                   run_key=None, config_path=DEFAULT_CONFIG,
+                   allow_multi_match_adoption=False):
     artefact = _load_artefact(preview_path)
     roster = _roster(artefact)
     title = artefact.get("title") or Path(preview_path).stem
@@ -889,9 +946,10 @@ def import_preview(db_path, preview_path, stored_names_path=None,
     explicit_id = artefact.get("work_id")
     candidate = explicit_id or _fallback_work_id(
         artefact, preview_path)
-    work_id, adopt_from = _resolve_import_identity(
+    work_id, adopt_from, multi_match = _resolve_import_identity(
         db_path, candidate, bool(explicit_id), title,
-        artefact.get("author"))
+        artefact.get("author"),
+        allow_multi_match_adoption=allow_multi_match_adoption)
     stored_names, source, stored_note = \
         _resolve_stored_set_detailed(
             artefact, work_id, stored_names_path, config_path)
@@ -986,6 +1044,24 @@ def import_preview(db_path, preview_path, stored_names_path=None,
         "has_chapter_data": bool(_chapter_map(artefact)),
         "stored_set_note": stored_note,
         "adopted_from": adopt_from,
+        # The multi-match gate (#56): the matched identities
+        # when an adoption was at stake among several books,
+        # and the outcome as its own counts, so the import
+        # summary can report a skipped or flagged adoption
+        # separately from the ordinary book counts instead of
+        # folding it into them invisibly. All empty/zero when
+        # no multi-match arose — single-match and no-match
+        # imports report exactly what they reported before.
+        "multi_match_matches": list(multi_match["matches"])
+        if multi_match else [],
+        "multi_match_count": len(multi_match["matches"])
+        if multi_match else 0,
+        "multi_match_target": multi_match["target"]
+        if multi_match else None,
+        "multi_match_blocked": 1 if multi_match
+        and not multi_match["adopted"] else 0,
+        "multi_match_adopted": 1 if multi_match
+        and multi_match["adopted"] else 0,
     }
 
 
@@ -1075,7 +1151,8 @@ def _book_lines(conn, work_id):
 def cmd_import(args):
     result = import_preview(
         args.db, args.preview, stored_names_path=args.stored_names,
-        run_key=args.run_key, config_path=args.config)
+        run_key=args.run_key, config_path=args.config,
+        allow_multi_match_adoption=args.allow_multi_match_adoption)
     print(f"imported {result['title']} ({result['work_id']})")
     print(f"  run key: {result['run_key']}")
     print(f"  roster: {result['roster_count']}  ·  stored set: "
@@ -1088,6 +1165,35 @@ def cmd_import(args):
               f"fallback identity {result['adopted_from']} — its "
               f"rows and push decisions were moved onto "
               f"{result['work_id']}")
+    if result.get("multi_match_matches"):
+        # Loud in both modes, by the #56 ruling: a skipped
+        # adoption the operator never hears about is just a
+        # quieter wrong book, and an adoption the flag enabled
+        # is still an arbitrary pick he should see happen.
+        matches = ", ".join(result["multi_match_matches"])
+        if result["multi_match_blocked"]:
+            print(f"  WARNING: {result['title']!r} matched "
+                  f"{result['multi_match_count']} stored books "
+                  f"({matches}) — multi-match adoption skipped "
+                  f"without --allow-multi-match-adoption: no "
+                  f"stored book was adopted, and this import "
+                  f"was recorded under its own identity "
+                  f"{result['work_id']} instead. Re-run with "
+                  f"--allow-multi-match-adoption to adopt "
+                  f"{result['multi_match_target']}.")
+            print(f"  multi-match adoptions skipped: "
+                  f"{result['multi_match_blocked']}")
+        else:
+            print(f"  WARNING: {result['title']!r} matched "
+                  f"{result['multi_match_count']} stored books "
+                  f"({matches}) — adopting "
+                  f"{result['multi_match_target']} because "
+                  f"--allow-multi-match-adoption was given. The "
+                  f"pick is the first in the store's adoption "
+                  f"order and may not be the book meant; the "
+                  f"other match(es) were left untouched.")
+            print(f"  multi-match adoptions: "
+                  f"{result['multi_match_adopted']}")
     if result["stored_absent_from_roster"]:
         print(f"  WARNING: {len(result['stored_absent_from_roster'])} "
               f"stored name(s) absent from the roster: "
@@ -1664,6 +1770,14 @@ def main(argv=None):
         "--config", default=str(DEFAULT_CONFIG),
         help="processor config.json holding the Supabase "
              f"credentials (default {DEFAULT_CONFIG})")
+    p_import.add_argument(
+        "--allow-multi-match-adoption", action="store_true",
+        default=False,
+        help="when the import's title matches more than one "
+             "stored book, adopt the first in adoption order "
+             "anyway (the default is to adopt none of them and "
+             "record the import under its own identity); the "
+             "multi-match warning prints either way")
     p_import.set_defaults(fn=cmd_import)
 
     p_list = sub.add_parser(
