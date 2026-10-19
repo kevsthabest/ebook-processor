@@ -48,7 +48,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.67"
+PORTABLE_VERSION = "2.13.68"
 
 
 import argparse
@@ -10937,6 +10937,8 @@ def _evidence_run(claims, *, call, embedder, window_filter=None,
     must retry it, not reuse it. Without a context the engine is
     byte-for-byte the per-run computation it has always been."""
     floor = CONFIG.get("evidence_retrieval_floor", 0.25)
+    UI.console_stage(getattr(_DIAG, "viz_book_key", None),
+                     "evidence_retrieval", "active")
     cache = {}
     evidence, records = {}, {}
     totals = {"attempted": 0, "supported_strong": 0,
@@ -11086,6 +11088,29 @@ def _evidence_run(claims, *, call, embedder, window_filter=None,
                     run_payload={"claims": len(specs)})
             except Exception:
                 pass
+    if UI._console_observer is not None:
+        # Retrieval outcomes publish as each record finalizes —
+        # which, for this engine, is here: records only enter the
+        # dict once judged or failed, never at batch submission.
+        # The evidence fields ride the claim's own row and never
+        # rewrite its gate state (spec §6.5).
+        _bk = getattr(_DIAG, "viz_book_key", None)
+        for _k, _r in records.items():
+            if _k.startswith("trigger:"):
+                _table, _rk = "triggers", f"trig:{_k.split(':', 1)[1]}"
+            else:
+                _table, _rk = "tropes", _k
+            UI.console_verdict(_bk, {
+                "table": _table, "row_key": _rk,
+                "record": {"evidence_outcome": _r.get("outcome"),
+                           "evidence_support": _r.get("support"),
+                           "evidence_passages":
+                               len(evidence.get(_k, []))}})
+        UI.console_counts(_bk, {
+            "retrieval_attempted": totals["attempted"],
+            "retrieval_supported": totals["supported_strong"]
+            + totals["supported_single"]})
+        UI.console_stage(_bk, "evidence_retrieval", "complete")
     return evidence, records, marker
 
 
@@ -15958,6 +15983,36 @@ def post_pass_merge(roster, validator=None):
     n_merged = 0
     _ln = _learn()
     _isbn = getattr(_DIAG, "learn_isbn", None)
+    # Console seam (Phase 3): merge outcomes stream as verdicts as
+    # each pair is decided. Inert without an attached observer.
+    _bk = getattr(_DIAG, "viz_book_key", None)
+    UI.console_stage(_bk, "merge_review", "active")
+
+    def _pub_merge(name_a, name_b, tier, outcome, p=None, reason=None):
+        if UI._console_observer is None:
+            return
+        _a, _b = sorted((norm_name(name_a), norm_name(name_b)))
+        _rec = {"name_a": name_a, "name_b": name_b, "tier": tier,
+                "outcome": outcome}
+        if p is not None:
+            _rec["p"] = round(p, 4)
+        if reason:
+            _rec["reason"] = reason
+        UI.console_verdict(_bk, {"table": "merges",
+                                 "row_key": f"merge:{_a}|{_b}",
+                                 "record": _rec})
+
+    def _pub_fold(keep_name, drop_name):
+        if UI._console_observer is None:
+            return
+        # Verdict form, not candidate form: the store merges a
+        # verdict's record into the existing row, so the folded
+        # character keeps the chapter count extraction gave it.
+        UI.console_verdict(_bk, {
+            "table": "characters", "row_key": drop_name,
+            "record": {"name": drop_name,
+                       "status": f"merged → {keep_name}",
+                       "merged_into": keep_name}})
 
     def _record(keep_key, drop_key):
         if _ln.enabled:
@@ -15987,8 +16042,13 @@ def post_pass_merge(roster, validator=None):
                     # Keep the entry with more appearances (more evidence).
                     keep, drop = (ka, kb) if ea.get("appearances", 0) >= \
                         eb.get("appearances", 0) else (kb, ka)
+                    _keep_name = roster[keep].get("name", keep)
+                    _drop_name = roster[drop].get("name", drop)
                     _merge_roster_entries(roster, keep, drop)
                     _record(keep, drop)
+                    _pub_merge(_keep_name, _drop_name, "Tier 1/2",
+                               "merged")
+                    _pub_fold(_keep_name, _drop_name)
                     n_merged += 1
                     _changed = True
                     break
@@ -16069,6 +16129,8 @@ def post_pass_merge(roster, validator=None):
             possible_merges.append({
                 "name_a": _na, "name_b": _nb, "p_yes": None,
                 "reason": "unresolved (decision model disabled)"})
+            _pub_merge(_na, _nb, "Tier 3", "unresolved_model_off",
+                       reason="decision model disabled")
             continue
         if not _dm_budget_claim(1, consumer="merge_tier3"):
             # Pairs beyond the cap are listed for manual review,
@@ -16076,6 +16138,8 @@ def post_pass_merge(roster, validator=None):
             possible_merges.append({
                 "name_a": _na, "name_b": _nb, "p_yes": None,
                 "reason": "unresolved (Tier 3 cap reached)"})
+            _pub_merge(_na, _nb, "Tier 3", "unresolved_budget",
+                       reason="Tier 3 cap reached")
             continue
         _tel_t0 = time.monotonic()
         _merged, _p = validator.ask_same_person(
@@ -16087,20 +16151,28 @@ def post_pass_merge(roster, validator=None):
             possible_merges.append({
                 "name_a": _na, "name_b": _nb, "p_yes": None,
                 "reason": "decision model error"})
+            _pub_merge(_na, _nb, "Tier 3", "error",
+                       reason="decision model error")
             if getattr(validator, "disabled", False):
                 _dm_off = True  # circuit breaker tripped; rest are unresolved
             continue
         if _merged:
             keep, drop = (ka, kb) if ea.get("appearances", 0) >= \
                 eb.get("appearances", 0) else (kb, ka)
+            _keep_name = _na if keep == ka else _nb
+            _drop_name = _nb if keep == ka else _na
             _merge_roster_entries(roster, keep, drop)
             _record(keep, drop)
+            _pub_merge(_na, _nb, "Tier 3", "merged", p=_p)
+            _pub_fold(_keep_name, _drop_name)
             n_merged += 1
         else:
             possible_merges.append({
                 "name_a": _na, "name_b": _nb,
                 "p_yes": round(_p, 4) if _p is not None else None,
                 "reason": f"below threshold ({_MERGE_P_YES_THRESHOLD})"})
+            _pub_merge(_na, _nb, "Tier 3", "split", p=_p,
+                       reason="below threshold")
     # Blocked name-candidate proposals (see the candidate block
     # above): pairs a Tier 1 veto kept from the judge entirely.
     # Only pairs whose entries both survived Tier 3 are listed —
@@ -16116,9 +16188,15 @@ def post_pass_merge(roster, validator=None):
             "reason": (f"name candidate ({', '.join(_srcs)}): "
                        f"blocked by Tier 1 — not judged, not "
                        f"merged; manual review")})
+        _pub_merge(roster[_ka].get("name", _ka),
+                   roster[_kb].get("name", _kb), "Tier 1", "blocked",
+                   reason="name candidate blocked by Tier 1")
     # The merge stage is done: its unused budget reserve becomes
     # borrowable by the validation stages that follow (spec §1.3).
     _dm_budget_finish("merge_tier3")
+    UI.console_counts(_bk, {"merges_merged": n_merged,
+                            "merges_unresolved": len(possible_merges)})
+    UI.console_stage(_bk, "merge_review", "complete")
     return n_merged, possible_merges
 
 
@@ -16367,6 +16445,54 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     """
     n = len(chapters)
     idx_to_label = {c["index"]: c["label"] for c in chapters}
+    # Console seam (Phase 3): verdict streaming. Everything below
+    # publishes facts at the point they become true; with no
+    # observer attached every helper here is inert and the reduce
+    # is byte-for-byte the computation it was before.
+    _bk = getattr(_DIAG, "viz_book_key", None)
+    _con = UI._console_observer is not None
+
+    def _spent():
+        return sum(v.get("spent", 0)
+                   for v in _dm_budget_snapshot().values())
+
+    def _rel_key(frm, to, typ, origin):
+        _a, _b = sorted((norm_name(frm), norm_name(to)))
+        return f"pair:{_a}|{_b}|type:{typ}|origin:{origin}"
+
+    def _rel_record(rel):
+        _rec = {"from": rel.get("from"), "to": rel.get("to"),
+                "type": rel.get("claimed_type") or rel.get("type"),
+                "claimed_type": rel.get("claimed_type")
+                or rel.get("type"),
+                "shipped_type": rel.get("type"),
+                "note": rel.get("validation_note"),
+                "model": rel.get("validation_model")}
+        _ev = rel.get("evidence_mined") or rel.get("evidence")
+        if _ev:
+            _rec["evidence"] = {
+                "quote": _ev[:500],
+                "source": "mined" if rel.get("evidence_mined")
+                else "extracted",
+                "grade": rel.get("evidence_grade"),
+                "chapter": idx_to_label.get(rel.get("_idx"))}
+        if rel.get("revived_runner_up"):
+            _rec["revived"] = True
+            _rec["revived_over"] = rel.get("revived_over_type")
+        if rel.get("direction_contradiction"):
+            _rec["direction_contradiction"] = True
+        return _rec
+
+    def _pub_rel_verdict(rel, decision, origin, typ=None):
+        if not _con:
+            return
+        UI.console_verdict(_bk, {
+            "table": "relationships",
+            "row_key": _rel_key(rel.get("from", ""), rel.get("to", ""),
+                                typ or rel.get("claimed_type")
+                                or rel.get("type", ""), origin),
+            "decision": decision, "p": rel.get("validation_p"),
+            "record": _rel_record(rel)})
     # Table-of-contents chapters are title lists, not story content. Their
     # candidates would be inferred from other chapters' titles, so they are
     # excluded from trope/trigger evidence collection below.
@@ -16733,6 +16859,48 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     if _pool_after != _pool_before:
         print(f"  Decision pool: {_pool_before} -> {_pool_after} "
               f"(candidate-aware sizing from the pair census)")
+    if _con:
+        # Reduce census: the first point where the candidate set,
+        # the reduced claims, and the losers all exist as facts.
+        # Candidates surface now — honestly labelled — rather than
+        # pretending the console knew them chapter by chapter.
+        _cand_rows = {}
+        for _cl in _pair_cands.values():
+            for _c in _cl:
+                _a, _b = sorted((norm_name(_c["from"]),
+                                 norm_name(_c["to"])))
+                _ck = (_a, _b, _c["type"])
+                _row = _cand_rows.setdefault(_ck, {
+                    "from": _c["from"], "to": _c["to"],
+                    "type": _c["type"], "status": "candidate",
+                    "chapters": 0})
+                _row["chapters"] += 1
+        for (_a, _b, _t), _row in _cand_rows.items():
+            UI.console_candidate(
+                _bk, "relationships", f"cand:{_a}|{_b}|{_t}", _row)
+        for _rel in relationships:
+            _rec = _rel_record(_rel)
+            _rec["status"] = "reduced_claim"
+            UI.console_candidate(
+                _bk, "relationships",
+                _rel_key(_rel["from"], _rel["to"], _rel["type"],
+                         "extracted"), _rec)
+        for _l in _pair_losers:
+            _rec = {"from": _l["from"], "to": _l["to"],
+                    "type": _l["type"], "not_selected": True,
+                    "lost_to_type": _l.get("lost_to_type"),
+                    "status": "not_selected"}
+            UI.console_candidate(
+                _bk, "relationships",
+                _rel_key(_l["from"], _l["to"], _l["type"], "loser"),
+                _rec)
+        UI.console_counts(_bk, {
+            "rel_candidates": sum(len(_cl)
+                                  for _cl in _pair_cands.values()),
+            "reduced_claims": len(relationships),
+            "pair_losers": len(_pair_losers),
+            "decision_pool": _pool_after, "decision_spent": _spent()})
+        UI.console_stage(_bk, "relationship_validation", "active")
 
     # --- Relationship importance: 1-5 from chapter co-occurrence ---
     # More chapters together = more important. Scaled to book length.
@@ -17047,7 +17215,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     for rel in _ordered_rels:
         if rel.get("type", "") not in _REL_FAMILY_TYPES:
             continue
+        _ptype = rel.get("type", "")
         _fate = _validate_family_claim(rel)
+        _pub_rel_verdict(rel, _fate, "extracted", typ=_ptype)
         if _fate in ("no_evidence", "dropped"):
             _dead_winners.append({
                 "pair_key": tuple(sorted(
@@ -17127,7 +17297,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
 
     if _DECISION_VALIDATOR is not None:
         for rel in _ordered_rels:
+            _ptype = rel.get("type", "")
             _fate = _validate_nonfamily_claim(rel)
+            if _fate != "skipped":
+                _pub_rel_verdict(rel, _fate, "extracted", typ=_ptype)
             if _fate == "dropped":
                 _dead_winners.append({
                     "pair_key": tuple(sorted(
@@ -17223,6 +17396,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             # stays visible with its recorded outcome, exactly as
             # a winning claim's preview outcome stays visible.
             relationships.append(_cand)
+        _pub_rel_verdict(_cand, _fate, "revived_runner_up",
+                         typ=_cand_type)
         print(f"  Runner-up revival: {_cand['from']} / {_cand['to']} "
               f"'{_cand_type}' revived over '{_dead['type']}' "
               f"({_dead['fate']}); outcome: {_fate}")
@@ -17321,6 +17496,51 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         rel.setdefault("source", "extracted")
         rel["validation_state"] = _rel_validation_state(rel)
 
+    if _con:
+        # Final states: published only now, after the derivation
+        # and the direction guard have run — an interim judgment
+        # must never promote itself (spec §5.4). Guard-suppressed
+        # claims are audit records, not claims, and get no row.
+        _note_decision = {"kept": "kept", "downgraded": "downgraded",
+                          "dropped": "dropped",
+                          "would_drop": "dropped",
+                          "no_evidence": "no_evidence",
+                          "budget_exhausted": "budget",
+                          "validator_error": "error"}
+        _final_counts = {}
+        for _rel in relationships + _dropped_relationships:
+            if _rel.get("family_guard") \
+                    and not _rel.get("revived_runner_up"):
+                continue
+            _st = _rel.get("validation_state")
+            _final_counts[_st] = _final_counts.get(_st, 0) + 1
+            _dec = _note_decision.get(_rel.get("validation_note"))
+            if _dec is None:
+                _dec = "review_required" \
+                    if _rel.get("revived_runner_up") else "unvalidated"
+            UI.console_verdict(_bk, {
+                "table": "relationships",
+                "row_key": _rel_key(
+                    _rel.get("from", ""), _rel.get("to", ""),
+                    _rel.get("claimed_type") or _rel.get("type", ""),
+                    "revived_runner_up" if _rel.get("revived_runner_up")
+                    else "extracted"),
+                "decision": _dec, "p": _rel.get("validation_p"),
+                "final_state": _st, "record": _rel_record(_rel)})
+        UI.console_counts(_bk, {
+            "rel_validated": _final_counts.get("validated", 0),
+            "rel_rejected": _final_counts.get("rejected", 0),
+            "rel_review_required":
+                _final_counts.get("review_required", 0),
+            "rel_budget_exhausted":
+                _final_counts.get("budget_exhausted", 0),
+            "rel_validator_error":
+                _final_counts.get("validator_error", 0),
+            "decision_pool": _dm_budget_pool(),
+            "decision_spent": _spent()})
+        UI.console_stage(_bk, "relationship_validation", "complete")
+        UI.console_stage(_bk, "content_gates", "active")
+
     if show_matrices:
         print(_rel_confidence_ascii(relationships))
 
@@ -17354,6 +17574,20 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     sev_names = ["none", "mentioned", "on_page", "graphic"]
     triggers = []
     _gated_dropped = 0
+
+    def _pub_trigger(cat, acc, decision, gate, sev_final=None):
+        if not _con:
+            return
+        _rec = {"warning": cat,
+                "severity_claimed": sev_names[acc["sev"]],
+                "chapters": len(acc["chapters"]), "gate": gate,
+                "status": decision}
+        if sev_final is not None:
+            _rec["severity"] = sev_names[sev_final]
+        UI.console_verdict(_bk, {"table": "triggers",
+                                 "row_key": f"trig:{cat}",
+                                 "decision": decision,
+                                 "record": _rec})
     for cat in TRIGGER_CATEGORIES:
         acc = trig_acc[cat]
         if acc["sev"] == 0:
@@ -17432,6 +17666,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                         # else: discard this quote's evidence
                     if not _kept:
                         _gated_dropped += 1
+                        _pub_trigger(cat, acc, "dropped", "decision")
                         continue
                     if _downgrade:
                         sev = 1
@@ -17447,6 +17682,8 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 _gate_re = _TRIGGER_EVIDENCE_RE.get(cat)
                 if _neg_re and _neg_re.search(_ev_text):
                     _gated_dropped += 1
+                    _pub_trigger(cat, acc, "dropped",
+                                 "fallback" if _was_dv else "regex")
                     continue
                 elif _gate_re and not _gate_re.search(_ev_text):
                     sev = 1
@@ -17454,6 +17691,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # on_page scene that happens once is exactly what a trigger warning
         # is for — never drop those on chapter count alone.
         if len(acc["chapters"]) < 2 and sev < 2:
+            _pub_trigger(cat, acc, "dropped",
+                         acc["evidence"][0].get("decision_gate", "none")
+                         if acc["evidence"] else "none")
             continue
         # Stamp any evidence that never went through a gate (sev was already
         # "mentioned", so no gate ran). The chapter index comes off
@@ -17481,6 +17721,22 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                            else _v2_trigger_confidence(sev, len(acc["chapters"]),
                                                       len(acc["evidence"]))),
         })
+        if _con:
+            _trec = {"warning": cat, "severity": sev_names[sev],
+                     "severity_claimed": sev_names[acc["sev"]],
+                     "chapters": len(acc["chapters"]),
+                     "gate": acc["evidence"][0].get("decision_gate",
+                                                     "none")
+                     if acc["evidence"] else "none",
+                     "status": "downgraded" if sev != acc["sev"]
+                     else "kept",
+                     "evidence": [{"quote": _e.get("quote", "")[:300],
+                                   "chapter": _e.get("chapter"),
+                                   "p": _e.get("decision_p")}
+                                  for _e in acc["evidence"][:3]]}
+            UI.console_verdict(_bk, {
+                "table": "triggers", "row_key": f"trig:{cat}",
+                "decision": _trec["status"], "record": _trec})
     if _gated_dropped:
         print(f"  Trigger gate: dropped {_gated_dropped} unsupported claim(s)")
     # The trigger stage is done: its unused reserve becomes
@@ -17722,6 +17978,25 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     for rel in relationships + _dropped_relationships:
         rel.pop("_idx", None)
 
+    if _con:
+        # Final character rows: the reduce's roster is the first
+        # point where role and chapter presence are facts.
+        for _c in characters:
+            UI.console_candidate(_bk, "characters",
+                                 _c.get("name") or "", {
+                                     "name": _c.get("name"),
+                                     "chapters":
+                                         _c.get("chapters_present"),
+                                     "status": _c.get("role")
+                                     or "roster",
+                                     "aliases": _c.get("aliases"),
+                                     "is_pov": _c.get("is_pov")})
+        UI.console_counts(_bk, {"quotes_checked": v_checked,
+                                "quotes_verified": v_verified,
+                                "decision_pool": _dm_budget_pool(),
+                                "decision_spent": _spent()})
+        UI.console_stage(_bk, "content_gates", "complete")
+
     return {
         "characters": characters,
         "relationships": relationships,
@@ -17856,6 +18131,7 @@ def v2_trope_gate(call, chapter_summaries, candidates, candidate_counts):
     confirmed, conf = [], {}
     if not candidates:
         return confirmed, conf
+    _bk = getattr(_DIAG, "viz_book_key", None)
     summaries = "\n".join(
         f"Ch {s['index']} ({s['label']}): {s['summary']}"
         for s in chapter_summaries if s.get("summary"))
@@ -17874,6 +18150,18 @@ def v2_trope_gate(call, chapter_summaries, candidates, candidate_counts):
             continue
         for v in out["verdicts"]:
             key = _tnorm(v["trope"])
+            if key in cand_keys \
+                    and UI._console_observer is not None:
+                # A candidate is displayable as judged only when
+                # its batch has returned — this loop is that point.
+                UI.console_verdict(_bk, {
+                    "table": "tropes", "row_key": key,
+                    "decision": {"yes": "gate_confirmed",
+                                 "no": "gate_rejected"}.get(
+                                     v["verdict"], "gate_pending"),
+                    "record": {"name": cand_keys[key],
+                               "justification":
+                                   v.get("justification")}})
             if v["verdict"] == "yes" and key in cand_keys:
                 name = cand_keys[key]
                 if name not in confirmed:
@@ -18345,6 +18633,11 @@ class PipelineUI:
 
     def console_verdict(self, book_key, payload):
         self._console_publish("verdict_upsert", book_key, payload=payload)
+
+    def console_candidate(self, book_key, table, key, record):
+        self._console_publish(
+            "candidate_upsert", book_key,
+            payload={"table": table, "key": key, "record": record})
 
     def console_counts(self, book_key, counts):
         self._console_publish("counts_snapshot", book_key,
@@ -26794,6 +27087,11 @@ def process_file_v2(fpath, dry_run=False, preview=False):
               f"{_recon_stats['entries_after']} entries "
               f"({_recon_stats['variants_merged']} variants merged, "
               f"{_recon_stats['aliases_pruned']} polluted aliases pruned)")
+        UI.console_counts(_book_key, {
+            "reconcile_variants_merged":
+                _recon_stats["variants_merged"],
+            "reconcile_aliases_pruned":
+                _recon_stats["aliases_pruned"]})
 
     # Post-pass character merge (Tier 1/2 deterministic + Tier 3 decision
     # model). Runs after all chapters, before the reduce, so v2_reduce sees
@@ -26881,23 +27179,37 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             red["trope_chapters"] = trope_chapters
         _denied = 0
         _rej_denied = 0
+
+        def _pub_trope(name, state):
+            if UI._console_observer is None:
+                return
+            UI.console_candidate(_book_key, "tropes", _tnorm(name), {
+                "name": name, "chapters": counts.get(_tnorm(name), 1),
+                "state": state})
+
         for c in red["trope_candidates"]:
+            _pub_trope(c, "candidate")
             # Drop genre/setting labels (not tropes)
             if _is_denylisted_trope(c):
                 _denied += 1
+                _pub_trope(c, "suppressed")
                 continue
             # Drop tropes humans have rejected 3+ times (rejection denylist)
             if _learn().is_trope_denylisted(_trej_key(c)):
                 _denied += 1
                 _rej_denied += 1
+                _pub_trope(c, "suppressed")
                 continue
             n_ch = counts.get(_tnorm(c), 1)
             if n_ch >= auto_min:
                 auto.append(c)
+                _pub_trope(c, "auto_threshold")
             elif n_ch >= 2 or not drop_single:
                 gated.append(c)
+                _pub_trope(c, "gate_pending")
             else:
                 dropped += 1
+                _pub_trope(c, "held_back")
         print(f"  Tropes: {len(auto)} auto ({auto_min}+ ch), {len(gated)} to gate, "
               f"{dropped} single-ch dropped, {_denied} denylisted...", end=" ", flush=True)
         _sb_auto, _sb_gated = list(auto), list(gated)
@@ -26914,8 +27226,15 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         # this trope (0.10 per rejection); 3+ rejections already denylisted.
         _rej_filtered = 0
         if tropes:
+            _pre_rej = {_tnorm(t): t for t in tropes}
             tropes, trope_conf, _rej_filtered = _apply_trope_rejections(
                 tropes, trope_conf, _learn())
+            if UI._console_observer is not None:
+                for _k in set(_pre_rej) - {_tnorm(t) for t in tropes}:
+                    UI.console_verdict(_book_key, {
+                        "table": "tropes", "row_key": _k,
+                        "record": {"name": _pre_rej[_k],
+                                   "state": "suppressed"}})
         _rej_total = _rej_denied + _rej_filtered
         rej_note = f", {_rej_total} rejected" if _rej_total else ""
         print(f"{len(tropes)} confirmed{rej_note}")
@@ -27068,6 +27387,32 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             for _nm in (_sg.get("suppressed_names") or []):
                 if _nm not in _supp_names:
                     _supp_names.append(_nm)
+
+    if UI._console_observer is not None:
+        # Final trope/trigger dispositions: the ship set as the
+        # staging seam left it, and the suppressed set by name —
+        # trigger names are category keys, everything else is a
+        # trope (the same classification the artefact carries).
+        for _t in tropes:
+            UI.console_verdict(_book_key, {
+                "table": "tropes", "row_key": _tnorm(_t),
+                "record": {
+                    "name": _t,
+                    "chapters": (red.get("trope_candidate_counts")
+                                 or {}).get(_tnorm(_t), 1),
+                    "state": "shipped",
+                    "confidence": trope_conf.get(_tnorm(_t))}})
+        for _nm in _supp_names:
+            if _nm in TRIGGER_CATEGORIES:
+                UI.console_verdict(_book_key, {
+                    "table": "triggers", "row_key": f"trig:{_nm}",
+                    "decision": "suppressed",
+                    "record": {"warning": _nm, "status": "suppressed"}})
+            else:
+                UI.console_verdict(_book_key, {
+                    "table": "tropes", "row_key": _tnorm(_nm),
+                    "record": {"name": _nm, "state": "suppressed"}})
+        UI.console_stage(_book_key, "final_gates", "active")
 
     # Spine §3.5.3: the suppression counter — one rejection_events
     # row per suppressed claim per run, counted on the UNION of
