@@ -27394,8 +27394,16 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     # priors are this series' registry only, and the seams they
     # feed (form tie-breaks, parked mentions, merge nominations)
     # treat them as hints, never facts. The key is computed from
-    # the same inputs the book-end landing uses, so the priors
-    # read the registry the fold will write. A compilation
+    # the file's title / author (the Hardcover match is memoized
+    # on those same inputs, so Hardcover-keyed series read
+    # exactly the registry the fold will write). One known gap:
+    # for a FALLBACK-keyed series, the book-end landing keys the
+    # fold from the metadata-corrected author while this load
+    # uses the file author — a surname-changing correction makes
+    # the priors read a different (empty) series and silently
+    # not engage, while the fold still lands correctly. The
+    # failure direction is safe (absent hints assert nothing);
+    # spec §6 records it. A compilation
     # consumes nothing (spec §4): its cast is a union of volumes,
     # not a sequence position. Assigned on every book — None
     # included — so a priors book can never leak its context
