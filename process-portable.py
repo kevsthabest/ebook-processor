@@ -48,7 +48,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.76"
+PORTABLE_VERSION = "2.13.77"
 
 
 import argparse
@@ -18234,6 +18234,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     # evidence_source="mined" so provenance survives into the preview
     # and the write payload; claims with original evidence are
     # untouched.
+    _mined_norms = {}
     for rel in relationships:
         if (rel.get("evidence") or "").strip():
             continue
@@ -18244,6 +18245,34 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                        or rel.get("validation_note") == "downgraded")
         if _family_bar and _mined["grade"] != "binding":
             continue
+        # The mined sentence must earn the verified stamp through
+        # the same check extracted evidence passes — it is never
+        # true by construction (the owner's ruling after F1 left
+        # the stamp untouched pending exactly this decision). The
+        # check is verify_all_evidence's own match (normalized,
+        # fuzzy >= 0.9, trivially short text never verifies), run
+        # against the chapter the sentence was mined from: that
+        # chapter is the text Call A checks a quote against, and
+        # the miner's chapter travels on the mined item, with the
+        # chapter text reachable here. The verdict is computed
+        # BEFORE anything mutates: on failure the sentence never
+        # attaches and the claim keeps the stamps extraction and
+        # competition left, which truthfully describe an
+        # evidence-less claim — the same end state the checker
+        # leaves a failed quote in, emptied and unshipped. An item
+        # whose source chapter cannot be resolved cannot be
+        # checked, and unchecked text does not ship.
+        _src_ch = _chapters_by_index.get(_mined["chapter"])
+        if _src_ch is None:
+            continue
+        _src_norm = _mined_norms.get(_mined["chapter"])
+        if _src_norm is None:
+            _src_norm = _norm_quote(_src_ch.get("text", "") or "")
+            _mined_norms[_mined["chapter"]] = _src_norm
+        _sentence_norm = _norm_quote(_mined["sentence"])
+        if len(_sentence_norm.split()) < 3 or not _verify_against_norm(
+                _sentence_norm, _src_norm):
+            continue
         rel["evidence"] = _mined["sentence"]
         rel["evidence_source"] = "mined"
         rel["evidence_grade"] = _mined["grade"]
@@ -18253,12 +18282,13 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # the support count floors at 1 — a claim shipping a quote
         # must not report zero quotes behind it. The floor is not
         # an increment: a count from competition-time candidates
-        # was already counted and stays as it is. evidence_verified
-        # deliberately keeps its value — the mined sentence never
-        # passed verify_all_evidence, and whether mined text may
-        # carry that stamp is a separate decision.
+        # was already counted and stays as it is. And the sentence
+        # passed the evidence check immediately above, so verified
+        # is set on the strength of that check, the same strength
+        # an extracted quote's stamp has.
         rel["evidence_offered"] = True
         rel["evidence_count"] = max(rel.get("evidence_count") or 0, 1)
+        rel["evidence_verified"] = True
         if _mined["grade"] == "binding":
             rel.setdefault("evidence_mined", _mined["sentence"])
         # The claim's evidence just changed hands, so its
