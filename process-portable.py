@@ -2973,20 +2973,33 @@ _REL_PROMPT_SENTENCE_BUILTIN = ("spouse, parent, child, sibling, friend, "
                                 "enemy, mentor, colleague, neighbor, other")
 
 
+def _rel_prompt_ids(template):
+    """Render an extraction prompt template against the active
+    vocabulary's type list only: the closed list spelled in the
+    template becomes the active list, and nothing is appended."""
+    ids = [e["id"] for e in _REL_VOCAB["types"]]
+    text = template.replace(_REL_PROMPT_LIST_BUILTIN, "|".join(ids))
+    text = text.replace(_REL_PROMPT_SENTENCE_BUILTIN, ", ".join(ids))
+    return text
+
+
+def _rel_definitions_block():
+    """The definitions section _rel_prompt appends to a template:
+    every active type's boundary gloss, as one block of text."""
+    lines = ["", "RELATIONSHIP TYPE DEFINITIONS — the only types you "
+             "may use, each with its boundary:"]
+    for e in _REL_VOCAB["types"]:
+        lines.append(f"- {e['id']}: {e['gloss']}")
+    return "\n" + "\n".join(lines)
+
+
 def _rel_prompt(template):
     """Render an extraction prompt template against the active
     vocabulary: the closed type list becomes the active type list, and
     a definitions section carrying every type's gloss is appended, so
     a type the model has never seen is proposed on its definition
     rather than guessed from its name."""
-    ids = [e["id"] for e in _REL_VOCAB["types"]]
-    text = template.replace(_REL_PROMPT_LIST_BUILTIN, "|".join(ids))
-    text = text.replace(_REL_PROMPT_SENTENCE_BUILTIN, ", ".join(ids))
-    lines = ["", "RELATIONSHIP TYPE DEFINITIONS — the only types you "
-             "may use, each with its boundary:"]
-    for e in _REL_VOCAB["types"]:
-        lines.append(f"- {e['id']}: {e['gloss']}")
-    return text + "\n" + "\n".join(lines)
+    return _rel_prompt_ids(template) + _rel_definitions_block()
 
 # ---------------------------------------------------------------------------
 # Relationship direction convention (AUTHORITATIVE — the app renders to this;
@@ -16189,6 +16202,22 @@ def _v2_call_a_inner(call, roster, chapter, n_chapters):
         _user_a = f"CHAPTER TEXT:\n{chapter['text']}\n\nTASK:\n{prompt}"
     else:
         _user_a = chapter["text"]
+    # Section estimates for the telemetry recorder: run totals say
+    # what a book's prompts cost, but only a per-section split can
+    # say where the mass sits — definitions vs template vs roster
+    # vs the chapter itself — which is what any prompt diet would
+    # have to cut. The template share is what remains of the
+    # assembled prompt once the roster render and the definitions
+    # block are subtracted; it carries the chapter label and the
+    # type lists along with the instructions.
+    _defs_len = len(_rel_definitions_block())
+    _DIAG.telemetry_prompt_sections = {
+        "rel_definitions": _telemetry_section_est(_defs_len),
+        "template": _telemetry_section_est(
+            len(prompt) - len(roster_text) - _defs_len),
+        "roster": _telemetry_section_est(len(roster_text)),
+        "chapter": _telemetry_section_est(len(chapter["text"])),
+    }
     a = _run_task(call, _system_a, _user_a, idx, n_chapters,
                   f"v2-ch{idx}-identity", sanitize_fn=_sanitize_v2a)
     # Apply POV hint if the LLM didn't determine one (or as override).
@@ -16196,7 +16225,17 @@ def _v2_call_a_inner(call, roster, chapter, n_chapters):
         a["pov_character"] = pov_hint
     fell_back = False
     if a is None:
-        a = _run_task(call, _rel_prompt(PROMPT_V2_CHARACTERS_SIMPLE),
+        simple_prompt = _rel_prompt(PROMPT_V2_CHARACTERS_SIMPLE)
+        # The fallback prompt carries no roster, so its section
+        # split is definitions vs the rest of the template.
+        _DIAG.telemetry_prompt_sections = {
+            "rel_definitions": _telemetry_section_est(_defs_len),
+            "template": _telemetry_section_est(
+                len(simple_prompt) - _defs_len),
+            "roster": 0,
+            "chapter": _telemetry_section_est(len(chapter["text"])),
+        }
+        a = _run_task(call, simple_prompt,
                       chapter["text"], idx,
                       n_chapters, f"v2-ch{idx}-identity-fallback",
                       sanitize_fn=_sanitize_v2a)
@@ -16231,6 +16270,12 @@ def _v2_call_b_inner(call, chapter, n_chapters):
         _user_b = f"CHAPTER TEXT:\n{chapter['text']}\n\nTASK:\n{PROMPT_V2_CONTENT}"
     else:
         _user_b = chapter["text"]
+    # Section estimates for the telemetry recorder, as in Call A:
+    # the content prompt's own mass against the chapter's.
+    _DIAG.telemetry_prompt_sections = {
+        "content_prompt": _telemetry_section_est(len(PROMPT_V2_CONTENT)),
+        "chapter": _telemetry_section_est(len(chapter["text"])),
+    }
     b = _run_task(call, _system_b, _user_b, idx, n_chapters,
                   f"v2-ch{idx}-content", sanitize_fn=_sanitize_v2b)
     if b is not None:
@@ -23904,9 +23949,13 @@ _TELEMETRY_DECISION_STAGES = (
 def _telemetry_fresh_calls():
     """Zeroed Call A / Call B counters. Token fields start as None
     (unmeasured), not 0: a measured zero and an absent measurement
-    must stay distinguishable in every artefact these feed."""
+    must stay distinguishable in every artefact these feed. The
+    per-section prompt estimates follow the same discipline: None
+    until a call site has stashed a section split (see
+    _telemetry_record_task), never an invented zero split."""
     return {kind: {"requests": 0, "prompt_tokens": None,
                    "prompt_chars_estimate": None,
+                   "prompt_section_est": None,
                    "completion_tokens": None, "elapsed_sec": 0.0}
             for kind in ("call_a", "call_b")}
 
@@ -23949,6 +23998,20 @@ def _telemetry_token(value):
     return int(value)
 
 
+# Prompt-section estimates convert characters to tokens at one
+# shared rough rate. They exist to attribute a request's prompt
+# mass to its sections (how much is definitions, how much is the
+# chapter itself) — a question the run totals cannot answer — not
+# to rival the server-reported token counts, so precision beyond
+# this rate would be false confidence.
+_TELEMETRY_CHARS_PER_TOKEN = 3.6
+
+
+def _telemetry_section_est(chars):
+    """Estimated tokens for a prompt section of `chars` characters."""
+    return int(round(chars / _TELEMETRY_CHARS_PER_TOKEN))
+
+
 def _telemetry_record_task(task_name, prompt, chunk, elapsed_sec):
     """Record one _run_task attempt against Call A or Call B.
 
@@ -23964,6 +24027,14 @@ def _telemetry_record_task(task_name, prompt, chunk, elapsed_sec):
     prevent, one level down."""
     usage = getattr(_DIAG, "telemetry_usage", None)
     _DIAG.telemetry_usage = None
+    # The section split rides the same read-and-clear discipline as
+    # the usage stash: the call site that assembled the prompt
+    # stashes its sections on _DIAG just before _run_task, and only
+    # the first recorded attempt of that task consumes them — a
+    # retry re-sends the same prompt, and counting its sections
+    # again would attribute one prompt's composition twice.
+    sections = getattr(_DIAG, "telemetry_prompt_sections", None)
+    _DIAG.telemetry_prompt_sections = None
     kind = None
     if task_name.startswith("v2-ch"):
         if "-identity" in task_name:
@@ -23981,6 +24052,11 @@ def _telemetry_record_task(task_name, prompt, chunk, elapsed_sec):
         entry = _TELEMETRY_CALLS[kind]
         entry["requests"] += 1
         entry["elapsed_sec"] += max(0.0, float(elapsed_sec))
+        if isinstance(sections, dict) and sections:
+            split = entry["prompt_section_est"] or {}
+            for name, est in sections.items():
+                split[name] = split.get(name, 0) + est
+            entry["prompt_section_est"] = split
         if prompt_tokens is not None:
             entry["prompt_tokens"] = \
                 (entry["prompt_tokens"] or 0) + prompt_tokens
@@ -24021,6 +24097,12 @@ def _telemetry_snapshot():
                  for kind, entry in _TELEMETRY_CALLS.items()}
         elapsed = dict(_TELEMETRY_DECISION_ELAPSED)
     for entry in calls.values():
+        # The shallow copy above would alias the live section
+        # split; the snapshot must stay frozen while the running
+        # book keeps accumulating into the original.
+        if isinstance(entry.get("prompt_section_est"), dict):
+            entry["prompt_section_est"] = \
+                dict(entry["prompt_section_est"])
         entry["elapsed_sec"] = round(entry["elapsed_sec"], 3)
     decision = {}
     for stage, consumers in _TELEMETRY_DECISION_STAGES:
