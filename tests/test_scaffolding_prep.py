@@ -224,5 +224,84 @@ class TestDefinitionsDietFlag(_TelemetryCase):
                       captured["instructions"])
 
 
+class TestRosterNameScanInclusion(unittest.TestCase):
+    """A roster name attested in the current chapter is always
+    rendered for Call A. The render cap ranks by recency, so
+    without the name scan a character returning after many
+    chapters away is invisible to the very call that must
+    recognise them — and the miss is silent."""
+
+    def _entry(self, name, aliases=()):
+        return {"name": name, "aliases": list(aliases),
+                "role": "minor", "description": "d", "evidence": ""}
+
+    def _big_roster(self, dormant):
+        # The dormant entry is created in chapter 1 and never
+        # seen again; the fillers are recent and numerous enough
+        # that their lines alone overflow the 1500-char cap.
+        roster = {}
+        pp._roster_update(roster, [dormant], 1)
+        for i in range(2, 47):
+            pp._roster_update(roster, [self._entry(
+                f"Recent Character Number {i:02d} Of The Long "
+                f"Queue")], i)
+        return roster
+
+    def test_dormant_character_named_in_chapter_is_rendered(self):
+        roster = self._big_roster(self._entry(
+            "Bartholomew Ashworth", ["Bartholomew"]))
+        text, dropped = pp._roster_prompt(
+            roster,
+            chapter_text="Bartholomew Ashworth returned at dawn.")
+        self.assertIn("Bartholomew Ashworth", text)
+        self.assertNotIn("Bartholomew Ashworth", dropped)
+        # Attested names render ahead of the recency-ranked fill:
+        # the chapter's own cast leads the roster it is read
+        # against.
+        self.assertTrue(
+            text.startswith("- Bartholomew Ashworth"))
+
+    def test_dormant_character_attested_by_alias_is_rendered(self):
+        roster = self._big_roster(self._entry(
+            "Bartholomew Ashworth", ["Bartholomew"]))
+        text, dropped = pp._roster_prompt(
+            roster, chapter_text="Bartholomew laughed.")
+        self.assertIn("Bartholomew Ashworth", text)
+        self.assertNotIn("Bartholomew Ashworth", dropped)
+
+    def test_unattested_overflow_name_is_still_dropped(self):
+        roster = self._big_roster(self._entry(
+            "Bartholomew Ashworth", ["Bartholomew"]))
+        text, dropped = pp._roster_prompt(
+            roster,
+            chapter_text="Bartholomew Ashworth returned at dawn.")
+        # The cap still binds the fill: the coldest unattested
+        # names do not fit and stay dropped.
+        self.assertIn(
+            "Recent Character Number 02 Of The Long Queue",
+            dropped)
+        self.assertNotIn(
+            "Recent Character Number 02 Of The Long Queue", text)
+        self.assertTrue(dropped)
+
+    def test_substring_mention_does_not_attest(self):
+        # Whole-word matching: "ashes" must not attest the alias
+        # "Ash" — a substring hit would spend the inclusion on a
+        # character the chapter never mentions.
+        roster = self._big_roster(self._entry(
+            "Catherine Ashford", ["Ash"]))
+        text, dropped = pp._roster_prompt(
+            roster, chapter_text="Cold ashes covered the road.")
+        self.assertIn("Catherine Ashford", dropped)
+        self.assertNotIn("Catherine Ashford", text)
+
+    def test_without_chapter_text_the_cap_behaves_as_before(self):
+        roster = self._big_roster(self._entry(
+            "Bartholomew Ashworth", ["Bartholomew"]))
+        text, dropped = pp._roster_prompt(roster)
+        self.assertIn("Bartholomew Ashworth", dropped)
+        self.assertNotIn("Bartholomew Ashworth", text)
+
+
 if __name__ == "__main__":
     unittest.main()

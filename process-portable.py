@@ -16050,17 +16050,56 @@ def _roster_update(roster, characters, chapter_idx):
         _series_priors_seed(roster, _sp)
 
 
-def _roster_prompt(roster, budget=1500):
-    """Render the roster for a Call A prompt. Capped by char budget (~tokens);
-    priority is recency then frequency. Returns (text, dropped_names)."""
-    ranked = sorted(roster.values(),
-                    key=lambda e: (e["last_seen"], e["appearances"]),
+def _roster_form_attested(forms, text):
+    """True when any of `forms` occurs in `text` as a whole word,
+    case-insensitively. Case-insensitive on purpose, unlike the
+    identity matching in _forms_re: attestation here only decides
+    prompt inclusion, where the failure costs are lopsided — a
+    false attestation spends a few prompt characters, while a
+    missed one hides a character the chapter is actually about.
+    Nothing is merged or asserted on the strength of this match."""
+    for form in forms:
+        if form and re.search(r"(?<!\w)" + re.escape(form)
+                              + r"(?!\w)", text, re.IGNORECASE):
+            return True
+    return False
+
+
+def _roster_prompt(roster, chapter_text=None, budget=1500):
+    """Render the roster for a Call A prompt. Capped by char budget
+    (~tokens); the fill's priority is recency then frequency.
+    Returns (text, dropped_names).
+
+    When the current chapter's text is supplied, entries the
+    chapter actually names (by name or alias) render first and
+    are never dropped: the cap ranks by recency, so without the
+    name scan a character returning after many chapters away fell
+    out of the render entirely, and Call A — the call that must
+    recognise them — never saw their name. The miss was silent
+    (the name simply wasn't there), which is why the scan exists.
+    Attested lines count toward the budget, so the render stays
+    bounded in the normal case; the budget's bite is reserved
+    for the fill, which is the part that can grow without limit.
+    Only a chapter that attests more names than the budget holds
+    can push the render past it, and a chapter cannot attest
+    more characters than it mentions."""
+    ranked = sorted(roster.items(),
+                    key=lambda kv: (kv[1]["last_seen"],
+                                    kv[1]["appearances"]),
                     reverse=True)
+    attested = set()
+    if chapter_text:
+        attested = {key for key, e in ranked
+                    if _roster_form_attested(
+                        [e["name"], *sorted(e["aliases"])],
+                        chapter_text)}
+    ordered = [kv for kv in ranked if kv[0] in attested] \
+        + [kv for kv in ranked if kv[0] not in attested]
     lines, dropped, total = [], [], 0
-    for e in ranked:
+    for key, e in ordered:
         alias_str = f" (also: {', '.join(sorted(e['aliases']))})" if e["aliases"] else ""
         line = f"- {e['name']}{alias_str}"
-        if total + len(line) > budget:
+        if key not in attested and total + len(line) > budget:
             dropped.append(e["name"])
             continue
         lines.append(line)
@@ -16200,7 +16239,7 @@ V2_SHARED_SYSTEM = "You are a book analysis assistant. Return only valid JSON. N
 
 def _v2_call_a_inner(call, roster, chapter, n_chapters):
     idx = chapter["index"]
-    roster_text, dropped = _roster_prompt(roster)
+    roster_text, dropped = _roster_prompt(roster, chapter["text"])
     if dropped and CONFIG.get("debug"):
         print(f"(roster capped, dropped: {', '.join(dropped[:5])})",
               end=" ", flush=True)
