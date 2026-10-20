@@ -3001,6 +3001,26 @@ def _rel_prompt(template):
     rather than guessed from its name."""
     return _rel_prompt_ids(template) + _rel_definitions_block()
 
+
+def _v2_rel_prompt(template):
+    """Render a Call A extraction template under the
+    v2_rel_definitions experiment flag: "full" (the default, and the
+    fallback for any unrecognised value) appends the boundary
+    definitions as _rel_prompt does; "ids" sends the type list
+    alone, to measure what the definitions block earns its tokens.
+
+    The flag is read here, at the Call A call sites only, on
+    purpose: the decision-model judges build their own prompts and
+    pull the glosses they need straight from the vocabulary
+    (_rel_gloss in validate_relationship, the registry list in
+    ask_discovery), and the legacy identity prompts and the prompt
+    stamps call _rel_prompt directly. An extraction experiment
+    must never be able to quietly thin a judge prompt or rewrite
+    the stamped record of what the canonical prompt is."""
+    if CONFIG.get("v2_rel_definitions") == "ids":
+        return _rel_prompt_ids(template)
+    return _rel_prompt(template)
+
 # ---------------------------------------------------------------------------
 # Relationship direction convention (AUTHORITATIVE — the app renders to this;
 # also documented in README.md, "Relationship direction").
@@ -16192,9 +16212,17 @@ def _v2_call_a_inner(call, roster, chapter, n_chapters):
         if e["name"].lower() in label_low and len(e["name"]) > 2:
             pov_hint = e["name"]
             break
-    prompt = (_rel_prompt(PROMPT_V2_CHARACTERS)
+    _base_prompt = _v2_rel_prompt(PROMPT_V2_CHARACTERS)
+    prompt = (_base_prompt
               .replace("{chapter_label}", chapter["label"])
               .replace("{roster}", roster_text))
+    # The definitions share of the assembled prompt, for the
+    # telemetry split below: the block's length under "full", zero
+    # under "ids" — derived by subtracting the ids-only rendering,
+    # so the split describes the prompt actually sent rather than
+    # the flag's intention.
+    _defs_len = len(_base_prompt) - len(
+        _rel_prompt_ids(PROMPT_V2_CHARACTERS))
     _use_shared = CONFIG.get("v2_shared_system")  # isolation flag only; hurts quality
     _task_last = (CONFIG.get("v2_prompt_cache") or CONFIG.get("v2_task_last"))
     _system_a = V2_SHARED_SYSTEM if _use_shared else prompt
@@ -16210,7 +16238,6 @@ def _v2_call_a_inner(call, roster, chapter, n_chapters):
     # assembled prompt once the roster render and the definitions
     # block are subtracted; it carries the chapter label and the
     # type lists along with the instructions.
-    _defs_len = len(_rel_definitions_block())
     _DIAG.telemetry_prompt_sections = {
         "rel_definitions": _telemetry_section_est(_defs_len),
         "template": _telemetry_section_est(
@@ -16225,7 +16252,7 @@ def _v2_call_a_inner(call, roster, chapter, n_chapters):
         a["pov_character"] = pov_hint
     fell_back = False
     if a is None:
-        simple_prompt = _rel_prompt(PROMPT_V2_CHARACTERS_SIMPLE)
+        simple_prompt = _v2_rel_prompt(PROMPT_V2_CHARACTERS_SIMPLE)
         # The fallback prompt carries no roster, so its section
         # split is definitions vs the rest of the template.
         _DIAG.telemetry_prompt_sections = {
@@ -26876,6 +26903,7 @@ _CHECKPOINT_FLAGS = (
     # CONFIG keys that affect output; a mismatch on --resume warns.
     "llm", "batch_size", "pipeline", "principals_only", "min_frequency",
     "dedupe", "v2_prompt_cache", "v2_shared_system", "v2_task_last",
+    "v2_rel_definitions",
     "decision_model", "decision_model_provider", "only_chunks",
 )
 

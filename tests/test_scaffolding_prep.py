@@ -154,5 +154,75 @@ class TestPromptSectionTelemetry(_TelemetryCase):
             pp._telemetry_snapshot()["call_a"]["prompt_section_est"])
 
 
+class TestDefinitionsDietFlag(_TelemetryCase):
+    """v2_rel_definitions: "full" by default, "ids" thins ONLY
+    the Call A extraction prompt. The judges never rendered
+    through the switched helper — these tests pin that their
+    gloss supply survives the flag."""
+
+    def _run_call_a(self, config_extra=None):
+        backend = _CaptureBackend(_CALL_A_PAYLOAD)
+        with mock.patch.dict(pp.CONFIG, config_extra or {}):
+            result, _ = pp._v2_call_a_inner(
+                backend, {}, _chapter(), 3)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(backend.calls), 1)
+        return backend.calls[0][0]
+
+    def test_default_prompt_carries_definitions(self):
+        prompt = self._run_call_a()
+        self.assertIn("RELATIONSHIP TYPE DEFINITIONS", prompt)
+
+    def test_ids_mode_drops_definitions_keeps_type_list(self):
+        prompt = self._run_call_a({"v2_rel_definitions": "ids"})
+        self.assertNotIn("RELATIONSHIP TYPE DEFINITIONS", prompt)
+        # The vocabulary itself is not thinned: ids mode removes
+        # the boundary glosses, never the types the model may use.
+        ids = [e["id"] for e in pp._REL_VOCAB["types"]]
+        self.assertIn("|".join(ids), prompt)
+        # The telemetry split tells the same story as the prompt:
+        # no definitions mass was sent.
+        sections = pp._telemetry_snapshot()[
+            "call_a"]["prompt_section_est"]
+        self.assertEqual(sections["rel_definitions"], 0)
+        self.assertGreater(sections["template"], 0)
+
+    def test_unrecognised_value_falls_back_to_full(self):
+        prompt = self._run_call_a({"v2_rel_definitions": "banana"})
+        self.assertIn("RELATIONSHIP TYPE DEFINITIONS", prompt)
+
+    def test_shared_renderer_ignores_the_flag(self):
+        # _rel_prompt also serves the legacy identity prompts and
+        # the prompt stamps; the flag lives at the Call A call
+        # sites, so the renderer's own output must not move.
+        with mock.patch.dict(pp.CONFIG,
+                             {"v2_rel_definitions": "ids"}):
+            rendered = pp._rel_prompt(pp.PROMPT_V2_CHARACTERS)
+        self.assertIn("RELATIONSHIP TYPE DEFINITIONS", rendered)
+
+    def test_judge_prompt_keeps_its_gloss_under_ids_mode(self):
+        # validate_relationship builds its own instructions and
+        # pulls the claimed type's gloss via _rel_gloss — capture
+        # the instructions it would send and check the gloss
+        # clause is intact while the flag is set.
+        validator = pp.DecisionValidator("http://127.0.0.1:9")
+        captured = {}
+
+        def fake_ask(question_key, instructions, state, label=""):
+            captured["instructions"] = instructions
+            return 0.9
+
+        validator._ask_noul = fake_ask
+        with mock.patch.dict(pp.CONFIG,
+                             {"v2_rel_definitions": "ids"}):
+            verdict, _p = validator.validate_relationship(
+                "Mira Solace", "Kael Vane", "spouse", _STORY)
+        self.assertTrue(verdict)
+        gloss = pp._rel_gloss("spouse")
+        self.assertTrue(gloss)
+        self.assertIn(f'"spouse" means: {gloss}',
+                      captured["instructions"])
+
+
 if __name__ == "__main__":
     unittest.main()
