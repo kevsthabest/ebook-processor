@@ -473,6 +473,19 @@ class TestChain(_PpCase):
             {"isbn": "9780000000000"}, "Freedom", "Daniel Suarez")
         self.assertEqual((name, pos, src), ("Daemon", 2.0, "filename"))
 
+    def test_compilation_membership_claims_no_position(self):
+        # Spec §4: a compilation (omnibus/box set) is a series
+        # member with NO position claim — the source hangs position
+        # 1 on Empyrean box sets, and claiming it would register
+        # the set as volume 1.
+        m = dict(HC_MATCH, compilation=True, series_position=1.0)
+        self._stub(m)
+        name, pos, src = pp._detect_series(
+            "Empyrean Collection.epub", {"isbn": "9781649374998"},
+            "The Empyrean Collection", "Rebecca Yarros")
+        self.assertEqual((name, pos, src),
+                         ("The Empyrean", None, "hardcover"))
+
     def test_match_without_series_falls_through(self):
         m = dict(HC_MATCH, series_name=None, series_id=None,
                  series_position=None)
@@ -517,6 +530,30 @@ class TestLanding(_PpCase):
                          "Iron Flame (The Empyrean, #2)")
         self.assertEqual(block["file_author"], "Yarros, Rebecca")
         self.assertEqual(result["series_key"], "hc-series:41764")
+
+    def test_compilation_flag_lands_in_block(self):
+        m = dict(HC_MATCH, compilation=True)
+        self._stub(m)
+        result = self._result()
+        pp._land_series_identity(result, {"isbn": "9781649374110"},
+                                 result["title"], result["author"])
+        self.assertTrue(result["hardcover"]["compilation"])
+
+    def test_seriesless_match_lands_none_series_key(self):
+        # A confident Hardcover match on a book with no series
+        # membership still lands — with series_key explicitly None,
+        # so the key's presence means the identity model ran.
+        m = dict(HC_MATCH, series_name=None, series_id=None,
+                 series_position=None)
+        self._stub(m)
+        result = self._result(series_name=None, series_position=None,
+                              series_source="none")
+        pp._land_series_identity(result, {"isbn": "9781649374110"},
+                                 result["title"], result["author"])
+        self.assertIn("hardcover", result)
+        self.assertIn("series_key", result)
+        self.assertIsNone(result["series_key"])
+        self.assertEqual(result["title"], "Iron Flame")
 
     def test_fallback_series_key_for_other_sources(self):
         self._stub(None)

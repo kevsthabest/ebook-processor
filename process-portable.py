@@ -840,7 +840,14 @@ def _detect_series(fpath, identifiers, title, author):
     #    outranks guessing a series from the filename (R-H3).
     hc = _hardcover_lookup(identifiers, title, author)
     if hc and hc.get("series_name"):
-        return hc["series_name"], hc.get("series_position"), "hardcover"
+        # A compilation membership names the series but claims no
+        # position in it: an omnibus sits outside the reading
+        # sequence even when the source hangs a number on it, and
+        # a claimed position would flow into the series registry
+        # as if the box set were that volume (spec §4).
+        pos = None if hc.get("compilation") \
+            else hc.get("series_position")
+        return hc["series_name"], pos, "hardcover"
     # 4. Filename pattern.
     fn_series, fn_pos = _parse_series_from_filename(fpath.name if hasattr(fpath, "name") else fpath)
     if fn_series:
@@ -965,6 +972,7 @@ def _land_series_identity(result, identifiers, file_title, file_author):
             "pages": match.get("pages"),
             "match_path": match.get("match_path"),
             "dominance": bool(match.get("dominance")),
+            "compilation": bool(match.get("compilation")),
             "alternates": match.get("alternates", 0),
             "file_title": file_title,
             "file_author": file_author,
