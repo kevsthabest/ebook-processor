@@ -48,7 +48,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.70"
+PORTABLE_VERSION = "2.13.71"
 
 
 import argparse
@@ -168,6 +168,16 @@ DEFAULT_CONFIG = {
     # of the miner's order. Default off (the miner-order arm);
     # ranking only — embeddings never become a confidence score.
     "discovery_embedding_rank": False,
+    # Hardcover metadata source (series-linking spec, Phase 1):
+    # when on, each book's identity is resolved against Hardcover
+    # at scan time and a confident match's canonical title, authors
+    # and series land on the work record. Default off; with it off
+    # (or no token, or no match) a run is byte-identical to before.
+    "hardcover": False,
+    # Hardcover API token. The HARDCOVER_TOKEN environment variable
+    # wins when set; the token is only ever sent to
+    # api.hardcover.app and never appears in previews or logs.
+    "hardcover_token": "",
 }
 
 
@@ -177,7 +187,8 @@ _INT_CONFIG_KEYS = {"sample_rate", "sample_edges", "batch_size", "llm_max_tokens
 # Config keys that are bools (EBOOK_DEDUPE=false must not be truthy).
 _BOOL_CONFIG_KEYS = {"debug", "dedupe", "llm_enable_thinking", "llm_json_schema",
                      "v2_prompt_cache", "run_history",
-                     "discovery_shadow", "discovery_embedding_rank"}
+                     "discovery_shadow", "discovery_embedding_rank",
+                     "hardcover"}
 
 
 def load_config():
@@ -749,8 +760,9 @@ def _handle_missing_isbn(fpath, preview=False, dry_run=False):
 # --- Series detection ---
 # Priority: 1. --series/--series-position flags
 #            2. EPUB calibre:series / calibre:series_index metadata
-#            3. Filename pattern: [Series 02] - Title  or  (Series #2)
-#            4. Open Library work record (best-effort)
+#            3. Hardcover series membership (only with --hardcover)
+#            4. Filename pattern: [Series 02] - Title  or  (Series #2)
+#            5. Open Library work record (best-effort)
 _SERIES_FILENAME_RES = (
     re.compile(r"^\[(.+?)\s+(\d+(?:\.\d+)?)\]\s*[-–:]\s*"),
     re.compile(r"^\((.+?)\s+#(\d+(?:\.\d+)?)\)"),
@@ -809,7 +821,8 @@ def _lookup_series_openlibrary(title, author):
 def _detect_series(fpath, identifiers, title, author):
     """Detect (series_name, position, source) by priority.
 
-    Sources: 'flag' > 'epub' > 'filename' > 'openlibrary' > 'none'.
+    Sources: 'flag' > 'epub' > 'hardcover' > 'filename' >
+    'openlibrary' > 'none'.
     identifiers may carry 'series'/'series_index' from EPUB calibre metadata.
     """
     # 1. CLI flags.
@@ -822,15 +835,144 @@ def _detect_series(fpath, identifiers, title, author):
     if epub_series:
         epub_pos = identifiers.get("series_index")
         return epub_series, epub_pos, "epub"
-    # 3. Filename pattern.
+    # 3. Hardcover (only with --hardcover). The file's own tags
+    #    above outrank any external source; curated external data
+    #    outranks guessing a series from the filename (R-H3).
+    hc = _hardcover_lookup(identifiers, title, author)
+    if hc and hc.get("series_name"):
+        return hc["series_name"], hc.get("series_position"), "hardcover"
+    # 4. Filename pattern.
     fn_series, fn_pos = _parse_series_from_filename(fpath.name if hasattr(fpath, "name") else fpath)
     if fn_series:
         return fn_series, fn_pos, "filename"
-    # 4. Open Library (best-effort, may be slow — shares the 10s timeout).
+    # 5. Open Library (best-effort, may be slow — shares the 10s timeout).
     ol_series, ol_pos = _lookup_series_openlibrary(title, author)
     if ol_series:
         return ol_series, ol_pos, "openlibrary"
     return None, None, "none"
+
+
+# --- Hardcover identity landing (series-linking spec, Phase 1) ---
+_HC_CLIENT = None   # this process's client; False once its import failed
+_HC_MEMO = {}       # (isbn, tnorm title, author) -> match dict | None
+
+
+def _hardcover_client():
+    """The process-wide Hardcover client, or None when the module
+    cannot load. Built once and shared: the client owns the
+    disabled latch and the cache handle, so building it per book
+    would warn per book and re-open the cache per book."""
+    global _HC_CLIENT
+    if _HC_CLIENT is not None:
+        return _HC_CLIENT or None
+    try:
+        import hardcover as _hc_module
+    except Exception:
+        _HC_CLIENT = False
+        return None
+    _HC_CLIENT = _hc_module.HardcoverClient(
+        token=_hc_module.resolve_token(CONFIG),
+        refresh=bool(CONFIG.get("hardcover_refresh")),
+        warn=lambda msg: print(msg))
+    return _HC_CLIENT
+
+
+def _hardcover_lookup(identifiers, title, author):
+    """This book's confident Hardcover match, or None.
+
+    Memoised per book identity: _detect_series consults it for
+    the chain and _land_series_identity consults it again for the
+    record landing, and the two must see the same match without a
+    second lookup. With --hardcover off, or the client
+    unavailable, it is always None — and a book whose client died
+    mid-lookup memoises that None too, so a latched client is
+    never re-asked within the run."""
+    if not CONFIG.get("hardcover"):
+        return None
+    key = ((identifiers or {}).get("isbn") or "",
+           _tnorm(title or ""), (author or "").strip().casefold())
+    if key in _HC_MEMO:
+        return _HC_MEMO[key]
+    client = _hardcover_client()
+    match = None
+    if client is not None:
+        match = client.lookup(isbn=key[0] or None, title=title,
+                              author=author)
+    _HC_MEMO[key] = match
+    return match
+
+
+def _hardcover_operational():
+    """True while a Hardcover lookup can still contribute: the
+    flag is on, the client built, and it has not latched off."""
+    if not CONFIG.get("hardcover"):
+        return False
+    client = _hardcover_client()
+    return bool(client is not None and client.available)
+
+
+def _author_surname(name):
+    """Surname key for one author name, in 'First Last' or
+    'Last, First' form (EPUB metadata uses both)."""
+    n = (name or "").strip()
+    if not n:
+        return ""
+    head = n.split(",", 1)[0] if "," in n else n.split()[-1]
+    return re.sub(r"[^a-z0-9]", "", head.lower())
+
+
+def _series_key_for(series_name, author, match):
+    """The series identity key for a resolved series (spec §4):
+    the Hardcover series id when this series came from the
+    Hardcover match, else a fallback of normalized name + author
+    surname, so Calibre- and filename-sourced series link too
+    (R-H5). The match's first author supplies the surname when
+    there is a match — it is the authoritative record's author."""
+    if (match is not None and match.get("series_id") is not None
+            and match.get("series_name") == series_name):
+        return f"hc-series:{match['series_id']}"
+    if not series_name:
+        return None
+    names = (match or {}).get("authors") or [author or ""]
+    return f"series:{_tnorm(series_name)}|{_author_surname(names[0])}"
+
+
+def _land_series_identity(result, identifiers, file_title, file_author):
+    """Land the Hardcover identity on a finished book record.
+
+    Called once per book, where the record is complete, so the
+    writes live in exactly one place for both pipelines. On a
+    confident match the record's canonical title and authors are
+    Hardcover's (R-H2 authoritative), the file's own values are
+    preserved in the record's hardcover block for audit, and
+    series_key names the resolved series (spec §4). With the
+    feature off, the client down, or nothing resolved, the record
+    is left exactly as the pipeline built it — that absence is
+    what keeps non-Hardcover runs byte-identical to before."""
+    match = _hardcover_lookup(identifiers, file_title, file_author)
+    if match is None and not _hardcover_operational():
+        return
+    if match is not None:
+        if match.get("title"):
+            result["title"] = match["title"]
+        if match.get("authors"):
+            result["author"] = ", ".join(match["authors"])
+        result["hardcover"] = {
+            "book_id": match.get("book_id"),
+            "series_id": match.get("series_id"),
+            "publisher": match.get("publisher"),
+            "release_date": match.get("release_date"),
+            "pages": match.get("pages"),
+            "match_path": match.get("match_path"),
+            "dominance": bool(match.get("dominance")),
+            "alternates": match.get("alternates", 0),
+            "file_title": file_title,
+            "file_author": file_author,
+        }
+    key = _series_key_for(result.get("series_name"),
+                          result.get("author"), match)
+    if key is not None or match is not None:
+        result["series_key"] = key
 
 def extract_mobi_identifiers(path):
     """Read ISBN (EXTH 104) / ASIN (EXTH 113) from a MOBI/AZW3 header. Stdlib."""
@@ -5434,9 +5576,10 @@ def _corpus_parse_book(fpath):
 def _corpus_series_offline(fpath, identifiers):
     """Series as resolved at ingest, from OFFLINE sources only —
     _detect_series' flag/calibre/filename steps. The Open Library
-    step is a network call, and §3.1 makes acquisition deterministic
-    (same file + parser version -> same corpus on any machine); the
-    run's own _detect_series remains the processing-time authority.
+    and Hardcover steps are network calls, and §3.1 makes
+    acquisition deterministic (same file + parser version -> same
+    corpus on any machine); the run's own _detect_series remains
+    the processing-time authority.
     Returns (name, index, source)."""
     flag_name = (CONFIG.get("series_override") or "").strip()
     if flag_name:
@@ -27737,10 +27880,17 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         print(f"  Evidence: {v['evidence_verified']}/{v['evidence_checked']} verified")
 
     # Metadata correction via OpenLibrary (one call per book; skipped in preview/dry-run).
+    _file_title, _file_author = title, author
     if not (preview or dry_run):
         title, author, _corrected = correct_metadata(title or fpath.stem, author, identifiers)
         result["title"] = title
         result["author"] = author
+    # The Hardcover landing runs after the Open Library correction
+    # so a confident match's values are the record's final ones
+    # (R-H2 authoritative). It writes the record only: the locals
+    # work resolution below uses are unchanged, because re-keying
+    # work identity on Hardcover metadata is out of scope (§8).
+    _land_series_identity(result, identifiers, _file_title, _file_author)
     # Work identity resolution (read-only in preview/dry-run).
     wid, how = resolve_work(title or fpath.stem, author, identifiers, False,
                             create=not (preview or dry_run))
@@ -28281,10 +28431,17 @@ def process_file(fpath, dry_run=False, preview=False):
               + (f", {v_dropped} quotes dropped" if v_dropped else ""))
 
     # Metadata correction via OpenLibrary (one call per book; skipped in preview/dry-run).
+    _file_title, _file_author = title, author
     if not (preview or dry_run):
         title, author, _corrected = correct_metadata(title or fpath.stem, author, identifiers)
         result["title"] = title
         result["author"] = author
+    # The Hardcover landing runs after the Open Library correction
+    # so a confident match's values are the record's final ones
+    # (R-H2 authoritative). It writes the record only: the locals
+    # work resolution below uses are unchanged, because re-keying
+    # work identity on Hardcover metadata is out of scope (§8).
+    _land_series_identity(result, identifiers, _file_title, _file_author)
     # Work identity resolution (read-only in preview/dry-run).
     wid, how = resolve_work(title or fpath.stem, author, identifiers, is_anth,
                             create=not (preview or dry_run))
@@ -28890,7 +29047,8 @@ _PROFILE_PERSISTABLE = frozenset({
     "decision_model", "decision_model_provider", "decision_model_url",
     "dedupe", "discovery_embedding_rank", "discovery_shadow",
     "dry_run", "emit_run_events", "emit_uncertainty",
-    "evidence_retrieval", "explain_blocks", "full", "jobs", "learn",
+    "evidence_retrieval", "explain_blocks", "full", "hardcover",
+    "jobs", "learn",
     "llm", "min_frequency", "no_viz", "persist_roster", "pipeline",
     "preview", "preview_summary", "principals_only", "prompt_cache",
     "rename_no_isbn", "roster_reconcile", "run_history", "sample",
@@ -28918,8 +29076,8 @@ _PROFILE_EXCLUDE = frozenset({
     "validate", "verify", "watch",
     # per-run selectors / overrides for a single run
     "alias", "chunks", "file", "import_labels", "import_rejections",
-    "from_supabase", "isbn", "max_books", "resume", "series",
-    "series_position",
+    "from_supabase", "hardcover_refresh", "isbn", "max_books",
+    "resume", "series", "series_position",
     # companion arguments that only aim a one-shot command
     "explain_character", "explain_claim", "ingest_force",
     "ingest_reason", "json", "quote", "snapshot_reason", "watch_ingest",
@@ -29075,6 +29233,16 @@ def _build_parser():
                          "takes priority over EPUB metadata, filename, and lookup")
     g_in.add_argument("--series-position", metavar="N", type=float, default=None,
                     help="override series position (e.g. 2 or 2.5)")
+    g_in.add_argument("--hardcover", action="store_true",
+                    help="resolve each book against Hardcover at scan "
+                         "time; on a confident match its canonical "
+                         "title, authors and series land on the work "
+                         "record (needs hardcover_token in config.json "
+                         "or the HARDCOVER_TOKEN env var)")
+    g_in.add_argument("--hardcover-refresh", action="store_true",
+                    help="with --hardcover: ignore the local "
+                         "Hardcover lookup cache for this run "
+                         "(fresh answers are still cached)")
 
     g_models = ap.add_argument_group("Models")
     g_models.add_argument("--llm", choices=["ollama", "openrouter", "openai"], help="override config llm")
@@ -29956,6 +30124,10 @@ def main():
         UI._show_matrices = True
     if args.roster_reconcile:
         CONFIG["roster_reconcile"] = True
+    if getattr(args, "hardcover", False):
+        CONFIG["hardcover"] = True
+    if getattr(args, "hardcover_refresh", False):
+        CONFIG["hardcover_refresh"] = True
     if args.staging_gate:
         CONFIG["staging_gate"] = True
 

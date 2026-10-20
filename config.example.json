@@ -17,5 +17,8 @@
   "pipeline": "v2",
   "_comment_run_history": "run_history: when true (or --run-history is passed), each run mirrors metadata about itself (versions, models, prompt hashes, per-book outcomes and claim counts — never book text) to the processor schema in Supabase; uploads are best-effort and never affect the run. machine_label: an optional label you choose (e.g. your PC's name) stamped on those rows so runs from different machines are distinguishable; it is never read from the machine automatically",
   "run_history": false,
-  "machine_label": ""
+  "machine_label": "",
+  "_comment_hardcover": "hardcover: when true (or --hardcover is passed), each book's identity is resolved against Hardcover at scan time; on a confident match its canonical title, authors and series become the work record's values. hardcover_token: a Hardcover API token (create one in your Hardcover account settings), or set the HARDCOVER_TOKEN environment variable instead; the token is only ever sent to api.hardcover.app and never appears in previews or logs",
+  "hardcover": false,
+  "hardcover_token": ""
 }
