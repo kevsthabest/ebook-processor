@@ -15632,6 +15632,156 @@ def _is_valid_alias(alias):
     return True
 
 
+# Tokens that can sit inside a display name without being part of the
+# person's name: titles, articles, conjunctions, and role words. The
+# attestation gate below uses this set to find a candidate's
+# name-bearing core and to judge surname evidence — print presenting
+# "the Sorrengail" must not make Sorrengail look borrowed, and a
+# candidate reduced to titles plus one token ("Special Agent
+# Decker") is a surname-only person, not a contamination target.
+# Resolved lazily because _NAME_STOPWORDS and _TITLES are defined
+# further down the module than the roster machinery that uses them.
+_NAME_GATE_NONNAME = None
+
+
+def _name_gate_nonname():
+    global _NAME_GATE_NONNAME
+    if _NAME_GATE_NONNAME is None:
+        _NAME_GATE_NONNAME = frozenset(
+            set(_NAME_STOPWORDS) | set(_TITLES) | {
+                "the", "a", "an", "of", "in", "on", "and", "or", "s",
+                "agent", "officer", "detective", "inspector", "special"})
+    return _NAME_GATE_NONNAME
+
+
+def _name_form_tokens(text):
+    """Casefolded word tokens of a name form or text span. Anything
+    that is not a word character splits (apostrophes, hyphens,
+    quotes), so a candidate form and the book's own printing of it
+    tokenize identically however either is punctuated."""
+    return re.findall(r"[^\W_]+", (text or "").casefold(), re.UNICODE)
+
+
+def _build_name_attestation(chapters):
+    """Attestation index over a whole book's chapter texts.
+
+    Built once per book, before any chapter is extracted, from the
+    full chapter set: a surname first revealed in the last chapter
+    legitimises the form for the whole run, so the index may not be
+    built incrementally from the chapters seen so far.
+
+    singles: every token that occurs. pairs: every adjacent token
+    pair, in reading order. joined: the token stream as one string
+    (chapters sentinel-joined so a form cannot attest across a
+    chapter seam) for exact-sequence lookup of any length.
+    surname_givens: surname -> given names print attaches to it,
+    counted only where print itself presents the first token as a
+    name (capitalized, and not a title or stopword) — the evidence
+    that a surname is borne by somebody in this book.
+    """
+    singles, pairs, surname_givens = set(), set(), {}
+    nonname = _name_gate_nonname()
+    chapter_joined = []
+    for c in chapters:
+        text = c.get("text", "")
+        toks = _name_form_tokens(text)
+        orig = re.findall(r"[^\W_]+", text, re.UNICODE)
+        singles.update(toks)
+        chapter_joined.append(" ".join(toks))
+        aligned = len(orig) == len(toks)
+        for i in range(len(toks) - 1):
+            pairs.add((toks[i], toks[i + 1]))
+            if aligned and orig[i][:1].isupper() \
+                    and toks[i] not in nonname:
+                surname_givens.setdefault(toks[i + 1], set()).add(toks[i])
+    return {"singles": singles, "pairs": pairs,
+            "joined": " " + " \x00 ".join(chapter_joined) + " ",
+            "surname_givens": surname_givens, "cache": {}}
+
+
+def _form_attested(att, toks):
+    """True when the book's text attests this name form: printed as
+    a consecutive token sequence, or with a given-side token printed
+    immediately before the surname token. The pair clause exists
+    because titles and nicknames sit between given name and surname
+    in a candidate ("Special Agent Roy Merritt", 'Roy "Tripwire"
+    Merritt', "Peter Andrew Sebeck") while print attests the pairing
+    itself ("Roy Merritt", "Peter Sebeck"). The order matters:
+    dialogue attribution puts an addressee's surname immediately
+    before a speaker's given name ("'…Sorrengail,' Imogen coos"),
+    so a reversed pair attests nothing."""
+    if len(toks) < 2:
+        return bool(toks) and toks[0] in att["singles"]
+    if " " + " ".join(toks) + " " in att["joined"]:
+        return True
+    surname = toks[-1]
+    return any((g, surname) in att["pairs"] for g in toks[:-1])
+
+
+def _attested_display_name(name):
+    """The #75 attestation gate: refuse a display name the book's
+    own text never attests, when the refusal has the contamination
+    signature. Returns the name unchanged unless ALL of these hold:
+
+    - the form is multi-token, carries no parenthetical annotation,
+      and ends in a plausible surname (not a stopword or title);
+    - stripped of leading titles it still has a given name and a
+      surname (a surname-only person has nothing to borrow onto);
+    - the form itself is unattested in the book's text;
+    - the surname IS attested attached to a different given name —
+      a borrowed surname is one the book prints on somebody else.
+      A surname print never attaches to anyone (an invention, a
+      neighbouring book's name) is a different failure and not this
+      gate's to correct.
+
+    The fallback is the candidate with the surname dropped when
+    that shorter form is attested, else the given name alone — the
+    attested forms the character can be sighted under — so the
+    entry keys on a form print supports and later sightings fold
+    into it. Descriptive labels and personas fail the conditions
+    above and are left alone on purpose: a persona's linkage is
+    stated once, elsewhere in the book, and no name-form rule can
+    settle it.
+
+    Inert when no attestation context is loaded (callers outside a
+    v2 book run): without the book's text there is nothing to judge
+    against, and guessing would be worse than the defect.
+    """
+    att = getattr(_DIAG, "name_attest", None)
+    if att is None or not name or "(" in name:
+        return name
+    cache = att["cache"]
+    if name not in cache:
+        cache[name] = _attested_display_name_inner(att, name)
+    return cache[name]
+
+
+def _attested_display_name_inner(att, name):
+    disp = name.split()
+    toks = _name_form_tokens(name)
+    if len(disp) != len(toks) or len(toks) < 2:
+        return name
+    surname = toks[-1]
+    if surname in _name_gate_nonname():
+        return name
+    core = list(toks)
+    while core and core[0] in _name_gate_nonname():
+        core.pop(0)
+    if len(core) < 2:
+        return name
+    if _form_attested(att, toks):
+        return name
+    others = att["surname_givens"].get(surname, set()) - set(toks)
+    if not others:
+        return name
+    if _form_attested(att, toks[:-1]):
+        return " ".join(disp[:-1])
+    for d, t in zip(disp, toks):
+        if t == core[0]:
+            return d
+    return name
+
+
 def _roster_update(roster, characters, chapter_idx):
     """Fold one chapter's characters into the roster. Mutates roster.
 
@@ -15657,6 +15807,14 @@ def _roster_update(roster, characters, chapter_idx):
 
     for c in characters:
         name = c.get("name", "")
+        # Attestation gate (#75): a coined full form adopted here
+        # becomes the roster entry's name, is echoed back in every
+        # later chapter prompt, and rides into every shipped
+        # relationship row — no later stage re-asks whether the book
+        # ever printed it. Gate before any keying so the entry is
+        # created under the attested form and later sightings of the
+        # coined form fold into it instead of splitting the person.
+        name = _attested_display_name(name)
         nkey = norm_name(name)
         if not nkey:
             continue
@@ -16160,12 +16318,14 @@ def _merge_roster_entries(roster, keep_key, drop_key):
             ke.setdefault(attr, []).extend(
                 x for x in de[attr] if x not in ke.get(attr, []))
     # Display name: prefer the cleaner variant (fewer noise tokens), then
-    # the one with more appearances.
+    # the one with more appearances. The adopted form passes the same
+    # attestation gate as roster intake, so a merge cannot resurrect a
+    # coined form the gate refused when it was first sighted.
     _keep_toks = _strip_merge_noise(keep_key)
     _drop_toks = _strip_merge_noise(drop_key)
     if (len(_drop_toks) < len(_keep_toks) and _drop_toks
             and de.get("name")):
-        ke["name"] = de["name"]
+        ke["name"] = _attested_display_name(de["name"])
     if _sp is not None and _sp_keep_char is not None \
             and _sp_keep_char is _sp_drop_char \
             and len(_drop_toks) == len(_keep_toks):
@@ -27373,6 +27533,13 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     _DIAG.learn_isbn = _learn_isbn
     # Author filter: the book's author is never a character.
     _DIAG.book_author = author
+    # Attestation gate (#75): index the whole book's name forms now,
+    # before any chapter runs, so _roster_update can refuse a surname
+    # the book never prints on that character. The index covers the
+    # full chapter set — parsed above on every acquisition path —
+    # because a surname first revealed in the last chapter
+    # legitimises the form for the whole run.
+    _DIAG.name_attest = _build_name_attestation(chapters)
     _learn_skey = _ln_book.series_key(author) if _ln_book.enabled else None
     _DIAG.learn_series_key = _learn_skey
     _learn_hints = (_ln_book.load_series_hints(_learn_skey)
