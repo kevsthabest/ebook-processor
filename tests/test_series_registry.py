@@ -409,5 +409,71 @@ class SeamTests(unittest.TestCase):
         self.assertFalse(pp._SR_REGISTRY)
 
 
+class RekeyTests(unittest.TestCase):
+    """rekey_book: the store-level restatement the pipeline seam
+    runs when work resolution completes (Phase 3, Step 0). The
+    fold lands under the pre-resolution fallback key; resolution
+    moves it under the work_id so one book has one presence key
+    however many times, and from whichever artefact, it folds."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.reg = _registry(self._tmp.name)
+        self.addCleanup(self.reg.close)
+
+    def _fold_without_work_id(self):
+        record = copy.deepcopy(FW_RECORD)
+        record.pop("work_id")
+        sr.populate_from_record(self.reg, record)
+        return sr.fallback_book_key_for(record)
+
+    def test_rekey_moves_presence_aliases_and_family(self):
+        fallback = self._fold_without_work_id()
+        self.assertNotEqual(fallback, FW_BOOK)
+        self.assertTrue(
+            self.reg.rekey_book(EMPYREAN, fallback, FW_BOOK))
+        chars = _by_name(self.reg.characters(EMPYREAN))
+        violet = chars["Violet Sorrengail"]
+        self.assertEqual([b["book_key"] for b in violet["books"]],
+                         [FW_BOOK])
+        self.assertTrue(all(a["books"] == [FW_BOOK]
+                            for a in violet["aliases"]))
+        self.assertTrue(all(
+            l["book_key"] == FW_BOOK
+            for l in self.reg.family_links(EMPYREAN)))
+
+    def test_rekey_replaces_a_stale_fold_under_the_new_key(self):
+        # The finished record folded first (work_id key); the
+        # live fold then landed under the fallback and restates.
+        # The restated fold replaces the stale one — rows never
+        # merge, and no character keeps a double attestation.
+        sr.populate_from_record(self.reg, copy.deepcopy(FW_RECORD))
+        fallback = self._fold_without_work_id()
+        self.assertTrue(
+            self.reg.rekey_book(EMPYREAN, fallback, FW_BOOK))
+        chars = _by_name(self.reg.characters(EMPYREAN))
+        self.assertTrue(all(len(c["books"]) == 1
+                            for c in chars.values()))
+        self.assertTrue(all(
+            a["books"] == [FW_BOOK]
+            for c in chars.values() for a in c["aliases"]))
+
+    def test_rekey_noop_cases(self):
+        fallback = self._fold_without_work_id()
+        self.assertFalse(
+            self.reg.rekey_book(EMPYREAN, fallback, fallback))
+        self.assertFalse(self.reg.rekey_book(EMPYREAN, "", "x"))
+        self.assertFalse(
+            self.reg.rekey_book(EMPYREAN, "no-such-book", "x"))
+        self.assertFalse(self.reg.rekey_book("", fallback, "x"))
+        # Nothing moved: the fold is still under the fallback.
+        chars = _by_name(self.reg.characters(EMPYREAN))
+        self.assertEqual(
+            [b["book_key"]
+             for b in chars["Violet Sorrengail"]["books"]],
+            [fallback])
+
+
 if __name__ == "__main__":
     unittest.main()

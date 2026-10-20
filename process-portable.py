@@ -48,7 +48,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.72"
+PORTABLE_VERSION = "2.13.73"
 
 
 import argparse
@@ -185,6 +185,14 @@ DEFAULT_CONFIG = {
     # of landing a book; off stops the writes (and the preview
     # block) entirely.
     "series_registry": True,
+    # Series priors (series-linking spec, Phase 3): when on, a
+    # book whose series has a registry offers that registry's
+    # character memory to the roster as hints — canonical-form
+    # tie-breaks, aliases parked as unresolved mentions, merge
+    # nominations. Default off; with it off (or no registry, or a
+    # compilation) a run is identical to before. Hints only: the
+    # registry never creates a character or supplies evidence.
+    "series_priors": False,
 }
 
 
@@ -195,7 +203,7 @@ _INT_CONFIG_KEYS = {"sample_rate", "sample_edges", "batch_size", "llm_max_tokens
 _BOOL_CONFIG_KEYS = {"debug", "dedupe", "llm_enable_thinking", "llm_json_schema",
                      "v2_prompt_cache", "run_history",
                      "discovery_shadow", "discovery_embedding_rank",
-                     "hardcover", "series_registry"}
+                     "hardcover", "series_registry", "series_priors"}
 
 
 def load_config():
@@ -994,6 +1002,25 @@ def _land_series_identity(result, identifiers, file_title, file_author):
 _SR_REGISTRY = None   # (module, SeriesRegistry); False once unavailable
 
 
+def _series_registry_handle():
+    """The run's (series_registry module, SeriesRegistry) pair,
+    or None when the store cannot be built. Shared by the
+    book-end population (Phase 2) and the book-start priors load
+    (Phase 3): one store per run, one failure warning, latched
+    off for the run — a broken store is not a per-book
+    condition, and a folder scan must not re-ask per book."""
+    global _SR_REGISTRY
+    if _SR_REGISTRY is None:
+        try:
+            import series_registry as _sr_module
+            _SR_REGISTRY = (_sr_module, _sr_module.SeriesRegistry())
+        except Exception as e:
+            print(f"  Warning: series registry unavailable ({e}); "
+                  f"continuing without it")
+            _SR_REGISTRY = False
+    return _SR_REGISTRY or None
+
+
 def _populate_series_registry(result):
     """Fold a finished book record into the series registry.
 
@@ -1007,18 +1034,10 @@ def _populate_series_registry(result):
     to it is the counts-only delta block."""
     if not CONFIG.get("series_registry", True):
         return
-    global _SR_REGISTRY
-    if _SR_REGISTRY is None:
-        try:
-            import series_registry as _sr_module
-            _SR_REGISTRY = (_sr_module, _sr_module.SeriesRegistry())
-        except Exception as e:
-            print(f"  Warning: series registry unavailable ({e}); "
-                  f"continuing without it")
-            _SR_REGISTRY = False
-    if not _SR_REGISTRY:
+    handle = _series_registry_handle()
+    if handle is None:
         return
-    _sr_module, registry = _SR_REGISTRY
+    _sr_module, registry = handle
     try:
         delta = _sr_module.populate_from_record(
             registry, result, family_types=_REL_FAMILY_TYPES)
@@ -1029,10 +1048,240 @@ def _populate_series_registry(result):
         # otherwise print this warning once per book.
         print(f"  Warning: series registry population failed ({e}); "
               f"continuing without it")
-        _SR_REGISTRY = False
+        _series_registry_latch_off()
         return
     if delta is not None:
         result["series_registry"] = delta
+
+
+def _series_registry_latch_off():
+    global _SR_REGISTRY
+    _SR_REGISTRY = False
+
+
+def _adopt_series_registry_book_key(result, work_id):
+    """Restate this book's registry fold under its resolved
+    work_id.
+
+    The fold ran beside the identity landing, before work
+    resolution, so it keyed the book by the title|author fallback
+    (or book_key); a later re-fold of the finished record keys by
+    work_id. Without this step the same book holds both keys and
+    every per-book aggregate double-counts it — the same defect
+    shape the staging store's adopt_for and the roster store's
+    adoption step exist to prevent, fixed the same way: when
+    resolution completes, move the fallback-keyed state under the
+    resolved key.
+
+    Guards keep it a no-op whenever no fold happened in this run:
+    the counts-only delta block is present exactly when
+    _populate_series_registry folded this record. Never fails the
+    book — a failed restatement leaves the fallback fold in
+    place, which the next re-fold or rebuild still reads
+    correctly, just split."""
+    if result.get("series_registry") is None:
+        return
+    handle = _series_registry_handle()
+    if handle is None:
+        return
+    _sr_module, registry = handle
+    try:
+        registry.rekey_book(
+            result.get("series_key"),
+            _sr_module.fallback_book_key_for(result),
+            str(work_id))
+    except Exception as e:
+        print(f"  Warning: series registry rekey failed ({e}); "
+              f"continuing without it")
+
+
+# --- Series priors (series-linking spec, Phase 3) ----------------
+# The registry's memory of a series' earlier books, offered to
+# this book's roster as HINTS through three seams — a canonical-
+# form tie-break at merge time, registry aliases parked as
+# unresolved mentions, and merge-candidate nominations. A prior
+# is never a fact: it creates no character, supplies no evidence,
+# and loses every contest with the book's own attestations. The
+# context rides _DIAG.series_priors (set per book by
+# process_file_v2, the way the learned series hints do); with
+# --series-priors off, or no registry for the book's series, the
+# attribute is None and every seam below is inert.
+
+
+def _load_series_priors(series_key):
+    """Build the priors context for one book's series, or None
+    when priors do not engage: flag off, no series key, registry
+    unavailable, or the series has no registry characters yet.
+
+    The context indexes every attested form of every registry
+    character — canonical surfaces and aliases alike — in the
+    REGISTRY's key space (series_registry.name_key; the roster's
+    own norm_name strips articles and would mis-key 'The Major').
+    A form two different characters claim is poisoned out of the
+    index: shared forms identify nobody, the same doctrine as the
+    roster's alias-shadow pruning."""
+    if not CONFIG.get("series_priors"):
+        return None
+    if not series_key:
+        return None
+    handle = _series_registry_handle()
+    if handle is None:
+        return None
+    _sr_module, registry = handle
+    try:
+        stored = registry.characters(series_key)
+    except Exception as e:
+        print(f"  Warning: series priors unavailable ({e}); "
+              f"continuing without them")
+        return None
+    if not stored:
+        return None
+    key_fn = _sr_module.name_key
+    characters = []
+    form_index = {}
+    poisoned = set()
+    for row in stored:
+        forms = {}
+        surfaces = [row.get("canonical_name") or ""]
+        surfaces += [a.get("alias") or ""
+                     for a in row.get("aliases") or []]
+        for surface in surfaces:
+            fkey = key_fn(surface)
+            if fkey and fkey not in forms:
+                forms[fkey] = surface
+        char = {"name_key": row.get("name_key"),
+                "canonical_name": row.get("canonical_name") or "",
+                "forms": forms}
+        characters.append(char)
+        for fkey in forms:
+            owner = form_index.get(fkey)
+            if owner is not None and owner is not char:
+                poisoned.add(fkey)
+            else:
+                form_index[fkey] = char
+    for fkey in poisoned:
+        form_index.pop(fkey, None)
+    return {"series_key": series_key, "key_fn": key_fn,
+            "characters": characters, "form_index": form_index,
+            "matched": {}, "matched_chars": set(), "seeded": set(),
+            "counts": {"aliases_seeded": 0, "form_tiebreaks": 0,
+                       "pairs_nominated": 0}}
+
+
+def _series_priors_for_book(identifiers, title, author, series_name):
+    """The priors context for the book being started, or None.
+
+    The book-start gate around _load_series_priors: flag off,
+    compilation, and no-series all resolve to None here so the
+    caller just assigns the result. A compilation consumes no
+    priors (spec §4 — its cast is a union of volumes, not a
+    sequence position), and the only compilation signal is the
+    Hardcover match's flag, so a book Hardcover never matched is
+    treated as an ordinary member. The series key is computed
+    from the same inputs the book-end landing uses (file title /
+    author, the memoized Hardcover match), so the priors read
+    the registry the fold will write."""
+    if not CONFIG.get("series_priors"):
+        return None
+    match = _hardcover_lookup(identifiers, title, author)
+    if match and match.get("compilation"):
+        return None
+    return _load_series_priors(
+        _series_key_for(series_name, author, match))
+
+
+def _priors_entry_char(ctx, entry):
+    """The registry character a roster entry matches, or None.
+    The match reads the entry's name and alias SURFACES in the
+    registry's key space; it fires only when the entry's forms
+    point at exactly one registry character — forms pointing at
+    two identify neither, and a poisoned form points at none."""
+    hits = {}
+    surfaces = {entry.get("name") or ""}
+    surfaces |= set(entry.get("aliases") or ())
+    for surface in surfaces:
+        if not surface:
+            continue
+        char = ctx["form_index"].get(ctx["key_fn"](surface))
+        if char is not None:
+            hits[char["name_key"]] = char
+    if len(hits) == 1:
+        return next(iter(hits.values()))
+    return None
+
+
+def _series_priors_seed(roster, ctx):
+    """Seam 2 (alias seeding): for each roster entry matched to a
+    registry character, park that character's OTHER attested
+    forms as unresolved mentions on the entry.
+
+    The parked state is the whole point: a seeded mention is an
+    ordinary unresolved_mentions member, indistinguishable from
+    one the extractor's own rejected aliases produced, and it
+    promotes only if the book itself attests the form through
+    the usual paths (a later chapter's alias adoption, a mutual
+    claim at reconciliation). Seeding asserts nothing — a form
+    the book never uses stays parked in the shipped record,
+    labelled as what it is. Each (entry, character) pair seeds
+    once per book; matches are recomputed on every call because
+    an entry's forms grow as chapters fold in."""
+    key_fn = ctx["key_fn"]
+    for roster_key, entry in roster.items():
+        char = _priors_entry_char(ctx, entry)
+        if char is None:
+            ctx["matched"].pop(roster_key, None)
+            continue
+        ctx["matched"][roster_key] = char["name_key"]
+        ctx["matched_chars"].add(char["name_key"])
+        marker = (roster_key, char["name_key"])
+        if marker in ctx["seeded"]:
+            continue
+        ctx["seeded"].add(marker)
+        own = {key_fn(entry.get("name") or "")}
+        own |= {key_fn(a) for a in entry.get("aliases") or ()}
+        mentions = entry.setdefault("unresolved_mentions", set())
+        for form_key, surface in sorted(char["forms"].items()):
+            if not form_key or form_key in own:
+                continue
+            if surface not in mentions:
+                mentions.add(surface)
+                ctx["counts"]["aliases_seeded"] += 1
+
+
+def _series_priors_pairs(roster, ctx):
+    """Seam 3's candidate source: unordered roster-key pairs
+    whose entries match the SAME registry character — one person
+    the series knows, sighted by this book under two of the
+    character's attested forms. Returning the pair is all this
+    does; post_pass_merge runs it through the ordinary tier
+    check and judge, and a Tier 1 cannot-link vetoes it like
+    any other candidate."""
+    groups = {}
+    for roster_key in sorted(roster):
+        char = _priors_entry_char(ctx, roster[roster_key])
+        if char is not None:
+            groups.setdefault(char["name_key"], []).append(roster_key)
+    pairs = []
+    for name_key in sorted(groups):
+        keys = groups[name_key]
+        for i, ka in enumerate(keys):
+            for kb in keys[i + 1:]:
+                pairs.append((ka, kb))
+    return pairs
+
+
+def _series_priors_report(ctx):
+    """The counts block for the book record: what the priors
+    actually did, so an eval can weigh the hints' footprint.
+    Matched characters are counted from the matched set, never
+    stored as a running total, so the number cannot drift from
+    the matches it summarizes."""
+    return {
+        "registry_characters_matched": len(ctx["matched_chars"]),
+        "aliases_seeded": ctx["counts"]["aliases_seeded"],
+        "form_tiebreaks": ctx["counts"]["form_tiebreaks"],
+        "pairs_nominated": ctx["counts"]["pairs_nominated"],
+    }
 
 def extract_mobi_identifiers(path):
     """Read ISBN (EXTH 104) / ASIN (EXTH 113) from a MOBI/AZW3 header. Stdlib."""
@@ -15601,6 +15850,14 @@ def _roster_update(roster, characters, chapter_idx):
         if c.get("evidence") and not e.get("evidence"):
             e["evidence"] = c["evidence"]  # first verified evidence wins
 
+    # Series priors (Phase 3): park the matched registry
+    # characters' other forms as unresolved mentions. Runs after
+    # the chapter's fold so an entry created or extended by this
+    # chapter can already match; inert without a priors context.
+    _sp = getattr(_DIAG, "series_priors", None)
+    if _sp is not None:
+        _series_priors_seed(roster, _sp)
+
 
 def _roster_prompt(roster, budget=1500):
     """Render the roster for a Call A prompt. Capped by char budget (~tokens);
@@ -15861,6 +16118,15 @@ def _merge_roster_entries(roster, keep_key, drop_key):
     if keep_key == drop_key or drop_key not in roster or keep_key not in roster:
         return
     ke, de = roster[keep_key], roster[drop_key]
+    # Series priors (Phase 3): note which registry character each
+    # side matches BEFORE the unions below blend the two entries'
+    # form sets together — the display-name tie-break further
+    # down is defined over the forms each entry brought in.
+    _sp = getattr(_DIAG, "series_priors", None)
+    _sp_keep_char = _sp_drop_char = None
+    if _sp is not None:
+        _sp_keep_char = _priors_entry_char(_sp, ke)
+        _sp_drop_char = _priors_entry_char(_sp, de)
     ke["alias_keys"] |= de.get("alias_keys", set())
     ke["primary_keys"] |= de.get("primary_keys", set())
     ke["aliases"] |= de.get("aliases", set())
@@ -15900,6 +16166,28 @@ def _merge_roster_entries(roster, keep_key, drop_key):
     if (len(_drop_toks) < len(_keep_toks) and _drop_toks
             and de.get("name")):
         ke["name"] = de["name"]
+    if _sp is not None and _sp_keep_char is not None \
+            and _sp_keep_char is _sp_drop_char \
+            and len(_drop_toks) == len(_keep_toks):
+        # Series-prior tie-break: the merge that brought these
+        # entries together has already judged them one person,
+        # and the display-name rule above is indifferent between
+        # their forms (equal noise-stripped length) — it kept the
+        # keeper's form only by position. When both sides match
+        # the same registry character and that character's
+        # canonical spelling is one of the two forms on the
+        # table, the registry's spelling wins the tie. A strictly
+        # cleaner form still wins on the book's own terms above:
+        # the prior breaks ties, it never overrules.
+        _sp_canon = _sp["key_fn"](_sp_keep_char["canonical_name"])
+        _sp_winner = None
+        if _sp_canon == _sp["key_fn"](ke.get("name") or ""):
+            _sp_winner = ke.get("name")
+        elif _sp_canon == _sp["key_fn"](de.get("name") or ""):
+            _sp_winner = de.get("name")
+        if _sp_winner and ke.get("name") != _sp_winner:
+            ke["name"] = _sp_winner
+            _sp["counts"]["form_tiebreaks"] += 1
     # Merge generic-key bookkeeping so first-person resolution still works.
     ke["_generic_keys"] = ke.get("_generic_keys", set()) | de.get(
         "_generic_keys", set())
@@ -16313,6 +16601,29 @@ def post_pass_merge(roster, validator=None):
         elif _tier == "no" and {"title_form", "containment"} \
                 & set(_srcs):
             _blocked_proposals.append((_ka, _kb, _srcs))
+    # Series-prior candidates (Phase 3): entry pairs the series
+    # registry knows as ONE character, each sighted under a
+    # different attested form of that character. A nomination is
+    # a proposal, not a signal — it earns the pair nothing but a
+    # place in the same tier check every other candidate passes:
+    # a Tier 1 cannot-link vetoes it outright (the book's own
+    # co-listing beats the prior), and a pair that reaches the
+    # judge arrives with the neutral signal and no other context —
+    # no score change, no registry text, no auto-merge.
+    _sp = getattr(_DIAG, "series_priors", None)
+    if _sp is not None:
+        for _ka, _kb in _series_priors_pairs(roster, _sp):
+            if tuple(sorted((_ka, _kb))) in _cand_pairs \
+                    or _ka not in roster or _kb not in roster:
+                continue
+            _tier = _merge_tier(
+                _ka, _kb, a_chapters=roster[_ka].get("chapters"),
+                b_chapters=roster[_kb].get("chapters"),
+                roster_keys=set(_keys))
+            if _tier == "ambiguous":
+                _cands.append((1, _ka, _kb))
+                _cand_pairs.add(tuple(sorted((_ka, _kb))))
+                _sp["counts"]["pairs_nominated"] += 1
     # Strongest signals first. The shared per-book budget (relationship
     # validation later draws from the same pool) is claimed per ACTUAL
     # call, immediately before it — never up front for the whole
@@ -27076,6 +27387,26 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         # Series hints win on conflict (more specific than author-level).
         _learn_hints = {**_learn_hints, **_series_hints}
     _DIAG.learn_series_hints = _learn_hints
+    # Series priors (Phase 3, --series-priors): the series
+    # registry's memory of this series' earlier books, loaded
+    # beside the learned hints but kept a separate mechanism —
+    # learned hints are the global store's cross-book claims,
+    # priors are this series' registry only, and the seams they
+    # feed (form tie-breaks, parked mentions, merge nominations)
+    # treat them as hints, never facts. The key is computed from
+    # the same inputs the book-end landing uses, so the priors
+    # read the registry the fold will write. A compilation
+    # consumes nothing (spec §4): its cast is a union of volumes,
+    # not a sequence position. Assigned on every book — None
+    # included — so a priors book can never leak its context
+    # into the next book on this thread.
+    _sp_ctx = _series_priors_for_book(identifiers, title, author,
+                                      _series_name)
+    if _sp_ctx is not None:
+        UI.status(f"  Series priors: "
+                  f"{len(_sp_ctx['characters'])} registry "
+                  f"characters for {_series_name}")
+    _DIAG.series_priors = _sp_ctx
     UI.status(f"  Title: {title or fpath.stem}, "
               f"Chars: {sum(len(c['text']) for c in chapters):,}")
     if identifiers.get("isbn"):
@@ -27342,6 +27673,13 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                 _recon_stats["variants_merged"],
             "reconcile_aliases_pruned":
                 _recon_stats["aliases_pruned"]})
+
+    # Series priors, final seeding pass: entries restored whole
+    # from a checkpoint never passed through _roster_update in
+    # this run, so seed once more with the whole roster sighted.
+    # Already-seeded (entry, character) pairs are no-ops.
+    if _sp_ctx is not None:
+        _series_priors_seed(roster, _sp_ctx)
 
     # Post-pass character merge (Tier 1/2 deterministic + Tier 3 decision
     # model). Runs after all chapters, before the reduce, so v2_reduce sees
@@ -27917,6 +28255,12 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     }
     if _recon_stats is not None:
         result["roster_reconcile"] = _recon_stats
+    if _sp_ctx is not None:
+        # The priors' footprint on this book (counts only), so
+        # the Phase 3 eval can weigh what the hints did. Absent
+        # whenever priors were not active — the absence is what
+        # keeps flag-off records identical to before.
+        result["series_priors"] = _series_priors_report(_sp_ctx)
     if _discovery_report is not None:
         result["discovery"] = _discovery_report
     if _staging_marker is not None:
@@ -27960,6 +28304,11 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                             create=not (preview or dry_run))
     result["work_id"] = wid
     result["work_resolution"] = how
+    if wid:
+        # The registry fold above keyed this book by its
+        # pre-resolution fallback; restate it under the work_id
+        # now that resolution has completed (see the helper).
+        _adopt_series_registry_book_key(result, wid)
     if _staging_marker is not None and wid:
         # OC-8: the observe seam ran before the work_id existed, so
         # this run's entries sit under a fallback key; adopt them
@@ -28515,6 +28864,11 @@ def process_file(fpath, dry_run=False, preview=False):
                             create=not (preview or dry_run))
     result["work_id"] = wid
     result["work_resolution"] = how
+    if wid:
+        # Same restatement as the v2 pipeline: the registry fold
+        # keyed this book pre-resolution; move it under the
+        # work_id (see _adopt_series_registry_book_key).
+        _adopt_series_registry_book_key(result, wid)
     if how == "new":
         result["work_candidates"] = _title_candidates(title or fpath.stem)
         print("  Work: no match — NEW WORK would be created")
@@ -29120,7 +29474,8 @@ _PROFILE_PERSISTABLE = frozenset({
     "llm", "min_frequency", "no_viz", "persist_roster", "pipeline",
     "preview", "preview_summary", "principals_only", "prompt_cache",
     "rename_no_isbn", "roster_reconcile", "run_history", "sample",
-    "shared_system", "show_matrices", "staging_gate", "task_last",
+    "series_priors", "shared_system", "show_matrices", "staging_gate",
+    "task_last",
     "tui", "use_corpus",
 })
 
@@ -29311,6 +29666,14 @@ def _build_parser():
                     help="with --hardcover: ignore the local "
                          "Hardcover lookup cache for this run "
                          "(fresh answers are still cached)")
+    g_in.add_argument("--series-priors", action="store_true",
+                    help="offer the series registry's character "
+                         "memory to the roster as hints while "
+                         "extracting: canonical-form tie-breaks, "
+                         "registry aliases parked as unresolved "
+                         "mentions, merge-candidate nominations. "
+                         "Hints never create characters or count "
+                         "as evidence (v2 pipeline only)")
 
     g_models = ap.add_argument_group("Models")
     g_models.add_argument("--llm", choices=["ollama", "openrouter", "openai"], help="override config llm")
@@ -30196,6 +30559,8 @@ def main():
         CONFIG["hardcover"] = True
     if getattr(args, "hardcover_refresh", False):
         CONFIG["hardcover_refresh"] = True
+    if getattr(args, "series_priors", False):
+        CONFIG["series_priors"] = True
     if args.staging_gate:
         CONFIG["staging_gate"] = True
 

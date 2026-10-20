@@ -56,11 +56,13 @@ so totals can never drift from the provenance they summarize.
 
 Book identity: a record's work_id when it carries one; at the
 pipeline seam the work_id does not exist yet (work resolution
-runs after the identity landing), so a record without one keys
+runs after the identity landing), so the pipeline-time fold keys
 by the normalized title|author fallback — the same shape
-tier3_store uses for artefact identity. The store is rebuilt
-from finished records, so a key change costs a re-fold, not
-data.
+tier3_store uses for artefact identity. The seam then restates
+the fold under the resolved work_id (rekey_book), so one book
+has exactly one presence key no matter which artefact a later
+fold reads. The store is rebuilt from finished records, so a
+key change costs a re-fold, not data.
 
 Stdlib only, Python 3.8+, Windows and Linux.
 """
@@ -149,6 +151,15 @@ def _name_key(name):
     return re.sub(r"[^a-z0-9]+", " ", s).strip()
 
 
+def name_key(name):
+    """The registry's character key for a name surface — the
+    public form of _name_key. Phase 3's priors match roster name
+    surfaces against registry characters, and the match is only
+    meaningful in this key space (the roster's own norm_name
+    strips leading articles; this one deliberately does not)."""
+    return _name_key(name)
+
+
 def _tnorm(text):
     """Title/author normalization for the fallback book key —
     the same shape process-portable's _tnorm uses."""
@@ -156,17 +167,30 @@ def _tnorm(text):
                   .replace("_", " ")).strip()
 
 
-def _book_key_for(result):
-    """The presence key for one finished record: its work_id
-    when it carries one, else its book_key, else the normalized
-    title|author fallback (see the module header for why the
-    pipeline-time fold lands on the fallback)."""
-    for field in ("work_id", "book_key"):
-        value = result.get(field)
-        if value:
-            return str(value)
+def fallback_book_key_for(result):
+    """The presence key a record folds under BEFORE work
+    resolution: its book_key when it carries one, else the
+    normalized title|author fallback. The pipeline seam folds at
+    identity-landing time, when no work_id exists yet, so live
+    folds land here; _book_key_for on a finished record prefers
+    the work_id, so the two disagree for the same book until the
+    seam restates the fold (SeriesRegistry.rekey_book — the same
+    adopt-after-resolution shape the staging and roster stores
+    use for their fallback-keyed state)."""
+    value = result.get("book_key")
+    if value:
+        return str(value)
     return f"title:{_tnorm(result.get('title'))}" \
            f"|{_tnorm(result.get('author'))}"
+
+
+def _book_key_for(result):
+    """The presence key for one finished record: its work_id
+    when it carries one, else the pre-resolution fallback."""
+    value = result.get("work_id")
+    if value:
+        return str(value)
+    return fallback_book_key_for(result)
 
 
 class SeriesRegistry:
@@ -299,6 +323,63 @@ class SeriesRegistry:
                 " (SELECT to_key FROM registry_family_links"
                 "   WHERE series_key=?)",
                 (series_key,) * 5)
+
+    def rekey_book(self, series_key, old_key, new_key):
+        """Move one book's fold from old_key to new_key, in one
+        transaction. Returns True when rows moved.
+
+        The pipeline folds before work resolution (the fold keys
+        by the title|author fallback) and resolves the work_id
+        moments later; without this restatement the same book
+        would sit under the fallback key from its live fold AND
+        under its work_id from any later re-fold of the finished
+        record — two presence keys for one book, and every
+        per-book aggregate (an alias's attesting books, a
+        character's book count) double-counting it.
+
+        Any rows already under new_key are deleted first: they
+        are an older fold of this same book (a finished-record
+        re-fold), and the fold being restated is the fresher one.
+        The fresh fold replaces; it never merges with the stale
+        one."""
+        if not series_key or not old_key or not new_key \
+                or old_key == new_key:
+            return False
+        conn = self._connect()
+        moved = 0
+        with conn:
+            for table in ("registry_presence", "registry_aliases",
+                          "registry_family_links"):
+                conn.execute(
+                    f"DELETE FROM {table}"
+                    " WHERE series_key=? AND book_key=?",
+                    (series_key, new_key))
+            for table in ("registry_presence", "registry_aliases",
+                          "registry_family_links"):
+                moved += conn.execute(
+                    f"UPDATE {table} SET book_key=?"
+                    " WHERE series_key=? AND book_key=?",
+                    (new_key, series_key, old_key)).rowcount
+            # The stale fold deleted above may have been a
+            # character's only attestation; the same orphan
+            # cleanup replace_book_fold runs applies here.
+            conn.execute(
+                "DELETE FROM registry_characters"
+                " WHERE series_key=?"
+                " AND name_key NOT IN"
+                " (SELECT name_key FROM registry_presence"
+                "   WHERE series_key=?)"
+                " AND name_key NOT IN"
+                " (SELECT name_key FROM registry_aliases"
+                "   WHERE series_key=?)"
+                " AND name_key NOT IN"
+                " (SELECT from_key FROM registry_family_links"
+                "   WHERE series_key=?)"
+                " AND name_key NOT IN"
+                " (SELECT to_key FROM registry_family_links"
+                "   WHERE series_key=?)",
+                (series_key,) * 5)
+        return moved > 0
 
     # -- read side (aggregates computed here, never stored) -------
 
