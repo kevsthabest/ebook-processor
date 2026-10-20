@@ -20,9 +20,11 @@ Run: python -m unittest tests.test_series_registry -v
 """
 import copy
 import importlib.util
+import io
 import json
 import sys
 import tempfile
+from contextlib import redirect_stdout
 import unittest
 from pathlib import Path
 
@@ -383,6 +385,28 @@ class SeamTests(unittest.TestCase):
         # Must not raise, and must not leave a block behind.
         pp._populate_series_registry(record)
         self.assertNotIn("series_registry", record)
+
+    def test_population_failure_latches_off_for_the_run(self):
+        # A store that fails once is broken, not per-book: the
+        # wrapper warns once and latches off, so a folder scan
+        # against a corrupt registry prints one warning, not one
+        # per book (Phase 2 gate follow-up).
+        class _Boom:
+            def other_books_state(self, *a):
+                raise RuntimeError("store on fire")
+
+            def canonical_for(self, *a):
+                raise RuntimeError("store on fire")
+
+        pp._SR_REGISTRY = (sr, _Boom())
+        out = io.StringIO()
+        with redirect_stdout(out):
+            pp._populate_series_registry(copy.deepcopy(FW_RECORD))
+            pp._populate_series_registry(copy.deepcopy(FW_RECORD))
+        self.assertEqual(
+            out.getvalue().count("series registry population failed"),
+            1)
+        self.assertFalse(pp._SR_REGISTRY)
 
 
 if __name__ == "__main__":

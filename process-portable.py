@@ -1023,8 +1023,13 @@ def _populate_series_registry(result):
         delta = _sr_module.populate_from_record(
             registry, result, family_types=_REL_FAMILY_TYPES)
     except Exception as e:
+        # Latch off for the run, like the unavailable case above:
+        # a store that failed once is a broken store, not a
+        # per-book condition, and a folder scan against it would
+        # otherwise print this warning once per book.
         print(f"  Warning: series registry population failed ({e}); "
               f"continuing without it")
+        _SR_REGISTRY = False
         return
     if delta is not None:
         result["series_registry"] = delta
