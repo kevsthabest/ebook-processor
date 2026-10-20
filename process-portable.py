@@ -48,7 +48,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.75"
+PORTABLE_VERSION = "2.13.76"
 
 
 import argparse
@@ -18247,6 +18247,18 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         rel["evidence"] = _mined["sentence"]
         rel["evidence_source"] = "mined"
         rel["evidence_grade"] = _mined["grade"]
+        # The stamps describing the claim's evidence follow the
+        # quote that just attached: the claim now offers one, so
+        # offered can no longer read as extraction's nothing, and
+        # the support count floors at 1 — a claim shipping a quote
+        # must not report zero quotes behind it. The floor is not
+        # an increment: a count from competition-time candidates
+        # was already counted and stays as it is. evidence_verified
+        # deliberately keeps its value — the mined sentence never
+        # passed verify_all_evidence, and whether mined text may
+        # carry that stamp is a separate decision.
+        rel["evidence_offered"] = True
+        rel["evidence_count"] = max(rel.get("evidence_count") or 0, 1)
         if _mined["grade"] == "binding":
             rel.setdefault("evidence_mined", _mined["sentence"])
         # The claim's evidence just changed hands, so its
