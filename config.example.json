@@ -20,5 +20,7 @@
   "machine_label": "",
   "_comment_hardcover": "hardcover: when true (or --hardcover is passed), each book's identity is resolved against Hardcover at scan time; on a confident match its canonical title, authors and series become the work record's values. hardcover_token: a Hardcover API token (create one in your Hardcover account settings), or set the HARDCOVER_TOKEN environment variable instead; the token is only ever sent to api.hardcover.app and never appears in previews or logs",
   "hardcover": false,
-  "hardcover_token": ""
+  "hardcover_token": "",
+  "_comment_series_registry": "series_registry: kill-switch for the local series character registry (default true). When true, each finished book folds its shipped cast into ~/.ebook-processor/series_registry.db so later books in the same series can draw on it; the registry is derived state rebuilt from finished records, and a registry failure only ever logs a warning",
+  "series_registry": true
 }

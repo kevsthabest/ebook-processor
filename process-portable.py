@@ -48,7 +48,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.71"
+PORTABLE_VERSION = "2.13.72"
 
 
 import argparse
@@ -178,6 +178,13 @@ DEFAULT_CONFIG = {
     # wins when set; the token is only ever sent to
     # api.hardcover.app and never appears in previews or logs.
     "hardcover_token": "",
+    # Series character registry (series-linking spec, Phase 2):
+    # when on, each finished book folds its shipped cast into the
+    # local series registry. It is a kill-switch, not a feature
+    # flag — the registry is derived state and population is part
+    # of landing a book; off stops the writes (and the preview
+    # block) entirely.
+    "series_registry": True,
 }
 
 
@@ -188,7 +195,7 @@ _INT_CONFIG_KEYS = {"sample_rate", "sample_edges", "batch_size", "llm_max_tokens
 _BOOL_CONFIG_KEYS = {"debug", "dedupe", "llm_enable_thinking", "llm_json_schema",
                      "v2_prompt_cache", "run_history",
                      "discovery_shadow", "discovery_embedding_rank",
-                     "hardcover"}
+                     "hardcover", "series_registry"}
 
 
 def load_config():
@@ -981,6 +988,46 @@ def _land_series_identity(result, identifiers, file_title, file_author):
                           result.get("author"), match)
     if key is not None or match is not None:
         result["series_key"] = key
+
+
+# --- Series registry landing (series-linking spec, Phase 2) -----
+_SR_REGISTRY = None   # (module, SeriesRegistry); False once unavailable
+
+
+def _populate_series_registry(result):
+    """Fold a finished book record into the series registry.
+
+    Called once per book beside _land_series_identity, in both
+    pipelines. The registry is derived state — it can be rebuilt
+    from finished records — so a failure here must never fail the
+    book: any error logs one warning and the run proceeds, and
+    the record simply carries no series_registry block (the same
+    absence that keeps registry-off and non-series runs
+    byte-identical). Population reads the record; the only write
+    to it is the counts-only delta block."""
+    if not CONFIG.get("series_registry", True):
+        return
+    global _SR_REGISTRY
+    if _SR_REGISTRY is None:
+        try:
+            import series_registry as _sr_module
+            _SR_REGISTRY = (_sr_module, _sr_module.SeriesRegistry())
+        except Exception as e:
+            print(f"  Warning: series registry unavailable ({e}); "
+                  f"continuing without it")
+            _SR_REGISTRY = False
+    if not _SR_REGISTRY:
+        return
+    _sr_module, registry = _SR_REGISTRY
+    try:
+        delta = _sr_module.populate_from_record(
+            registry, result, family_types=_REL_FAMILY_TYPES)
+    except Exception as e:
+        print(f"  Warning: series registry population failed ({e}); "
+              f"continuing without it")
+        return
+    if delta is not None:
+        result["series_registry"] = delta
 
 def extract_mobi_identifiers(path):
     """Read ISBN (EXTH 104) / ASIN (EXTH 113) from a MOBI/AZW3 header. Stdlib."""
@@ -27899,6 +27946,10 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     # work resolution below uses are unchanged, because re-keying
     # work identity on Hardcover metadata is out of scope (§8).
     _land_series_identity(result, identifiers, _file_title, _file_author)
+    # The registry fold sits beside the identity landing: the
+    # series key has just been resolved, and the record is the
+    # finished cast the registry keeps.
+    _populate_series_registry(result)
     # Work identity resolution (read-only in preview/dry-run).
     wid, how = resolve_work(title or fpath.stem, author, identifiers, False,
                             create=not (preview or dry_run))
@@ -28450,6 +28501,10 @@ def process_file(fpath, dry_run=False, preview=False):
     # work resolution below uses are unchanged, because re-keying
     # work identity on Hardcover metadata is out of scope (§8).
     _land_series_identity(result, identifiers, _file_title, _file_author)
+    # The registry fold sits beside the identity landing: the
+    # series key has just been resolved, and the record is the
+    # finished cast the registry keeps.
+    _populate_series_registry(result)
     # Work identity resolution (read-only in preview/dry-run).
     wid, how = resolve_work(title or fpath.stem, author, identifiers, is_anth,
                             create=not (preview or dry_run))
