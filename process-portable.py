@@ -50,7 +50,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.85"
+PORTABLE_VERSION = "2.13.86"
 
 
 import argparse
@@ -18392,6 +18392,103 @@ def _artefact_roster(art):
     return roster
 
 
+def cmd_stage_extract(fpath):
+    """--stage extract: run Stage E alone over --file. Returns the
+    process exit code (0 = extraction artefacts complete, 1 =
+    refusal or failure).
+
+    Stage E is the v2 pipeline's own first half — the acquisition
+    head and the chapter loop in process_file_v2 — driven under a
+    CONFIG marker (CONFIG["stage_extract"]) that stops the run at
+    the extraction stamp, the one seam every completion path
+    flows through. Nothing downstream runs: no merge, no decide,
+    no preview, no app write, and — the point of the stage — NO
+    checkpoint clear. A finished monolith run clears its
+    checkpoints at its end because they were scaffolding; here
+    the artefact set (chapter payloads + roster + extraction.json)
+    is the product the later stages consume, so it stays.
+
+    Failure honesty: an aborted extraction lands no complete
+    stamp (the stamp seam itself is gated on the run not
+    aborting) and the entry exits non-zero with the run's own
+    failure reporting; a later --stage merge refuses the set
+    through the same completeness checks it applies to any
+    incomplete extraction. The stage covers the v2 pipeline only:
+    the v1 extractor has no checkpoint artefact set to leave
+    behind, so a v1-shaped invocation refuses by name.
+
+    Run history: exactly one row, armed here with the stage named
+    in the row's existing mode field ("stage_extract" — no schema
+    change). process_file_v2 does not arm the recorder itself —
+    full runs are armed by run_once, which this entry bypasses —
+    so the entry arms it with the same balanced-hooks discipline
+    as cmd_stage_decide (refusals arm nothing: every refusal
+    above returns before the recorder arms). The marker is
+    restored on every exit path, so it can never leak into a
+    later in-process run and silently truncate it at the stamp."""
+    fpath = Path(fpath)
+    if not fpath.is_file():
+        print(f"  --stage extract: file not found: {fpath}")
+        return 1
+    if fpath.suffix.lower() not in (".epub", ".mobi", ".azw3"):
+        print(f"  --stage extract: unsupported format: {fpath.suffix} "
+              f"(need .epub, .mobi, or .azw3)")
+        return 1
+    if CONFIG.get("pipeline") != "v2":
+        print(f"  --stage extract: the stage split covers the v2 "
+              f"pipeline only (this invocation is --pipeline "
+              f"{CONFIG.get('pipeline')}) — the v1 pipeline leaves "
+              f"no extraction artefact set for the later stages. "
+              f"Nothing was run.")
+        return 1
+    _history_begin("stage_extract", preview=False, dry_run=False,
+                   files_seen=1)
+    _history_note_admitted(1)
+    _history_book_start(fpath)
+    _prev_marker = CONFIG.get("stage_extract")
+    CONFIG["stage_extract"] = True
+    try:
+        _ok = process_file_v2(fpath, dry_run=False, preview=False)
+    except Exception as e:
+        _history_book_end(fpath, e)
+        _history_book_outcome(fpath, False)
+        _history_finish(failures=1)
+        print(f"  --stage extract FAILED for {fpath.name}: "
+              f"{type(e).__name__}: {e}")
+        return 1
+    finally:
+        if _prev_marker is None:
+            CONFIG.pop("stage_extract", None)
+        else:
+            CONFIG["stage_extract"] = _prev_marker
+    if _ok and not _extraction_complete(_checkpoint_book_key(fpath)):
+        # The run finished, but the stamp did not land complete —
+        # reachable with a --chunks selection whose chapter
+        # indices fall outside the selection's own count (the
+        # payloads carry the book's indices; meta's total is the
+        # selection size, so the stamp's coverage check cannot
+        # count them — a property of the checkpoint machinery a
+        # plain chunked run shares). In the monolith the stamp is
+        # bookkeeping and its absence is silent; standalone the
+        # stamp IS the product, so the stage reports its absence
+        # as its own failure instead of claiming a completion the
+        # later stages would refuse anyway.
+        print(f"  --stage extract FAILED for {fpath.name}: the "
+              f"run completed but no complete extraction stamp "
+              f"landed — the artefact set is not consumable by "
+              f"the later stages. Nothing was staged.")
+        _ok = False
+    _history_book_outcome(fpath, _ok)
+    _history_book_end(fpath)
+    _history_finish(failures=0 if _ok else 1)
+    if _ok:
+        print(f"  Stage E complete: extraction artefacts for "
+              f"'{_checkpoint_book_key(fpath)}' are stamped "
+              f"complete in the checkpoint directory — run "
+              f"--stage merge next, when ready.")
+    return 0 if _ok else 1
+
+
 def cmd_stage_merge(fpath):
     """--stage merge: run Stage M alone over a stored Stage-E
     extraction. Returns the process exit code (0 = artefact
@@ -31325,6 +31422,19 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         _checkpoint_save_extraction_stamp(_ckpt_key, _ckpt_fp,
                                           n - len(_fm_idx_v2))
 
+    if CONFIG.get("stage_extract"):
+        # Stage E standalone (stage-split step 4): the extraction
+        # is the whole job. Stop here — before Stage M, before the
+        # decide segment, and before every epilogue, in particular
+        # the checkpoint clears a finished monolith run performs
+        # at its end: the artefact set is the product the later
+        # stages consume, not scaffolding. An aborted extraction
+        # reaches this seam too (its failure is already reported
+        # above, exactly as a full run reports it) but lands no
+        # complete stamp, so it returns False and the downstream
+        # stages will refuse the partial set on its stamp.
+        return not aborted
+
     # Recorded human NOs for this work (roster store): standing
     # rulings the in-run merge passes and alias pruning below must
     # honour. Loaded whether or not --persist-roster is on — the
@@ -32588,15 +32698,16 @@ def _build_parser():
                     choices=["all", "extract", "merge", "decide"],
                     help="stage split: run ONE pipeline stage against "
                          "stored artefacts instead of the whole run. "
-                         "'merge' runs Stage M (roster merge) over a "
-                         "completed extraction's checkpoints for --file "
-                         "and writes merged-roster.json; 'decide' runs "
+                         "'extract' runs Stage E (extraction) alone "
+                         "for --file and leaves the completed "
+                         "checkpoint artefacts in place; 'merge' runs "
+                         "Stage M (roster merge) over a completed "
+                         "extraction's checkpoints for --file and "
+                         "writes merged-roster.json; 'decide' runs "
                          "Stage D (decide) over the extraction plus "
                          "merged-roster.json and emits the preview "
                          "(preview-only: --preview required); 'all' "
-                         "(the default) is the ordinary full run. "
-                         "'extract' lands in a later step of the split "
-                         "and currently refuses, legibly.")
+                         "(the default) is the ordinary full run.")
     g_pipe.add_argument("--chunks", default=None,
                     help="process only these chunk indices (e.g. --chunks 2 or --chunks 2,5,8); "
                          "numbering matches the sampled chunk list and debug files")
@@ -33134,6 +33245,15 @@ def _flag_conflicts(args, defaults):
             # M neither previews nor writes, so the flag would be
             # silently dropped there.)
             modes = [m for m in modes if m != "--preview"]
+        if getattr(args, "stage", None) == "extract":
+            # --chunks beside --stage extract is likewise designed:
+            # the selector shapes the extraction itself — the stamp
+            # records the selection and Stages M/D refuse the
+            # partial book by name — so the flag is honoured by the
+            # dispatch, not dropped. (Beside --stage merge/decide
+            # it still conflicts: those stages consume a stored
+            # extraction and cannot re-select its chapters.)
+            modes = [m for m in modes if m != "--chunks"]
     if shots == ["--save-profile"]:
         # --save-profile's whole job is capturing run-shaping
         # settings, and preview/dry_run are persistable settings it
@@ -33199,17 +33319,6 @@ def main():
             sys.exit(f"ERROR: profile '{args.profile}' not found "
                      "(--list-profiles to see available)")
         _apply_profile(args, defaults, profile)
-
-    # Stage entry points land one at a time (stage-split §8):
-    # 'merge' shipped in step 2, 'decide' in step 3; 'extract'
-    # still refuses here — before any state migration or other
-    # side effect — rather than silently running something else.
-    if getattr(args, "stage", "all") == "extract":
-        print(f"  --stage {args.stage} is not available yet: the "
-              f"stage entry points land one at a time (this build "
-              f"ships 'merge' and 'decide'; 'extract' follows in "
-              f"step 4 of the stage split). Nothing was run.")
-        sys.exit(2)
 
     # Spine OC-7: the state stores migrate to the SQLite substrate
     # automatically on the first run that touches state. Placed
@@ -33587,6 +33696,22 @@ def main():
     if CONFIG["llm"] == "cohere" and not _cohere_api_key():
         sys.exit("ERROR: Cohere API key is not set (set \"cohere_api_key\" "
                  "in config.json or the COHERE_API_KEY environment variable)")
+
+    # --stage extract (stage-split step 4): run Stage E alone for
+    # the --file book, stopping at the extraction stamp with the
+    # artefact set left in place. Same dispatch discipline as the
+    # stages below — after every CONFIG-shaping flag above has
+    # been applied exactly as a full run applies it (--chunks
+    # included: it shapes the extraction, and its stamp records
+    # the selection), with the validator and learned state already
+    # constructed — and before the Supabase gate: the stage writes
+    # only its checkpoint artefacts, so it must not demand write
+    # credentials.
+    if getattr(args, "stage", "all") == "extract":
+        if not args.file:
+            sys.exit("ERROR: --stage extract needs --file <book> — "
+                     "the book to extract")
+        sys.exit(cmd_stage_extract(args.file))
 
     # --stage merge (stage-split step 2): run Stage M alone over the
     # --file book's stored extraction. Dispatched here — after every

@@ -7,7 +7,7 @@ whatever ebook files you hand it. **Preview first, write later** — every run
 can save a full Markdown/JSON report for human review before anything
 touches the database.
 
-**Current version: 2.13.85** (`PORTABLE_VERSION` in `process-portable.py`).
+**Current version: 2.13.86** (`PORTABLE_VERSION` in `process-portable.py`).
 
 ## How it works
 
@@ -92,6 +92,61 @@ review file, nothing to Supabase).
 The abort threshold is the `MAX_FAILED_CHUNK_RATIO = 0.5` constant
 (`:169`), not a flag; aborted runs still save a preview marked
 `"aborted": true`.
+
+## Pipeline stages (`--stage`)
+
+A full run is three stages — extract, merge, decide — that
+communicate through persisted artefacts in the book's checkpoint
+directory (`preview/.checkpoints/<book>/`). `--stage all` (the
+default) runs them in one process, exactly as always. Each stage
+can also run alone against the stored artefacts, so extraction
+(the expensive, model-bound pass) never has to be redone to
+re-merge or re-decide a book:
+
+```bash
+# Stage E: extract only — leaves the artefact set in place
+python process-portable.py --stage extract --file book.epub
+
+# Stage M: merge the stored extraction -> merged-roster.json
+python process-portable.py --stage merge --file book.epub
+
+# Stage D: decide (preview-only) — the judge flags on THIS
+# invocation are the ones that count, so one extraction can be
+# decided under different judges
+python process-portable.py --stage decide --file book.epub --preview
+```
+
+Artefacts: `extraction.json` (Stage E's stamp — book fingerprint,
+extraction-flags hash, processor version, extractor identity, and
+a `complete` marker that readers re-verify against the payloads
+actually on disk) and `merged-roster.json` (Stage M's canonical
+roster, the merge verdict table, and the full judge packets,
+stamped with the extraction fingerprint it consumed and its own
+merge-config fingerprint). Stage D's preview carries a
+`decide_report` holding all three stages' fingerprints, so any
+preview traces to the exact extraction and merge it came from.
+
+Refusals are hard stops with the reason printed — a stage never
+runs an upstream stage to fill a gap:
+
+- missing or incomplete extraction (finish it, or re-extract);
+- a chunk-limited extraction (`--chunks`): complete only for the
+  selected chapters, so Stages M and D refuse it by name;
+- artefact-format mismatch (re-extract / re-merge with this
+  build);
+- Stage D's fingerprint hard stop: the merged roster was merged
+  from a different extraction (or under different extraction
+  flags) than the stamp it would be decided against — re-run
+  `--stage merge`.
+
+Budgets are per-stage: each stage arms its own decision pool
+(a full run shares one pool across the stages), and the
+preview's `decide_report.budget.basis` stamps which shape
+produced it — outcomes can differ only where the shared pool
+would have exhausted. A finished full run still clears its
+checkpoints at the end; stage runs never clear the artefacts
+they consume, so one extraction can be re-merged and re-decided
+any number of times.
 
 ## Corpus (v2.13)
 
