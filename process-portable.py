@@ -17197,6 +17197,63 @@ def _jev_merge_no_pairs(title, author, identifiers):
         return []
 
 
+def _jev_no_form_match(form_key, side_key):
+    """Does FORM_KEY denote the person a recorded human NO names
+    by SIDE_KEY? In-run form-cluster match: exact, equal after
+    title stripping, or token containment either way ('devon'
+    against 'karl devon'; 'major devon' against either).
+
+    Ported from the algorithmic path's NO matcher (v2.13.78): the
+    cross-run store layer matches NOs by exact form, but inside a
+    run the contamination a NO exists to kill wears variant forms
+    of the banned name (a title form, a bare surname), and exact
+    matching would let every variant through. Used ONLY where a
+    recorded NO already applies — it widens which spellings count
+    as the banned person, never where a ban exists."""
+    if not form_key or not side_key:
+        return False
+    if form_key == side_key:
+        return True
+    fa = _strip_merge_noise(form_key)
+    fb = _strip_merge_noise(side_key)
+    if not fa or not fb:
+        return False
+    if fa == fb:
+        return True
+    short, long_ = (fa, fb) if len(fa) <= len(fb) else (fb, fa)
+    return _is_contig_subseq(short, long_)
+
+
+def _jev_no_prune_keys(no_pairs, own_forms, alias_keys):
+    """Alias keys an entry must drop under recorded human NOs.
+
+    An alias is pruned when it denotes the OTHER side of a NO
+    whose remaining side the entry itself claims (as its own
+    form, or elsewhere among its claims): the entry is asserting
+    two people a human ruled distinct, and the alias side of the
+    assertion is the pollution. Aliases denoting the entry's OWN
+    side of a NO are its own person's variants and are kept —
+    the ban separates two people, it does not strip a person of
+    their own name forms. (Ported from the algorithmic path's
+    reconcile pruning, v2.13.78.)"""
+    out = set()
+    if not no_pairs or not alias_keys:
+        return out
+    for a, b in no_pairs:
+        for side, other in ((a, b), (b, a)):
+            if any(_jev_no_form_match(f, other) for f in own_forms):
+                # `other` is (also) one of the entry's own forms:
+                # its aliases are the entry's own person's
+                # variants and are never pruned by this NO.
+                continue
+            if any(_jev_no_form_match(f, side) for f in own_forms) \
+                    or any(_jev_no_form_match(ak, side)
+                           for ak in alias_keys):
+                out |= {ak for ak in alias_keys
+                        if _jev_no_form_match(ak, other)}
+    return out
+
+
 def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
     """The bake-off merge pass: judge-nominated pairs, apply YES
     verdicts, return the diagnostics dict stamped into the preview
@@ -17216,13 +17273,40 @@ def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
     diag = {"pairs_nominated": 0, "pairs_judged": 0,
             "merges_applied": 0, "clusters_formed": 0,
             "vetoed": [], "verdicts": [], "transitive_veto_blocks": 0,
-            "budget_topup": 0}
+            "budget_topup": 0, "intra_entry_prunes": []}
+    no_pairs = [(norm_name(a), norm_name(b)) for a, b in no_pairs
+                if a and b]
+    # Intra-entry NO enforcement, before anything reads the alias
+    # lists: the between-entry veto below can only act when the
+    # banned form became an entry of its own. When it never did —
+    # the Devon shape, a banned name riding inside another entry's
+    # alias lists — there is no pair to veto, so the foreign side's
+    # aliases are pruned here instead, mirroring the reconcile's
+    # NO pruning on the algorithmic path. Pruned aliases must not
+    # nominate pairs, consume judging budget, or reach the judge's
+    # evidence packets.
+    if no_pairs:
+        for k in sorted(roster):
+            e = roster[k]
+            _prune = _jev_no_prune_keys(
+                no_pairs,
+                set(e.get("primary_keys") or ()) | {k},
+                set(e.get("alias_keys") or ()))
+            if not _prune:
+                continue
+            e["alias_keys"] = {ak for ak in e.get("alias_keys") or ()
+                               if ak not in _prune}
+            e["aliases"] = {a for a in e.get("aliases") or ()
+                            if norm_name(a) not in _prune}
+            diag["intra_entry_prunes"].append(
+                {"entry": e.get("name", k), "removed": sorted(_prune)})
+            print(f"  Jev merge: {e.get('name', k)[:40]}: pruned "
+                  f"{len(_prune)} alias form(s) under a recorded NO "
+                  f"({', '.join(sorted(_prune))})")
     if len(roster) < 2:
         return diag
     chapters_by_index = {c.get("index"): c.get("text") or ""
                          for c in chapters or []}
-    no_pairs = [(norm_name(a), norm_name(b)) for a, b in no_pairs
-                if a and b]
     nominated = _jev_merge_nominate(roster)
     diag["pairs_nominated"] = len(nominated)
     ordered = sorted(nominated.items(), key=lambda kv: (-kv[1], kv[0]))

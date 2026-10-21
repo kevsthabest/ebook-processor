@@ -233,6 +233,91 @@ class TestCannotLinkVeto(_Base):
             roster[devon_side[0]]["appearances"], 7)
 
 
+class TestIntraEntryNoPrune(_Base):
+    """A recorded NO must also protect the shape where the banned
+    form never became an entry: it sits INSIDE one entry's alias
+    lists, so there is no second entry for the between-entry veto
+    to act on. The pass prunes the foreign side's aliases at the
+    start — before nomination — mirroring the algorithmic path's
+    reconcile NO pruning (v2.13.78), and records each prune in the
+    diagnostics."""
+
+    _NO = [("Karl Devon", "Major Pain in the Ass")]
+
+    def test_foreign_aliases_pruned_from_single_entry(self):
+        """Run-3 shape: Devon's forms live only as aliases on the
+        Major Pain entry. The NO prunes every Devon form — the bare
+        form and its title variants alike — keeps MPITA and the
+        entry itself, and records the prune."""
+        roster = _roster(_entry(
+            "Major Pain in the Ass",
+            aliases=("Karl Devon", "Major Karl Devon", "Major Devon",
+                     "MPITA"),
+            chapters=(1,)))
+        diag = pp.jev_merge_pass(roster, _CHAPTERS, validator=None,
+                                 no_pairs=self._NO)
+        self.assertEqual(sorted(roster), ["major pain in the ass"])
+        entry = roster["major pain in the ass"]
+        self.assertEqual(entry["aliases"], {"MPITA"})
+        self.assertEqual(entry["alias_keys"], {"mpita"})
+        self.assertEqual(entry["primary_keys"],
+                         {"major pain in the ass"})
+        self.assertEqual(len(diag["intra_entry_prunes"]), 1)
+        rec = diag["intra_entry_prunes"][0]
+        self.assertEqual(rec["entry"], "Major Pain in the Ass")
+        self.assertEqual(rec["removed"],
+                         ["karl devon", "major devon",
+                          "major karl devon"])
+
+    def test_reverse_direction_prunes_the_other_side(self):
+        """The mirror image: a Devon entry carrying a stray Major
+        Pain alias loses that alias; Devon and his own forms —
+        including his own title form — stay."""
+        roster = _roster(_entry(
+            "Karl Devon",
+            aliases=("The Major", "Major Devon",
+                     "Major Pain in the Ass"),
+            chapters=(1,)))
+        diag = pp.jev_merge_pass(roster, _CHAPTERS, validator=None,
+                                 no_pairs=self._NO)
+        self.assertEqual(sorted(roster), ["karl devon"])
+        entry = roster["karl devon"]
+        self.assertEqual(entry["aliases"], {"The Major", "Major Devon"})
+        self.assertEqual(
+            entry["alias_keys"],
+            {pp.norm_name(a) for a in ("The Major", "Major Devon")})
+        self.assertEqual(len(diag["intra_entry_prunes"]), 1)
+        rec = diag["intra_entry_prunes"][0]
+        self.assertEqual(rec["entry"], "Karl Devon")
+        self.assertEqual(rec["removed"], ["major pain in the ass"])
+
+    def test_no_recorded_no_leaves_entry_untouched(self):
+        roster = _roster(_entry(
+            "Major Pain in the Ass",
+            aliases=("Karl Devon", "Major Devon", "MPITA"),
+            chapters=(1,)))
+        diag = pp.jev_merge_pass(roster, _CHAPTERS, validator=None)
+        entry = roster["major pain in the ass"]
+        self.assertEqual(entry["aliases"],
+                         {"Karl Devon", "Major Devon", "MPITA"})
+        self.assertEqual(diag["intra_entry_prunes"], [])
+
+    def test_unrelated_no_does_not_touch_the_entry(self):
+        """A NO between two other people is not a licence to prune
+        this entry: neither side matches any form it claims."""
+        roster = _roster(_entry(
+            "Major Pain in the Ass",
+            aliases=("Karl Devon", "Major Devon", "MPITA"),
+            chapters=(1,)))
+        diag = pp.jev_merge_pass(
+            roster, _CHAPTERS, validator=None,
+            no_pairs=[("Ann Lee", "Lee Park")])
+        entry = roster["major pain in the ass"]
+        self.assertEqual(entry["aliases"],
+                         {"Karl Devon", "Major Devon", "MPITA"})
+        self.assertEqual(diag["intra_entry_prunes"], [])
+
+
 class TestNomination(_Base):
     def test_alias_claim_nominates(self):
         """An entry claiming another entry's key as an alias nominates
