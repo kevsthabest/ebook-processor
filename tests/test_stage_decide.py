@@ -50,6 +50,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
@@ -440,6 +441,139 @@ class TestStageDecideBook(_StageDecideCase):
         self.assertNotIn("v2_reduce(", src)
         self.assertNotIn("v2_trope_gate(", src)
         self.assertNotIn("evidence_retrieve_result(", src)
+
+
+def _full_entry(name, chapters, appearances, alias_keys=()):
+    """A roster entry in the full shape _roster_update builds,
+    for a test that must control entries the update-time tiers
+    would have merged before the seam ever saw them (the shape
+    is test_series_priors' _entry, plus explicit alias claims)."""
+    key = pp.norm_name(name)
+    return {"name": name, "aliases": set(),
+            "alias_keys": {key}
+            | {pp.norm_name(a) for a in alias_keys},
+            "primary_keys": {key}, "_generic_keys": set(),
+            "appearances": appearances,
+            "last_seen": max(chapters) if chapters else 0,
+            "chapters": set(chapters), "roles": Counter(),
+            "descriptions": [], "evidence": ""}
+
+
+class TestPriorsReportTiming(_StageDecideCase):
+    """The monolith's series-priors report must be read AFTER
+    the Option B identity seam inside the stage, the point the
+    pre-split pipeline always computed it: the seam's folds can
+    still move the counters (a canonical tiebreak), so a report
+    snapshotted by the driver before the stage runs undercounts
+    form_tiebreaks whenever --series-priors and --persist-roster
+    are both on and the seam folds a same-registry pair."""
+
+    def test_seam_tiebreak_lands_in_the_book_records_report(self):
+        _sr_spec = importlib.util.spec_from_file_location(
+            "series_registry",
+            str(Path(__file__).resolve().parent.parent
+                / "series_registry.py"))
+        sr = importlib.util.module_from_spec(_sr_spec)
+        sys.modules["series_registry"] = sr
+        _sr_spec.loader.exec_module(sr)
+        reg = sr.SeriesRegistry(
+            path=Path(self._tmp) / "series_registry.db")
+        self.addCleanup(reg.close)
+        # The earlier book: Sebeck attested under his canonical
+        # form, with the nickname as a recorded alias — the
+        # registry character both roster entries below match.
+        sr.populate_from_record(reg, {
+            "title": "Daemon", "author": "Daniel Suarez",
+            "work_id": "book-1", "series_name": "Daemon",
+            "series_position": 1, "series_source": "hardcover",
+            "series_key": "hc-series:999",
+            "hardcover": {"compilation": False},
+            "characters": [{"name": "Peter Sebeck",
+                            "aliases": ["Pete Sebeck", "Sebeck"]}],
+            "relationships": []})
+        saved_registry = pp._SR_REGISTRY
+        pp._SR_REGISTRY = (sr, reg)
+        self.addCleanup(setattr, pp, "_SR_REGISTRY", saved_registry)
+
+        cfg = dict(_DECIDE_CONFIG, series_priors=True,
+                   persist_roster=True)
+        with mock.patch.dict(pp.CONFIG, cfg):
+            ctx = pp._load_series_priors("hc-series:999")
+        self.assertIsNotNone(ctx)
+        pp._DIAG.series_priors = ctx
+
+        # A previous run minted one entity for the canonical
+        # form, its extraction claiming the nickname as an alias
+        # — the substrate this run's two entries both link to.
+        store, _wid = pp._roster_store_for(TITLE, AUTHOR,
+                                           IDENTIFIERS)
+        self.assertIsNotNone(store)
+        roster1 = {"peter sebeck": _full_entry(
+            "Peter Sebeck", (1, 2), appearances=40,
+            alias_keys=("Pete Sebeck",))}
+        with contextlib.redirect_stdout(io.StringIO()):
+            pp.roster_assign_entities(roster1, store, anchors=[])
+
+        # This run's post-merge roster still holds the pair as
+        # two entries (disjoint chapters, mutual form claims):
+        # the seam links both to the minted entity and folds
+        # them, keeper = the better-attested nickname form.
+        roster = {
+            "pete sebeck": _full_entry(
+                "Pete Sebeck", (1, 2), appearances=30,
+                alias_keys=("Peter Sebeck",)),
+            "peter sebeck": _full_entry(
+                "Peter Sebeck", (3,), appearances=12),
+        }
+        _char = {"name": "Pete Sebeck", "aliases": [],
+                 "role": "supporting", "description": "",
+                 "evidence": ""}
+        payloads = {1: (_a(characters=[_char]), _b("One.")),
+                    2: (_a(characters=[_char]), _b("Two.")),
+                    3: (_a(), _b("Three."))}
+        chapter_as = {i: ab[0] for i, ab in payloads.items()}
+        chapter_bs = {i: ab[1] for i, ab in payloads.items()}
+        indexed = pp._select_chunks(CHAPTERS, None)
+        pp._dm_budget_reset(chapter_count=len(CHAPTERS))
+        out = io.StringIO()
+        with mock.patch.dict(pp.CONFIG, cfg), \
+                contextlib.redirect_stdout(out):
+            seg = pp.stage_decide_book(
+                roster, CHAPTERS, indexed, chapter_as, chapter_bs,
+                fpath=Path(self._tmp) / "stagebook.epub",
+                _book_key="book", _ckpt_key="stagebook",
+                _ckpt_fp=_fingerprint(),
+                title=TITLE, author=AUTHOR, identifiers=IDENTIFIERS,
+                _isbn_source="epub", _series_name=None,
+                _series_pos=None, _series_source="none",
+                word_count=42, _chap_fallback=False,
+                a_ok=3, b_ok=3, a_failed=0, b_failed=0, a_fallback=0,
+                aborted=False, dry_run=False, preview=True,
+                call=_fake_llm,
+                _recon_stats=None, _pp_merged=0, _pp_possible=[],
+                _merge_judge_stats=None,
+                # The monolith driver's shape: the live report as
+                # a zero-arg callable, resolved by the stage at
+                # result assembly — after the seam.
+                priors_report=lambda: pp._series_priors_report(ctx),
+                priors_source="live",
+                _resumed_chapters=payloads,
+                extraction_flags_hash=pp._extraction_flags_hash(),
+                merge_config_fingerprint=pp._merge_config_fingerprint(),
+                budget_basis="shared-run")
+        result = seg["result"]
+        self.assertIsNotNone(result)
+        # The seam really folded the pair, and the registry's
+        # canonical spelling won the display-name tie.
+        self.assertEqual(len(roster), 1)
+        self.assertEqual(next(iter(roster.values()))["name"],
+                         "Peter Sebeck")
+        self.assertEqual(ctx["counts"]["form_tiebreaks"], 1)
+        # …and the book record's report counts that increment:
+        # the pre-seam snapshot the buggy driver took read 0.
+        self.assertEqual(result["series_priors"]["form_tiebreaks"], 1)
+        self.assertEqual(
+            result["decide_report"]["series_priors_source"], "live")
 
 
 # ---------------------------------------------------------------------------

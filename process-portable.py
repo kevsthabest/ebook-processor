@@ -18572,12 +18572,17 @@ def stage_decide_book(roster, chapters, indexed, chapter_as, chapter_bs,
     not the arming.
 
     Two deliberate inputs deserve naming. priors_report is the
-    series-priors counts block for the book record, computed by
+    series-priors counts block for the book record, supplied by
     the caller: in the monolith the priors context is live
-    process state and the report is read off it, but the context
-    does not survive staging, so the standalone driver passes
-    the block Stage M stamped onto merged-roster.json instead
-    (priors_source says which). budget_basis names whose pool
+    process state, so the caller passes a zero-arg callable that
+    reads the report off it — the stage resolves the callable at
+    result assembly, after the identity seam, because the seam's
+    folds can still increment the counters (a canonical
+    tiebreak) and the report has always been read at that point;
+    the context does not survive staging, so the standalone
+    driver passes the block Stage M stamped onto
+    merged-roster.json instead (priors_source says which).
+    budget_basis names whose pool
     the decision budget is: "shared-run" in the monolith, where
     merges and validation draw from one pool armed at book
     start, "per-stage" standalone, where the stage arms its own
@@ -19170,16 +19175,24 @@ def stage_decide_book(roster, chapters, indexed, chapter_as, chapter_bs,
         # The bake-off's scoreboard: present only on --jev-merge runs,
         # so flag-off artefacts stay byte-identical to before.
         result["merge_judge"] = _merge_judge_stats
-    if priors_report is not None:
+    _priors_block = priors_report() if callable(priors_report) \
+        else priors_report
+    if _priors_block is not None:
         # The priors' footprint on this book (counts only), so
         # the Phase 3 eval can weigh what the hints did. Absent
         # whenever priors were not active — the absence is what
         # keeps flag-off records identical to before. The report is
         # the CALLER's: the priors context is merge-process state
-        # that does not survive staging, so the monolith computes
-        # the report from its live context while the standalone
-        # stage reads the block Stage M stamped on its artefact.
-        result["series_priors"] = priors_report
+        # that does not survive staging, so the standalone stage
+        # passes the block Stage M stamped on its artefact, while
+        # the monolith passes a zero-arg callable over its live
+        # context — resolved HERE, at result assembly, because the
+        # identity seam above can still move the counters (a
+        # fold's canonical tiebreak) after the driver handed over;
+        # a snapshot taken before the seam would undercount them,
+        # and assembly is the point the pre-split pipeline always
+        # read the report.
+        result["series_priors"] = _priors_block
     if _discovery_report is not None:
         result["discovery"] = _discovery_report
     if _staging_marker is not None:
@@ -31381,7 +31394,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         _recon_stats=_recon_stats, _pp_merged=_pp_merged,
         _pp_possible=_pp_possible,
         _merge_judge_stats=_merge_judge_stats,
-        priors_report=(_series_priors_report(_sp_ctx)
+        priors_report=((lambda _ctx=_sp_ctx:
+                        _series_priors_report(_ctx))
                        if _sp_ctx is not None else None),
         priors_source=("live" if _sp_ctx is not None else None),
         _resumed_chapters=_resumed_chapters,
