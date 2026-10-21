@@ -48,7 +48,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.78"
+PORTABLE_VERSION = "2.13.79"
 
 
 import argparse
@@ -4709,6 +4709,30 @@ def resolve_decision_model(provider, url_override="", config=None, env=None):
     return (base_url, "default", "", {})
 
 
+# The same-person instructions, shared by every merge-judge caller —
+# ask_same_person (post_pass_merge Tier 3) and ask_same_person_packet
+# (the --jev-merge bake-off) — so the two judgment paths can never
+# drift into different questions. The eval harness pins this text
+# against evaluate-merges.py's PRODUCTION_INSTRUCTIONS.
+_SAME_PERSON_INSTRUCTIONS = (
+    "Are these two character entries referring to the same person? "
+    "Answer YES only when there is positive evidence of one identity: "
+    "a supported alias or nickname linking the two names, a reliable "
+    "name variant (shortened form, title change, minor spelling "
+    "difference) with compatible attributes, or contextual evidence "
+    "that both entries describe the same individual. "
+    "Answer NO when the book supports two distinct identities, when "
+    "the descriptions meaningfully contradict each other (roles, "
+    "relationships, or histories one person could not hold), or when "
+    "a deterministic constraint rules the pair out. "
+    "Similar descriptions alone never establish identity: different "
+    "people can share a surname, a role, and a description. "
+    "If the evidence is insufficient either way, score near the "
+    "middle of the scale rather than guessing — an unresolved pair "
+    "stays separate and is reviewed; it is not merged on a guess."
+)
+
+
 class DecisionValidator:
     """Validates trigger evidence via a /v1/systemone decision model.
 
@@ -4859,24 +4883,7 @@ class DecisionValidator:
             _parts.append(f"Description B: {desc_b[:600]}")
         if ev_b:
             _parts.append(f"Evidence B: {ev_b[:300]}")
-        _instructions = (
-            "Are these two character entries referring to the same person? "
-            "Answer YES only when there is positive evidence of one identity: "
-            "a supported alias or nickname linking the two names, a reliable "
-            "name variant (shortened form, title change, minor spelling "
-            "difference) with compatible attributes, or contextual evidence "
-            "that both entries describe the same individual. "
-            "Answer NO when the book supports two distinct identities, when "
-            "the descriptions meaningfully contradict each other (roles, "
-            "relationships, or histories one person could not hold), or when "
-            "a deterministic constraint rules the pair out. "
-            "Similar descriptions alone never establish identity: different "
-            "people can share a surname, a role, and a description. "
-            "If the evidence is insufficient either way, score near the "
-            "middle of the scale rather than guessing — an unresolved pair "
-            "stays separate and is reviewed; it is not merged on a guess."
-        )
-        p_yes = self._ask_noul("same_person", _instructions,
+        p_yes = self._ask_noul("same_person", _SAME_PERSON_INSTRUCTIONS,
                                "\n".join(_parts), label="merge")
         if p_yes is None:
             return None, None
@@ -4886,6 +4893,23 @@ class DecisionValidator:
               f"{_MERGE_P_YES_THRESHOLD:.2f} → "
               f"{'merge' if merged else 'keep separate'}")
         return merged, p_yes
+
+    def ask_same_person_packet(self, state):
+        """Same-person judgment over a caller-built evidence packet
+        (the --jev-merge bake-off). Identical transport, question key,
+        instructions and threshold as ask_same_person; only the state
+        assembly differs — the packet carries both entries' name
+        forms, chapter counts and verbatim text snippets instead of
+        one description + one evidence string per side, because the
+        production state's truncation caps would cut a multi-snippet
+        packet down to its first snippet. Returns (merged_bool,
+        p_yes); (None, None) on any error, in which case the caller
+        keeps the entries separate."""
+        p_yes = self._ask_noul("same_person", _SAME_PERSON_INSTRUCTIONS,
+                               state, label="merge")
+        if p_yes is None:
+            return None, None
+        return p_yes >= _MERGE_P_YES_THRESHOLD, p_yes
 
     def validate_relationship(self, from_name, to_name, rel_type, quote,
                               context=""):
@@ -17215,6 +17239,451 @@ def post_pass_merge(roster, validator=None, no_pairs=()):
     return n_merged, possible_merges
 
 
+# ---------------------------------------------------------------------------
+# --jev-merge bake-off (user-ordered experiment, 2026-10)
+#
+# The algorithmic merge stages make their decisions the moment Call A
+# folds a chapter — against a partial roster, by string rules — and
+# the errors harden before the whole book is sighted. This pass tests
+# the opposite order: Call A's raw roster is the input, alias claims
+# stay DATA, deterministic signals only NOMINATE pairs, recorded
+# human NOs VETO pairs outright, and the decision model judges each
+# remaining pair from an evidence packet. Only YES verdicts merge.
+# The pass is scored offline against the algorithmic roster from the
+# preview artefact's "merge_judge" diagnostics.
+# ---------------------------------------------------------------------------
+
+# Function words dropped from nomination token sets. Titles are
+# deliberately NOT dropped: a title token ("Major") is the bridge the
+# Devon / Major Pain pair turns on, and nomination must not blind
+# itself to the pair the experiment exists to judge. Signals
+# nominate; only the judge decides what a shared token means.
+_JEV_FORM_STOPWORDS = frozenset({"the", "and", "for", "with", "from"})
+
+
+def _jev_entry_form_keys(key, entry):
+    """Every name-form key an entry claims: its own key, its observed
+    primary keys, its adopted alias keys and its unresolved mentions
+    — the same claim surface the reconcile reads. Veto checks run
+    over this set: a human NO names FORMS, not entries."""
+    keys = {key}
+    keys |= set(entry.get("primary_keys") or ())
+    keys |= _roster_claim_keys(entry)
+    return {k for k in keys if k}
+
+
+def _jev_form_token_sets(entry):
+    """Content-token sets, one per name form (primary + aliases).
+
+    Raw normalized tokens, NOT noise-stripped: _strip_merge_noise
+    eats title tokens as noise, and a title shared between an alias
+    form and another entry's name is a nomination signal here, not
+    noise. Short tokens and function words are dropped — they would
+    nominate the whole roster against itself."""
+    forms = [entry.get("name") or ""] + sorted(entry.get("aliases")
+                                               or ())
+    out = []
+    for form in forms:
+        toks = {t for t in norm_name(form).split()
+                if len(t) >= 3 and t not in _JEV_FORM_STOPWORDS}
+        if toks:
+            out.append(toks)
+    return out
+
+
+def _jev_form_surnames(entry):
+    """Last token of each name form, unfiltered: surname sharing is
+    its own nomination route, and a two-letter surname still counts."""
+    out = set()
+    for form in [entry.get("name") or ""] + list(entry.get("aliases")
+                                                 or ()):
+        toks = norm_name(form).split()
+        if toks:
+            out.add(toks[-1])
+    return out
+
+
+def _jev_merge_nominate(roster):
+    """Candidate pairs for the bake-off judge: {(ka, kb): signal}
+    with ka < kb. The union of three nomination routes —
+
+    (i)   the existing Tier 3 similarity signal over the primary
+          keys (_merge_pair_signal, any positive score);
+    (ii)  an alias claim: either entry claims a form the other
+          entry owns (alias_keys / unresolved mentions against the
+          other's key + primary keys);
+    (iii) form-token overlap between ANY of the entries' forms —
+          a shared surname token, a shared content token, or one
+          form's tokens contained in another's.
+
+    A pair's signal is its (i) score when it has one, else 1; the
+    score only orders judging (strongest first), never decides."""
+    keys = sorted(roster)
+    pairs = {}
+
+    def _add(ka, kb, sig):
+        pair = (ka, kb) if ka < kb else (kb, ka)
+        if sig > pairs.get(pair, 0):
+            pairs[pair] = sig
+
+    claims = {k: _roster_claim_keys(roster[k]) for k in keys}
+    owned = {k: {k} | set(roster[k].get("primary_keys") or ())
+             for k in keys}
+    token_sets = {k: _jev_form_token_sets(roster[k]) for k in keys}
+    surnames = {k: _jev_form_surnames(roster[k]) for k in keys}
+    for i, ka in enumerate(keys):
+        for kb in keys[i + 1:]:
+            sig = _merge_pair_signal(ka, kb)
+            if sig:
+                _add(ka, kb, sig)
+            if claims[ka] & owned[kb] or claims[kb] & owned[ka]:
+                _add(ka, kb, 1)
+            if surnames[ka] & surnames[kb]:
+                _add(ka, kb, 1)
+                continue
+            _hit = False
+            for ta in token_sets[ka]:
+                for tb in token_sets[kb]:
+                    if ta & tb or ta <= tb or tb <= ta:
+                        _hit = True
+                        break
+                if _hit:
+                    break
+            if _hit:
+                _add(ka, kb, 1)
+    return pairs
+
+
+def _jev_entry_snippets(key, entry, chapters_by_index, cache):
+    """Up to 3 verbatim sentences from the entry's own chapters that
+    contain one of its name forms (primary or alias), longest forms
+    matched first, each capped at 260 chars. Cached per entry: a
+    principal appears in many pairs but its evidence never changes."""
+    if key in cache:
+        return cache[key]
+    forms = sorted({f for f in [entry.get("name") or ""]
+                    + list(entry.get("aliases") or ()) if len(f) >= 3},
+                   key=len, reverse=True)
+    lowered = [f.lower() for f in forms]
+    out = []
+    for idx in sorted(entry.get("chapters") or ()):
+        text = chapters_by_index.get(idx)
+        if not text:
+            continue
+        for sent in re.split(r"(?<=[.!?])\s+", text):
+            s = sent.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if any(f in low for f in lowered):
+                out.append(s[:260])
+                if len(out) >= 3:
+                    break
+        if len(out) >= 3:
+            break
+    cache[key] = out
+    return out
+
+
+def _jev_merge_packet(ka, ea, kb, eb, chapters_by_index, snip_cache):
+    """The evidence packet one pair is judged on: both entries' name
+    forms and alias lists, chapter-set sizes, best descriptions, and
+    verbatim snippets from each entry's own chapters."""
+
+    def _side(tag, key, entry):
+        lines = [f"Character {tag}: {entry.get('name', key)}"]
+        forms = [entry.get("name", key)] + sorted(entry.get("aliases")
+                                                  or ())
+        lines.append(f"Name forms {tag}: "
+                     + "; ".join(forms)[:400])
+        lines.append(f"Chapters {tag}: "
+                     f"{len(entry.get('chapters') or ())}")
+        desc = _roster_best_desc(entry)
+        if desc:
+            lines.append(f"Description {tag}: {desc[:600]}")
+        snips = _jev_entry_snippets(key, entry, chapters_by_index,
+                                    snip_cache)
+        if snips:
+            lines.append(f"Evidence {tag}:")
+            lines.extend(snips)
+        return lines
+
+    return "\n".join(_side("A", ka, ea) + _side("B", kb, eb))
+
+
+def _jev_merge_no_pairs(title, author, identifiers):
+    """The work's recorded cannot-link NOs as (form_key, form_key)
+    pairs, read through the same store and key derivation the roster
+    persistence seam uses (_roster_store_for). Fail-soft to none:
+    the NO list is a guardrail for an experiment, not a dependency —
+    a missing or unreadable store must never crash the run."""
+    try:
+        store, _wid = _roster_store_for(title, author, identifiers)
+        if store is None:
+            return []
+        return [(p["a"], p["b"]) for p in store.data.get("no_pairs", [])
+                if p.get("a") and p.get("b")]
+    except Exception:
+        return []
+
+
+def _jev_no_form_match(form_key, side_key):
+    """Does FORM_KEY denote the person a recorded human NO names
+    by SIDE_KEY? In-run form-cluster match: exact, equal after
+    title stripping, or token containment either way ('devon'
+    against 'karl devon'; 'major devon' against either).
+
+    Ported from the algorithmic path's NO matcher (v2.13.78): the
+    cross-run store layer matches NOs by exact form, but inside a
+    run the contamination a NO exists to kill wears variant forms
+    of the banned name (a title form, a bare surname), and exact
+    matching would let every variant through. Used ONLY where a
+    recorded NO already applies — it widens which spellings count
+    as the banned person, never where a ban exists."""
+    if not form_key or not side_key:
+        return False
+    if form_key == side_key:
+        return True
+    fa = _strip_merge_noise(form_key)
+    fb = _strip_merge_noise(side_key)
+    if not fa or not fb:
+        return False
+    if fa == fb:
+        return True
+    short, long_ = (fa, fb) if len(fa) <= len(fb) else (fb, fa)
+    return _is_contig_subseq(short, long_)
+
+
+def _jev_no_prune_keys(no_pairs, own_forms, alias_keys):
+    """Alias keys an entry must drop under recorded human NOs.
+
+    An alias is pruned when it denotes the OTHER side of a NO
+    whose remaining side the entry itself claims (as its own
+    form, or elsewhere among its claims): the entry is asserting
+    two people a human ruled distinct, and the alias side of the
+    assertion is the pollution. Aliases denoting the entry's OWN
+    side of a NO are its own person's variants and are kept —
+    the ban separates two people, it does not strip a person of
+    their own name forms. (Ported from the algorithmic path's
+    reconcile pruning, v2.13.78.)"""
+    out = set()
+    if not no_pairs or not alias_keys:
+        return out
+    for a, b in no_pairs:
+        for side, other in ((a, b), (b, a)):
+            if any(_jev_no_form_match(f, other) for f in own_forms):
+                # `other` is (also) one of the entry's own forms:
+                # its aliases are the entry's own person's
+                # variants and are never pruned by this NO.
+                continue
+            if any(_jev_no_form_match(f, side) for f in own_forms) \
+                    or any(_jev_no_form_match(ak, side)
+                           for ak in alias_keys):
+                out |= {ak for ak in alias_keys
+                        if _jev_no_form_match(ak, other)}
+    return out
+
+
+def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
+    """The bake-off merge pass: judge-nominated pairs, apply YES
+    verdicts, return the diagnostics dict stamped into the preview
+    artefact under "merge_judge".
+
+    Fail-closed throughout: a vetoed pair is never judged and never
+    merged (not even transitively — a union that would join the two
+    sides of a NO is refused); a judge error, an unparseable answer,
+    a denied budget claim or a disabled/absent model leaves the pair
+    split and the run continues. Judging runs against the RAW roster
+    for every pair, so verdicts are comparable pair-by-pair with the
+    algorithmic roster; merges apply afterwards, union-find over the
+    YES verdicts, survivor = the fullest, most-attested form.
+    Judge merges are NOT recorded into learned state: an experiment's
+    folds must not become next run's learned links before the
+    experiment is scored."""
+    diag = {"pairs_nominated": 0, "pairs_judged": 0,
+            "merges_applied": 0, "clusters_formed": 0,
+            "vetoed": [], "verdicts": [], "transitive_veto_blocks": 0,
+            "budget_topup": 0, "intra_entry_prunes": []}
+    no_pairs = [(norm_name(a), norm_name(b)) for a, b in no_pairs
+                if a and b]
+    # Intra-entry NO enforcement, before anything reads the alias
+    # lists: the between-entry veto below can only act when the
+    # banned form became an entry of its own. When it never did —
+    # the Devon shape, a banned name riding inside another entry's
+    # alias lists — there is no pair to veto, so the foreign side's
+    # aliases are pruned here instead, mirroring the reconcile's
+    # NO pruning on the algorithmic path. Pruned aliases must not
+    # nominate pairs, consume judging budget, or reach the judge's
+    # evidence packets.
+    if no_pairs:
+        for k in sorted(roster):
+            e = roster[k]
+            _prune = _jev_no_prune_keys(
+                no_pairs,
+                set(e.get("primary_keys") or ()) | {k},
+                set(e.get("alias_keys") or ()))
+            if not _prune:
+                continue
+            e["alias_keys"] = {ak for ak in e.get("alias_keys") or ()
+                               if ak not in _prune}
+            e["aliases"] = {a for a in e.get("aliases") or ()
+                            if norm_name(a) not in _prune}
+            diag["intra_entry_prunes"].append(
+                {"entry": e.get("name", k), "removed": sorted(_prune)})
+            print(f"  Jev merge: {e.get('name', k)[:40]}: pruned "
+                  f"{len(_prune)} alias form(s) under a recorded NO "
+                  f"({', '.join(sorted(_prune))})")
+    if len(roster) < 2:
+        return diag
+    chapters_by_index = {c.get("index"): c.get("text") or ""
+                         for c in chapters or []}
+    nominated = _jev_merge_nominate(roster)
+    diag["pairs_nominated"] = len(nominated)
+    ordered = sorted(nominated.items(), key=lambda kv: (-kv[1], kv[0]))
+    snip_cache = {}
+    # Vetoes are settled before any judging: a vetoed pair is
+    # never judged, so it must never be funded either — the
+    # allowance below counts only the pairs that survive.
+    to_judge = []
+    for (ka, kb), _sig in ordered:
+        ea, eb = roster[ka], roster[kb]
+        name_a, name_b = ea.get("name", ka), eb.get("name", kb)
+        if no_pairs:
+            _veto = _matcher_no_veto(
+                no_pairs, _jev_entry_form_keys(ka, ea),
+                _jev_entry_form_keys(kb, eb))
+            if _veto:
+                diag["vetoed"].append(
+                    {"a": name_a, "b": name_b,
+                     "no": [_veto[0], _veto[1]]})
+                print(f"  Jev merge: {name_a[:40]} vs {name_b[:40]}: "
+                      f"VETOED by recorded NO "
+                      f"({_veto[0]} / {_veto[1]})")
+                continue
+        to_judge.append((ka, kb))
+    # Fund the judging before it begins: one added call per pair
+    # about to be judged, claimed below under the pass's own
+    # consumer key. Claiming against the shared pool instead
+    # would starve the pass against the validation stages'
+    # protected reserves — most pairs skipped unjudged, and the
+    # bake-off measuring the budget instead of the judge. No
+    # live judge means no judging happens, hence nothing to
+    # fund and the pool stays exactly as armed.
+    if to_judge and validator is not None \
+            and not getattr(validator, "disabled", False):
+        diag["budget_topup"] = len(to_judge)
+        _dm_budget_jev_merge_topup(len(to_judge))
+    yes_pairs = []
+    for ka, kb in to_judge:
+        ea, eb = roster[ka], roster[kb]
+        name_a, name_b = ea.get("name", ka), eb.get("name", kb)
+        if validator is None or getattr(validator, "disabled", False):
+            diag["verdicts"].append(
+                {"a": name_a, "b": name_b, "verdict": "skipped",
+                 "confidence": None})
+            continue
+        if not _dm_budget_claim(1, consumer="jev_merge"):
+            diag["verdicts"].append(
+                {"a": name_a, "b": name_b, "verdict": "skipped",
+                 "confidence": None})
+            continue
+        state = _jev_merge_packet(ka, ea, kb, eb, chapters_by_index,
+                                  snip_cache)
+        _t0 = time.monotonic()
+        try:
+            _merged, _p = validator.ask_same_person_packet(state)
+        except Exception:
+            _merged, _p = None, None
+        _telemetry_decision_elapsed("merge", time.monotonic() - _t0)
+        diag["pairs_judged"] += 1
+        if _merged is None:
+            diag["verdicts"].append(
+                {"a": name_a, "b": name_b, "verdict": "error",
+                 "confidence": None})
+            print(f"  Jev merge: {name_a[:40]} vs {name_b[:40]}: "
+                  f"judge error — kept separate")
+            continue
+        diag["verdicts"].append(
+            {"a": name_a, "b": name_b,
+             "verdict": "yes" if _merged else "no",
+             "confidence": round(_p, 4) if _p is not None else None})
+        print(f"  Jev merge: {name_a[:40]} vs {name_b[:40]}: "
+              f"P(yes)={_p:.2f} → "
+              f"{'merge' if _merged else 'keep separate'}")
+        if _merged:
+            yes_pairs.append((ka, kb))
+    # The merge stage is done: its unused budget reserve becomes
+    # borrowable by the validation stages that follow (as in
+    # post_pass_merge). The pass's own consumer finishes too —
+    # allowance it did not spend (a judge that disabled itself
+    # mid-pass) rejoins the shared pool on the same terms, and
+    # the merge_tier3 finish keeps the downstream borrowing
+    # state identical to the algorithmic path's.
+    _dm_budget_finish("jev_merge")
+    _dm_budget_finish("merge_tier3")
+
+    # Union-find over YES verdicts only. A union that would put
+    # entries claiming the two sides of a recorded NO in one cluster
+    # is refused: the NO is a human ruling about identity, and a
+    # transitive chain through a third entry must not smuggle the
+    # pair back together. The guard is computed from the NO list
+    # mapped onto entry form claims, NOT from the nominated pairs —
+    # a vetoed pair nobody nominated still vetoes the union.
+    _no_owner_sides = []
+    if no_pairs:
+        _forms_by_key = {k: _jev_entry_form_keys(k, roster[k])
+                         for k in roster}
+        for _na, _nb in no_pairs:
+            _oa = {k for k, _fs in _forms_by_key.items() if _na in _fs}
+            _ob = {k for k, _fs in _forms_by_key.items() if _nb in _fs}
+            if _oa and _ob:
+                _no_owner_sides.append((_oa, _ob))
+    parent = {k: k for k in roster}
+    members = {k: {k} for k in roster}
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for ka, kb in yes_pairs:
+        ra, rb = _find(ka), _find(kb)
+        if ra == rb:
+            continue
+        joined = members[ra] | members[rb]
+        _blocked = False
+        for _oa, _ob in _no_owner_sides:
+            _ja, _jb = _oa & joined, _ob & joined
+            if _ja and _jb and any(x != y for x in _ja for y in _jb):
+                _blocked = True
+                break
+        if _blocked:
+            diag["transitive_veto_blocks"] += 1
+            continue
+        parent[rb] = ra
+        members[ra] = joined
+        del members[rb]
+    clusters = [sorted(m) for m in members.values() if len(m) > 1]
+    diag["clusters_formed"] = len(clusters)
+    for cluster in clusters:
+        # Survivor: the fullest form (most name tokens once titles
+        # and noise are stripped), then the most-attested entry
+        # (appearances, then chapter spread), then key order — a
+        # total order, so the same verdicts always fold the same way.
+        survivor = sorted(
+            cluster,
+            key=lambda k: (-len(_strip_merge_noise(k)),
+                           -roster[k].get("appearances", 0),
+                           -len(roster[k].get("chapters") or ()),
+                           k))[0]
+        for drop in cluster:
+            if drop != survivor:
+                _merge_roster_entries(roster, survivor, drop)
+                diag["merges_applied"] += 1
+    return diag
+
+
 def _v2_char_confidence(appearances, has_verified_evidence):
     """Evidence-based character confidence (replaces legacy hit-count formula).
 
@@ -21957,7 +22426,7 @@ _HISTORY_NOSB_WARNED = False     # missing-Supabase warning fires once
 # list (plus the model/threshold stamps), so nothing else in CONFIG —
 # keys, endpoints, paths — can leak into the mirror by convenience.
 _HISTORY_FLAG_KEYS = (
-    "use_corpus", "corpus_only", "evidence_retrieval",
+    "use_corpus", "corpus_only", "evidence_retrieval", "jev_merge",
     "roster_reconcile", "staging_gate", "persist_roster",
     "corpus_quotes", "emit_run_events", "rename_no_isbn",
     "decision_model", "dedupe")
@@ -24277,7 +24746,7 @@ _TELEMETRY_DECISION_ELAPSED = {}
 # is one stage with two consumers (family runs before non-family
 # in pipeline order, but both judge relationship claims).
 _TELEMETRY_DECISION_STAGES = (
-    ("merge", ("merge_tier3",)),
+    ("merge", ("merge_tier3", "jev_merge")),
     ("relationship", ("rel_family", "rel_nonfamily")),
     ("trigger", ("trigger_gate",)),
     ("quote", ("quote_poll",)),
@@ -24552,6 +25021,19 @@ def _dm_budget_pool():
 #   reserve. This closes the phase-1 bypass (untagged claims
 #   used to keep whole-pool semantics and could silently defeat
 #   the floor — recorded as a PASS_WITH_RISK item in 2.13.18).
+# - jev_merge (NO entry in the dict below): the --jev-merge
+#   bake-off's merge pass. It is not part of this scheme — the
+#   dict is a config-fingerprint input and must stay identical
+#   on runs that never use the flag — so its key lives only in
+#   _DM_BUDGET_ORDER, where a missing reserve reads as the zero
+#   it carries. The pass funds itself instead: before judging,
+#   it tops the pool up by exactly its nominated, non-vetoed
+#   pair count (_dm_budget_jev_merge_topup) and claims once per
+#   pair under its own key, so its spend is fully covered by
+#   its own addition and it never draws on the slices above.
+#   It sits LAST in pipeline order, so its presence can neither
+#   unlock borrowing nor add protection for any consumer that
+#   runs ahead of it.
 _DM_BUDGET_RESERVES = {
     "merge_tier3": 10,
     "rel_family": 10,
@@ -24563,7 +25045,7 @@ _DM_BUDGET_RESERVES = {
 }
 _DM_BUDGET_ORDER = ("merge_tier3", "rel_family", "rel_nonfamily",
                     "trigger_gate", "quote_poll", "discovery",
-                    "untagged")
+                    "untagged", "jev_merge")
 _DM_BUDGET_FINISHED = set()
 # Kept for the phase-1 tests and code that reference the floor by
 # name: the trigger reserve IS the old provisional floor.
@@ -24675,6 +25157,43 @@ def _dm_budget_resize_pool(relationship_census):
         if new_pool > _DM_BUDGET_POOL:
             _DM_BUDGET_POOL = new_pool
         return _DM_BUDGET_POOL
+
+
+def _dm_budget_jev_merge_topup(pairs):
+    """Add the --jev-merge bake-off's own allowance to the armed
+    pool and return the pool in force.
+
+    The bake-off replaces both algorithmic merge stages with the
+    judge, and the question it exists to answer — is the judge
+    better than the algorithm? — is only answered if EVERY
+    nominated, non-vetoed pair is actually judged. The shared
+    pool cannot fund that: it opens at one call per chapter and
+    protects the later stages' reserves against the first
+    consumer, so on a real book most pairs would be skipped
+    unjudged and the run would measure budget starvation, not
+    judgment. The pass therefore funds itself additively: the
+    pool grows by exactly the number of pairs about to be
+    judged, and the pass claims once per pair under its own
+    consumer key ("jev_merge"), so every call it spends is
+    matched by a call it added. The reserves are never drawn
+    on, and the pool the later stages draw on is exactly what
+    it would have been without the flag — the addition and the
+    spend cancel before any other stage claims.
+
+    Only jev_merge_pass calls this, only on a --jev-merge run
+    with a live judge, and only for the pairs that survived the
+    NO veto: nothing here runs on a normal run, and a vetoed
+    pair is never funded."""
+    global _DM_BUDGET_POOL
+    try:
+        pairs = int(pairs)
+    except (TypeError, ValueError):
+        pairs = 0
+    pairs = max(0, pairs)
+    if pairs:
+        with _DM_BUDGET_LOCK:
+            _DM_BUDGET_POOL += pairs
+    return _dm_budget_pool()
 
 
 def _dm_budget_arm_seq():
@@ -28266,7 +28785,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     # canonicalize it once with the whole book sighted, before the
     # post-pass merge and the reduce consume it. Deterministic.
     _recon_stats = None
-    if CONFIG.get("roster_reconcile"):
+    if CONFIG.get("roster_reconcile") and not CONFIG.get("jev_merge"):
         _recon_stats = _roster_reconcile(roster, no_pairs=_no_pairs)
         print(f"  Roster reconcile: {_recon_stats['entries_before']} -> "
               f"{_recon_stats['entries_after']} entries "
@@ -28288,13 +28807,29 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     # Post-pass character merge (Tier 1/2 deterministic + Tier 3 decision
     # model). Runs after all chapters, before the reduce, so v2_reduce sees
     # the final merged roster and relationships canonical-remap correctly.
-    _pp_merged, _pp_possible = post_pass_merge(
-        roster, validator=_DECISION_VALIDATOR, no_pairs=_no_pairs)
-    if _pp_merged:
-        print(f"  Post-pass merge: {_pp_merged} roster entries merged")
-    if _pp_possible:
-        print(f"  Post-pass merge: {len(_pp_possible)} ambiguous pairs "
-              f"left for review")
+    # --jev-merge bake-off replaces BOTH merge stages (the reconcile
+    # above is skipped too): the raw roster goes to jev_merge_pass and
+    # only the decision model's YES verdicts fold it.
+    _merge_judge_stats = None
+    if CONFIG.get("jev_merge"):
+        _pp_merged, _pp_possible = 0, []
+        _merge_judge_stats = jev_merge_pass(
+            roster, chapters, validator=_DECISION_VALIDATOR,
+            no_pairs=_jev_merge_no_pairs(title, author, identifiers))
+        print(f"  Jev merge bake-off: "
+              f"{_merge_judge_stats['pairs_nominated']} pairs nominated, "
+              f"{_merge_judge_stats['pairs_judged']} judged, "
+              f"{len(_merge_judge_stats['vetoed'])} vetoed, "
+              f"{_merge_judge_stats['merges_applied']} entries merged "
+              f"into {_merge_judge_stats['clusters_formed']} clusters")
+    else:
+        _pp_merged, _pp_possible = post_pass_merge(
+            roster, validator=_DECISION_VALIDATOR, no_pairs=_no_pairs)
+        if _pp_merged:
+            print(f"  Post-pass merge: {_pp_merged} roster entries merged")
+        if _pp_possible:
+            print(f"  Post-pass merge: {len(_pp_possible)} ambiguous pairs "
+                  f"left for review")
 
     # Option B seam (design section 7): ONE identity assignment
     # point, after the post-pass merge and before the reduce, over
@@ -28859,6 +29394,10 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     }
     if _recon_stats is not None:
         result["roster_reconcile"] = _recon_stats
+    if _merge_judge_stats is not None:
+        # The bake-off's scoreboard: present only on --jev-merge runs,
+        # so flag-off artefacts stay byte-identical to before.
+        result["merge_judge"] = _merge_judge_stats
     if _sp_ctx is not None:
         # The priors' footprint on this book (counts only), so
         # the Phase 3 eval can weigh what the hints did. Absent
@@ -30074,7 +30613,7 @@ _PROFILE_PERSISTABLE = frozenset({
     "dedupe", "discovery_embedding_rank", "discovery_shadow",
     "dry_run", "emit_run_events", "emit_uncertainty",
     "evidence_retrieval", "explain_blocks", "full", "hardcover",
-    "jobs", "learn",
+    "jev_merge", "jobs", "learn",
     "llm", "min_frequency", "no_viz", "persist_roster", "pipeline",
     "preview", "preview_summary", "principals_only", "prompt_cache",
     "rename_no_isbn", "roster_reconcile", "run_history", "sample",
@@ -30330,6 +30869,14 @@ def _build_parser():
                          "reconciliation after Call A — mutual alias "
                          "claims and learned links merge, stale alias "
                          "pollution is pruned (default off)")
+    g_merge.add_argument("--jev-merge", action="store_true",
+                    help="bake-off experiment (v2): skip roster "
+                         "reconcile and the post-pass merge entirely; "
+                         "deterministic signals nominate character "
+                         "pairs, recorded cannot-link NOs veto them, "
+                         "and the decision model judges each remaining "
+                         "pair from an evidence packet — only its YES "
+                         "verdicts merge (default off)")
     g_merge.add_argument("--staging-gate", action="store_true",
                     help="option F (v2): gate-band trope claims and "
                          "evidence-less trigger claims stage locally "
@@ -31174,6 +31721,8 @@ def main():
         UI._show_matrices = True
     if args.roster_reconcile:
         CONFIG["roster_reconcile"] = True
+    if getattr(args, "jev_merge", False):
+        CONFIG["jev_merge"] = True
     if getattr(args, "hardcover", False):
         CONFIG["hardcover"] = True
     if getattr(args, "hardcover_refresh", False):
