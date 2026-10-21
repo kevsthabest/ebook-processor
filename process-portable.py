@@ -48,7 +48,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.79"
+PORTABLE_VERSION = "2.13.80"
 
 
 import argparse
@@ -16682,10 +16682,17 @@ def _roster_claim_keys(entry):
     return keys
 
 
-def _roster_reconcile(roster, no_pairs=()):
+def _roster_reconcile(roster, no_pairs=(), prune_only=False):
     """Deterministic whole-roster reconciliation (Experiment 1,
     --roster-reconcile). Runs ONCE after Call A completes, before
     post_pass_merge / v2_reduce consume the roster. Mutates roster.
+
+    prune_only (the --jev-merge janitor mode): passes 1+2 are
+    skipped entirely — merging is the judge's job on that path —
+    and only pass 3's pruning runs, as deterministic hygiene ahead
+    of judging. The end state the pruning guarantees (shadowed and
+    NO-banned aliases gone) is identical on both paths; which
+    mechanism folded two entries into one is not.
 
     Call A builds the roster chapter by chapter, so alias claims are
     judged against a partial roster: a claim adopted in ch. 2 may be
@@ -16753,7 +16760,7 @@ def _roster_reconcile(roster, no_pairs=()):
     # sorted for determinism; each merge shrinks the roster.
     _vetoed_pairs = set()
     _changed = True
-    while _changed:
+    while _changed and not prune_only:
         _changed = False
         prim = {}
         for k, e in roster.items():
@@ -17385,30 +17392,295 @@ def _jev_entry_snippets(key, entry, chapters_by_index, cache):
     return out
 
 
-def _jev_merge_packet(ka, ea, kb, eb, chapters_by_index, snip_cache):
-    """The evidence packet one pair is judged on: both entries' name
-    forms and alias lists, chapter-set sizes, best descriptions, and
-    verbatim snippets from each entry's own chapters."""
+# The reading-brief block heading the v2 packet. It rides in the
+# packet state, NOT in _SAME_PERSON_INSTRUCTIONS: Tier 3 and the
+# packet path share those instructions byte-for-byte (the eval
+# harness pins them), and this block teaches the judge how to weigh
+# THIS packet's fact classes — it is part of the brief, not of the
+# question. No fact about the pair appears here; the block is the
+# same for every pair in every book.
+_JEV_BRIEF_BLOCK = (
+    "HOW TO READ THIS BRIEF: the sections below are evidence about "
+    "the two entries, not verdicts, and no section decides the "
+    "answer by itself. Two entries whose forms never share a "
+    "chapter despite many appearances each — especially when a "
+    "bridging or definitional passage links them — are strong "
+    "evidence of one person sighted under two names. A shared "
+    "surname by itself is weak evidence: entries that appear "
+    "together in the same chapters, keep different company (disjoint "
+    "frequent companions) and carry separate definitional passages "
+    "are usually two people who share a name. Lines labelled CLAIM "
+    "record what an earlier extraction pass guessed; they count "
+    "only when the passages support them."
+)
 
-    def _side(tag, key, entry):
-        lines = [f"Character {tag}: {entry.get('name', key)}"]
+
+def _jev_sentences(text):
+    """Sentences of a chapter text, in order (the split convention
+    the snippet builder already used)."""
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "")
+            if s.strip()]
+
+
+def _jev_entry_forms(entry):
+    """Display forms an entry answers to: its name plus its aliases,
+    longest first (the longer form is the more specific match)."""
+    return sorted({f for f in [entry.get("name") or ""]
+                   + list(entry.get("aliases") or ()) if len(f) >= 3},
+                  key=len, reverse=True)
+
+
+def _jev_cooccurrence_lines(ea, eb):
+    """(lines, shared_count): deterministic chapter-set facts for
+    the pair — how much of the book each form covers, how much they
+    share, and, for two chapter-rich forms that never share a
+    chapter, the explicit never-co-listed statement: that absence
+    is the classic one-person-two-names signature (the deterministic
+    reconcile treats its inverse — co-listing — as a cannot-link).
+    A chapter-poor side proves nothing by its absence, so the
+    statement is made only when both sides appear in >= 3 chapters."""
+    cha = set(ea.get("chapters") or ())
+    chb = set(eb.get("chapters") or ())
+    shared = len(cha & chb)
+    lines = [f"Shared chapters: {shared} (A appears in {len(cha)}, "
+             f"B in {len(chb)})"]
+    if not shared and len(cha) >= 3 and len(chb) >= 3:
+        lines.append(
+            "Never co-listed: these forms never appear in the same "
+            "chapter, though each appears in several.")
+    return lines, shared
+
+
+def _jev_bridging(ea, eb, chapters_by_index):
+    """(lines, count): verbatim passages linking the two entries'
+    forms — sentences carrying forms of BOTH entries first (up to
+    3), then sentence windows where the two sides' forms sit within
+    +/-2 sentences of each other (up to 2), the evidence-window
+    convention the relationship validator uses. Searched over the
+    union of the two entries' chapters: a linking sentence lives
+    where at least one side was sighted."""
+    fa = [f.lower() for f in _jev_entry_forms(ea)]
+    fb = [f.lower() for f in _jev_entry_forms(eb)]
+
+    def _hits(forms, lowered):
+        return [i for i, s in enumerate(lowered)
+                if any(f in s for f in forms)]
+
+    both, windows = [], []
+    seen = set()
+    union = sorted(set(ea.get("chapters") or ())
+                   | set(eb.get("chapters") or ()))
+    for idx in union:
+        text = chapters_by_index.get(idx)
+        if not text:
+            continue
+        sents = _jev_sentences(text)
+        lowered = [s.lower() for s in sents]
+        hits_a = _hits(fa, lowered)
+        hits_b = set(_hits(fb, lowered))
+        for i in hits_a:
+            if i in hits_b and len(both) < 3:
+                passage = sents[i][:260]
+                if passage not in seen:
+                    seen.add(passage)
+                    both.append(passage)
+        if len(windows) < 2:
+            for i in hits_a:
+                for j in sorted(hits_b):
+                    if i != j and abs(i - j) <= 2:
+                        lo, hi = min(i, j), max(i, j)
+                        passage = " ".join(sents[lo:hi + 1])[:500]
+                        if passage not in seen:
+                            seen.add(passage)
+                            windows.append(passage)
+                        break
+                if len(windows) >= 2:
+                    break
+    lines = []
+    if both or windows:
+        lines.append("Bridging passages (verbatim):")
+        lines.extend(both)
+        lines.extend(windows)
+    return lines, len(both) + len(windows)
+
+
+def _jev_definitional(key, entry, chapters_by_index, cache,
+                      snip_cache):
+    """(sentences, pattern_count, is_fallback): identity-pattern
+    sentences for one entry's forms — appositives ("X, the ..."),
+    "known as X", copula introductions ("X was a ...") — harvested
+    deterministically, up to 2. When no pattern matches anywhere,
+    the entry's first-mention sentence stands in, LABELLED as a
+    first mention rather than a definition: first mentions are
+    disproportionately definitional in fiction, but the judge
+    should know which kind of evidence it is reading."""
+    if key in cache:
+        return cache[key]
+    pats = []
+    for f in _jev_entry_forms(entry):
+        ef = re.escape(f)
+        pats.append(re.compile(ef + r"\s*,\s+the\s+", re.I))
+        pats.append(re.compile(r"known as\s+" + ef + r"\b", re.I))
+        pats.append(re.compile(ef + r"\s*,\s+known as\s+", re.I))
+        pats.append(re.compile(
+            ef + r"\s+(?:was|is)\s+(?:a|an|the)\s+", re.I))
+    found = []
+    for idx in sorted(entry.get("chapters") or ()):
+        text = chapters_by_index.get(idx)
+        if not text:
+            continue
+        for s in _jev_sentences(text):
+            if any(p.search(s) for p in pats) and s[:260] not in found:
+                found.append(s[:260])
+                if len(found) >= 2:
+                    break
+        if len(found) >= 2:
+            break
+    if found:
+        result = (found, len(found), False)
+    else:
+        snips = _jev_entry_snippets(key, entry, chapters_by_index,
+                                    snip_cache)
+        result = (([snips[0]], 0, True) if snips else ([], 0, False))
+    cache[key] = result
+    return result
+
+
+def _jev_partner_lines(roster, ka, kb):
+    """Scene-partner contrast: each entry's top-5 co-present other
+    roster entries (shared-chapter counts). Overlapping company
+    supports one person; disjoint company with distinct regulars
+    argues two people who share a name. Computed from the roster's
+    chapter sets — who is sighted in a chapter together."""
+    by_chapter = {}
+    for k, e in roster.items():
+        for c in e.get("chapters") or ():
+            by_chapter.setdefault(c, []).append(k)
+    partners = {k: Counter() for k in roster}
+    for ks in by_chapter.values():
+        for k in ks:
+            for other in ks:
+                if other != k:
+                    partners[k][other] += 1
+    lines = []
+    for tag, k in (("A", ka), ("B", kb)):
+        top = sorted(
+            partners.get(k, {}).items(),
+            key=lambda kv: (-kv[1],
+                            roster[kv[0]].get("name", kv[0])))[:5]
+        if top:
+            lines.append(
+                f"Frequent companions {tag}: " + ", ".join(
+                    f"{roster[ok].get('name', ok)} ({n})"
+                    for ok, n in top))
+        else:
+            lines.append(
+                f"Frequent companions {tag}: (shares chapters with "
+                f"no other roster entry)")
+    return lines
+
+
+def _jev_provenance_lines(ka, ea, kb, eb, learned):
+    """Claim provenance: what earlier passes GUESSED about this
+    pair — the extractor's alias claims between the two entries
+    (either entry claiming a form the other owns) and learned or
+    manual nickname links between them. Labelled as CLAIMS, never
+    stated as facts: a claim is a hypothesis the passages may or
+    may not support. Cannot-link status never appears here —
+    ruled pairs are vetoed before judging and the judge never
+    sees them."""
+    owned_a = {ka} | set(ea.get("primary_keys") or ())
+    owned_b = {kb} | set(eb.get("primary_keys") or ())
+    lines = []
+    for c in sorted(_roster_claim_keys(ea) & owned_b):
+        lines.append(f"CLAIM: entry A claimed B's form '{c}' as its "
+                     f"own alias or mention")
+    for c in sorted(_roster_claim_keys(eb) & owned_a):
+        lines.append(f"CLAIM: entry B claimed A's form '{c}' as its "
+                     f"own alias or mention")
+    if learned is not None and getattr(learned, "enabled", False):
+        for pk in sorted(ea.get("primary_keys") or ()):
+            tgt = learned.nick_lookup(pk)
+            if tgt and tgt in owned_b:
+                lines.append(f"CLAIM: a learned/manual link maps A's "
+                             f"form '{pk}' to B's form '{tgt}'")
+        for pk in sorted(eb.get("primary_keys") or ()):
+            tgt = learned.nick_lookup(pk)
+            if tgt and tgt in owned_a:
+                lines.append(f"CLAIM: a learned/manual link maps B's "
+                             f"form '{pk}' to A's form '{tgt}'")
+    if lines:
+        return ["Claims (unverified — recorded by earlier passes, "
+                "not evidence):"] + lines
+    return []
+
+
+def _jev_merge_packet(ka, ea, kb, eb, chapters_by_index, snip_cache,
+                      roster=None, def_cache=None, learned=None):
+    """The v2 evidence brief one pair is judged on (packet spec §2):
+    identity cards, co-occurrence facts, bridging passages,
+    definitional passages, scene-partner contrast and claim
+    provenance, over the v1 own-chapter snippets kept as
+    supplementary evidence. Deterministic code computes and states
+    the facts; the judge reads evidence. No matcher score or
+    similarity number appears anywhere in the brief — the judge
+    must not anchor on the nominating signal's opinion.
+
+    Returns (packet_text, facts) where facts carries the counts
+    the diagnostics record per verdict: shared_chapters,
+    bridging_found, definitional_found."""
+    if def_cache is None:
+        def_cache = {}
+
+    def _card(tag, key, entry):
+        out = [f"Character {tag}: {entry.get('name', key)}"]
         forms = [entry.get("name", key)] + sorted(entry.get("aliases")
                                                   or ())
-        lines.append(f"Name forms {tag}: "
-                     + "; ".join(forms)[:400])
-        lines.append(f"Chapters {tag}: "
-                     f"{len(entry.get('chapters') or ())}")
+        out.append(f"Name forms {tag}: "
+                   + "; ".join(forms)[:400])
+        chs = set(entry.get("chapters") or ())
+        out.append(f"Chapters {tag}: {len(chs)}")
+        if chs:
+            out.append(f"Chapter range {tag}: first {min(chs)}, "
+                       f"last {max(chs)}")
+        out.append(f"Appearances {tag}: "
+                   f"{entry.get('appearances', 0)} mentions")
         desc = _roster_best_desc(entry)
         if desc:
-            lines.append(f"Description {tag}: {desc[:600]}")
+            out.append(f"Description {tag}: {desc[:600]}")
+        return out
+
+    lines = [_JEV_BRIEF_BLOCK, ""]
+    lines += _card("A", ka, ea)
+    lines += _card("B", kb, eb)
+    co_lines, shared = _jev_cooccurrence_lines(ea, eb)
+    lines += co_lines
+    br_lines, br_n = _jev_bridging(ea, eb, chapters_by_index)
+    lines += br_lines
+    def_block = []
+    def_n = 0
+    for tag, key, entry in (("A", ka, ea), ("B", kb, eb)):
+        sents, n, is_fb = _jev_definitional(
+            key, entry, chapters_by_index, def_cache, snip_cache)
+        def_n += n
+        for s in sents:
+            label = "First mention" if is_fb else "Definitional"
+            def_block.append(f"{label} {tag}: {s}")
+    if def_block:
+        lines.append("Definitional passages:")
+        lines += def_block
+    if roster is not None:
+        lines += _jev_partner_lines(roster, ka, kb)
+    lines += _jev_provenance_lines(ka, ea, kb, eb, learned)
+    for tag, key, entry in (("A", ka, ea), ("B", kb, eb)):
         snips = _jev_entry_snippets(key, entry, chapters_by_index,
                                     snip_cache)
         if snips:
             lines.append(f"Evidence {tag}:")
             lines.extend(snips)
-        return lines
-
-    return "\n".join(_side("A", ka, ea) + _side("B", kb, eb))
+    facts = {"shared_chapters": shared, "bridging_found": br_n,
+             "definitional_found": def_n}
+    return "\n".join(lines), facts
 
 
 def _jev_merge_no_pairs(title, author, identifiers):
@@ -17500,7 +17772,8 @@ def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
     Judge merges are NOT recorded into learned state: an experiment's
     folds must not become next run's learned links before the
     experiment is scored."""
-    diag = {"pairs_nominated": 0, "pairs_judged": 0,
+    diag = {"packet_version": 2,
+            "pairs_nominated": 0, "pairs_judged": 0,
             "merges_applied": 0, "clusters_formed": 0,
             "vetoed": [], "verdicts": [], "transitive_veto_blocks": 0,
             "budget_topup": 0, "intra_entry_prunes": []}
@@ -17573,6 +17846,13 @@ def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
             and not getattr(validator, "disabled", False):
         diag["budget_topup"] = len(to_judge)
         _dm_budget_jev_merge_topup(len(to_judge))
+    try:
+        _learned = _learn()
+    except Exception:
+        _learned = None
+    def_cache = {}
+    _no_facts = {"shared_chapters": None, "bridging_found": None,
+                 "definitional_found": None}
     yes_pairs = []
     for ka, kb in to_judge:
         ea, eb = roster[ka], roster[kb]
@@ -17580,15 +17860,16 @@ def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
         if validator is None or getattr(validator, "disabled", False):
             diag["verdicts"].append(
                 {"a": name_a, "b": name_b, "verdict": "skipped",
-                 "confidence": None})
+                 "confidence": None, **_no_facts})
             continue
         if not _dm_budget_claim(1, consumer="jev_merge"):
             diag["verdicts"].append(
                 {"a": name_a, "b": name_b, "verdict": "skipped",
-                 "confidence": None})
+                 "confidence": None, **_no_facts})
             continue
-        state = _jev_merge_packet(ka, ea, kb, eb, chapters_by_index,
-                                  snip_cache)
+        state, _facts = _jev_merge_packet(
+            ka, ea, kb, eb, chapters_by_index, snip_cache,
+            roster=roster, def_cache=def_cache, learned=_learned)
         _t0 = time.monotonic()
         try:
             _merged, _p = validator.ask_same_person_packet(state)
@@ -17599,14 +17880,15 @@ def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
         if _merged is None:
             diag["verdicts"].append(
                 {"a": name_a, "b": name_b, "verdict": "error",
-                 "confidence": None})
+                 "confidence": None, **_facts})
             print(f"  Jev merge: {name_a[:40]} vs {name_b[:40]}: "
                   f"judge error — kept separate")
             continue
         diag["verdicts"].append(
             {"a": name_a, "b": name_b,
              "verdict": "yes" if _merged else "no",
-             "confidence": round(_p, 4) if _p is not None else None})
+             "confidence": round(_p, 4) if _p is not None else None,
+             **_facts})
         print(f"  Jev merge: {name_a[:40]} vs {name_b[:40]}: "
               f"P(yes)={_p:.2f} → "
               f"{'merge' if _merged else 'keep separate'}")
@@ -28785,7 +29067,20 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     # canonicalize it once with the whole book sighted, before the
     # post-pass merge and the reduce consume it. Deterministic.
     _recon_stats = None
-    if CONFIG.get("roster_reconcile") and not CONFIG.get("jev_merge"):
+    if CONFIG.get("jev_merge"):
+        # Janitor clause (packet spec §6.2): under --jev-merge the
+        # reconcile's MERGES stay skipped — folding is the judge's
+        # job — but its pruning is retained as deterministic hygiene
+        # ahead of judging. Bake-off run 1's roster carried polluted
+        # aliases (one principal holding two other people's name
+        # forms) precisely because skipping the reconcile removed
+        # the janitor along with the merger.
+        _recon_stats = _roster_reconcile(roster, no_pairs=_no_pairs,
+                                         prune_only=True)
+        print(f"  Roster janitor (--jev-merge): "
+              f"{_recon_stats['aliases_pruned']} polluted aliases "
+              f"pruned, merges left to the Jev pass")
+    elif CONFIG.get("roster_reconcile"):
         _recon_stats = _roster_reconcile(roster, no_pairs=_no_pairs)
         print(f"  Roster reconcile: {_recon_stats['entries_before']} -> "
               f"{_recon_stats['entries_after']} entries "
@@ -28808,8 +29103,9 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     # model). Runs after all chapters, before the reduce, so v2_reduce sees
     # the final merged roster and relationships canonical-remap correctly.
     # --jev-merge bake-off replaces BOTH merge stages (the reconcile
-    # above is skipped too): the raw roster goes to jev_merge_pass and
-    # only the decision model's YES verdicts fold it.
+    # above runs prune-only as janitor): the roster goes to
+    # jev_merge_pass and only the decision model's YES verdicts
+    # fold it.
     _merge_judge_stats = None
     if CONFIG.get("jev_merge"):
         _pp_merged, _pp_possible = 0, []
