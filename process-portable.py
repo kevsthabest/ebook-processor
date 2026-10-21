@@ -18308,12 +18308,20 @@ def cmd_stage_merge(fpath):
     book file (spec §4): the file locates the book and re-derives
     its chapters through the shared acquisition path — Stage M's
     packets are built from chapter text, which the checkpoint set
-    deliberately does not store (it stores Call A/B payloads) — and
-    the recomputed book fingerprint must match the stamp's, so the
-    chapters are PROVEN to be the extraction's own before any
-    packet is built from them. Every unmet precondition is a
-    legible hard stop; the entry never extracts or otherwise runs
-    an upstream stage to fill a gap (spec R4)."""
+    deliberately does not store (it stores Call A/B payloads). The
+    re-derived chapters are checked against the stamp before any
+    packet is built from them, but those checks prove less than
+    whole-text identity, and the limits matter: the fingerprint
+    ties the file to the extraction through its identifiers, its
+    normalized title/author, and a sample of the book's OPENING
+    text, and the chapter-count check below ties the shape — two
+    editions sharing an opening and a chapter count would pass
+    both. That is the parse path's ceiling; the --use-corpus path
+    is stronger, because corpus acquisition is keyed by the
+    file's bytes hash, so corpus-sourced chapters are the
+    extraction's own bytes, not a lookalike's. Every unmet
+    precondition is a legible hard stop; the entry never extracts
+    or otherwise runs an upstream stage to fill a gap (spec R4)."""
     fpath = Path(fpath)
     if not fpath.is_file():
         print(f"  --stage merge: file not found: {fpath}")
@@ -18379,6 +18387,21 @@ def cmd_stage_merge(fpath):
               f"{_fp[:12]}… vs {stamp['book_fingerprint'][:12]}…) — "
               f"refusing to merge one book's roster against another "
               f"book's text. Nothing was run.")
+        return 1
+    # The fingerprint samples only the opening text, so it cannot
+    # see a different edition hiding behind the same opening — but
+    # such an edition usually betrays itself in the chapter count.
+    # The stamp's total is the extraction's own chapter-slot count
+    # (meta's total, slots incl. front/back matter), and len() of
+    # the acquired set counts the same slots through the same
+    # acquisition path, so the two counts are directly comparable.
+    _stamp_total = stamp.get("total_chapters")
+    if not isinstance(_stamp_total, int) or len(chapters) != _stamp_total:
+        print(f"  --stage merge: {fpath.name} parses to "
+              f"{len(chapters)} chapters but the stamped extraction "
+              f"covers {_stamp_total} — refusing to merge against a "
+              f"chapter set the extraction did not produce. Nothing "
+              f"was run.")
         return 1
     print(f"Stage M (merge) for {fpath.name}: extraction stamped by "
           f"portable v{stamp.get('processor_version')}, "

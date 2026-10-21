@@ -577,6 +577,33 @@ class TestCmdStageMerge(_TmpCheckpointCase):
         self.assertEqual(rc, 1)
         self.assertIn("fingerprint", out.lower())
 
+    def test_chapter_count_mismatch_refuses(self):
+        # The edition attack the fingerprint cannot see: it samples
+        # only the opening text, so the same book under a different
+        # edition — identical opening, extra chapters behind it —
+        # recomputes the SAME fingerprint (asserted here, so the
+        # refusal below can only have come from the count check).
+        # The stamp's total is the extraction's chapter-slot count;
+        # a re-derived set with a different count is not the chapter
+        # set the extraction produced, and merging against it would
+        # build packets from text the extraction never saw.
+        self._seed_extraction()
+        longer = copy.deepcopy(_CHAPTERS) + [
+            {"index": 3, "label": "Ch 4",
+             "text": "An extra chapter the extraction never saw, "
+                     "appended behind an identical opening."}]
+        self.assertEqual(
+            pp._checkpoint_fingerprint(
+                IDENTIFIERS, TITLE, AUTHOR,
+                pp._checkpoint_text_sample(longer)),
+            _fingerprint())
+        rc, out = self._run_cmd(acquire=self._acquire(chapters=longer))
+        self.assertEqual(rc, 1)
+        self.assertIn("4 chapters", out)
+        self.assertIn("covers 3", out)
+        self.assertFalse((Path(self._tmp) / "stagebook"
+                          / "merged-roster.json").exists())
+
     def test_cross_version_stamp_warns_and_proceeds(self):
         self._seed_extraction()
         self._edit_stamp("stagebook", processor_version="2.13.50")
