@@ -50,7 +50,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.82"
+PORTABLE_VERSION = "2.13.83"
 
 
 import argparse
@@ -28256,6 +28256,23 @@ _CHECKPOINT_FLAGS = (
     "decision_model", "decision_model_provider", "only_chunks",
 )
 
+# Stage-split step 1 (spec §3): the extraction's own flag identity.
+# _CHECKPOINT_FLAGS welds the decision-model keys into the hash that
+# validates a stored extraction, so re-judging a book under another
+# judge reads as a different extraction. The extraction subset is
+# everything that shapes what gets EXTRACTED; judge settings are a
+# downstream stage's identity, not this one's. only_chunks stays: it
+# selects which chapters exist in the artefact set at all.
+_EXTRACTION_FLAGS = tuple(
+    k for k in _CHECKPOINT_FLAGS
+    if k not in ("decision_model", "decision_model_provider"))
+
+# Version of the checkpoint artefact FORMAT (the chapter payload set
+# + meta + the extraction stamp). Bumped only when the on-disk shape
+# changes incompatibly; consumers hard-stop on a format mismatch
+# (spec §3), while a mere processor-version difference only warns.
+_ARTEFACT_FORMAT_VERSION = 1
+
 
 def _checkpoint_book_key(fpath):
     """Safe directory name for a book's checkpoints."""
@@ -28322,6 +28339,22 @@ def _checkpoint_flags_hash():
     import json as _js
     vals = {k: CONFIG.get(k) for k in _CHECKPOINT_FLAGS}
     vals["_code_sha"] = _git_commit_sha() or "unknown"
+    return _hl.sha256(_js.dumps(vals, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _extraction_flags_hash():
+    """Hash of the extraction-affecting CONFIG values alone.
+
+    Mirrors _checkpoint_flags_hash's construction with two deliberate
+    differences: the decision-model keys are excluded (judging is a
+    downstream stage's identity — flipping the judge must not
+    re-identify the extraction), and the git SHA is excluded
+    (artefacts are data: an extraction's identity must survive the
+    code being rebuilt or updated after the extraction was written).
+    """
+    import hashlib as _hl
+    import json as _js
+    vals = {k: CONFIG.get(k) for k in _EXTRACTION_FLAGS}
     return _hl.sha256(_js.dumps(vals, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -28522,6 +28555,172 @@ def _checkpoint_save_roster(book_key, roster):
     d.mkdir(parents=True, exist_ok=True)
     with open(d / "roster.json", "w", encoding="utf-8") as f:
         json.dump(_ckpt_json_safe(roster), f, ensure_ascii=False)
+
+
+def _extraction_chapter_coverage(book_key):
+    """(present, total): chapter payloads on disk vs meta's total.
+
+    A payload counts when its file parses and its index is within
+    meta's total — _checkpoint_load's own validity rule (an index
+    beyond the total is a longer book's leftover in a shared stem
+    directory, not this book's coverage). total is None when no
+    readable meta exists. Never raises: downstream stages ask this
+    before trusting a directory, so a corrupt artefact must read as
+    no coverage rather than crash the asker.
+    """
+    d = _checkpoint_dir(book_key)
+    mp = d / "meta.json"
+    if not mp.is_file():
+        return 0, None
+    try:
+        meta = json.load(open(mp, encoding="utf-8"))
+    except Exception:
+        return 0, None
+    if not isinstance(meta, dict):
+        return 0, None
+    total = meta.get("total_chapters")
+    if not isinstance(total, int) or total <= 0:
+        return 0, None
+    present = 0
+    for cp in d.glob("chapter_*.json"):
+        try:
+            idx = int(cp.stem.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        if idx > total:
+            continue
+        try:
+            json.load(open(cp, encoding="utf-8"))
+        except Exception:
+            continue  # a truncated payload is not coverage
+        present += 1
+    return present, total
+
+
+def _checkpoint_save_extraction_stamp(book_key, fingerprint=None,
+                                      payload_chapters=None):
+    """Stamp a COMPLETED extraction into its checkpoint directory.
+
+    Called once, at the seam where the v2 chapter loop has finished
+    the whole chapter set without aborting — fresh runs and --resume
+    runs that complete the set both flow through it. The stamp is the
+    Stage-E artefact contract (stage-split spec §1): later stages
+    consume the extraction through it instead of reaching into a
+    live run.
+
+    Completeness is claimed only when the payloads on disk actually
+    cover the run's expectation. payload_chapters is the number of
+    chapter payload files a finished extraction of this book leaves:
+    front/back-matter chapters hold slots in meta's total but never
+    produce payloads, so the expectation can sit below the total.
+    When coverage cannot be verified, nothing is written — an absent
+    stamp is the incomplete signal, and a later completion can still
+    land one. Returns True when the stamp was written.
+
+    The write is atomic (temp file + os.replace): a crash mid-write
+    leaves no stamp rather than a truncated one a reader might trust.
+    """
+    if _REPLAY_CTX is not None:
+        return False  # replay never writes into the snapshot (spine §3.4)
+    d = _checkpoint_dir(book_key)
+    present, total = _extraction_chapter_coverage(book_key)
+    if total is None:
+        return False
+    expected = payload_chapters
+    if not isinstance(expected, int) or expected <= 0:
+        expected = total
+    if present < expected:
+        return False
+    meta = {}
+    try:
+        meta = json.load(open(d / "meta.json", encoding="utf-8"))
+    except Exception:
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    models = _history_models()
+    stamp = {
+        "book_key": book_key,
+        "book_fingerprint": fingerprint or meta.get("fingerprint"),
+        "artefact_format_version": _ARTEFACT_FORMAT_VERSION,
+        "processor_version": PORTABLE_VERSION,
+        "extraction_flags_hash": _extraction_flags_hash(),
+        "flags_hash": _checkpoint_flags_hash(),
+        "extraction_flags": {k: CONFIG.get(k) for k in _EXTRACTION_FLAGS},
+        "extractor": {"backend": models.get("llm_backend"),
+                      "model": models.get("llm_model")},
+        "total_chapters": total,
+        "payload_chapters": expected,
+        "chapters_present": present,
+        "complete": True,
+        "written_at": time.time(),
+    }
+    p = d / "extraction.json"
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(stamp, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, p)
+    return True
+
+
+def _load_extraction_stamp(book_key):
+    """Read a book's extraction stamp, completeness RE-VERIFIED.
+
+    Returns the stamp dict, or None when no readable stamp exists
+    (missing file, corrupt JSON, non-dict payload) — never raises.
+
+    The stamp's own claim is not trusted: "complete" in the returned
+    dict is recomputed against the directory as it stands NOW, and
+    survives only when the stamp claimed it, the artefact format
+    version is current, meta still names the same total and the same
+    book fingerprint, and the chapter payloads on disk still cover
+    the stamp's recorded payload expectation. A stamp copied onto a
+    partial directory — or a directory that lost payloads after
+    stamping — therefore reads incomplete. "chapters_present" is
+    refreshed to the count found at read time.
+    """
+    d = _checkpoint_dir(book_key)
+    p = d / "extraction.json"
+    if not p.is_file():
+        return None
+    try:
+        stamp = json.load(open(p, encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(stamp, dict):
+        return None
+    present, total = _extraction_chapter_coverage(book_key)
+    stamp["chapters_present"] = present
+    complete = bool(stamp.get("complete"))
+    if stamp.get("artefact_format_version") != _ARTEFACT_FORMAT_VERSION:
+        complete = False
+    if total is None or stamp.get("total_chapters") != total:
+        complete = False
+    else:
+        expected = stamp.get("payload_chapters")
+        if not isinstance(expected, int) or expected <= 0:
+            expected = total
+        if present < expected:
+            complete = False
+        # A stamp whose fingerprint disagrees with meta's belongs to
+        # another book that shared the stem — not this extraction.
+        meta = {}
+        try:
+            meta = json.load(open(d / "meta.json", encoding="utf-8"))
+        except Exception:
+            meta = {}
+        mfp = meta.get("fingerprint") if isinstance(meta, dict) else None
+        sfp = stamp.get("book_fingerprint")
+        if mfp and sfp and mfp != sfp:
+            complete = False
+    stamp["complete"] = complete
+    return stamp
+
+
+def _extraction_complete(book_key):
+    """True when the book has a verified-complete extraction stamp."""
+    stamp = _load_extraction_stamp(book_key)
+    return bool(stamp and stamp.get("complete"))
 
 
 def _checkpoint_load(book_key):
@@ -29290,6 +29489,18 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     aborted = (a_ok == 0 and b_ok == 0) or failed / max(2 * n, 1) > MAX_FAILED_CHUNK_RATIO
     if aborted:
         print(f"  {failed}/{2 * n} calls failed; not writing partial results")
+    if not aborted:
+        # Stage-E artefact stamp (stage-split step 1): the chapter
+        # loop has finished the whole set, so the extraction is
+        # complete — record it in the checkpoint directory. Purely
+        # additive in this step: the stamp shares the checkpoints'
+        # existing lifecycle (a finished full run still clears the
+        # directory at its end, as it does today), and cancellation
+        # returns earlier in the loop, so a partial set never reaches
+        # this seam. Front/back-matter chapters leave no payloads,
+        # hence the payload expectation net of their count.
+        _checkpoint_save_extraction_stamp(_ckpt_key, _ckpt_fp,
+                                          n - len(_fm_idx_v2))
 
     # Recorded human NOs for this work (roster store): standing
     # rulings the in-run merge passes and alias pruning below must
