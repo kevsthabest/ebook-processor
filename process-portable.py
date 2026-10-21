@@ -48,7 +48,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.77"
+PORTABLE_VERSION = "2.13.78"
 
 
 import argparse
@@ -13179,6 +13179,65 @@ def cmd_roster_unlink(work, entity_id, form, learn_dir=None):
           f"form will not re-link to this entity automatically.")
 
 
+def cmd_roster_no(work, form_a, form_b, learn_dir=None):
+    """--roster-no: a human records that FORM_A and FORM_B are
+    NOT the same person, directly as a pair. --roster-unlink
+    records NOs only as a side effect of detaching an observed
+    primary form from its entity — which cannot express the
+    ruling when one side was never observed as a form at all
+    (the alias-only person: their name exists in the data solely
+    as other entries' aliases). This command records the pair
+    itself into the work's roster store, where the store layer,
+    the matcher, and the in-run merge/pruning passes all read
+    it. When the work has no store yet, passing its work_id
+    creates the store under the very key a run derives for the
+    work, so the NO is in force from the next run on."""
+    a, b = norm_name(form_a), norm_name(form_b)
+    if not a or not b or a == b:
+        print(f"Refused: a NO needs two distinct name forms "
+              f"(got '{form_a}' and '{form_b}').")
+        return
+    # A work_id is a UUID and store lookup is exact-string: the
+    # key a run derives for a work is the canonical lowercase
+    # rendering. Canonicalize before find/create — an uppercase
+    # rendering taken verbatim would create a store under a key
+    # no run ever derives, and the NO would sit in a store
+    # nothing reads.
+    _is_uuid = isinstance(work, str) and bool(re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", work))
+    if _is_uuid:
+        work = work.lower()
+    learn_dir = _roster_cmd_learn_dir(learn_dir)
+    store, err = find_roster_store(learn_dir, work)
+    created = False
+    if store is None:
+        if _is_uuid:
+            store = RosterStore(learn_dir=learn_dir,
+                                work_key=str(work))
+            created = True
+        else:
+            print(f"{err} — pass the work's work_id to create "
+                  f"its roster store and record the NO now.")
+            return
+    if not store.record_no(form_a, form_b, source="--roster-no"):
+        print(f"NO already recorded: '{form_a}' is not "
+              f"'{form_b}' in this work's roster store.")
+        return
+    if not store.save():
+        # record_no changed only memory; a failed write means the
+        # ruling is not in force. Say so plainly — claiming the
+        # recording would leave the user trusting a ban the next
+        # run never sees.
+        print(f"FAILED: the roster store could not be written "
+              f"({store.path}); the NO was NOT recorded.")
+        return
+    print(f"Recorded NO: '{form_a}' is not '{form_b}' "
+          f"({'created' if created else 'found'} roster store "
+          f"{store.path}) — the pair cannot merge, link, or "
+          f"share name forms as aliases on future runs.")
+
+
 def cmd_roster_split(work, entity_id, forms, learn_dir=None):
     """--roster-split: a human partitions ENTITY by form — each
     listed form's observations move to a fresh successor entity
@@ -13249,6 +13308,91 @@ def _view_form_keys(view):
         forms.add(norm_name(anchor.get("name") or ""))
         forms |= {norm_name(a) for a in anchor.get("aliases") or []}
     return forms
+
+
+def _no_form_match(form_key, side_key):
+    """Does FORM_KEY denote the person a recorded human NO names
+    by SIDE_KEY? In-run form-cluster match: exact, equal after
+    title stripping, or token containment either way ('devon'
+    against 'karl devon'; 'major devon' against either).
+
+    The cross-run store layer deliberately matches NOs by exact
+    form (its tests pin that), but inside a run an entry is still
+    mid-formation: the contamination a NO exists to kill wears
+    variant forms of the banned name (a title form, a bare
+    surname), and exact matching would let every variant through.
+    This predicate is used ONLY where a recorded NO already
+    applies to the pair under consideration — it widens which
+    spellings count as the banned person, never where a ban
+    exists."""
+    if not form_key or not side_key:
+        return False
+    if form_key == side_key:
+        return True
+    fa = _strip_merge_noise(form_key)
+    fb = _strip_merge_noise(side_key)
+    if not fa or not fb:
+        return False
+    if fa == fb:
+        return True
+    short, long_ = (fa, fb) if len(fa) <= len(fb) else (fb, fa)
+    return _is_contig_subseq(short, long_)
+
+
+def _entry_form_set(key, entry):
+    """Every form key an in-run roster entry claims as itself:
+    its primary keys plus its claim keys (adopted alias keys and
+    preserved unresolved mentions). This is the set a union with
+    another entry would assert as one person."""
+    forms = set(entry.get("primary_keys") or {key})
+    forms |= _roster_claim_keys(entry)
+    forms.add(key)
+    return forms
+
+
+def _no_pair_veto(no_pairs, forms_a, forms_b):
+    """The recorded NO a union of these two form sets would
+    contradict, or None — the in-run companion of
+    RosterStore.union_veto, with _no_form_match's cluster
+    semantics in place of exact form equality. A union is
+    contradicted when one side of a NO pair is claimed by each
+    set."""
+    for a, b in no_pairs:
+        if (any(_no_form_match(f, a) for f in forms_a)
+                and any(_no_form_match(f, b) for f in forms_b)) \
+                or (any(_no_form_match(f, b) for f in forms_a)
+                    and any(_no_form_match(f, a) for f in forms_b)):
+            return (a, b)
+    return None
+
+
+def _no_prune_keys(no_pairs, own_forms, alias_keys):
+    """Alias keys an entry must drop under recorded human NOs.
+
+    An alias is pruned when it denotes the OTHER side of a NO
+    whose remaining side the entry itself claims (as its own
+    form, or elsewhere among its claims): the entry is asserting
+    two people a human ruled distinct, and the alias side of the
+    assertion is the pollution. Aliases denoting the entry's OWN
+    side of a NO are its own person's variants and are kept —
+    the ban separates two people, it does not strip a person of
+    their own name forms."""
+    out = set()
+    if not no_pairs or not alias_keys:
+        return out
+    for a, b in no_pairs:
+        for side, other in ((a, b), (b, a)):
+            if any(_no_form_match(f, other) for f in own_forms):
+                # `other` is (also) one of the entry's own forms:
+                # its aliases are the entry's own person's
+                # variants and are never pruned by this NO.
+                continue
+            if any(_no_form_match(f, side) for f in own_forms) \
+                    or any(_no_form_match(ak, side)
+                           for ak in alias_keys):
+                out |= {ak for ak in alias_keys
+                        if _no_form_match(ak, other)}
+    return out
 
 
 def roster_match_entries(entries, views, no_pairs=()):
@@ -13916,6 +14060,36 @@ def _roster_record_dedupe_folds(store, pre_characters, report,
     if n:
         store.save()
     return n
+
+
+def _roster_no_pairs_for(title, author, identifiers):
+    """The recorded human NO pairs for this work's roster store,
+    for the in-run enforcement in _roster_reconcile /
+    post_pass_merge.
+
+    The store is opened through the seam's own key derivation, so
+    the pairs a run honours are the pairs its store holds. The
+    lookup engages whether or not --persist-roster is on: a NO is
+    a standing human ruling about this work, not a feature of the
+    persistence seam. Fail-soft by design — any problem (no store,
+    unreadable store, resolution error) yields no pairs and the
+    run behaves exactly as a run that never heard of NOs; the
+    cheap existence probe keeps store-less works from paying a
+    work resolution they would not otherwise make here.
+    """
+    try:
+        learn_dir = _learn().dir
+        if _state_db_for(learn_dir) is None \
+                and not roster_store_paths(learn_dir):
+            return ()
+        store, _wid = _roster_store_for(title, author, identifiers)
+        if store is None:
+            return ()
+        return tuple((p["a"], p["b"])
+                     for p in store.data.get("no_pairs") or ()
+                     if p.get("a") and p.get("b"))
+    except Exception:
+        return ()
 
 
 def _roster_store_for(title, author, identifiers):
@@ -16484,7 +16658,7 @@ def _roster_claim_keys(entry):
     return keys
 
 
-def _roster_reconcile(roster):
+def _roster_reconcile(roster, no_pairs=()):
     """Deterministic whole-roster reconciliation (Experiment 1,
     --roster-reconcile). Runs ONCE after Call A completes, before
     post_pass_merge / v2_reduce consume the roster. Mutates roster.
@@ -16514,17 +16688,31 @@ def _roster_reconcile(roster):
        claim can never become the unique claimant that resolves a
        name to the wrong entry.
 
+    Recorded human NOs (no_pairs: the work's roster-store pairs,
+    loaded by the caller) bind every pass: a merge whose union
+    would claim both sides of a NO is refused (counted in
+    no_vetoed_merges), and pass 3 additionally prunes aliases that
+    denote the other side of a NO the entry itself claims —
+    shadow pruning alone cannot do that job, because the banned
+    person may have no entry of their own to shadow with, and
+    their variant forms are nobody's primary.
+
     Membership invariant: merges only fold sighted entries into each
     other (_merge_roster_entries unions existing forms and keeps a
     sighted display name). Nothing is created.
 
     Returns {"entries_before", "entries_after", "variants_merged",
-    "aliases_pruned"}; aliases_pruned counts alias keys + display
-    aliases removed by pass 3 (merges prune their own keepers).
+    "aliases_pruned", "no_vetoed_merges"}; aliases_pruned counts
+    alias keys + display aliases removed by pass 3 (merges prune
+    their own keepers).
     """
+    no_pairs = [(norm_name(a), norm_name(b))
+                for a, b in (no_pairs or ()) if a and b]
+    no_pairs = [(a, b) for a, b in no_pairs if a and b and a != b]
     stats = {"entries_before": len(roster),
              "entries_after": len(roster),
-             "variants_merged": 0, "aliases_pruned": 0}
+             "variants_merged": 0, "aliases_pruned": 0,
+             "no_vetoed_merges": 0}
     _ln = _learn()
     _isbn = getattr(_DIAG, "learn_isbn", None)
 
@@ -16539,6 +16727,7 @@ def _roster_reconcile(roster):
     # Passes 1+2, converging: a merge can complete a mutual claim
     # for a third entry, so loop until stable. Pair enumeration is
     # sorted for determinism; each merge shrinks the roster.
+    _vetoed_pairs = set()
     _changed = True
     while _changed:
         _changed = False
@@ -16547,6 +16736,7 @@ def _roster_reconcile(roster):
             for pk in e.get("primary_keys", {k}):
                 prim[pk] = k
         claims = {k: _roster_claim_keys(e) for k, e in roster.items()}
+        forms = {k: _entry_form_set(k, e) for k, e in roster.items()}
         # target primary key -> claimant entry keys (an entry's
         # claims on its OWN forms are not claims on another entry).
         claimants = {}
@@ -16576,6 +16766,15 @@ def _roster_reconcile(roster):
                 # uses): co-listed in a chapter -> two people.
                 if ea.get("chapters", set()) & eb.get("chapters", set()):
                     continue
+                # A recorded human NO outranks every merge signal
+                # below: the union would assert as one person two
+                # people a human ruled distinct.
+                if no_pairs and _no_pair_veto(no_pairs, forms[ka],
+                                              forms[kb]):
+                    if (ka, kb) not in _vetoed_pairs:
+                        _vetoed_pairs.add((ka, kb))
+                        stats["no_vetoed_merges"] += 1
+                    continue
                 pa = ea.get("primary_keys", {ka})
                 pb = eb.get("primary_keys", {kb})
                 mutual = (any(c in pb for c in claims[ka])
@@ -16603,15 +16802,23 @@ def _roster_reconcile(roster):
 
     # Pass 3: prune stale shadowed aliases with final-roster
     # hindsight (the keeper pruning _merge_roster_entries does,
-    # applied to every entry).
+    # applied to every entry). Recorded NOs prune alongside the
+    # shadow rule: an alias denoting the other side of a NO the
+    # entry itself claims is pollution even when the banned
+    # person has no entry to shadow it.
     for k, e in roster.items():
+        no_prune = _no_prune_keys(
+            no_pairs, set(e.get("primary_keys", {k})) | {k},
+            e.get("alias_keys", set()))
         kept_keys = {ak for ak in e.get("alias_keys", set())
-                     if not _alias_shadowed(roster, k, ak)}
+                     if ak not in no_prune
+                     and not _alias_shadowed(roster, k, ak)}
         stats["aliases_pruned"] += \
             len(e.get("alias_keys", set())) - len(kept_keys)
         e["alias_keys"] = kept_keys
         kept_aliases = {a for a in e.get("aliases", set())
-                        if not _alias_shadowed(roster, k, norm_name(a))}
+                        if norm_name(a) not in no_prune
+                        and not _alias_shadowed(roster, k, norm_name(a))}
         stats["aliases_pruned"] += \
             len(e.get("aliases", set())) - len(kept_aliases)
         e["aliases"] = kept_aliases
@@ -16732,15 +16939,32 @@ def _merge_name_candidates(roster):
     return out
 
 
-def post_pass_merge(roster, validator=None):
+def post_pass_merge(roster, validator=None, no_pairs=()):
     """Post-chapter merge pass over the roster. Tier 1/2 deterministic first
     (converging loop), then Tier 3 via the decision model for ambiguous pairs
     with a similarity signal.
+
+    no_pairs: recorded human NOs for this work (the roster store's
+    pairs, loaded by the caller). A pair whose union would claim
+    both sides of a NO is vetoed before every tier — it is never
+    merged deterministically and never proposed to the Tier 3
+    judge, whose YES could not be allowed to stand anyway.
 
     Returns (n_merged, possible_merges) where possible_merges is a list of
     {"name_a", "name_b", "p_yes", "reason"} for manual review. Pairs are left
     separate (never force-merged) when the model is unavailable or unsure.
     """
+    no_pairs = [(norm_name(a), norm_name(b))
+                for a, b in (no_pairs or ()) if a and b]
+    no_pairs = [(a, b) for a, b in no_pairs if a and b and a != b]
+
+    def _vetoed(ka, kb):
+        if not no_pairs or ka not in roster or kb not in roster:
+            return False
+        return _no_pair_veto(no_pairs,
+                             _entry_form_set(ka, roster[ka]),
+                             _entry_form_set(kb, roster[kb])) \
+            is not None
     possible_merges = []
     n_merged = 0
     _ln = _learn()
@@ -16797,6 +17021,8 @@ def post_pass_merge(roster, validator=None):
                 if kb not in roster:
                     continue
                 ea, eb = roster[ka], roster[kb]
+                if _vetoed(ka, kb):
+                    continue  # a human NO: never merged, any tier
                 _tier = _merge_tier(
                     ka, kb, a_chapters=ea.get("chapters"),
                     b_chapters=eb.get("chapters"), roster_keys=_rkeys)
@@ -16833,7 +17059,7 @@ def post_pass_merge(roster, validator=None):
                 ka, kb, a_chapters=ea.get("chapters"),
                 b_chapters=eb.get("chapters"),
                 roster_keys=set(_keys))
-            if _tier != "ambiguous":
+            if _tier != "ambiguous" or _vetoed(ka, kb):
                 continue
             _sig = _merge_pair_signal(ka, kb)
             if _sig:
@@ -16860,7 +17086,8 @@ def post_pass_merge(roster, validator=None):
     _blocked_proposals = []
     for _ka, _kb, _srcs in _merge_name_candidates(roster):
         if tuple(sorted((_ka, _kb))) in _cand_pairs \
-                or _ka not in roster or _kb not in roster:
+                or _ka not in roster or _kb not in roster \
+                or _vetoed(_ka, _kb):
             continue
         _tier = _merge_tier(
             _ka, _kb, a_chapters=roster[_ka].get("chapters"),
@@ -16885,7 +17112,8 @@ def post_pass_merge(roster, validator=None):
     if _sp is not None:
         for _ka, _kb in _series_priors_pairs(roster, _sp):
             if tuple(sorted((_ka, _kb))) in _cand_pairs \
-                    or _ka not in roster or _kb not in roster:
+                    or _ka not in roster or _kb not in roster \
+                    or _vetoed(_ka, _kb):
                 continue
             _tier = _merge_tier(
                 _ka, _kb, a_chapters=roster[_ka].get("chapters"),
@@ -16908,6 +17136,8 @@ def post_pass_merge(roster, validator=None):
     for _sig, ka, kb in _cands:
         if ka not in roster or kb not in roster:
             continue  # merged by an earlier Tier 3 decision
+        if _vetoed(ka, kb):
+            continue  # an earlier merge brought a NO'd form in
         ea, eb = roster[ka], roster[kb]
         _na, _nb = ea.get("name", ka), eb.get("name", kb)
         if _dm_off:
@@ -28023,13 +28253,21 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if aborted:
         print(f"  {failed}/{2 * n} calls failed; not writing partial results")
 
+    # Recorded human NOs for this work (roster store): standing
+    # rulings the in-run merge passes and alias pruning below must
+    # honour. Loaded whether or not --persist-roster is on — the
+    # NO binds the roster the run ships, not just the store the
+    # seam writes. Empty when the work has no store or no NOs.
+    _no_pairs = _roster_no_pairs_for(title or fpath.stem, author,
+                                     identifiers)
+
     # Roster reconciliation (Experiment 1, --roster-reconcile): Call A
     # built the roster chapter by chapter against partial information;
     # canonicalize it once with the whole book sighted, before the
     # post-pass merge and the reduce consume it. Deterministic.
     _recon_stats = None
     if CONFIG.get("roster_reconcile"):
-        _recon_stats = _roster_reconcile(roster)
+        _recon_stats = _roster_reconcile(roster, no_pairs=_no_pairs)
         print(f"  Roster reconcile: {_recon_stats['entries_before']} -> "
               f"{_recon_stats['entries_after']} entries "
               f"({_recon_stats['variants_merged']} variants merged, "
@@ -28051,7 +28289,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     # model). Runs after all chapters, before the reduce, so v2_reduce sees
     # the final merged roster and relationships canonical-remap correctly.
     _pp_merged, _pp_possible = post_pass_merge(
-        roster, validator=_DECISION_VALIDATOR)
+        roster, validator=_DECISION_VALIDATOR, no_pairs=_no_pairs)
     if _pp_merged:
         print(f"  Post-pass merge: {_pp_merged} roster entries merged")
     if _pp_possible:
@@ -29859,8 +30097,9 @@ _PROFILE_EXCLUDE = frozenset({
     "corpus_remove", "corpus_snapshot", "corpus_status",
     "corpus_verify_quote", "explain", "ingest", "learn_status",
     "preview_diff", "push_preview", "recalibrate_spice", "replay",
-    "restore_state", "retry_failed", "roster_link", "roster_report",
-    "roster_split", "roster_unlink", "run_history_backfill",
+    "restore_state", "retry_failed", "roster_link", "roster_no",
+    "roster_report", "roster_split", "roster_unlink",
+    "run_history_backfill",
     "staging_report", "trope_map",
     "validate", "verify", "watch",
     # per-run selectors / overrides for a single run
@@ -30248,6 +30487,14 @@ def _build_parser():
                          "form: --roster-split WORK ENTITY FORM "
                          "[FORM ...] moves each form's observations "
                          "to a fresh successor entity, and exit")
+    g_learn.add_argument("--roster-no", nargs=3,
+                    metavar=("WORK", "FORM_A", "FORM_B"),
+                    help="record a human NO in WORK's roster store: "
+                         "FORM_A and FORM_B are not the same person "
+                         "and must never merge, link, or share name "
+                         "forms as aliases; creates the store when "
+                         "WORK is a work_id with no store yet, "
+                         "and exit")
     ap.add_argument("--json", action="store_true",
                     help="emit JSON where a command supports it "
                          "(--staging-report, --corpus-status, "
@@ -30501,6 +30748,7 @@ _ONE_SHOT_FLAGS = {
     "roster_link": "--roster-link",
     "roster_unlink": "--roster-unlink",
     "roster_split": "--roster-split",
+    "roster_no": "--roster-no",
     "corpus_status": "--corpus-status",
     "corpus_snapshot": "--corpus-snapshot",
     "run_history_backfill": "--run-history-backfill",
@@ -30714,6 +30962,11 @@ def main():
         cmd_roster_split(args.roster_split[0], args.roster_split[1],
                          args.roster_split[2:],
                          learn_dir=args.learn_dir or None)
+        return
+    if args.roster_no:
+        load_config()
+        cmd_roster_no(*args.roster_no,
+                      learn_dir=args.learn_dir or None)
         return
 
     if args.corpus_status:
