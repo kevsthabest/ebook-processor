@@ -50,7 +50,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.81"
+PORTABLE_VERSION = "2.13.82"
 
 
 import argparse
@@ -6978,7 +6978,7 @@ def cmd_corpus_reembed(learn_dir=None, work=None):
 # exists. The query-shape version versions evidence_query_text /
 # evidence_query_terms (§4.2's enumerated hash input).
 RETRIEVE_STAGE_VERSION = "1"
-_EVIDENCE_QUERY_SHAPE_VERSION = "1"
+_EVIDENCE_QUERY_SHAPE_VERSION = "2"
 
 # Stage -> envelope section (§6.4): the sections a stage write
 # refreshes in its own transaction.
@@ -11065,6 +11065,72 @@ def evidence_query_terms(name, description=None):
     return terms
 
 
+# Embedding endpoints cap input tokens (embeddinggemma-2: 510) and
+# truncate the excess SILENTLY server-side: the vector comes back
+# computed over a prefix of the text and nothing on the client side
+# complains — a book-wide trope's unmapped query (every support
+# chapter's summary joined) once ran to ~7,900 characters and its
+# passage ranking silently described only the first third of the
+# book. Every text this module sends for embedding is therefore
+# held to a character budget safely under the token ceiling:
+# prose tokenizes at roughly four characters per token, dense
+# prose nearer three, so 1400 characters at a conservative three
+# chars/token is ~467 tokens — under the ceiling with headroom
+# for tokenizer variance.
+_EMBED_INPUT_CHAR_BUDGET = 1400
+
+
+def _spread_order(n):
+    """Indices into a list of n, ordered so early picks span the
+    whole list: first, last, middle, then the midpoints of the
+    remaining gaps, recursively. Sampling in this order spends a
+    tight budget on coverage of the whole list instead of on its
+    opening entries."""
+    order = []
+    seen = set()
+
+    def add(i):
+        if 0 <= i < n and i not in seen:
+            seen.add(i)
+            order.append(i)
+
+    add(0)
+    add(n - 1)
+    add(n // 2)
+    gaps = [(0, n // 2), (n // 2, n - 1)]
+    while gaps:
+        nxt = []
+        for lo, hi in gaps:
+            if hi - lo > 1:
+                mid = (lo + hi) // 2
+                add(mid)
+                nxt.append((lo, mid))
+                nxt.append((mid, hi))
+        gaps = nxt
+    return order
+
+
+def _bounded_summaries_join(summaries, budget):
+    """Join whole summaries within a character budget, sampled
+    evenly across the list (see _spread_order) and emitted in the
+    list's own order. A single summary longer than the whole
+    budget is hard-trimmed to fit — a truncated summary still
+    represents its chapter; an unsampled one represents nothing."""
+    chosen = []
+    used = 0
+    for i in _spread_order(len(summaries)):
+        s = summaries[i]
+        cost = len(s) + (1 if chosen else 0)
+        if used + cost <= budget:
+            chosen.append((i, s))
+            used += cost
+        elif not chosen:
+            chosen.append((i, s[:budget]))
+            break
+    chosen.sort()
+    return " ".join(s for _i, s in chosen)
+
+
 def evidence_query_text(name, description=None, summaries=None):
     """The embedding query for a claim, in a deliberately chosen
     text shape (design §3 stage 2). Mapped claims embed in the
@@ -11072,13 +11138,25 @@ def evidence_query_text(name, description=None, summaries=None):
     never as a bare name: cosine against prose windows must measure
     trope presence, not name-mention. Unmapped claims (OC-7) use
     the name plus the gate's own summaries of the claim's support
-    chapters, the richest honest description available."""
+    chapters, the richest honest description available — bounded
+    to _EMBED_INPUT_CHAR_BUDGET by sampling the summaries evenly
+    across the support list, because an unbounded join overflows
+    the embedder's token ceiling and is truncated in silence.
+    Queries that already fit the budget are byte-identical to the
+    unbounded construction."""
     if description:
         return f"{name}: {description}"
     if summaries:
-        joined = " ".join(s.strip() for s in summaries if s and s.strip())
+        clean = [s.strip() for s in summaries if s and s.strip()]
+        joined = " ".join(clean)
         if joined:
-            return f"{name}: {joined}"
+            full = f"{name}: {joined}"
+            if len(full) <= _EMBED_INPUT_CHAR_BUDGET:
+                return full
+            budget = _EMBED_INPUT_CHAR_BUDGET - len(name) - 2
+            if budget <= 0:
+                return full[:_EMBED_INPUT_CHAR_BUDGET]
+            return f"{name}: {_bounded_summaries_join(clean, budget)}"
     return name or ""
 
 
@@ -27745,6 +27823,27 @@ def _cos(a, b):
 
 def embed_vectors(base_url, model, texts):
     """POST texts to <base_url>/embeddings (OpenAI shape); raise on error."""
+    # The endpoint truncates inputs past its token ceiling in
+    # silence (see _EMBED_INPUT_CHAR_BUDGET), so an overlong input
+    # is worth one line in the run console where the operator
+    # actually looks — a warning only: what is sent and returned
+    # is unchanged, because callers own their text shapes.
+    # The warning is best-effort bookkeeping only: a failure to
+    # print it (e.g. a broken stdout pipe) must never fail the
+    # embedding call itself, so it is guarded like the other
+    # best-effort writes in this file.
+    try:
+        overlong = [t for t in texts
+                    if len(t) > _EMBED_INPUT_CHAR_BUDGET]
+        if overlong:
+            largest = max(overlong, key=len)
+            print(f"  embed: {len(overlong)} of {len(texts)} inputs "
+                  f"exceed the {_EMBED_INPUT_CHAR_BUDGET}-char safe "
+                  f"length and will be truncated by the endpoint; "
+                  f"longest is {len(largest)} chars: "
+                  f"{largest[:50].replace(chr(10), ' ')}")
+    except Exception:
+        pass
     url = base_url.rstrip("/") + "/embeddings"
     payload = {"model": model, "input": texts}
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
