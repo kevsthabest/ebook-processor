@@ -665,6 +665,55 @@ class TestCmdStageDecide(_StageDecideCase):
         self.assertEqual(rc, 1)
         self.assertIn("format", out.lower())
 
+    def _tear(self, name, book="stagebook"):
+        """Truncate an artefact file mid-content — the shape a
+        write killed halfway leaves behind (the checkpoint
+        writers write in place, not atomically)."""
+        p = Path(self._tmp) / book / name
+        text = p.read_text(encoding="utf-8")
+        p.write_text(text[: max(1, len(text) // 2)],
+                     encoding="utf-8")
+        return p
+
+    def test_torn_roster_refuses_legibly(self):
+        # As in Stage M: coverage never reads the checkpoint
+        # roster, so a mid-write tear leaves the stamp complete
+        # and the loader RAISES on the truncated JSON. The entry
+        # must turn that into its "no readable checkpoint set"
+        # refusal — no traceback, no preview, the set untouched.
+        self._seed_artefacts()
+        torn = self._tear("roster.json")
+        before = torn.read_bytes()
+        rc, out = self._run_cmd()
+        self.assertEqual(rc, 1)
+        self.assertIn("no readable checkpoint set", out)
+        self.assertFalse(list(Path(self._tmp).glob("preview/*.json")))
+        self.assertEqual(torn.read_bytes(), before)
+
+    def test_truncated_chapter_payload_refuses_legibly(self):
+        # A truncated payload is pre-refused upstream (coverage
+        # counts parseable payloads only, so the stamp reads
+        # incomplete). Pinned for the end-to-end contract, as in
+        # the Stage M suite.
+        self._seed_artefacts()
+        self._tear("chapter_2.json")
+        rc, out = self._run_cmd()
+        self.assertEqual(rc, 1)
+        self.assertIn("not complete", out)
+
+    def test_unusable_chapter_payload_refuses_legibly(self):
+        # The torn shape that reaches the loader: parseable (so
+        # coverage counts it and the stamp stays complete) but
+        # not a payload object, so the loader's field access
+        # raises. The entry refuses; it does not crash.
+        self._seed_artefacts()
+        (Path(self._tmp) / "stagebook" / "chapter_2.json") \
+            .write_text("[1, 2]", encoding="utf-8")
+        rc, out = self._run_cmd()
+        self.assertEqual(rc, 1)
+        self.assertIn("no readable checkpoint set", out)
+        self.assertFalse(list(Path(self._tmp).glob("preview/*.json")))
+
     def test_missing_merged_roster_refuses(self):
         self._seed_artefacts()
         (Path(self._tmp) / "stagebook" / "merged-roster.json").unlink()

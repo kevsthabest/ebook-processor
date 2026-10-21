@@ -18555,7 +18555,21 @@ def cmd_stage_merge(fpath):
               f"v{stamp.get('processor_version')} (this build is "
               f"v{PORTABLE_VERSION}) — proceeding; both versions are "
               f"recorded on the artefact")
-    loaded = _checkpoint_load(book_key)
+    # The load can RAISE on a set torn mid-write: the checkpoint
+    # writers write in place (not atomically), so a concurrent
+    # re-extraction of this same book can leave roster.json
+    # truncated, and coverage never reads roster.json — the
+    # stamp above still reads complete while the loader's
+    # json.load raises instead of returning its "no set" signal.
+    # A corrupt set is the same refusal as a missing one (a
+    # stage never crashes on the artefacts it consumes, spec
+    # R4), so the raise is folded into the None case. The guard
+    # lives here, not in _checkpoint_load: --resume and the
+    # replay path share that loader and keep its semantics.
+    try:
+        loaded = _checkpoint_load(book_key)
+    except Exception:
+        loaded = None
     if loaded is None:
         print(f"  --stage merge: no readable checkpoint set for "
               f"'{book_key}' despite its stamp — the artefact set is "
@@ -19705,7 +19719,16 @@ def cmd_stage_decide(fpath, preview=False, dry_run=False):
         print(f"  --stage decide: merged roster was written by "
               f"portable v{art.get('processor_version')} (this "
               f"build is v{PORTABLE_VERSION}) — proceeding")
-    loaded = _checkpoint_load(book_key)
+    # Same torn-set guard as cmd_stage_merge: the loader raises
+    # on a checkpoint file left truncated by a concurrent
+    # re-extraction, and a corrupt set is the same "no readable
+    # checkpoint set" refusal as a missing one — the guard is at
+    # this call site so _checkpoint_load's shared semantics
+    # (--resume, replay) stay untouched.
+    try:
+        loaded = _checkpoint_load(book_key)
+    except Exception:
+        loaded = None
     if loaded is None:
         print(f"  --stage decide: no readable checkpoint set for "
               f"'{book_key}' despite its stamp — the artefact set "

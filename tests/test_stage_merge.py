@@ -550,6 +550,76 @@ class TestCmdStageMerge(_TmpCheckpointCase):
         self.assertEqual(rc, 1)
         self.assertIn("not complete", out)
 
+    def _tear(self, book, name):
+        """Truncate an artefact file mid-content — the shape a
+        write killed halfway leaves behind. The checkpoint
+        writers write in place, not atomically, so a concurrent
+        re-extraction of the same book can present exactly this
+        to a stage reading the set."""
+        p = Path(self._tmp) / book / name
+        text = p.read_text(encoding="utf-8")
+        p.write_text(text[: max(1, len(text) // 2)],
+                     encoding="utf-8")
+        return p
+
+    def test_torn_roster_refuses_legibly(self):
+        # roster.json is the one artefact no upstream guard
+        # covers: coverage never reads it, so a set torn mid-write
+        # still stamps complete — and the checkpoint loader then
+        # RAISES on the truncated JSON instead of returning its
+        # "no set" signal. The entry must turn that raise into
+        # its own "no readable checkpoint set" refusal (spec R4:
+        # a stage never crashes on the artefacts it consumes),
+        # not propagate a traceback, and must not touch the set.
+        self._seed_extraction()
+        torn = self._tear("stagebook", "roster.json")
+        before = torn.read_bytes()
+        rc, out = self._run_cmd()
+        self.assertEqual(rc, 1)
+        self.assertIn("no readable checkpoint set", out)
+        self.assertFalse((Path(self._tmp) / "stagebook"
+                          / "merged-roster.json").exists())
+        self.assertEqual(torn.read_bytes(), before)
+
+    def test_truncated_chapter_payload_refuses_legibly(self):
+        # A truncated payload never reaches the loader: coverage
+        # counts parseable payloads only, so the stamp reads
+        # incomplete and the entry pre-refuses. Pinned so the
+        # end-to-end contract (rc 1, a legible refusal, no crash)
+        # is on record for the plain torn-write shape too.
+        self._seed_extraction()
+        self._tear("stagebook", "chapter_1.json")
+        rc, out = self._run_cmd()
+        self.assertEqual(rc, 1)
+        self.assertIn("not complete", out)
+
+    def test_unusable_chapter_payload_refuses_legibly(self):
+        # The torn shape that DOES reach the loader: a payload
+        # replaced between the coverage read and the load — the
+        # TOCTOU residue of a concurrent re-extraction — can
+        # still parse (coverage counts it, the stamp stays
+        # complete) yet not be a payload object at all, and the
+        # loader's field access raises on it. Same refusal as a
+        # torn roster: the stage refuses, it does not crash.
+        self._seed_extraction()
+        (Path(self._tmp) / "stagebook" / "chapter_1.json") \
+            .write_text("[1, 2]", encoding="utf-8")
+        rc, out = self._run_cmd()
+        self.assertEqual(rc, 1)
+        self.assertIn("no readable checkpoint set", out)
+        self.assertFalse((Path(self._tmp) / "stagebook"
+                          / "merged-roster.json").exists())
+
+    def test_checkpoint_load_still_raises_on_a_torn_set(self):
+        # The refusal lives at the stage ENTRIES, not in the
+        # loader: _checkpoint_load is shared with --resume and
+        # the replay path, whose semantics this fix must not
+        # change — called directly on a torn set it still raises.
+        self._seed_extraction()
+        self._tear("stagebook", "roster.json")
+        with self.assertRaises(json.JSONDecodeError):
+            pp._checkpoint_load("stagebook")
+
     def test_chunk_limited_extraction_refuses_by_name(self):
         self._seed_extraction()
         stamp = pp._load_extraction_stamp("stagebook")
