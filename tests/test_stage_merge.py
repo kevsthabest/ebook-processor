@@ -690,15 +690,28 @@ class TestStageCli(unittest.TestCase):
         self.assertIn("not available yet", out.getvalue())
 
     def test_stage_decide_refuses_without_running(self):
-        out = io.StringIO()
+        # Superseded by stage-split step 3: 'decide' no longer
+        # refuses as unshipped — it dispatches (after state
+        # migration, like merge) and demands its --file target,
+        # the same shape as test_stage_merge_needs_a_file. The
+        # refusal pin for a stage that has not landed moves to
+        # 'extract' (still pinned above). Step 3's own suite
+        # (tests/test_stage_decide.py) pins the decide dispatch
+        # and its refusals in full.
         with mock.patch.object(sys, "argv",
                                ["process-portable.py", "--stage",
                                 "decide"]), \
-                contextlib.redirect_stdout(out):
+                mock.patch.object(pp, "ensure_state_migrated",
+                                  lambda *a, **k: None), \
+                mock.patch.object(pp, "LearnedState",
+                                  lambda *a, **k: mock.Mock(
+                                      dir="/tmp", nicknames={},
+                                      trusted_titles=lambda: [],
+                                      rejected_tropes=[])):
             with self.assertRaises(SystemExit) as cm:
                 pp.main()
-        self.assertEqual(cm.exception.code, 2)
-        self.assertIn("not available yet", out.getvalue())
+        self.assertTrue(cm.exception.code)
+        self.assertIn("--file", str(cm.exception.code))
 
     def test_stage_merge_needs_a_file(self):
         with mock.patch.object(sys, "argv",

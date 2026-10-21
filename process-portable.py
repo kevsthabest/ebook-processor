@@ -50,7 +50,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.84"
+PORTABLE_VERSION = "2.13.85"
 
 
 import argparse
@@ -18101,6 +18101,56 @@ def _merge_config_fingerprint():
         default=str).encode()).hexdigest()[:16]
 
 
+def _decide_config():
+    """The decide stage's own config identity (spec §3): what
+    Stage D consumes from the invocation, in canonical form. The
+    judge's identity counts in full — re-deciding under a
+    different judge is the stage's reason to exist. The extractor
+    backend counts too: the trope gate is judged by it, so two
+    decides under different backends are different decides. The
+    embedder is named by model only, never by endpoint (the
+    run-history discipline: an endpoint is deployment plumbing,
+    the model is the semantic identity). Merge-only flags are
+    deliberately absent — Stage M's identity is its own
+    fingerprint, stamped separately on the decide_report, so a
+    re-merge never re-identifies a decide. Code constants
+    (thresholds, prompt text) are covered by the processor
+    version stamped beside the fingerprint."""
+    return {
+        "decision_model": bool(CONFIG.get("decision_model")),
+        "decision_model_provider":
+            CONFIG.get("decision_model_provider"),
+        "decision_model_model": CONFIG.get("decision_model_model"),
+        "llm": CONFIG.get("llm"),
+        "embed_model": CONFIG.get("embed_model"),
+        "evidence_retrieval": bool(CONFIG.get("evidence_retrieval")),
+        "evidence_retrieval_floor":
+            CONFIG.get("evidence_retrieval_floor"),
+        "use_corpus": bool(CONFIG.get("use_corpus")),
+        "staging_gate": bool(CONFIG.get("staging_gate")),
+        "corpus_quotes": bool(CONFIG.get("corpus_quotes")),
+        "dedupe": bool(CONFIG.get("dedupe")),
+        "principals_only": bool(CONFIG.get("principals_only", True)),
+        "min_frequency": CONFIG.get("min_frequency", 0.20),
+        "persist_roster": bool(CONFIG.get("persist_roster")),
+        "emit_uncertainty": bool(CONFIG.get("emit_uncertainty")),
+        "show_matrices": bool(CONFIG.get("show_matrices")),
+        "discovery_shadow": bool(CONFIG.get("discovery_shadow")),
+        "series_priors": bool(CONFIG.get("series_priors")),
+    }
+
+
+def _decide_config_fingerprint():
+    """Hash of _decide_config(), stamped onto the preview's
+    decide_report so a stored decide can be told apart from a
+    decide of the same merge under a different decide
+    configuration."""
+    import hashlib as _hl
+    return _hl.sha256(json.dumps(
+        _decide_config(), sort_keys=True,
+        default=str).encode()).hexdigest()[:16]
+
+
 def _fold_verdicts(roster_after, keys_before, mechanism):
     """Verdict records for a deterministic pass's folds: one per
     roster key that existed before the pass and is gone after it.
@@ -18163,7 +18213,8 @@ def stage_merge_book(roster, chapters, validator=None, no_pairs=(),
     report = {"merge_config": _merge_config(),
               "merge_config_fingerprint": _merge_config_fingerprint(),
               "reconcile": None, "post_pass": None, "jev": None,
-              "series_priors_seeded": False, "verdicts": []}
+              "series_priors_seeded": False, "series_priors": None,
+              "verdicts": []}
 
     # Roster reconciliation / janitor. Under --jev-merge the
     # reconcile's MERGES stay skipped — folding is the judge's job —
@@ -18234,6 +18285,16 @@ def stage_merge_book(roster, chapters, validator=None, no_pairs=(),
         report["verdicts"] += _fold_verdicts(
             roster, _keys_before_pp, "post_pass_merge")
 
+    if series_priors_ctx is not None:
+        # The priors counts ride the artefact: the context is
+        # merge-process state that does not survive staging, and
+        # Stage D's book record carries the report — without this
+        # block a staged decide could only omit the field or
+        # fabricate counts it cannot know. Computed here, at the
+        # end, so the merge passes' own nominations are in it.
+        report["series_priors"] = _series_priors_report(
+            series_priors_ctx)
+
     return {"roster": roster, "reconcile": recon_stats,
             "post_pass_merged": pp_merged,
             "post_pass_possible": pp_possible,
@@ -18297,6 +18358,38 @@ def _save_merged_roster_artefact(book_key, seg, *, book_fingerprint,
               f"{e}")
         return False
     return True
+
+
+def _load_merged_roster_artefact(book_key):
+    """Read a book's merged-roster.json (the Stage-M artefact).
+
+    Returns the parsed dict, or None when no readable artefact
+    exists (missing file, corrupt JSON, non-dict payload) — never
+    raises, mirroring the extraction stamp reader's posture: the
+    artefact is data a stage consumes, and an unreadable one is a
+    refusal the caller words, not a crash."""
+    p = _checkpoint_dir(book_key) / "merged-roster.json"
+    if not p.is_file():
+        return None
+    try:
+        art = json.load(open(p, encoding="utf-8"))
+    except Exception:
+        return None
+    return art if isinstance(art, dict) else None
+
+
+def _artefact_roster(art):
+    """Restore the canonical roster from a merged-roster artefact
+    to its live shape, through the checkpoint loader's own roster
+    path (_ckpt_json_restore plus the per-entry restore), so a
+    roster consumed from the artefact is the roster the monolith
+    held — same types, same restored fields — not a JSON-shadow
+    of it."""
+    roster = _ckpt_json_restore((art or {}).get("roster") or {})
+    if isinstance(roster, dict):
+        for _entry in roster.values():
+            _ckpt_restore_roster_entry(_entry)
+    return roster
 
 
 def cmd_stage_merge(fpath):
@@ -18440,6 +18533,1275 @@ def cmd_stage_merge(fpath):
           f"recorded in merged-roster.json "
           f"(merge config {_seg['merge_report']['merge_config_fingerprint']})")
     return 0
+
+
+def stage_decide_book(roster, chapters, indexed, chapter_as, chapter_bs,
+                      *, fpath, _book_key, _ckpt_key, _ckpt_fp,
+                      title, author, identifiers, _isbn_source,
+                      _series_name, _series_pos, _series_source,
+                      word_count, _chap_fallback,
+                      a_ok, b_ok, a_failed, b_failed, a_fallback,
+                      aborted, dry_run, preview, call,
+                      _recon_stats, _pp_merged, _pp_possible,
+                      _merge_judge_stats, priors_report, priors_source,
+                      _resumed_chapters, extraction_flags_hash,
+                      merge_config_fingerprint, budget_basis):
+    """Stage D over one book's merged state: everything the v2
+    pipeline does downstream of Stage M — the Option B identity
+    seam, the deterministic reduce (claim assembly and remapping
+    onto the canonical roster), relationship validation, the
+    trope confirmation gate, verdict suppression, evidence
+    retrieval, the staging seam, result/book-record assembly,
+    and the learned-state save. Returns:
+
+        {"result": the assembled book record (None only when the
+             stage itself failed — the dedupe blowup),
+         "wid" / "how": the work resolution the drivers'
+             epilogues act on,
+         "title" / "author": the record's final metadata (the
+             Open Library correction rebinds them in write mode),
+         "decide_report": this stage's stamp, also carried on the
+             result as result["decide_report"]}
+
+    The caller arms the per-book state the segment has always
+    read from its surroundings — the decision budget, the _DIAG
+    identity fields, the learned state, the decision validator —
+    exactly as process_file_v2's head arms it, because the
+    reduce and its helpers read that state from the globals they
+    have always read. What the stage function owns is the work,
+    not the arming.
+
+    Two deliberate inputs deserve naming. priors_report is the
+    series-priors counts block for the book record, computed by
+    the caller: in the monolith the priors context is live
+    process state and the report is read off it, but the context
+    does not survive staging, so the standalone driver passes
+    the block Stage M stamped onto merged-roster.json instead
+    (priors_source says which). budget_basis names whose pool
+    the decision budget is: "shared-run" in the monolith, where
+    merges and validation draw from one pool armed at book
+    start, "per-stage" standalone, where the stage arms its own
+    pool at the chapter count — identical unless the shared pool
+    would have exhausted, and stamped on the decide_report
+    either way so the two are never silently compared.
+
+    The app WRITE is not part of the stage: the function
+    assembles the record and resolves the work, and each driver
+    runs its own epilogue (the monolith: dry-run return /
+    preview save / write; the standalone stage: the preview
+    artefact only)."""
+    n = len(indexed)
+    decide_report = {
+        "decide_config": _decide_config(),
+        "decide_config_fingerprint": _decide_config_fingerprint(),
+        "extraction_fingerprint": _ckpt_fp,
+        "extraction_flags_hash": extraction_flags_hash,
+        "merge_config_fingerprint": merge_config_fingerprint,
+        "budget": {"basis": budget_basis,
+                   "pool": _dm_budget_pool(),
+                   "chapters": n},
+        "series_priors_source": priors_source,
+        "processor_version": PORTABLE_VERSION,
+    }
+    # Option B seam (design section 7): ONE identity assignment
+    # point, after the post-pass merge and before the reduce, over
+    # the run's FINAL roster. Flag off (or dry-run, or an aborted
+    # run): skipped entirely — no store access, no marker,
+    # byte-identical behaviour. Flag on: entries are annotated with
+    # entity_id and every downstream consumer (reduce, builders,
+    # plan) inherits identity from that annotation.
+    _roster_marker = None
+    _roster_store = None
+    _roster_ordinal = None
+    if CONFIG.get("persist_roster") and not dry_run and not aborted:
+        _roster_store, _seam_wid = _roster_store_for(
+            title or fpath.stem, author, identifiers)
+        if _roster_store is not None and _roster_store.writable:
+            _anchors = _roster_fetch_anchors(_seam_wid) \
+                if _seam_wid else []
+            _roster_marker = roster_assign_entities(
+                roster, _roster_store, anchors=_anchors,
+                alias_targets=_roster_alias_targets())
+            if _roster_marker is not None:
+                _roster_ordinal = _roster_marker["run_ordinal"]
+                print(f"  Roster persistence: "
+                      f"{_roster_marker['linked']} linked, "
+                      f"{_roster_marker['minted']} new entities, "
+                      f"{_roster_marker['folded']} folded, "
+                      f"{len(_roster_marker['suspects'])} split "
+                      f"suspects")
+            else:
+                _roster_store = None  # disengaged (A8): flag-off run
+        else:
+            _roster_store = None
+
+    # Deterministic reduce (no LLM). n_chapters_total is the FULL
+    # chapter list's length: `indexed` may be a --chunks subset, but
+    # chapter_bs keys (and the spice array) live in original indices.
+    red = v2_reduce(chapter_as, chapter_bs, roster,
+                    [ch for _, ch in indexed], preview=preview,
+                    show_matrices=CONFIG.get("show_matrices", False),
+                    n_chapters_total=len(chapters))
+
+    # Trope confirmation: frequency tiers, LLM gate only for the borderline.
+    # Thresholds scale with book length (5% of chapters, min 3):
+    # - >= auto_min chapters: auto-confirm (a recurring pattern is a trope).
+    # - 2 to auto_min-1 chapters: LLM gate judges against summaries.
+    # - 1 chapter: drop in long books (not a book-level trope).
+    tropes, trope_conf = [], {}
+    _sb_auto, _sb_gated = [], []  # staging observe inputs (Option F)
+    if not dry_run and red["trope_candidates"]:
+        counts = red["trope_candidate_counts"]
+        # Scale thresholds with book length: 5% of chapters, min 3.
+        # (e.g. 73-chapter book -> 3; 100-chapter book -> 5.)
+        auto_min = max(3, n // 20)  # 5% of chapters, min 3
+        drop_single = n >= 20  # only drop single-chapter tropes in long books
+        auto, gated, dropped = [], [], 0
+        # Build chapter lists per trope for evidence.
+        # Prefer the display-keyed map from v2_reduce (handles paraphrases);
+        # fall back to raw-text keys only if the reduce didn't build one
+        # (e.g. no embed_url, so no catalog mapping ran).
+        if red.get("trope_chapters"):
+            trope_chapters = red["trope_chapters"]
+        else:
+            trope_chapters = {}
+            for idx in sorted(chapter_bs):
+                b = chapter_bs[idx]
+                if not b:
+                    continue
+                seen_ch = set()
+                for tc in b.get("trope_candidates", []):
+                    key = _tnorm(tc)
+                    if key not in seen_ch:
+                        seen_ch.add(key)
+                        trope_chapters.setdefault(key, []).append(idx)
+            red["trope_chapters"] = trope_chapters
+        _denied = 0
+        _rej_denied = 0
+
+        def _pub_trope(name, state):
+            if UI._console_observer is None:
+                return
+            UI.console_candidate(_book_key, "tropes", _tnorm(name), {
+                "name": name, "chapters": counts.get(_tnorm(name), 1),
+                "state": state})
+
+        for c in red["trope_candidates"]:
+            _pub_trope(c, "candidate")
+            # Drop genre/setting labels (not tropes)
+            if _is_denylisted_trope(c):
+                _denied += 1
+                _pub_trope(c, "suppressed")
+                continue
+            # Drop tropes humans have rejected 3+ times (rejection denylist)
+            if _learn().is_trope_denylisted(_trej_key(c)):
+                _denied += 1
+                _rej_denied += 1
+                _pub_trope(c, "suppressed")
+                continue
+            n_ch = counts.get(_tnorm(c), 1)
+            if n_ch >= auto_min:
+                auto.append(c)
+                _pub_trope(c, "auto_threshold")
+            elif n_ch >= 2 or not drop_single:
+                gated.append(c)
+                _pub_trope(c, "gate_pending")
+            else:
+                dropped += 1
+                _pub_trope(c, "held_back")
+        print(f"  Tropes: {len(auto)} auto ({auto_min}+ ch), {len(gated)} to gate, "
+              f"{dropped} single-ch dropped, {_denied} denylisted...", end=" ", flush=True)
+        _sb_auto, _sb_gated = list(auto), list(gated)
+        for c in auto:
+            tropes.append(c)
+            trope_conf[_tnorm(c)] = round(
+                min(0.9, 0.55 + 0.1 * counts.get(_tnorm(c), auto_min)), 2)
+        if gated:
+            g_tropes, g_conf = v2_trope_gate(
+                call, red["chapter_summaries"], gated, counts)
+            tropes.extend(g_tropes)
+            trope_conf.update(g_conf)
+        # Rejection learning: human rejections raise the acceptance bar for
+        # this trope (0.10 per rejection); 3+ rejections already denylisted.
+        _rej_filtered = 0
+        if tropes:
+            _pre_rej = {_tnorm(t): t for t in tropes}
+            tropes, trope_conf, _rej_filtered = _apply_trope_rejections(
+                tropes, trope_conf, _learn())
+            if UI._console_observer is not None:
+                for _k in set(_pre_rej) - {_tnorm(t) for t in tropes}:
+                    UI.console_verdict(_book_key, {
+                        "table": "tropes", "row_key": _k,
+                        "record": {"name": _pre_rej[_k],
+                                   "state": "suppressed"}})
+        _rej_total = _rej_denied + _rej_filtered
+        rej_note = f", {_rej_total} rejected" if _rej_total else ""
+        print(f"{len(tropes)} confirmed{rej_note}")
+    red["tropes"] = tropes
+    red["trope_confidence"] = trope_conf
+
+
+    # Spine §3.5: per-work verdict read-back + suppression net A.
+    # Runs only when Supabase is configured (the fields below exist
+    # on the result only when a fetch was attempted, so runs without
+    # read-back are byte-identical to before). Confirmed verdicts
+    # do nothing here — no force-ship, no boost (authority creep
+    # is forbidden by the design); rejected verdicts suppress.
+    _verdict_attempted = False
+    _verdict_note = None
+    _rejected_keys = set()
+    _supp_keys = set()
+    _supp_names = []
+    if not dry_run and not aborted \
+            and CONFIG.get("supabase_url") \
+            and CONFIG.get("supabase_key"):
+        _verdict_attempted = True
+        _vwid = None
+        try:
+            _vwid, _vhow = resolve_work(
+                title or fpath.stem, author, identifiers, False,
+                create=False)
+        except Exception:
+            _vwid = None
+        if _vwid:
+            _vs, _verdict_note = work_verdicts(str(_vwid),
+                                               _learn().dir)
+            if _vs is not None:
+                _rejected_keys = _vs.rejected_keys()
+            if _rejected_keys:
+                _cat_map = red.get("trope_catalog_map") or {}
+                (tropes, trope_conf, red["triggers"], _supp_keys,
+                 _supp_names) = apply_verdict_suppression(
+                    tropes, trope_conf, red["triggers"],
+                    _rejected_keys, _cat_map)
+                red["tropes"] = tropes
+                red["trope_confidence"] = trope_conf
+
+                def _cand_key(c):
+                    return staging_claim_key(
+                        "trope", name=c,
+                        catalog_id=_cat_map.get(_tnorm(c)))
+                _sb_auto = [c for c in _sb_auto
+                            if _cand_key(c) not in _rejected_keys]
+                _sb_gated = [c for c in _sb_gated
+                             if _cand_key(c) not in _rejected_keys]
+        if _verdict_note:
+            print(f"  Verdicts: {_verdict_note}")
+
+    # Option G trigger retrieval (design section 8): evidence-less
+    # triggers are retrieved for BEFORE the staging seam, so a
+    # trigger that gains judge-supported passages has them in its
+    # evidence list when the seam computes has_evidence and F's
+    # existing evidence-arrival promotion fires unchanged. Flag
+    # off: the trigger list is untouched, byte-identical.
+    _trope_evidence = {}
+    _trope_retrieval = {}
+    _trigger_retrieval = {}
+    _evidence_marker = None
+    if CONFIG.get("evidence_retrieval") and not dry_run \
+            and not aborted:
+        _gtrig = evidence_retrieve_triggers(
+            red["triggers"], chapters, call=call,
+            embedder=lambda texts: embed_vectors(
+                CONFIG.get("embed_url", ""),
+                CONFIG.get("embed_model", ""), texts))
+        _trigger_retrieval = _gtrig["trigger_retrieval"]
+        _evidence_marker = _gtrig["marker"]
+        _filled = sum(1 for _r in _trigger_retrieval.values()
+                      if _r.get("passages"))
+        if _filled:
+            print(f"  Trigger evidence: {_filled} evidence-less "
+                  f"trigger(s) gained retrieved passages")
+
+
+    # Option F staging seam (design section 5): ONE split point,
+    # after the trope gate + rejection learning and the trigger
+    # finalization in v2_reduce, before result assembly. Flag off
+    # (or dry-run, or an aborted run): skipped entirely — no store
+    # access, no marker, byte-identical behaviour. Flag on: observe
+    # the run's stageable claims and rewrite tropes/triggers to the
+    # ship set here; write_claims, plan_replace, save_preview and
+    # push-preview all inherit the split from the result.
+    _staging_marker = None
+    _trope_persistence = {}
+    _trigger_persistence = {}
+    _st = None
+    _sg_work_key = None
+    if CONFIG.get("staging_gate") and not dry_run and not aborted:
+        _st = _staging()
+        if _st.enabled and _st.writable:
+            # Resolve the work READ-ONLY before observing (the read
+            # the roster seam also performs): when the work already
+            # exists, the observe must land on its canonical entry.
+            # Observing under the fallback key and adopting after
+            # the fact restarts the fallback entry at ordinal 1 on
+            # every run (adoption deletes it), so the persistence
+            # check could never fire on a resolved work and staged
+            # claims neither promoted nor absence-expired. With
+            # create=False this adds no write in either mode; the
+            # real resolution (creation, on corrected metadata)
+            # still runs after result assembly, and OC-8 adoption
+            # below remains the net for works that only resolve
+            # there. A failed or empty resolution keeps the
+            # fallback key — delay-only, as before.
+            _sg_wid = None
+            try:
+                _sg_wid, _sg_how = resolve_work(
+                    title or fpath.stem, author, identifiers, False,
+                    create=False)
+            except Exception:
+                _sg_wid = None
+            _sg_work_key = staging_work_key(
+                _sg_wid, identifiers.get("isbn"),
+                title or fpath.stem, author)
+            _sg = staging_observe_result({
+                "work_key": _sg_work_key,
+                "work_id": _sg_wid, "title": title or fpath.stem,
+                "author": author, "isbn": identifiers.get("isbn"),
+                "auto_min": max(3, n // 20),
+                "trope_auto": _sb_auto, "trope_gated": _sb_gated,
+                "trope_counts": red.get("trope_candidate_counts")
+                                or {},
+                "trope_ship": tropes, "trope_conf": trope_conf,
+                "catalog_map": red.get("trope_catalog_map") or {},
+                "triggers": red["triggers"],
+                # Spine §3.5 net B: the seam drops promoted
+                # re-ships of human-rejected claims itself.
+                "verdict_rejected": _rejected_keys,
+            }, _st, independent=not _resumed_chapters)
+            tropes = _sg["ship_tropes"]
+            trope_conf = _sg["trope_conf"]
+            red["tropes"] = tropes
+            red["trope_confidence"] = trope_conf
+            red["triggers"] = _sg["ship_triggers"]
+            _staging_marker = _sg["marker"]
+            _trope_persistence = _sg["trope_persistence"]
+            _trigger_persistence = _sg["trigger_persistence"]
+            print(f"  Staging: {len(_staging_marker['staged'])} held "
+                  f"back, {len(_staging_marker['promoted'])} promoted, "
+                  f"{_staging_marker['trapped_total']} trapped for "
+                  f"this work")
+            # Net B's suppressed set joins the counter union.
+            _supp_keys |= set(_sg.get("suppressed_keys") or set())
+            for _nm in (_sg.get("suppressed_names") or []):
+                if _nm not in _supp_names:
+                    _supp_names.append(_nm)
+
+    if UI._console_observer is not None:
+        # Final trope/trigger dispositions: the ship set as the
+        # staging seam left it, and the suppressed set by name —
+        # trigger names are category keys, everything else is a
+        # trope (the same classification the artefact carries).
+        for _t in tropes:
+            UI.console_verdict(_book_key, {
+                "table": "tropes", "row_key": _tnorm(_t),
+                "record": {
+                    "name": _t,
+                    "chapters": (red.get("trope_candidate_counts")
+                                 or {}).get(_tnorm(_t), 1),
+                    "state": "shipped",
+                    "confidence": trope_conf.get(_tnorm(_t))}})
+        for _nm in _supp_names:
+            if _nm in TRIGGER_CATEGORIES:
+                UI.console_verdict(_book_key, {
+                    "table": "triggers", "row_key": f"trig:{_nm}",
+                    "decision": "suppressed",
+                    "record": {"warning": _nm, "status": "suppressed"}})
+            else:
+                UI.console_verdict(_book_key, {
+                    "table": "tropes", "row_key": _tnorm(_nm),
+                    "record": {"name": _nm, "state": "suppressed"}})
+        UI.console_stage(_book_key, "final_gates", "active")
+
+    # Spine §3.5.3: the suppression counter — one rejection_events
+    # row per suppressed claim per run, counted on the UNION of
+    # both nets (before dedup the same claim could be caught twice;
+    # it is still one suppressed claim).
+    if _supp_keys:
+        record_rejection_events(
+            _learn().dir, f"v2:{fpath.stem}",
+            staging_work_key(None, identifiers.get("isbn"),
+                             title or fpath.stem, author),
+            _supp_keys)
+        print(f"  Suppressed {len(_supp_keys)} human-rejected "
+              f"claims for this work")
+
+    # Option G trope retrieval (design section 8): runs AFTER the
+    # staging seam — staged tropes are retrieved for too, because
+    # their recorded evidence is what a later run's observe
+    # evaluates under promotion rule 4 — and before result
+    # assembly, so write_claims, plan_replace, save_preview and the
+    # dashboard all inherit the annotated result; there is no
+    # second copy of the evidence decision for a consumer to
+    # understate. Flag off (or dry-run, or aborted): no embed
+    # calls, no judge calls, no marker, byte-identical behaviour.
+    if CONFIG.get("evidence_retrieval") and not dry_run \
+            and not aborted:
+        _g_specs, _g_seen = [], set()
+        _g_staged = {}
+        if _staging_marker:
+            for _s in _staging_marker.get("staged") or []:
+                if _s.get("class") == "trope":
+                    _g_staged[_tnorm(_s.get("display") or "")] = \
+                        _s.get("display") or ""
+        _g_catmap = red.get("trope_catalog_map") or {}
+        _g_chaps = red.get("trope_chapters") or {}
+        for _nm in list(tropes) + sorted(_g_staged.values()):
+            _k = _tnorm(_nm)
+            if _k in _g_seen:
+                continue
+            _g_seen.add(_k)
+            _g_specs.append({
+                "name": _nm,
+                "support_refs": _g_chaps.get(_k, []),
+                "catalog_id": _g_catmap.get(_k),
+                "staged": _k in _g_staged})
+        # Corpus stage adoption (corpus-design §4.2): when the
+        # corpus holds this work complete, retrieval verdicts are
+        # stage outputs — current ones are re-read instead of
+        # re-judged, fresh ones settle. No corpus (or an
+        # incomplete/suspect one) => the context is None and the
+        # seam is exactly the per-run computation it has always
+        # been. (Under replay the learn dir is the sandbox, which
+        # holds no corpus: no adoption — replay corpus reads are
+        # §4.3's validated path, slice 5.)
+        _g_ctx = corpus_retrieve_context(_learn().dir, _ckpt_fp)
+        _g = evidence_retrieve_result({
+            "claims": _g_specs,
+            "catalog": _trope_catalog_entries(),
+            "summaries": {s.get("label"): s.get("summary")
+                          for s in red.get("chapter_summaries")
+                          or []},
+        }, chapters, call=call, embedder=lambda texts:
+            embed_vectors(CONFIG.get("embed_url", ""),
+                          CONFIG.get("embed_model", ""), texts),
+            stage_ctx=_g_ctx)
+        _trope_evidence = _g["trope_evidence"]
+        _trope_retrieval = _g["trope_retrieval"]
+        _evidence_marker = _merge_evidence_markers(
+            _evidence_marker, _g["marker"])
+        # Record this run's retrieved evidence for STAGED tropes
+        # into F's staging store (evidence_ever + grade): run
+        # N+1's observe evaluates it under promotion rule 4 —
+        # never this run (amendment G2). The recording is declared
+        # in the marker, and so on the preview's face (F's OC-4
+        # condition, inherited per design section 5).
+        _recorded, _promotes_next = 0, []
+        if _st is not None and _sg_work_key and _st.enabled \
+                and _st.writable:
+            for _k, _rec in _trope_retrieval.items():
+                if _rec.get("staged") and _rec.get("support") in (
+                        "strong", "single"):
+                    if _st.record_trope_evidence(
+                            _sg_work_key, _rec["name"],
+                            _g_catmap.get(_k), _rec["support"]):
+                        _recorded += 1
+                        if _rec["support"] == "strong":
+                            _promotes_next.append(_rec["name"])
+        _evidence_marker["evidence_recorded"] = _recorded
+        _evidence_marker["promotes_next"] = _promotes_next
+        _gt = _g["marker"]["totals"]
+        print(f"  Trope evidence: {_gt['supported_strong'] + _gt['supported_single']} "
+              f"claims with passages ({_gt['supported_strong']} strong), "
+              f"{_gt['abstained']} abstentions, "
+              f"{_gt['adjacent_only']} adjacent-only, "
+              f"{_gt['failed']} failed")
+
+    # Corpus quote verification (corpus-design §10.1 call site b,
+    # --corpus-quotes, default OFF): this run's model-proposed
+    # quotes verified against the corpus when the work is
+    # ingested. The corpus records verdicts; the run's own quote
+    # list is untouched (publication is slice 7's payload, not the
+    # run's face). Corpus trouble degrades to silence — a corpus
+    # write never fails a run (§5.2).
+    _cq_stats = None
+    if CONFIG.get("corpus_quotes") and not dry_run and not aborted:
+        try:
+            _qdb = _corpus_db_for(_learn().dir, mode="processor")
+            if _qdb is not None and corpus_work_state(
+                    _qdb, _ckpt_fp) in ("text_complete",
+                                        "vectors_partial",
+                                        "complete"):
+                _qv = corpus_verify_run_quotes(
+                    _qdb, _ckpt_fp, red.get("quotes"))
+                if _qv:
+                    print(f"  Corpus quotes: {_qv['verified']} "
+                          f"verified, {_qv['rejected']} rejected "
+                          f"against the corpus text")
+                # Selection (§10.2): the poll is the shared
+                # decision budget's lowest priority and its first
+                # shed; a shed ships nothing and never fails the
+                # run.
+                _qs = corpus_select_quotes(_qdb, _ckpt_fp)
+                if _qs.get("poll") == "ok":
+                    print(f"  Corpus quotes: {_qs['selected']} "
+                          f"selected for the payload")
+                else:
+                    print(f"  Corpus quotes: selection shed "
+                          f"({_qs.get('reason')}) — no quotes ship "
+                          f"from this run")
+                # The stage's counts are kept so they can ride on
+                # the result record for the history mirror (the
+                # attach below, when run history is armed); until
+                # now they existed only as printed lines. A shed
+                # selected nothing — 0 is a measurement there, not
+                # an unknown.
+                # The quote-poll stage is done: its unused reserve
+                # is borrowable by anything still running (§1.3).
+                _dm_budget_finish("quote_poll")
+                _cq_stats = {
+                    "verified": _qv["verified"] if _qv else None,
+                    "rejected": _qv["rejected"] if _qv else None,
+                    "selected": (_qs.get("selected") or 0)
+                    if _qs.get("poll") == "ok" else 0}
+        except Exception:
+            pass
+
+    # Shadow discovery (spec §3.5): placed LAST in pipeline order,
+    # after the quote-poll block above — the quote poll's
+    # finished-marker fires at the end of that block (Release A
+    # gate note R-A5), so discovery's borrow position is honest:
+    # it starts only once every earlier consumer has either
+    # finished or never run, and the report records which. Shadow
+    # mode spends its own reported experimental allowance rather
+    # than the shared pool (see _discovery_shadow_run), so even
+    # at this last position it cannot take a call a production
+    # consumer was owed. Flag off (or an aborted run — partial
+    # results are not a book to discover from): no report, no
+    # result key, byte-identical output.
+    _discovery_report = None
+    if not aborted:
+        _discovery_report = _maybe_run_discovery(
+            roster, [ch for _, ch in indexed],
+            red["relationships"], red["characters"])
+    if _discovery_report is not None:
+        _keeps = sum(t["shadow_keeps"]
+                     for t in _discovery_report["per_tier"].values())
+        print(f"  Discovery (shadow): "
+              f"{_discovery_report['pairs_considered']} candidate "
+              f"pairs, {_discovery_report['pairs_judged']} judged, "
+              f"{_keeps} shadow keeps — nothing written")
+
+    reading_mins = word_count // 250
+    result = {
+        "file": fpath.name, "title": title or fpath.stem, "author": author,
+        "isbn": identifiers.get("isbn"), "asin": identifiers.get("asin"),
+        "isbn_source": _isbn_source,  # "flag" | "epub" | "openlibrary" | "none"
+        "series_name": _series_name, "series_position": _series_pos,
+        "series_source": _series_source,  # "flag"|"epub"|"filename"|"openlibrary"|"none"
+        "word_count": word_count, "reading_time_mins": reading_mins,
+        # Same A+B definition as the abort decision above: a persisted
+        # A-only count showed zero failures for books whose content
+        # calls mostly failed.
+        "chunks": n, "chunks_failed": a_failed + b_failed,
+        "pipeline": "v2",
+        "tropes": tropes, "trope_confidence": trope_conf,
+        "triggers": red["triggers"], "characters": red["characters"],
+        "relationships": red["relationships"],
+        "dropped_relationships": red.get("dropped_relationships", []),
+        "pair_losers": red.get("pair_losers", []),
+        "validation_order": red.get("validation_order"),
+        "decision_pool": red.get("decision_pool"),
+        "rel_registry": red.get("rel_registry"),
+        "relationship_type_vocabulary": red.get(
+            "relationship_type_vocabulary"),
+        "validator_circuit_breaker": red.get(
+            "validator_circuit_breaker"),
+        "self_pairs_dropped": red.get("self_pairs_dropped",
+                                      {"extracted": 0, "remapped": 0}),
+        "direction_contradictions": red.get(
+            "direction_contradictions", []),
+        "spice_level": red["spice_level"],
+        # Reduce-computed fields the consumers read from the RESULT
+        # (not from red): --recalibrate-spice needs chapter_spice +
+        # chapters_successful, _preview_summary needs the peak/freq
+        # bands, save_preview needs avg_dialogue_ratio. Forwarding
+        # none of them left recalibrate permanently at no_data and
+        # the summary claiming "(no spicy content)" for spicy books.
+        "spice_peak": red["spice_peak"],
+        "spice_peak_band": red["spice_peak_band"],
+        "spice_freq_band": red["spice_freq_band"],
+        "chapter_spice": red["chapter_spice"],
+        "chapters_successful": red["chapters_successful"],
+        "trigger_chapters": red["trigger_chapters"],
+        "avg_dialogue_ratio": red["avg_dialogue_ratio"],
+        "povs": red["povs"], "quotes": red["quotes"],
+        "chapter_summaries": red["chapter_summaries"],
+        "is_anthology": False, "stories": [],
+        "aborted": aborted, "chunks_ok": a_ok,
+        "tasks": {"discipline": b_ok, "identity": a_ok,
+                  "identity_simple": a_fallback},
+        # Phase 0 telemetry (spec §6, amendment A2): this book's
+        # per-stage accounting, armed at this book's start by
+        # _dm_budget_reset above — the snapshot is taken here,
+        # after every stage (merge, validation, trigger gate,
+        # quote poll) has run, so it carries the book's whole
+        # measured work and nothing from any other book. Under
+        # parallel jobs (--jobs > 1) that attribution cannot be
+        # made: the counters are process-global, so another book's
+        # arm and records can interleave before this stamp. The
+        # book-end and history stamps already refuse that snapshot
+        # under the same jobs condition; the preview stamp carries
+        # the same guard and stamps None there instead.
+        "telemetry": _telemetry_snapshot()
+        if int(CONFIG.get("jobs", 1) or 1) <= 1 else None,
+        "verification": red["verification"],
+        "roster_size": len(roster),
+        # Saved for future remapping (--trope-map can retry these later).
+        "trope_candidates": red.get("trope_candidates", []),
+        "trope_candidate_counts": red.get("trope_candidate_counts", {}),
+        "trope_catalog_map": red.get("trope_catalog_map", {}),
+        "trope_chapters": red.get("trope_chapters", {}),
+        "possible_merges": _pp_possible,
+        "post_pass_merged": _pp_merged,
+        "chapter_detection": "fallback" if _chap_fallback else "spine",
+        # P8/P9: per-chapter Call A/B results + roster, for --resume and
+        # --retry-failed. Keys are str(idx) for JSON stability.
+        "chapter_data": {
+            "chapters": {str(i): {"a": _ckpt_json_safe(chapter_as.get(i)),
+                                  "b": _ckpt_json_safe(chapter_bs.get(i))}
+                         for i, _ch in indexed},
+            "roster": _ckpt_json_safe(roster),
+        },
+    }
+    if _recon_stats is not None:
+        result["roster_reconcile"] = _recon_stats
+    if _merge_judge_stats is not None:
+        # The bake-off's scoreboard: present only on --jev-merge runs,
+        # so flag-off artefacts stay byte-identical to before.
+        result["merge_judge"] = _merge_judge_stats
+    if priors_report is not None:
+        # The priors' footprint on this book (counts only), so
+        # the Phase 3 eval can weigh what the hints did. Absent
+        # whenever priors were not active — the absence is what
+        # keeps flag-off records identical to before. The report is
+        # the CALLER's: the priors context is merge-process state
+        # that does not survive staging, so the monolith computes
+        # the report from its live context while the standalone
+        # stage reads the block Stage M stamped on its artefact.
+        result["series_priors"] = priors_report
+    if _discovery_report is not None:
+        result["discovery"] = _discovery_report
+    if _staging_marker is not None:
+        result["staging"] = _staging_marker
+    if _roster_marker is not None:
+        result["roster_persistence"] = _roster_marker
+    if _trope_persistence:
+        result["trope_persistence"] = _trope_persistence
+    if _trigger_persistence:
+        result["trigger_persistence"] = _trigger_persistence
+    if _evidence_marker is not None:
+        result["evidence_retrieval"] = _evidence_marker
+    if _trope_evidence:
+        result["trope_evidence"] = _trope_evidence
+    if _trope_retrieval:
+        result["trope_retrieval"] = _trope_retrieval
+    if _trigger_retrieval:
+        result["trigger_retrieval"] = _trigger_retrieval
+    # Stage D's own stamp (stage-split step 3): the three stage
+    # fingerprints and this stage's config + budget basis, so any
+    # preview can be traced to the exact extraction and merge it
+    # was decided from, and a staged decide (per-stage budget) is
+    # never silently compared against a monolith one (shared pool).
+    result["decide_report"] = decide_report
+    v = red["verification"]
+    if v["evidence_checked"]:
+        print(f"  Evidence: {v['evidence_verified']}/{v['evidence_checked']} verified")
+
+    # Metadata correction via OpenLibrary (one call per book; skipped in preview/dry-run).
+    _file_title, _file_author = title, author
+    if not (preview or dry_run):
+        title, author, _corrected = correct_metadata(title or fpath.stem, author, identifiers)
+        result["title"] = title
+        result["author"] = author
+    # The Hardcover landing runs after the Open Library correction
+    # so a confident match's values are the record's final ones
+    # (R-H2 authoritative). It writes the record only: the locals
+    # work resolution below uses are unchanged, because re-keying
+    # work identity on Hardcover metadata is out of scope (§8).
+    _land_series_identity(result, identifiers, _file_title, _file_author)
+    # The registry fold sits beside the identity landing: the
+    # series key has just been resolved, and the record is the
+    # finished cast the registry keeps.
+    _populate_series_registry(result)
+    # Work identity resolution (read-only in preview/dry-run).
+    wid, how = resolve_work(title or fpath.stem, author, identifiers, False,
+                            create=not (preview or dry_run))
+    result["work_id"] = wid
+    result["work_resolution"] = how
+    if wid:
+        # The registry fold above keyed this book by its
+        # pre-resolution fallback; restate it under the work_id
+        # now that resolution has completed (see the helper).
+        _adopt_series_registry_book_key(result, wid)
+    if _staging_marker is not None and wid:
+        # OC-8: the observe seam ran before the work_id existed, so
+        # this run's entries sit under a fallback key; adopt them
+        # into the resolved work's entry now that the id is known.
+        _staging().adopt_for(wid, result.get("title") or "",
+                             result.get("author") or "",
+                             identifiers.get("isbn"))
+    if _roster_store is not None and wid:
+        # Option B (design section 8): the seam ran before the
+        # work_id existed (new works), so this run's store may sit
+        # under a fallback key; adopt it into the resolved work's
+        # key now and reopen on the surviving store so the dedupe
+        # tombstone hook below writes to the right file.
+        if adopt_roster_store(_learn().dir, wid,
+                               result.get("title") or "",
+                               result.get("author") or "",
+                               identifiers.get("isbn")):
+            _roster_store = RosterStore(learn_dir=_learn().dir,
+                                        work_key=str(wid))
+    if how == "new":
+        result["work_candidates"] = _title_candidates(title or fpath.stem)
+        print("  Work: no match — NEW WORK would be created")
+    elif wid:
+        print(f"  Work: matched via {how} -> {wid[:8]}")
+    else:
+        print(f"  Work: resolution failed ({how})")
+
+    # Spine §3.4: snapshot capture rides a fresh preview run (the
+    # payloads are complete here, before the preview epilogue clears
+    # the checkpoint dir), and a replay stamps its provenance marker.
+    # Spine §3.5: the verdict fields exist ONLY when a fetch was
+    # attempted, so unconfigured runs stay byte-identical.
+    if _verdict_attempted:
+        result["verdicts_note"] = _verdict_note
+        result["suppressed_rejected"] = sorted(set(_supp_names))
+    # The corpus-quote counts attach only when run history is
+    # armed (the same CONFIG check _history_begin arms on): their
+    # one reader is the history writer (_history_quotes), and with
+    # the flag off the preview must stay byte-identical to a run
+    # that never heard of the mirror — same discipline as §3.5.
+    if _cq_stats is not None and CONFIG.get("run_history"):
+        result["corpus_quotes"] = _cq_stats
+    if CONFIG.get("emit_uncertainty") and not aborted:
+        # Amendment A6: during a replay, _learn().dir is the
+        # sandbox, so these emissions land in the throwaway
+        # substrate and are discarded with it — by design. A
+        # replay's uncertainty describes a discarded world; the
+        # live queue only ever holds real runs' items.
+        try:
+            _uq = collect_uncertainty_items(
+                result,
+                book_label=f"{result.get('title')} "
+                           f"({result.get('author')})",
+                work_key=staging_work_key(
+                    None, identifiers.get("isbn"),
+                    title or fpath.stem, author),
+                suspects=roster_split_suspects(_learn().dir))
+            _uq_n = emit_uncertainty(_learn().dir,
+                                     f"v2:{fpath.stem}", _uq)
+            if _uq_n:
+                print(f"  Uncertainty queue: {_uq_n} item(s) "
+                      "emitted for labelling")
+        except Exception as _uq_e:
+            print(f"  Uncertainty queue emission failed ({_uq_e})")
+    if _CAPTURE_CTX is not None and not aborted:
+        # §4.3: the snapshot's corpus block attests THIS run's own
+        # parse — its chapter hashes, computed here from the run's
+        # chapters, never read back from corpus rows.
+        _cap_hashes = [_corpus_text_hash(c["text"]) for c in chapters]
+        _PENDING_CAPTURE_HASHES[_ckpt_fp] = {
+            "chapter_hashes": _cap_hashes,
+            "text_root_hash": _corpus_root_hash(_cap_hashes)}
+        _cap_id = capture_snapshot(
+            _CAPTURE_CTX["snapshot_id"], book_key=_ckpt_key,
+            fingerprint=_ckpt_fp, title=result.get("title"),
+            author=result.get("author"), identifiers=identifiers,
+            chapter_count=n, reason=_CAPTURE_CTX.get("reason", ""))
+        if _cap_id:
+            result["snapshot_captured"] = _cap_id
+    if _REPLAY_CTX is not None:
+        _src_ext = (_REPLAY_CTX["manifest"].get("extraction")
+                    or {})
+        result["replay"] = {
+            "snapshot_id": _REPLAY_CTX["snapshot_id"],
+            "source_code_sha": _src_ext.get("code_sha"),
+            "source_config_digest": _src_ext.get("config_digest"),
+            "replay_code_sha": _git_commit_sha(),
+            "replay_config_digest": _config_digest(),
+        }
+
+    smsg = f" ({a_fallback} via simple fallback)" if a_fallback else ""
+    UI.book_done(_book_key)
+    _gr = red.get("grounding", {})
+    _g_chars = f"{_gr.get('characters_grounded', '?')}/{_gr.get('characters_total', '?')}"
+    _g_rels = f"{_gr.get('relationships_grounded', '?')}/{_gr.get('relationships_total', '?')}"
+    UI.summary(f"📖 {title or fpath.stem}", [
+        ("Tropes", f"{len(tropes)} confirmed"),
+        ("Triggers", len(red['triggers'])),
+        ("Characters", f"{len(red['characters'])} ({len(roster)} roster)"),
+        ("Grounded", f"chars {_g_chars}, rels {_g_rels}"),
+        ("Tasks", f"content {b_ok}/{n} ok, identity {a_ok}/{n} ok{smsg}"),
+        ("Spice", f"{red['spice_level']}/5"),
+        ("POVs", ', '.join(red['povs']) or 'none'),
+        ("Reading time", f"~{reading_mins} min"),
+    ])
+    _ung = _gr.get("ungrounded_names", [])
+    if _ung:
+        UI.status(f"  ⚠ Ungrounded characters (name never appears in text): {', '.join(_ung[:10])}"
+                  + (f" (+{len(_ung)-10} more)" if len(_ung) > 10 else ""))
+
+    if CONFIG.get("dedupe") and result["characters"]:
+        n_before = len(result["characters"])
+        _pre_dedupe_chars = result["characters"]
+        try:
+            d_chars, d_rels, d_povs, dreport = dedupe_characters(
+                result["characters"], result["relationships"], result["povs"])
+        except Exception as e:
+            print(f"  Dedup failed ({e}); not writing partial results")
+            return {"result": None, "wid": None, "how": None,
+                    "title": title, "author": author,
+                    "decide_report": decide_report}
+        result["characters"], result["relationships"], result["povs"] = \
+            d_chars, d_rels, d_povs
+        result["dedup_merges"] = dreport
+        print(f"  Dedup: {n_before} -> {len(d_chars)} characters "
+              f"({len(dreport)} clusters merged)")
+        if _roster_store is not None and dreport:
+            # Option B (design section 4): a within-run merge of two
+            # entity-carrying characters tombstones the folded ID in
+            # the store; the run's shipped rows are unaffected.
+            _n_tomb = _roster_record_dedupe_folds(
+                _roster_store, _pre_dedupe_chars, dreport,
+                _roster_ordinal)
+            if _n_tomb:
+                print(f"  Roster persistence: {_n_tomb} dedupe "
+                      f"fold(s) tombstoned in the store")
+
+    # Principal filter (default on): keep only significant characters.
+    # Non-principals are preserved in result["minor_characters"] for
+    # reference; only principals go to Supabase. The series roster below
+    # still receives the FULL list (a minor here may recur later).
+    _full_characters = result["characters"]
+    _full_relationships = result["relationships"]
+    result["minor_characters"] = []
+    if CONFIG.get("principals_only", True):
+        _min_freq = CONFIG.get("min_frequency", 0.20)
+        _princs, _minors, _prels = _filter_principals(
+            _full_characters, _full_relationships, _min_freq)
+        result["characters"] = _princs
+        result["relationships"] = _prels
+        result["minor_characters"] = _minors
+        # Claim-earner retention (see _claim_earner_chars): the
+        # claims this filter removes solely because their source is
+        # not a principal are kept on the result. Once the filter
+        # runs they exist nowhere else — the result is the only
+        # record the write path (and any later push of the saved
+        # preview) ever sees — and without them a judged claim
+        # sourced by a minor could never reach storage.
+        _principal_names = {norm_name(c.get("name", ""))
+                            for c in _princs}
+        result["minor_sourced_relationships"] = [
+            r for r in _full_relationships
+            if norm_name(r.get("from", "")) not in _principal_names]
+        print(f"  Principals: {len(_princs)}/{len(_full_characters)} characters, "
+              f"{len(_prels)}/{len(_full_relationships)} relationships "
+              f"(min_frequency={_min_freq})")
+        if CONFIG.get("show_matrices"):
+            print(_char_importance_ascii(_princs, _minors))
+
+    # Judged coverage of principal relationships (spec §1.5's
+    # headline metric): computed here, where the principal set is
+    # final and the validation outcomes are already recorded on
+    # the claims. With the principal filter off, every character
+    # ships, so coverage runs over all relationships.
+    _cov_names = None
+    if CONFIG.get("principals_only", True):
+        _cov_names = [c.get("name", "") for c in result["characters"]]
+    result["principal_rel_coverage"] = _principal_rel_coverage(
+        _cov_names, result["relationships"],
+        result.get("dropped_relationships"))
+
+    # Ghost-endpoint relationships: a claim can name a person who has
+    # no character row in the final set (with the principals filter
+    # off, nothing else removes those). Account for them in
+    # dropped_relationships instead of letting preview and DB diverge
+    # silently (see _drop_ghost_relationships).
+    _n_ghost = _drop_ghost_relationships(result)
+    if _n_ghost:
+        print(f"  Relationships: dropped {_n_ghost} with an endpoint "
+              f"outside the character set (ghost_endpoint)")
+
+    # Cross-run learning: persist series roster + learned state. Runs in
+    # preview/dry-run too (learning from a preview is the point).
+    _ln_end = _learn()
+    if _ln_end.enabled:
+        _skey = getattr(_DIAG, "learn_series_key", None)
+        if _skey:
+            _ln_end.save_series_roster(
+                _skey, title, author,
+                getattr(_DIAG, "learn_isbn", None),
+                _full_characters)
+        # Named-series roster (in addition to author roster): cross-book
+        # character continuity within a detected series.
+        _snkey = getattr(_DIAG, "learn_series_name_key", None)
+        if _snkey:
+            _ln_end.save_series_name_roster(
+                _snkey, title, author,
+                getattr(_DIAG, "learn_isbn", None),
+                _series_pos, _full_characters)
+        _ln_end.save()
+        _lsummary = _ln_end.pop_summary()
+        if _lsummary:
+            print(f"  {_lsummary}")
+
+    return {"result": result, "wid": wid, "how": how,
+            "title": title, "author": author,
+            "decide_report": decide_report}
+
+
+
+def cmd_stage_decide(fpath, preview=False, dry_run=False):
+    """--stage decide: run Stage D alone over a stored Stage-E
+    extraction and its Stage-M artefact. Returns the process
+    exit code (0 = preview written, 1 = refusal or failure).
+
+    Preview-only by construction: the stage ASSEMBLES the book
+    record; writing it to the app stays the separate downstream
+    act it is in the monolith (spec §1), so an invocation in a
+    write posture (no --preview) or a dry-run posture (which
+    would assemble nothing and save no preview) refuses by name
+    rather than silently changing what the stage means.
+
+    The hard stop (spec §2): the merged roster's extraction
+    fingerprint AND extraction-flags hash must equal the
+    extraction stamp's. A roster merged from a different
+    extraction — or from the same book extracted under different
+    extraction flags — decided against this extraction's claims
+    is exactly the silent mix the split exists to prevent, so
+    the mismatch refuses by name before any judging. Every other
+    unmet precondition is the same legible hard stop Stage M
+    uses (R4); the entry never runs an upstream stage to fill a
+    gap. Chapter text is re-derived through the shared
+    acquisition path and bound by the fingerprint + chapter
+    count checks, exactly as in cmd_stage_merge (whose docstring
+    states what those checks do and do not prove).
+
+    The stage run is recorded in run history through the same
+    recorder as any run, with the stage named in the row's
+    existing mode field ("stage_decide" — the column that already
+    carries "scan" / "watch_cycle" / "replay", so no schema
+    change). The row cannot carry the extraction/merge
+    fingerprints — the payload's keys are pinned to the table's
+    columns — so the three-fingerprint chain lives where it
+    fits: the preview's decide_report, and the preview file is
+    named with the same run key the history row carries."""
+    if dry_run:
+        print("  --stage decide: a dry run decides nothing and "
+              "saves no preview — the stage's product is the "
+              "preview artefact. Re-run with --preview; nothing "
+              "was run.")
+        return 1
+    if not preview:
+        print("  --stage decide is preview-only: Stage D "
+              "assembles the book record and emits the preview "
+              "artefact; writing to the app stays a separate act "
+              "(a full run, or a push of the saved preview). "
+              "Re-run with --preview; nothing was run.")
+        return 1
+    fpath = Path(fpath)
+    if not fpath.is_file():
+        print(f"  --stage decide: file not found: {fpath}")
+        return 1
+    if fpath.suffix.lower() not in (".epub", ".mobi", ".azw3"):
+        print(f"  --stage decide: unsupported format: {fpath.suffix} "
+              f"(need .epub, .mobi, or .azw3)")
+        return 1
+    book_key = _checkpoint_book_key(fpath)
+    stamp = _load_extraction_stamp(book_key)
+    if stamp is None:
+        print(f"  --stage decide: no extraction stamp for "
+              f"'{book_key}' — Stage D consumes a completed "
+              f"Stage-E extraction (run the book once, or finish "
+              f"its --resume, first). Nothing was run.")
+        return 1
+    if stamp.get("artefact_format_version") != _ARTEFACT_FORMAT_VERSION:
+        print(f"  --stage decide: extraction artefact format "
+              f"{stamp.get('artefact_format_version')} is not the "
+              f"current format {_ARTEFACT_FORMAT_VERSION} — the "
+              f"artefact set must be re-extracted by this build. "
+              f"Nothing was run.")
+        return 1
+    if not stamp.get("complete"):
+        print(f"  --stage decide: the extraction for '{book_key}' "
+              f"is not complete ({stamp.get('chapters_present')} of "
+              f"{stamp.get('payload_chapters')} chapter payloads on "
+              f"disk) — Stage D decides complete extractions only. "
+              f"Finish the extraction first; nothing was run.")
+        return 1
+    _flags = stamp.get("extraction_flags") or {}
+    if _flags.get("only_chunks"):
+        print(f"  --stage decide: the extraction for '{book_key}' "
+              f"is chunk-limited (--chunks "
+              f"{_flags.get('only_chunks')}): it is complete only "
+              f"for the selected chapters, and deciding it would "
+              f"judge a partial book. Re-extract without --chunks "
+              f"first; nothing was run.")
+        return 1
+    if (_flags.get("pipeline") or "v2") != "v2":
+        print(f"  --stage decide: the extraction for '{book_key}' "
+              f"was made by the {_flags.get('pipeline')} pipeline — "
+              f"the stage split covers the v2 pipeline only. "
+              f"Nothing was run.")
+        return 1
+    art = _load_merged_roster_artefact(book_key)
+    if art is None:
+        print(f"  --stage decide: no merged-roster artefact for "
+              f"'{book_key}' — Stage D consumes Stage M's output "
+              f"(run --stage merge for this book first). Nothing "
+              f"was run.")
+        return 1
+    if art.get("artefact_format_version") != _ARTEFACT_FORMAT_VERSION:
+        print(f"  --stage decide: merged-roster artefact format "
+              f"{art.get('artefact_format_version')} is not the "
+              f"current format {_ARTEFACT_FORMAT_VERSION} — "
+              f"re-run --stage merge with this build. Nothing was "
+              f"run.")
+        return 1
+    # THE hard stop (spec §2), before any judging: the roster must
+    # be a merge OF THIS EXTRACTION — same book, same extraction
+    # flags — or every claim decided below would be judged
+    # against a roster that came from somewhere else.
+    if stamp.get("book_fingerprint") \
+            and art.get("book_fingerprint") != stamp["book_fingerprint"]:
+        print(f"  --stage decide: merged-roster artefact belongs "
+              f"to a different extraction (fingerprint "
+              f"{(art.get('book_fingerprint') or '')[:12]}… vs the "
+              f"stamp's {stamp['book_fingerprint'][:12]}…) — "
+              f"refusing to decide one extraction's claims against "
+              f"another's roster. Re-run --stage merge over this "
+              f"extraction; nothing was run.")
+        return 1
+    if art.get("extraction_flags_hash") \
+            != stamp.get("extraction_flags_hash"):
+        print(f"  --stage decide: merged-roster artefact was "
+              f"merged from an extraction under different "
+              f"extraction flags (flags hash "
+              f"{(art.get('extraction_flags_hash') or '')[:12]}… vs "
+              f"the stamp's "
+              f"{(stamp.get('extraction_flags_hash') or '')[:12]}…) "
+              f"— refusing to decide across an extraction-flags "
+              f"change. Re-run --stage merge over this extraction; "
+              f"nothing was run.")
+        return 1
+    if stamp.get("processor_version") != PORTABLE_VERSION:
+        print(f"  --stage decide: extraction was stamped by "
+              f"portable v{stamp.get('processor_version')} (this "
+              f"build is v{PORTABLE_VERSION}) — proceeding")
+    if art.get("processor_version") != PORTABLE_VERSION:
+        print(f"  --stage decide: merged roster was written by "
+              f"portable v{art.get('processor_version')} (this "
+              f"build is v{PORTABLE_VERSION}) — proceeding")
+    loaded = _checkpoint_load(book_key)
+    if loaded is None:
+        print(f"  --stage decide: no readable checkpoint set for "
+              f"'{book_key}' despite its stamp — the artefact set "
+              f"is inconsistent; re-extract. Nothing was run.")
+        return 1
+    _meta, _raw_roster, payloads = loaded
+    _acq = _acquire_chapters(fpath)
+    if _acq is None:
+        print(f"  --stage decide: could not read {fpath}")
+        return 1
+    chapters = _acq["chapters"]
+    title, author = _acq["title"], _acq["author"]
+    identifiers = _acq["identifiers"]
+    word_count = _acq["word_count"]
+    _fp = _checkpoint_fingerprint(
+        identifiers, title, author, _checkpoint_text_sample(chapters))
+    if stamp.get("book_fingerprint") and _fp != stamp["book_fingerprint"]:
+        print(f"  --stage decide: {fpath.name} parses to a "
+              f"different book than the stamped extraction "
+              f"(fingerprint {_fp[:12]}… vs "
+              f"{stamp['book_fingerprint'][:12]}…) — refusing to "
+              f"decide one book's extraction against another "
+              f"book's text. Nothing was run.")
+        return 1
+    _stamp_total = stamp.get("total_chapters")
+    if not isinstance(_stamp_total, int) \
+            or len(chapters) != _stamp_total:
+        print(f"  --stage decide: {fpath.name} parses to "
+              f"{len(chapters)} chapters but the stamped "
+              f"extraction covers {_stamp_total} — refusing to "
+              f"decide against a chapter set the extraction did "
+              f"not produce. Nothing was run.")
+        return 1
+    print(f"Stage D (decide) for {fpath.name}: extraction stamped "
+          f"by portable v{stamp.get('processor_version')}, merge "
+          f"config {art.get('merge_config_fingerprint')}, "
+          f"{stamp.get('chapters_present')} chapters")
+
+    # From here the stage can fail mid-work, so the run-history
+    # recorder arms first (its construction snapshots the budget
+    # arming sequence — the per-stage budget reset in the run
+    # below must land AFTER it, or the book's decision stamps
+    # cannot be attributed to this stage).
+    _history_begin("stage_decide", preview=True, files_seen=1)
+    _history_note_admitted(1)
+    _history_book_start(fpath)
+    try:
+        _ok = _stage_decide_run(
+            fpath, book_key, stamp, art, payloads, chapters, title,
+            author, identifiers, word_count,
+            _acq["chapter_detection_fallback"])
+    except Exception as e:
+        _history_book_end(fpath, e)
+        _history_book_outcome(fpath, False)
+        _history_finish(failures=1)
+        print(f"  --stage decide FAILED for {fpath.name}: "
+              f"{type(e).__name__}: {e}")
+        return 1
+    _history_book_outcome(fpath, _ok)
+    _history_book_end(fpath)
+    _history_finish(failures=0 if _ok else 1)
+    return 0 if _ok else 1
+
+
+def _stage_decide_run(fpath, book_key, stamp, art, payloads,
+                      chapters, title, author, identifiers,
+                      word_count, chap_fallback):
+    """The armed half of cmd_stage_decide: arm the per-book state
+    process_file_v2's head arms, run the shared stage function,
+    and run the preview epilogue. Returns True on success."""
+    global _DEBUG_TAG
+    _DEBUG_TAG = fpath.stem if CONFIG.get("debug") else None
+    _book_key = str(fpath)
+    # ISBN resolution without the missing-ISBN gate: that gate is
+    # an extraction-admission decision (it can skip or rename the
+    # book), and a completed extraction has already passed it —
+    # the stage only needs the source string for the record.
+    _isbn, _isbn_source = _resolve_book_isbn(identifiers, title,
+                                             author)
+    # The decision budget opens at the chapter-scaled pool for
+    # THIS stage (per-stage basis): Stage M spent its own pool in
+    # its own process, so the decide pool here is whole — the
+    # divergence from the monolith's one shared pool is real
+    # (it bites only where the shared pool would have exhausted)
+    # and is stamped on the decide_report rather than hidden.
+    _dm_budget_reset(chapter_count=len(chapters))
+    _series_name, _series_pos, _series_source = _detect_series(
+        fpath, identifiers, title, author)
+    # Per-book _DIAG / learned arming, replicated from
+    # process_file_v2's head: the reduce and its helpers read
+    # this state from the globals they have always read, so the
+    # standalone stage must present the same surroundings the
+    # monolith presents — a field left unarmed here would be a
+    # silent behavioural difference, not a missing feature.
+    _ln_book = _learn()
+    _DIAG.learn_isbn = identifiers.get("isbn") \
+        or identifiers.get("asin")
+    _DIAG.book_author = author
+    _DIAG.name_attest = _build_name_attestation(chapters)
+    _learn_skey = _ln_book.series_key(author) \
+        if _ln_book.enabled else None
+    _DIAG.learn_series_key = _learn_skey
+    _learn_hints = (_ln_book.load_series_hints(_learn_skey)
+                    if _learn_skey else {})
+    _learn_series_name_key = (
+        _ln_book.series_name_key(_series_name)
+        if (_ln_book.enabled and _series_name) else None)
+    _DIAG.learn_series_name_key = _learn_series_name_key
+    if _learn_series_name_key:
+        _series_hints = _ln_book.load_series_name_hints(
+            _learn_series_name_key)
+        _learn_hints = {**_learn_hints, **_series_hints}
+    _DIAG.learn_series_hints = _learn_hints
+    _sp_ctx = _series_priors_for_book(identifiers, title, author,
+                                      _series_name)
+    _DIAG.series_priors = _sp_ctx
+    _DIAG.viz_book_key = _book_key
+
+    indexed = _select_chunks(chapters, None)
+    n = len(indexed)
+    _fm_idx = {i for i, ch in indexed if ch.get("is_frontmatter")}
+    chapter_as, chapter_bs = {}, {}
+    for _i, _ch in indexed:
+        _a, _b = payloads.get(_i, (None, None))
+        chapter_as[_i] = _a
+        chapter_bs[_i] = _b
+    for _fi in _fm_idx:
+        # Front/back matter slots are permanently empty in the
+        # monolith too — a stale payload under one is dropped,
+        # never decided from.
+        chapter_as[_fi] = None
+        chapter_bs[_fi] = None
+    _nonfm = [i for i, _ch in indexed if i not in _fm_idx]
+    a_ok = sum(1 for i in _nonfm if chapter_as.get(i) is not None)
+    b_ok = sum(1 for i in _nonfm if chapter_bs.get(i) is not None)
+    a_failed = len(_nonfm) - a_ok
+    b_failed = len(_nonfm) - b_ok
+    _failed = a_failed + b_failed
+    aborted = (a_ok == 0 and b_ok == 0) or \
+        _failed / max(2 * n, 1) > MAX_FAILED_CHUNK_RATIO
+    # a_fallback is unrecoverable from the artefacts: Call A's
+    # fell_back is a return value, never persisted (the replay
+    # path takes the same posture). It feeds only the record's
+    # task telemetry, never a decision.
+    call = _llm_backend()
+    roster = _artefact_roster(art)
+    _mrep = art.get("merge_report") or {}
+    _recon_stats = (_mrep.get("reconcile") or {}).get("stats")
+    _pp = _mrep.get("post_pass") or {}
+    _merge_judge_stats = None
+    if _mrep.get("jev") is not None:
+        # The monolith's preview carries the jev diagnostics
+        # whole, verdicts included; the artefact re-homes the
+        # verdicts into its table with mechanism tags, so the
+        # diagnostics are reassembled from the two.
+        _jev_verdicts = [
+            {k: v for k, v in _v.items() if k != "mechanism"}
+            for _v in _mrep.get("verdicts") or []
+            if _v.get("mechanism") == "jev_merge"]
+        _merge_judge_stats = dict(_mrep["jev"],
+                                  verdicts=_jev_verdicts)
+    _priors_report = _mrep.get("series_priors")
+    UI.book_start(_book_key, f"📖 {title or fpath.stem}", total=2 * n)
+    _dseg = stage_decide_book(
+        roster, chapters, indexed, chapter_as, chapter_bs,
+        fpath=fpath, _book_key=_book_key, _ckpt_key=book_key,
+        _ckpt_fp=stamp.get("book_fingerprint"),
+        title=title, author=author, identifiers=identifiers,
+        _isbn_source=_isbn_source,
+        _series_name=_series_name, _series_pos=_series_pos,
+        _series_source=_series_source, word_count=word_count,
+        _chap_fallback=chap_fallback,
+        a_ok=a_ok, b_ok=b_ok, a_failed=a_failed,
+        b_failed=b_failed, a_fallback=0,
+        aborted=aborted, dry_run=False, preview=True, call=call,
+        _recon_stats=_recon_stats,
+        _pp_merged=_pp.get("merged", 0),
+        _pp_possible=_pp.get("possible_merges", []),
+        _merge_judge_stats=_merge_judge_stats,
+        priors_report=_priors_report,
+        priors_source=("merge_artefact"
+                       if _priors_report is not None else None),
+        _resumed_chapters=payloads,
+        extraction_flags_hash=stamp.get("extraction_flags_hash"),
+        merge_config_fingerprint=art.get(
+            "merge_config_fingerprint"),
+        budget_basis="per-stage")
+    result = _dseg["result"]
+    if result is None:
+        print(f"  --stage decide FAILED for {fpath.name}: the "
+              f"stage produced no result (dedupe failure) — no "
+              f"preview written.")
+        return False
+    # The preview epilogue, mirroring the monolith's preview
+    # branch minus the checkpoint clear: the artefacts are the
+    # other stages' products, and a re-decide under another
+    # judge starts from them — clearing them would make the
+    # stage single-use.
+    save_preview(fpath, result)
+    print(f"  Preview saved (pipeline=v2, stage=decide)")
+    if _dseg["wid"]:
+        # Replace-wholesale validation gate: log what a write run
+        # would replace for this in-DB work (read-only).
+        print_replace_plan(_dseg["wid"], result)
+    return True
+
 
 
 def _v2_char_confidence(appearances, has_verified_evidence):
@@ -21909,15 +23271,28 @@ def _run_task(call, prompt, chunk, i, n, task_name, sanitize_fn=None):
     return None
 
 
+def _llm_backend():
+    """The extractor backend function for CONFIG["llm"], defaulting
+    to ollama for an unknown name.
+
+    One dispatch for every caller — the v1 extractor, the v2
+    pipeline head, Stage D's standalone entry. The map used to
+    live as a literal at each call site; Stage D's entry would
+    have made a third copy, and a provider added to one copy and
+    not the others would silently route a stage to a different
+    backend than the run it mirrors."""
+    backends = {"ollama": llm_ollama, "openrouter": llm_openrouter,
+                "openai": llm_openai_compat, "cohere": llm_cohere}
+    return backends.get(CONFIG["llm"], llm_ollama)
+
+
 def extract_llm(chunk, i, n):
     """Run the discipline task (tropes/triggers/spice/quotes) and the identity
     task (characters/relationships) separately. A failed task does not
     invalidate the other. If the rich identity prompt fails twice, one attempt
     is made with the simplified no-evidence fallback prompt. Returns merged
     dict, or None if both failed."""
-    backends = {"ollama": llm_ollama, "openrouter": llm_openrouter, "openai": llm_openai_compat,
-                "cohere": llm_cohere}
-    call = backends.get(CONFIG["llm"], llm_ollama)
+    call = _llm_backend()
     disc = _run_task(call, PROMPT_DISCIPLINE, chunk, i, n, "discipline")
     ident = _run_task(call, _rel_prompt(PROMPT_IDENTITY), chunk, i, n,
                       "identity")
@@ -29710,9 +31085,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     # 2 work units per chapter (Call A identity + Call B content)
     UI.book_start(_book_key, f"📖 {title or fpath.stem}", total=2 * n)
 
-    backends = {"ollama": llm_ollama, "openrouter": llm_openrouter,
-                "openai": llm_openai_compat, "cohere": llm_cohere}
-    call = backends.get(CONFIG["llm"], llm_ollama)
+    call = _llm_backend()
     batch_size = effective_batch_size()
 
     # P8: crash resume. Checkpoint key is the file stem, which two
@@ -29985,838 +31358,42 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             extraction_flags_hash=_extraction_flags_hash(),
             extraction_processor_version=PORTABLE_VERSION)
 
-    # Option B seam (design section 7): ONE identity assignment
-    # point, after the post-pass merge and before the reduce, over
-    # the run's FINAL roster. Flag off (or dry-run, or an aborted
-    # run): skipped entirely — no store access, no marker,
-    # byte-identical behaviour. Flag on: entries are annotated with
-    # entity_id and every downstream consumer (reduce, builders,
-    # plan) inherits identity from that annotation.
-    _roster_marker = None
-    _roster_store = None
-    _roster_ordinal = None
-    if CONFIG.get("persist_roster") and not dry_run and not aborted:
-        _roster_store, _seam_wid = _roster_store_for(
-            title or fpath.stem, author, identifiers)
-        if _roster_store is not None and _roster_store.writable:
-            _anchors = _roster_fetch_anchors(_seam_wid) \
-                if _seam_wid else []
-            _roster_marker = roster_assign_entities(
-                roster, _roster_store, anchors=_anchors,
-                alias_targets=_roster_alias_targets())
-            if _roster_marker is not None:
-                _roster_ordinal = _roster_marker["run_ordinal"]
-                print(f"  Roster persistence: "
-                      f"{_roster_marker['linked']} linked, "
-                      f"{_roster_marker['minted']} new entities, "
-                      f"{_roster_marker['folded']} folded, "
-                      f"{len(_roster_marker['suspects'])} split "
-                      f"suspects")
-            else:
-                _roster_store = None  # disengaged (A8): flag-off run
-        else:
-            _roster_store = None
-
-    # Deterministic reduce (no LLM). n_chapters_total is the FULL
-    # chapter list's length: `indexed` may be a --chunks subset, but
-    # chapter_bs keys (and the spice array) live in original indices.
-    red = v2_reduce(chapter_as, chapter_bs, roster,
-                    [ch for _, ch in indexed], preview=preview,
-                    show_matrices=CONFIG.get("show_matrices", False),
-                    n_chapters_total=len(chapters))
-
-    # Trope confirmation: frequency tiers, LLM gate only for the borderline.
-    # Thresholds scale with book length (5% of chapters, min 3):
-    # - >= auto_min chapters: auto-confirm (a recurring pattern is a trope).
-    # - 2 to auto_min-1 chapters: LLM gate judges against summaries.
-    # - 1 chapter: drop in long books (not a book-level trope).
-    tropes, trope_conf = [], {}
-    _sb_auto, _sb_gated = [], []  # staging observe inputs (Option F)
-    if not dry_run and red["trope_candidates"]:
-        counts = red["trope_candidate_counts"]
-        # Scale thresholds with book length: 5% of chapters, min 3.
-        # (e.g. 73-chapter book -> 3; 100-chapter book -> 5.)
-        auto_min = max(3, n // 20)  # 5% of chapters, min 3
-        drop_single = n >= 20  # only drop single-chapter tropes in long books
-        auto, gated, dropped = [], [], 0
-        # Build chapter lists per trope for evidence.
-        # Prefer the display-keyed map from v2_reduce (handles paraphrases);
-        # fall back to raw-text keys only if the reduce didn't build one
-        # (e.g. no embed_url, so no catalog mapping ran).
-        if red.get("trope_chapters"):
-            trope_chapters = red["trope_chapters"]
-        else:
-            trope_chapters = {}
-            for idx in sorted(chapter_bs):
-                b = chapter_bs[idx]
-                if not b:
-                    continue
-                seen_ch = set()
-                for tc in b.get("trope_candidates", []):
-                    key = _tnorm(tc)
-                    if key not in seen_ch:
-                        seen_ch.add(key)
-                        trope_chapters.setdefault(key, []).append(idx)
-            red["trope_chapters"] = trope_chapters
-        _denied = 0
-        _rej_denied = 0
-
-        def _pub_trope(name, state):
-            if UI._console_observer is None:
-                return
-            UI.console_candidate(_book_key, "tropes", _tnorm(name), {
-                "name": name, "chapters": counts.get(_tnorm(name), 1),
-                "state": state})
-
-        for c in red["trope_candidates"]:
-            _pub_trope(c, "candidate")
-            # Drop genre/setting labels (not tropes)
-            if _is_denylisted_trope(c):
-                _denied += 1
-                _pub_trope(c, "suppressed")
-                continue
-            # Drop tropes humans have rejected 3+ times (rejection denylist)
-            if _learn().is_trope_denylisted(_trej_key(c)):
-                _denied += 1
-                _rej_denied += 1
-                _pub_trope(c, "suppressed")
-                continue
-            n_ch = counts.get(_tnorm(c), 1)
-            if n_ch >= auto_min:
-                auto.append(c)
-                _pub_trope(c, "auto_threshold")
-            elif n_ch >= 2 or not drop_single:
-                gated.append(c)
-                _pub_trope(c, "gate_pending")
-            else:
-                dropped += 1
-                _pub_trope(c, "held_back")
-        print(f"  Tropes: {len(auto)} auto ({auto_min}+ ch), {len(gated)} to gate, "
-              f"{dropped} single-ch dropped, {_denied} denylisted...", end=" ", flush=True)
-        _sb_auto, _sb_gated = list(auto), list(gated)
-        for c in auto:
-            tropes.append(c)
-            trope_conf[_tnorm(c)] = round(
-                min(0.9, 0.55 + 0.1 * counts.get(_tnorm(c), auto_min)), 2)
-        if gated:
-            g_tropes, g_conf = v2_trope_gate(
-                call, red["chapter_summaries"], gated, counts)
-            tropes.extend(g_tropes)
-            trope_conf.update(g_conf)
-        # Rejection learning: human rejections raise the acceptance bar for
-        # this trope (0.10 per rejection); 3+ rejections already denylisted.
-        _rej_filtered = 0
-        if tropes:
-            _pre_rej = {_tnorm(t): t for t in tropes}
-            tropes, trope_conf, _rej_filtered = _apply_trope_rejections(
-                tropes, trope_conf, _learn())
-            if UI._console_observer is not None:
-                for _k in set(_pre_rej) - {_tnorm(t) for t in tropes}:
-                    UI.console_verdict(_book_key, {
-                        "table": "tropes", "row_key": _k,
-                        "record": {"name": _pre_rej[_k],
-                                   "state": "suppressed"}})
-        _rej_total = _rej_denied + _rej_filtered
-        rej_note = f", {_rej_total} rejected" if _rej_total else ""
-        print(f"{len(tropes)} confirmed{rej_note}")
-    red["tropes"] = tropes
-    red["trope_confidence"] = trope_conf
-
-
-    # Spine §3.5: per-work verdict read-back + suppression net A.
-    # Runs only when Supabase is configured (the fields below exist
-    # on the result only when a fetch was attempted, so runs without
-    # read-back are byte-identical to before). Confirmed verdicts
-    # do nothing here — no force-ship, no boost (authority creep
-    # is forbidden by the design); rejected verdicts suppress.
-    _verdict_attempted = False
-    _verdict_note = None
-    _rejected_keys = set()
-    _supp_keys = set()
-    _supp_names = []
-    if not dry_run and not aborted \
-            and CONFIG.get("supabase_url") \
-            and CONFIG.get("supabase_key"):
-        _verdict_attempted = True
-        _vwid = None
-        try:
-            _vwid, _vhow = resolve_work(
-                title or fpath.stem, author, identifiers, False,
-                create=False)
-        except Exception:
-            _vwid = None
-        if _vwid:
-            _vs, _verdict_note = work_verdicts(str(_vwid),
-                                               _learn().dir)
-            if _vs is not None:
-                _rejected_keys = _vs.rejected_keys()
-            if _rejected_keys:
-                _cat_map = red.get("trope_catalog_map") or {}
-                (tropes, trope_conf, red["triggers"], _supp_keys,
-                 _supp_names) = apply_verdict_suppression(
-                    tropes, trope_conf, red["triggers"],
-                    _rejected_keys, _cat_map)
-                red["tropes"] = tropes
-                red["trope_confidence"] = trope_conf
-
-                def _cand_key(c):
-                    return staging_claim_key(
-                        "trope", name=c,
-                        catalog_id=_cat_map.get(_tnorm(c)))
-                _sb_auto = [c for c in _sb_auto
-                            if _cand_key(c) not in _rejected_keys]
-                _sb_gated = [c for c in _sb_gated
-                             if _cand_key(c) not in _rejected_keys]
-        if _verdict_note:
-            print(f"  Verdicts: {_verdict_note}")
-
-    # Option G trigger retrieval (design section 8): evidence-less
-    # triggers are retrieved for BEFORE the staging seam, so a
-    # trigger that gains judge-supported passages has them in its
-    # evidence list when the seam computes has_evidence and F's
-    # existing evidence-arrival promotion fires unchanged. Flag
-    # off: the trigger list is untouched, byte-identical.
-    _trope_evidence = {}
-    _trope_retrieval = {}
-    _trigger_retrieval = {}
-    _evidence_marker = None
-    if CONFIG.get("evidence_retrieval") and not dry_run \
-            and not aborted:
-        _gtrig = evidence_retrieve_triggers(
-            red["triggers"], chapters, call=call,
-            embedder=lambda texts: embed_vectors(
-                CONFIG.get("embed_url", ""),
-                CONFIG.get("embed_model", ""), texts))
-        _trigger_retrieval = _gtrig["trigger_retrieval"]
-        _evidence_marker = _gtrig["marker"]
-        _filled = sum(1 for _r in _trigger_retrieval.values()
-                      if _r.get("passages"))
-        if _filled:
-            print(f"  Trigger evidence: {_filled} evidence-less "
-                  f"trigger(s) gained retrieved passages")
-
-
-    # Option F staging seam (design section 5): ONE split point,
-    # after the trope gate + rejection learning and the trigger
-    # finalization in v2_reduce, before result assembly. Flag off
-    # (or dry-run, or an aborted run): skipped entirely — no store
-    # access, no marker, byte-identical behaviour. Flag on: observe
-    # the run's stageable claims and rewrite tropes/triggers to the
-    # ship set here; write_claims, plan_replace, save_preview and
-    # push-preview all inherit the split from the result.
-    _staging_marker = None
-    _trope_persistence = {}
-    _trigger_persistence = {}
-    _st = None
-    _sg_work_key = None
-    if CONFIG.get("staging_gate") and not dry_run and not aborted:
-        _st = _staging()
-        if _st.enabled and _st.writable:
-            # Resolve the work READ-ONLY before observing (the read
-            # the roster seam also performs): when the work already
-            # exists, the observe must land on its canonical entry.
-            # Observing under the fallback key and adopting after
-            # the fact restarts the fallback entry at ordinal 1 on
-            # every run (adoption deletes it), so the persistence
-            # check could never fire on a resolved work and staged
-            # claims neither promoted nor absence-expired. With
-            # create=False this adds no write in either mode; the
-            # real resolution (creation, on corrected metadata)
-            # still runs after result assembly, and OC-8 adoption
-            # below remains the net for works that only resolve
-            # there. A failed or empty resolution keeps the
-            # fallback key — delay-only, as before.
-            _sg_wid = None
-            try:
-                _sg_wid, _sg_how = resolve_work(
-                    title or fpath.stem, author, identifiers, False,
-                    create=False)
-            except Exception:
-                _sg_wid = None
-            _sg_work_key = staging_work_key(
-                _sg_wid, identifiers.get("isbn"),
-                title or fpath.stem, author)
-            _sg = staging_observe_result({
-                "work_key": _sg_work_key,
-                "work_id": _sg_wid, "title": title or fpath.stem,
-                "author": author, "isbn": identifiers.get("isbn"),
-                "auto_min": max(3, n // 20),
-                "trope_auto": _sb_auto, "trope_gated": _sb_gated,
-                "trope_counts": red.get("trope_candidate_counts")
-                                or {},
-                "trope_ship": tropes, "trope_conf": trope_conf,
-                "catalog_map": red.get("trope_catalog_map") or {},
-                "triggers": red["triggers"],
-                # Spine §3.5 net B: the seam drops promoted
-                # re-ships of human-rejected claims itself.
-                "verdict_rejected": _rejected_keys,
-            }, _st, independent=not _resumed_chapters)
-            tropes = _sg["ship_tropes"]
-            trope_conf = _sg["trope_conf"]
-            red["tropes"] = tropes
-            red["trope_confidence"] = trope_conf
-            red["triggers"] = _sg["ship_triggers"]
-            _staging_marker = _sg["marker"]
-            _trope_persistence = _sg["trope_persistence"]
-            _trigger_persistence = _sg["trigger_persistence"]
-            print(f"  Staging: {len(_staging_marker['staged'])} held "
-                  f"back, {len(_staging_marker['promoted'])} promoted, "
-                  f"{_staging_marker['trapped_total']} trapped for "
-                  f"this work")
-            # Net B's suppressed set joins the counter union.
-            _supp_keys |= set(_sg.get("suppressed_keys") or set())
-            for _nm in (_sg.get("suppressed_names") or []):
-                if _nm not in _supp_names:
-                    _supp_names.append(_nm)
-
-    if UI._console_observer is not None:
-        # Final trope/trigger dispositions: the ship set as the
-        # staging seam left it, and the suppressed set by name —
-        # trigger names are category keys, everything else is a
-        # trope (the same classification the artefact carries).
-        for _t in tropes:
-            UI.console_verdict(_book_key, {
-                "table": "tropes", "row_key": _tnorm(_t),
-                "record": {
-                    "name": _t,
-                    "chapters": (red.get("trope_candidate_counts")
-                                 or {}).get(_tnorm(_t), 1),
-                    "state": "shipped",
-                    "confidence": trope_conf.get(_tnorm(_t))}})
-        for _nm in _supp_names:
-            if _nm in TRIGGER_CATEGORIES:
-                UI.console_verdict(_book_key, {
-                    "table": "triggers", "row_key": f"trig:{_nm}",
-                    "decision": "suppressed",
-                    "record": {"warning": _nm, "status": "suppressed"}})
-            else:
-                UI.console_verdict(_book_key, {
-                    "table": "tropes", "row_key": _tnorm(_nm),
-                    "record": {"name": _nm, "state": "suppressed"}})
-        UI.console_stage(_book_key, "final_gates", "active")
-
-    # Spine §3.5.3: the suppression counter — one rejection_events
-    # row per suppressed claim per run, counted on the UNION of
-    # both nets (before dedup the same claim could be caught twice;
-    # it is still one suppressed claim).
-    if _supp_keys:
-        record_rejection_events(
-            _learn().dir, f"v2:{fpath.stem}",
-            staging_work_key(None, identifiers.get("isbn"),
-                             title or fpath.stem, author),
-            _supp_keys)
-        print(f"  Suppressed {len(_supp_keys)} human-rejected "
-              f"claims for this work")
-
-    # Option G trope retrieval (design section 8): runs AFTER the
-    # staging seam — staged tropes are retrieved for too, because
-    # their recorded evidence is what a later run's observe
-    # evaluates under promotion rule 4 — and before result
-    # assembly, so write_claims, plan_replace, save_preview and the
-    # dashboard all inherit the annotated result; there is no
-    # second copy of the evidence decision for a consumer to
-    # understate. Flag off (or dry-run, or aborted): no embed
-    # calls, no judge calls, no marker, byte-identical behaviour.
-    if CONFIG.get("evidence_retrieval") and not dry_run \
-            and not aborted:
-        _g_specs, _g_seen = [], set()
-        _g_staged = {}
-        if _staging_marker:
-            for _s in _staging_marker.get("staged") or []:
-                if _s.get("class") == "trope":
-                    _g_staged[_tnorm(_s.get("display") or "")] = \
-                        _s.get("display") or ""
-        _g_catmap = red.get("trope_catalog_map") or {}
-        _g_chaps = red.get("trope_chapters") or {}
-        for _nm in list(tropes) + sorted(_g_staged.values()):
-            _k = _tnorm(_nm)
-            if _k in _g_seen:
-                continue
-            _g_seen.add(_k)
-            _g_specs.append({
-                "name": _nm,
-                "support_refs": _g_chaps.get(_k, []),
-                "catalog_id": _g_catmap.get(_k),
-                "staged": _k in _g_staged})
-        # Corpus stage adoption (corpus-design §4.2): when the
-        # corpus holds this work complete, retrieval verdicts are
-        # stage outputs — current ones are re-read instead of
-        # re-judged, fresh ones settle. No corpus (or an
-        # incomplete/suspect one) => the context is None and the
-        # seam is exactly the per-run computation it has always
-        # been. (Under replay the learn dir is the sandbox, which
-        # holds no corpus: no adoption — replay corpus reads are
-        # §4.3's validated path, slice 5.)
-        _g_ctx = corpus_retrieve_context(_learn().dir, _ckpt_fp)
-        _g = evidence_retrieve_result({
-            "claims": _g_specs,
-            "catalog": _trope_catalog_entries(),
-            "summaries": {s.get("label"): s.get("summary")
-                          for s in red.get("chapter_summaries")
-                          or []},
-        }, chapters, call=call, embedder=lambda texts:
-            embed_vectors(CONFIG.get("embed_url", ""),
-                          CONFIG.get("embed_model", ""), texts),
-            stage_ctx=_g_ctx)
-        _trope_evidence = _g["trope_evidence"]
-        _trope_retrieval = _g["trope_retrieval"]
-        _evidence_marker = _merge_evidence_markers(
-            _evidence_marker, _g["marker"])
-        # Record this run's retrieved evidence for STAGED tropes
-        # into F's staging store (evidence_ever + grade): run
-        # N+1's observe evaluates it under promotion rule 4 —
-        # never this run (amendment G2). The recording is declared
-        # in the marker, and so on the preview's face (F's OC-4
-        # condition, inherited per design section 5).
-        _recorded, _promotes_next = 0, []
-        if _st is not None and _sg_work_key and _st.enabled \
-                and _st.writable:
-            for _k, _rec in _trope_retrieval.items():
-                if _rec.get("staged") and _rec.get("support") in (
-                        "strong", "single"):
-                    if _st.record_trope_evidence(
-                            _sg_work_key, _rec["name"],
-                            _g_catmap.get(_k), _rec["support"]):
-                        _recorded += 1
-                        if _rec["support"] == "strong":
-                            _promotes_next.append(_rec["name"])
-        _evidence_marker["evidence_recorded"] = _recorded
-        _evidence_marker["promotes_next"] = _promotes_next
-        _gt = _g["marker"]["totals"]
-        print(f"  Trope evidence: {_gt['supported_strong'] + _gt['supported_single']} "
-              f"claims with passages ({_gt['supported_strong']} strong), "
-              f"{_gt['abstained']} abstentions, "
-              f"{_gt['adjacent_only']} adjacent-only, "
-              f"{_gt['failed']} failed")
-
-    # Corpus quote verification (corpus-design §10.1 call site b,
-    # --corpus-quotes, default OFF): this run's model-proposed
-    # quotes verified against the corpus when the work is
-    # ingested. The corpus records verdicts; the run's own quote
-    # list is untouched (publication is slice 7's payload, not the
-    # run's face). Corpus trouble degrades to silence — a corpus
-    # write never fails a run (§5.2).
-    _cq_stats = None
-    if CONFIG.get("corpus_quotes") and not dry_run and not aborted:
-        try:
-            _qdb = _corpus_db_for(_learn().dir, mode="processor")
-            if _qdb is not None and corpus_work_state(
-                    _qdb, _ckpt_fp) in ("text_complete",
-                                        "vectors_partial",
-                                        "complete"):
-                _qv = corpus_verify_run_quotes(
-                    _qdb, _ckpt_fp, red.get("quotes"))
-                if _qv:
-                    print(f"  Corpus quotes: {_qv['verified']} "
-                          f"verified, {_qv['rejected']} rejected "
-                          f"against the corpus text")
-                # Selection (§10.2): the poll is the shared
-                # decision budget's lowest priority and its first
-                # shed; a shed ships nothing and never fails the
-                # run.
-                _qs = corpus_select_quotes(_qdb, _ckpt_fp)
-                if _qs.get("poll") == "ok":
-                    print(f"  Corpus quotes: {_qs['selected']} "
-                          f"selected for the payload")
-                else:
-                    print(f"  Corpus quotes: selection shed "
-                          f"({_qs.get('reason')}) — no quotes ship "
-                          f"from this run")
-                # The stage's counts are kept so they can ride on
-                # the result record for the history mirror (the
-                # attach below, when run history is armed); until
-                # now they existed only as printed lines. A shed
-                # selected nothing — 0 is a measurement there, not
-                # an unknown.
-                # The quote-poll stage is done: its unused reserve
-                # is borrowable by anything still running (§1.3).
-                _dm_budget_finish("quote_poll")
-                _cq_stats = {
-                    "verified": _qv["verified"] if _qv else None,
-                    "rejected": _qv["rejected"] if _qv else None,
-                    "selected": (_qs.get("selected") or 0)
-                    if _qs.get("poll") == "ok" else 0}
-        except Exception:
-            pass
-
-    # Shadow discovery (spec §3.5): placed LAST in pipeline order,
-    # after the quote-poll block above — the quote poll's
-    # finished-marker fires at the end of that block (Release A
-    # gate note R-A5), so discovery's borrow position is honest:
-    # it starts only once every earlier consumer has either
-    # finished or never run, and the report records which. Shadow
-    # mode spends its own reported experimental allowance rather
-    # than the shared pool (see _discovery_shadow_run), so even
-    # at this last position it cannot take a call a production
-    # consumer was owed. Flag off (or an aborted run — partial
-    # results are not a book to discover from): no report, no
-    # result key, byte-identical output.
-    _discovery_report = None
-    if not aborted:
-        _discovery_report = _maybe_run_discovery(
-            roster, [ch for _, ch in indexed],
-            red["relationships"], red["characters"])
-    if _discovery_report is not None:
-        _keeps = sum(t["shadow_keeps"]
-                     for t in _discovery_report["per_tier"].values())
-        print(f"  Discovery (shadow): "
-              f"{_discovery_report['pairs_considered']} candidate "
-              f"pairs, {_discovery_report['pairs_judged']} judged, "
-              f"{_keeps} shadow keeps — nothing written")
-
-    reading_mins = word_count // 250
-    result = {
-        "file": fpath.name, "title": title or fpath.stem, "author": author,
-        "isbn": identifiers.get("isbn"), "asin": identifiers.get("asin"),
-        "isbn_source": _isbn_source,  # "flag" | "epub" | "openlibrary" | "none"
-        "series_name": _series_name, "series_position": _series_pos,
-        "series_source": _series_source,  # "flag"|"epub"|"filename"|"openlibrary"|"none"
-        "word_count": word_count, "reading_time_mins": reading_mins,
-        # Same A+B definition as the abort decision above: a persisted
-        # A-only count showed zero failures for books whose content
-        # calls mostly failed.
-        "chunks": n, "chunks_failed": a_failed + b_failed,
-        "pipeline": "v2",
-        "tropes": tropes, "trope_confidence": trope_conf,
-        "triggers": red["triggers"], "characters": red["characters"],
-        "relationships": red["relationships"],
-        "dropped_relationships": red.get("dropped_relationships", []),
-        "pair_losers": red.get("pair_losers", []),
-        "validation_order": red.get("validation_order"),
-        "decision_pool": red.get("decision_pool"),
-        "rel_registry": red.get("rel_registry"),
-        "relationship_type_vocabulary": red.get(
-            "relationship_type_vocabulary"),
-        "validator_circuit_breaker": red.get(
-            "validator_circuit_breaker"),
-        "self_pairs_dropped": red.get("self_pairs_dropped",
-                                      {"extracted": 0, "remapped": 0}),
-        "direction_contradictions": red.get(
-            "direction_contradictions", []),
-        "spice_level": red["spice_level"],
-        # Reduce-computed fields the consumers read from the RESULT
-        # (not from red): --recalibrate-spice needs chapter_spice +
-        # chapters_successful, _preview_summary needs the peak/freq
-        # bands, save_preview needs avg_dialogue_ratio. Forwarding
-        # none of them left recalibrate permanently at no_data and
-        # the summary claiming "(no spicy content)" for spicy books.
-        "spice_peak": red["spice_peak"],
-        "spice_peak_band": red["spice_peak_band"],
-        "spice_freq_band": red["spice_freq_band"],
-        "chapter_spice": red["chapter_spice"],
-        "chapters_successful": red["chapters_successful"],
-        "trigger_chapters": red["trigger_chapters"],
-        "avg_dialogue_ratio": red["avg_dialogue_ratio"],
-        "povs": red["povs"], "quotes": red["quotes"],
-        "chapter_summaries": red["chapter_summaries"],
-        "is_anthology": False, "stories": [],
-        "aborted": aborted, "chunks_ok": a_ok,
-        "tasks": {"discipline": b_ok, "identity": a_ok,
-                  "identity_simple": a_fallback},
-        # Phase 0 telemetry (spec §6, amendment A2): this book's
-        # per-stage accounting, armed at this book's start by
-        # _dm_budget_reset above — the snapshot is taken here,
-        # after every stage (merge, validation, trigger gate,
-        # quote poll) has run, so it carries the book's whole
-        # measured work and nothing from any other book. Under
-        # parallel jobs (--jobs > 1) that attribution cannot be
-        # made: the counters are process-global, so another book's
-        # arm and records can interleave before this stamp. The
-        # book-end and history stamps already refuse that snapshot
-        # under the same jobs condition; the preview stamp carries
-        # the same guard and stamps None there instead.
-        "telemetry": _telemetry_snapshot()
-        if int(CONFIG.get("jobs", 1) or 1) <= 1 else None,
-        "verification": red["verification"],
-        "roster_size": len(roster),
-        # Saved for future remapping (--trope-map can retry these later).
-        "trope_candidates": red.get("trope_candidates", []),
-        "trope_candidate_counts": red.get("trope_candidate_counts", {}),
-        "trope_catalog_map": red.get("trope_catalog_map", {}),
-        "trope_chapters": red.get("trope_chapters", {}),
-        "possible_merges": _pp_possible,
-        "post_pass_merged": _pp_merged,
-        "chapter_detection": "fallback" if _chap_fallback else "spine",
-        # P8/P9: per-chapter Call A/B results + roster, for --resume and
-        # --retry-failed. Keys are str(idx) for JSON stability.
-        "chapter_data": {
-            "chapters": {str(i): {"a": _ckpt_json_safe(chapter_as.get(i)),
-                                  "b": _ckpt_json_safe(chapter_bs.get(i))}
-                         for i, _ch in indexed},
-            "roster": _ckpt_json_safe(roster),
-        },
-    }
-    if _recon_stats is not None:
-        result["roster_reconcile"] = _recon_stats
-    if _merge_judge_stats is not None:
-        # The bake-off's scoreboard: present only on --jev-merge runs,
-        # so flag-off artefacts stay byte-identical to before.
-        result["merge_judge"] = _merge_judge_stats
-    if _sp_ctx is not None:
-        # The priors' footprint on this book (counts only), so
-        # the Phase 3 eval can weigh what the hints did. Absent
-        # whenever priors were not active — the absence is what
-        # keeps flag-off records identical to before.
-        result["series_priors"] = _series_priors_report(_sp_ctx)
-    if _discovery_report is not None:
-        result["discovery"] = _discovery_report
-    if _staging_marker is not None:
-        result["staging"] = _staging_marker
-    if _roster_marker is not None:
-        result["roster_persistence"] = _roster_marker
-    if _trope_persistence:
-        result["trope_persistence"] = _trope_persistence
-    if _trigger_persistence:
-        result["trigger_persistence"] = _trigger_persistence
-    if _evidence_marker is not None:
-        result["evidence_retrieval"] = _evidence_marker
-    if _trope_evidence:
-        result["trope_evidence"] = _trope_evidence
-    if _trope_retrieval:
-        result["trope_retrieval"] = _trope_retrieval
-    if _trigger_retrieval:
-        result["trigger_retrieval"] = _trigger_retrieval
-    v = red["verification"]
-    if v["evidence_checked"]:
-        print(f"  Evidence: {v['evidence_verified']}/{v['evidence_checked']} verified")
-
-    # Metadata correction via OpenLibrary (one call per book; skipped in preview/dry-run).
-    _file_title, _file_author = title, author
-    if not (preview or dry_run):
-        title, author, _corrected = correct_metadata(title or fpath.stem, author, identifiers)
-        result["title"] = title
-        result["author"] = author
-    # The Hardcover landing runs after the Open Library correction
-    # so a confident match's values are the record's final ones
-    # (R-H2 authoritative). It writes the record only: the locals
-    # work resolution below uses are unchanged, because re-keying
-    # work identity on Hardcover metadata is out of scope (§8).
-    _land_series_identity(result, identifiers, _file_title, _file_author)
-    # The registry fold sits beside the identity landing: the
-    # series key has just been resolved, and the record is the
-    # finished cast the registry keeps.
-    _populate_series_registry(result)
-    # Work identity resolution (read-only in preview/dry-run).
-    wid, how = resolve_work(title or fpath.stem, author, identifiers, False,
-                            create=not (preview or dry_run))
-    result["work_id"] = wid
-    result["work_resolution"] = how
-    if wid:
-        # The registry fold above keyed this book by its
-        # pre-resolution fallback; restate it under the work_id
-        # now that resolution has completed (see the helper).
-        _adopt_series_registry_book_key(result, wid)
-    if _staging_marker is not None and wid:
-        # OC-8: the observe seam ran before the work_id existed, so
-        # this run's entries sit under a fallback key; adopt them
-        # into the resolved work's entry now that the id is known.
-        _staging().adopt_for(wid, result.get("title") or "",
-                             result.get("author") or "",
-                             identifiers.get("isbn"))
-    if _roster_store is not None and wid:
-        # Option B (design section 8): the seam ran before the
-        # work_id existed (new works), so this run's store may sit
-        # under a fallback key; adopt it into the resolved work's
-        # key now and reopen on the surviving store so the dedupe
-        # tombstone hook below writes to the right file.
-        if adopt_roster_store(_learn().dir, wid,
-                               result.get("title") or "",
-                               result.get("author") or "",
-                               identifiers.get("isbn")):
-            _roster_store = RosterStore(learn_dir=_learn().dir,
-                                        work_key=str(wid))
-    if how == "new":
-        result["work_candidates"] = _title_candidates(title or fpath.stem)
-        print("  Work: no match — NEW WORK would be created")
-    elif wid:
-        print(f"  Work: matched via {how} -> {wid[:8]}")
-    else:
-        print(f"  Work: resolution failed ({how})")
-
-    # Spine §3.4: snapshot capture rides a fresh preview run (the
-    # payloads are complete here, before the preview epilogue clears
-    # the checkpoint dir), and a replay stamps its provenance marker.
-    # Spine §3.5: the verdict fields exist ONLY when a fetch was
-    # attempted, so unconfigured runs stay byte-identical.
-    if _verdict_attempted:
-        result["verdicts_note"] = _verdict_note
-        result["suppressed_rejected"] = sorted(set(_supp_names))
-    # The corpus-quote counts attach only when run history is
-    # armed (the same CONFIG check _history_begin arms on): their
-    # one reader is the history writer (_history_quotes), and with
-    # the flag off the preview must stay byte-identical to a run
-    # that never heard of the mirror — same discipline as §3.5.
-    if _cq_stats is not None and CONFIG.get("run_history"):
-        result["corpus_quotes"] = _cq_stats
-    if CONFIG.get("emit_uncertainty") and not aborted:
-        # Amendment A6: during a replay, _learn().dir is the
-        # sandbox, so these emissions land in the throwaway
-        # substrate and are discarded with it — by design. A
-        # replay's uncertainty describes a discarded world; the
-        # live queue only ever holds real runs' items.
-        try:
-            _uq = collect_uncertainty_items(
-                result,
-                book_label=f"{result.get('title')} "
-                           f"({result.get('author')})",
-                work_key=staging_work_key(
-                    None, identifiers.get("isbn"),
-                    title or fpath.stem, author),
-                suspects=roster_split_suspects(_learn().dir))
-            _uq_n = emit_uncertainty(_learn().dir,
-                                     f"v2:{fpath.stem}", _uq)
-            if _uq_n:
-                print(f"  Uncertainty queue: {_uq_n} item(s) "
-                      "emitted for labelling")
-        except Exception as _uq_e:
-            print(f"  Uncertainty queue emission failed ({_uq_e})")
-    if _CAPTURE_CTX is not None and not aborted:
-        # §4.3: the snapshot's corpus block attests THIS run's own
-        # parse — its chapter hashes, computed here from the run's
-        # chapters, never read back from corpus rows.
-        _cap_hashes = [_corpus_text_hash(c["text"]) for c in chapters]
-        _PENDING_CAPTURE_HASHES[_ckpt_fp] = {
-            "chapter_hashes": _cap_hashes,
-            "text_root_hash": _corpus_root_hash(_cap_hashes)}
-        _cap_id = capture_snapshot(
-            _CAPTURE_CTX["snapshot_id"], book_key=_ckpt_key,
-            fingerprint=_ckpt_fp, title=result.get("title"),
-            author=result.get("author"), identifiers=identifiers,
-            chapter_count=n, reason=_CAPTURE_CTX.get("reason", ""))
-        if _cap_id:
-            result["snapshot_captured"] = _cap_id
-    if _REPLAY_CTX is not None:
-        _src_ext = (_REPLAY_CTX["manifest"].get("extraction")
-                    or {})
-        result["replay"] = {
-            "snapshot_id": _REPLAY_CTX["snapshot_id"],
-            "source_code_sha": _src_ext.get("code_sha"),
-            "source_config_digest": _src_ext.get("config_digest"),
-            "replay_code_sha": _git_commit_sha(),
-            "replay_config_digest": _config_digest(),
-        }
-
-    smsg = f" ({a_fallback} via simple fallback)" if a_fallback else ""
-    UI.book_done(_book_key)
-    _gr = red.get("grounding", {})
-    _g_chars = f"{_gr.get('characters_grounded', '?')}/{_gr.get('characters_total', '?')}"
-    _g_rels = f"{_gr.get('relationships_grounded', '?')}/{_gr.get('relationships_total', '?')}"
-    UI.summary(f"📖 {title or fpath.stem}", [
-        ("Tropes", f"{len(tropes)} confirmed"),
-        ("Triggers", len(red['triggers'])),
-        ("Characters", f"{len(red['characters'])} ({len(roster)} roster)"),
-        ("Grounded", f"chars {_g_chars}, rels {_g_rels}"),
-        ("Tasks", f"content {b_ok}/{n} ok, identity {a_ok}/{n} ok{smsg}"),
-        ("Spice", f"{red['spice_level']}/5"),
-        ("POVs", ', '.join(red['povs']) or 'none'),
-        ("Reading time", f"~{reading_mins} min"),
-    ])
-    _ung = _gr.get("ungrounded_names", [])
-    if _ung:
-        UI.status(f"  ⚠ Ungrounded characters (name never appears in text): {', '.join(_ung[:10])}"
-                  + (f" (+{len(_ung)-10} more)" if len(_ung) > 10 else ""))
-
-    if CONFIG.get("dedupe") and result["characters"]:
-        n_before = len(result["characters"])
-        _pre_dedupe_chars = result["characters"]
-        try:
-            d_chars, d_rels, d_povs, dreport = dedupe_characters(
-                result["characters"], result["relationships"], result["povs"])
-        except Exception as e:
-            print(f"  Dedup failed ({e}); not writing partial results")
-            return False
-        result["characters"], result["relationships"], result["povs"] = \
-            d_chars, d_rels, d_povs
-        result["dedup_merges"] = dreport
-        print(f"  Dedup: {n_before} -> {len(d_chars)} characters "
-              f"({len(dreport)} clusters merged)")
-        if _roster_store is not None and dreport:
-            # Option B (design section 4): a within-run merge of two
-            # entity-carrying characters tombstones the folded ID in
-            # the store; the run's shipped rows are unaffected.
-            _n_tomb = _roster_record_dedupe_folds(
-                _roster_store, _pre_dedupe_chars, dreport,
-                _roster_ordinal)
-            if _n_tomb:
-                print(f"  Roster persistence: {_n_tomb} dedupe "
-                      f"fold(s) tombstoned in the store")
-
-    # Principal filter (default on): keep only significant characters.
-    # Non-principals are preserved in result["minor_characters"] for
-    # reference; only principals go to Supabase. The series roster below
-    # still receives the FULL list (a minor here may recur later).
-    _full_characters = result["characters"]
-    _full_relationships = result["relationships"]
-    result["minor_characters"] = []
-    if CONFIG.get("principals_only", True):
-        _min_freq = CONFIG.get("min_frequency", 0.20)
-        _princs, _minors, _prels = _filter_principals(
-            _full_characters, _full_relationships, _min_freq)
-        result["characters"] = _princs
-        result["relationships"] = _prels
-        result["minor_characters"] = _minors
-        # Claim-earner retention (see _claim_earner_chars): the
-        # claims this filter removes solely because their source is
-        # not a principal are kept on the result. Once the filter
-        # runs they exist nowhere else — the result is the only
-        # record the write path (and any later push of the saved
-        # preview) ever sees — and without them a judged claim
-        # sourced by a minor could never reach storage.
-        _principal_names = {norm_name(c.get("name", ""))
-                            for c in _princs}
-        result["minor_sourced_relationships"] = [
-            r for r in _full_relationships
-            if norm_name(r.get("from", "")) not in _principal_names]
-        print(f"  Principals: {len(_princs)}/{len(_full_characters)} characters, "
-              f"{len(_prels)}/{len(_full_relationships)} relationships "
-              f"(min_frequency={_min_freq})")
-        if CONFIG.get("show_matrices"):
-            print(_char_importance_ascii(_princs, _minors))
-
-    # Judged coverage of principal relationships (spec §1.5's
-    # headline metric): computed here, where the principal set is
-    # final and the validation outcomes are already recorded on
-    # the claims. With the principal filter off, every character
-    # ships, so coverage runs over all relationships.
-    _cov_names = None
-    if CONFIG.get("principals_only", True):
-        _cov_names = [c.get("name", "") for c in result["characters"]]
-    result["principal_rel_coverage"] = _principal_rel_coverage(
-        _cov_names, result["relationships"],
-        result.get("dropped_relationships"))
-
-    # Ghost-endpoint relationships: a claim can name a person who has
-    # no character row in the final set (with the principals filter
-    # off, nothing else removes those). Account for them in
-    # dropped_relationships instead of letting preview and DB diverge
-    # silently (see _drop_ghost_relationships).
-    _n_ghost = _drop_ghost_relationships(result)
-    if _n_ghost:
-        print(f"  Relationships: dropped {_n_ghost} with an endpoint "
-              f"outside the character set (ghost_endpoint)")
-
-    # Cross-run learning: persist series roster + learned state. Runs in
-    # preview/dry-run too (learning from a preview is the point).
-    _ln_end = _learn()
-    if _ln_end.enabled:
-        _skey = getattr(_DIAG, "learn_series_key", None)
-        if _skey:
-            _ln_end.save_series_roster(
-                _skey, title, author,
-                getattr(_DIAG, "learn_isbn", None),
-                _full_characters)
-        # Named-series roster (in addition to author roster): cross-book
-        # character continuity within a detected series.
-        _snkey = getattr(_DIAG, "learn_series_name_key", None)
-        if _snkey:
-            _ln_end.save_series_name_roster(
-                _snkey, title, author,
-                getattr(_DIAG, "learn_isbn", None),
-                _series_pos, _full_characters)
-        _ln_end.save()
-        _lsummary = _ln_end.pop_summary()
-        if _lsummary:
-            print(f"  {_lsummary}")
+    # Stage D (stage-split step 3): everything downstream of the
+    # merge — the identity seam, claim assembly/reduce,
+    # validation, the trope and trigger gates, evidence
+    # retrieval, result assembly — is one shared implementation
+    # (stage_decide_book) behind this driver and the standalone
+    # --stage decide entry. The epilogue below (the dry-run
+    # return, the preview save, the app write) stays the
+    # monolith's own: the write is a separate downstream act,
+    # not part of the stage.
+    _dseg = stage_decide_book(
+        roster, chapters, indexed, chapter_as, chapter_bs,
+        fpath=fpath, _book_key=_book_key, _ckpt_key=_ckpt_key,
+        _ckpt_fp=_ckpt_fp, title=title, author=author,
+        identifiers=identifiers, _isbn_source=_isbn_source,
+        _series_name=_series_name, _series_pos=_series_pos,
+        _series_source=_series_source, word_count=word_count,
+        _chap_fallback=_chap_fallback,
+        a_ok=a_ok, b_ok=b_ok, a_failed=a_failed, b_failed=b_failed,
+        a_fallback=a_fallback, aborted=aborted,
+        dry_run=dry_run, preview=preview, call=call,
+        _recon_stats=_recon_stats, _pp_merged=_pp_merged,
+        _pp_possible=_pp_possible,
+        _merge_judge_stats=_merge_judge_stats,
+        priors_report=(_series_priors_report(_sp_ctx)
+                       if _sp_ctx is not None else None),
+        priors_source=("live" if _sp_ctx is not None else None),
+        _resumed_chapters=_resumed_chapters,
+        extraction_flags_hash=_extraction_flags_hash(),
+        merge_config_fingerprint=_seg["merge_report"][
+            "merge_config_fingerprint"],
+        budget_basis="shared-run")
+    if _dseg["result"] is None:
+        return False  # the stage failed (dedupe): no result to ship
+    result = _dseg["result"]
+    wid, how = _dseg["wid"], _dseg["how"]
+    title, author = _dseg["title"], _dseg["author"]
 
     if dry_run:
         print("  DRY RUN — nothing written")
@@ -31999,10 +32576,13 @@ def _build_parser():
                          "stored artefacts instead of the whole run. "
                          "'merge' runs Stage M (roster merge) over a "
                          "completed extraction's checkpoints for --file "
-                         "and writes merged-roster.json; 'all' (the "
-                         "default) is the ordinary full run. 'extract' "
-                         "and 'decide' land in later steps of the split "
-                         "and currently refuse, legibly.")
+                         "and writes merged-roster.json; 'decide' runs "
+                         "Stage D (decide) over the extraction plus "
+                         "merged-roster.json and emits the preview "
+                         "(preview-only: --preview required); 'all' "
+                         "(the default) is the ordinary full run. "
+                         "'extract' lands in a later step of the split "
+                         "and currently refuses, legibly.")
     g_pipe.add_argument("--chunks", default=None,
                     help="process only these chunk indices (e.g. --chunks 2 or --chunks 2,5,8); "
                          "numbering matches the sampled chunk list and debug files")
@@ -32529,9 +33109,17 @@ def _flag_conflicts(args, defaults):
     if shots == ["--replay"]:
         modes = [m for m in modes if m != "--file"]
     if shots == ["--stage"]:
-        # --stage merge locates its book BY --file (the same path
-        # Stage E was given): the pairing is designed, like replay's.
+        # --stage locates its book BY --file (the same path Stage E
+        # was given): the pairing is designed, like replay's.
         modes = [m for m in modes if m != "--file"]
+        if getattr(args, "stage", None) == "decide":
+            # --preview beside --stage decide is likewise designed:
+            # the stage is preview-only, so the flag is its required
+            # posture, honoured by the dispatch — not a dropped
+            # mode. (Beside --stage merge it still conflicts: Stage
+            # M neither previews nor writes, so the flag would be
+            # silently dropped there.)
+            modes = [m for m in modes if m != "--preview"]
     if shots == ["--save-profile"]:
         # --save-profile's whole job is capturing run-shaping
         # settings, and preview/dry_run are persistable settings it
@@ -32598,15 +33186,15 @@ def main():
                      "(--list-profiles to see available)")
         _apply_profile(args, defaults, profile)
 
-    # Stage entry points land one at a time (stage-split §8): step 2
-    # ships 'merge'; 'extract' and 'decide' refuse here — before any
-    # state migration or other side effect — rather than silently
-    # running something else.
-    if getattr(args, "stage", "all") in ("extract", "decide"):
+    # Stage entry points land one at a time (stage-split §8):
+    # 'merge' shipped in step 2, 'decide' in step 3; 'extract'
+    # still refuses here — before any state migration or other
+    # side effect — rather than silently running something else.
+    if getattr(args, "stage", "all") == "extract":
         print(f"  --stage {args.stage} is not available yet: the "
               f"stage entry points land one at a time (this build "
-              f"ships 'merge'; 'extract' and 'decide' follow in "
-              f"steps 3-4 of the stage split). Nothing was run.")
+              f"ships 'merge' and 'decide'; 'extract' follows in "
+              f"step 4 of the stage split). Nothing was run.")
         sys.exit(2)
 
     # Spine OC-7: the state stores migrate to the SQLite substrate
@@ -32998,6 +33586,21 @@ def main():
             sys.exit("ERROR: --stage merge needs --file <book> — the "
                      "book whose stored extraction it merges")
         sys.exit(cmd_stage_merge(args.file))
+
+    # --stage decide (stage-split step 3): run Stage D alone over
+    # the --file book's stored extraction + merged-roster
+    # artefact. Same dispatch discipline as merge — after every
+    # CONFIG-shaping flag, before the Supabase gate: the stage is
+    # preview-only and never writes app data, so it must not
+    # demand write credentials. Its preview-only posture is
+    # enforced inside the command (a write-posture invocation
+    # refuses by name there).
+    if getattr(args, "stage", "all") == "decide":
+        if not args.file:
+            sys.exit("ERROR: --stage decide needs --file <book> — "
+                     "the book whose stored artefacts it decides")
+        sys.exit(cmd_stage_decide(args.file, preview=args.preview,
+                                  dry_run=args.dry_run))
 
     if not (args.dry_run or args.preview) and not (CONFIG["supabase_url"] and CONFIG["supabase_key"]):
         sys.exit("ERROR: Set supabase_url and supabase_key in config.json")

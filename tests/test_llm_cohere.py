@@ -288,12 +288,20 @@ class TestProviderEnumeration(unittest.TestCase):
         self.fail("--llm argument not found on the parser")
 
     def test_both_dispatch_maps_serve_cohere(self):
-        # extract_llm (v1) is exercised behaviourally in
-        # TestDispatchRouting; the v2 map sits inside process_file_v2,
-        # which no unit test can invoke, so the invariant that neither
-        # map can drift away from cohere is pinned at the source.
+        # The invariant this pin has always guarded: no dispatch
+        # site can drift away from cohere (or from any provider)
+        # while another keeps it. It used to pin two literal maps
+        # (extract_llm's and process_file_v2's); stage-split step 3
+        # would have added a third copy for the standalone Stage D
+        # entry, so the maps were deduplicated into the single
+        # _llm_backend() dispatch every caller routes through —
+        # the invariant is now structural, and the pin retargets:
+        # exactly one map exists, it serves cohere, and both
+        # original call sites route through the helper.
         src = Path(pp.__file__).read_text(encoding="utf-8")
-        self.assertEqual(src.count('"cohere": llm_cohere'), 2)
+        self.assertEqual(src.count('"cohere": llm_cohere'), 1)
+        self.assertIn("def _llm_backend():", src)
+        self.assertEqual(src.count("call = _llm_backend()"), 3)
 
     def test_extraction_identity_resolution_knows_cohere(self):
         saved = dict(pp.CONFIG)
