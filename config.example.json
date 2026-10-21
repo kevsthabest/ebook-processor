@@ -6,6 +6,8 @@
   "ollama_model": "qwen2.5-coder:7b",
   "openrouter_key": "",
   "openrouter_model": "qwen/qwen3-27b",
+  "cohere_api_key": "",
+  "cohere_model": "command-a-plus-05-2026",
   "supabase_key": "YOUR_SUPABASE_SERVICE_OR_ANON_KEY_HERE",
   "supabase_url": "https://dvhimjkrroxuatthiizc.supabase.co",
   "llm_max_tokens": 8000,

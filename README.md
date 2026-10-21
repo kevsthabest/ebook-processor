@@ -7,7 +7,7 @@ whatever ebook files you hand it. **Preview first, write later** — every run
 can save a full Markdown/JSON report for human review before anything
 touches the database.
 
-**Current version: 2.13.80** (`PORTABLE_VERSION` in `process-portable.py`).
+**Current version: 2.13.81** (`PORTABLE_VERSION` in `process-portable.py`).
 
 ## How it works
 
@@ -50,6 +50,7 @@ touches the database.
 |---|---|---|
 | `--llm ollama` | Ollama `/api/chat` | default model `qwen2.5-coder:7b`, override with `--ollama-model` |
 | `--llm openrouter` | OpenRouter | set `openrouter_model` + `openrouter_key` |
+| `--llm cohere` | Cohere v2 chat (native API) | set `cohere_api_key` (or the `COHERE_API_KEY` env var); `cohere_model` defaults to `command-a-plus-05-2026` (Command A+) |
 | `--llm openai` | Any OpenAI-compatible endpoint | `openai_base_url` + `openai_model` (+ `openai_key`); used for Unsloth |
 
 Current stack: local Qwen3.5-4B Q4 via Unsloth (`--llm openai`,
