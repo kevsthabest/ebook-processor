@@ -129,6 +129,24 @@ class TestEmbedVectorsWarning(unittest.TestCase):
         self.assertEqual(vecs, [[0.1, 0.2], [0.1, 0.2]])
         self.assertEqual(out, "")
 
+    def test_broken_stdout_does_not_break_embedding(self):
+        # The warning is cosmetic: if printing it fails (e.g. a
+        # broken pipe on stdout), the embedding call must still
+        # go out and return its vectors.
+        long_text = "prose " * (BUDGET // 2)  # well over the budget
+
+        def fake_urlopen(req, timeout=None):
+            payload = json.loads(req.data.decode("utf-8"))
+            return _FakeEmbedResponse(len(payload["input"]))
+
+        with mock.patch.object(urllib.request, "urlopen", fake_urlopen):
+            with mock.patch("builtins.print",
+                            side_effect=BrokenPipeError("pipe closed")):
+                vecs = pp.embed_vectors("http://embed.invalid/v1",
+                                        "embed-model",
+                                        ["short input", long_text])
+        self.assertEqual(vecs, [[0.1, 0.2], [0.1, 0.2]])
+
 
 if __name__ == "__main__":
     unittest.main()

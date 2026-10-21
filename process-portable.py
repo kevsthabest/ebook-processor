@@ -27828,14 +27828,22 @@ def embed_vectors(base_url, model, texts):
     # is worth one line in the run console where the operator
     # actually looks — a warning only: what is sent and returned
     # is unchanged, because callers own their text shapes.
-    overlong = [t for t in texts if len(t) > _EMBED_INPUT_CHAR_BUDGET]
-    if overlong:
-        largest = max(overlong, key=len)
-        print(f"  embed: {len(overlong)} of {len(texts)} inputs exceed "
-              f"the {_EMBED_INPUT_CHAR_BUDGET}-char safe length and "
-              f"will be truncated by the endpoint; longest is "
-              f"{len(largest)} chars: "
-              f"{largest[:50].replace(chr(10), ' ')}")
+    # The warning is best-effort bookkeeping only: a failure to
+    # print it (e.g. a broken stdout pipe) must never fail the
+    # embedding call itself, so it is guarded like the other
+    # best-effort writes in this file.
+    try:
+        overlong = [t for t in texts
+                    if len(t) > _EMBED_INPUT_CHAR_BUDGET]
+        if overlong:
+            largest = max(overlong, key=len)
+            print(f"  embed: {len(overlong)} of {len(texts)} inputs "
+                  f"exceed the {_EMBED_INPUT_CHAR_BUDGET}-char safe "
+                  f"length and will be truncated by the endpoint; "
+                  f"longest is {len(largest)} chars: "
+                  f"{largest[:50].replace(chr(10), ' ')}")
+    except Exception:
+        pass
     url = base_url.rstrip("/") + "/embeddings"
     payload = {"model": model, "input": texts}
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
