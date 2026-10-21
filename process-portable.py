@@ -50,7 +50,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.83"
+PORTABLE_VERSION = "2.13.84"
 
 
 import argparse
@@ -17855,7 +17855,15 @@ def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
     YES verdicts, survivor = the fullest, most-attested form.
     Judge merges are NOT recorded into learned state: an experiment's
     folds must not become next run's learned links before the
-    experiment is scored."""
+    experiment is scored.
+
+    Each judged verdict carries the FULL packet text it was judged
+    on ("packet"): the brief is persisted with the verdict (preview
+    diagnostics and the Stage-M artefact alike) so a pair can be
+    re-judged offline against exactly the evidence the first judge
+    saw — before this, the packet was built, judged and discarded.
+    Skipped verdicts (no judge, or budget denied before the packet
+    was built) carry no packet: there is nothing the judge saw."""
     diag = {"packet_version": 2,
             "pairs_nominated": 0, "pairs_judged": 0,
             "merges_applied": 0, "clusters_formed": 0,
@@ -17964,7 +17972,7 @@ def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
         if _merged is None:
             diag["verdicts"].append(
                 {"a": name_a, "b": name_b, "verdict": "error",
-                 "confidence": None, **_facts})
+                 "confidence": None, "packet": state, **_facts})
             print(f"  Jev merge: {name_a[:40]} vs {name_b[:40]}: "
                   f"judge error — kept separate")
             continue
@@ -17972,7 +17980,7 @@ def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
             {"a": name_a, "b": name_b,
              "verdict": "yes" if _merged else "no",
              "confidence": round(_p, 4) if _p is not None else None,
-             **_facts})
+             "packet": state, **_facts})
         print(f"  Jev merge: {name_a[:40]} vs {name_b[:40]}: "
               f"P(yes)={_p:.2f} → "
               f"{'merge' if _merged else 'keep separate'}")
@@ -18048,6 +18056,367 @@ def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
                 _merge_roster_entries(roster, survivor, drop)
                 diag["merges_applied"] += 1
     return diag
+
+
+# ---------------------------------------------------------------------------
+# Stage M (stage-split step 2): the merge stage behind one function.
+#
+# The monolith (process_file_v2) and the standalone --stage merge
+# entry both drive stage_merge_book — one implementation, two
+# drivers (spec §2). The function owns exactly the segment that used
+# to sit inline in process_file_v2 between the chapter loop and the
+# Option B persistence seam: the cannot-link-bound janitor, the
+# series-priors seeding seam, and the merge passes (legacy tiers or
+# the --jev-merge judge pass). Its output artefact, merged-roster.json,
+# persists the canonical roster WITH the merge verdict table and the
+# full judge packets, so merge work becomes reviewable and
+# re-judgeable data instead of console output.
+# ---------------------------------------------------------------------------
+
+def _merge_config():
+    """The merge stage's own config identity (spec §3): the flags
+    that shape what Stage M does, in canonical form. The decision
+    model's provider + model count only under --jev-merge — there
+    the judge IS the merge mechanism, so its identity is part of
+    the merge's identity; on the algorithmic path the judge is an
+    advisor to Tier 3, not the mechanism. Code constants (merge
+    thresholds, packet shape) are covered by the processor version
+    stamped beside the fingerprint, not by the fingerprint."""
+    cfg = {"roster_reconcile": bool(CONFIG.get("roster_reconcile")),
+           "jev_merge": bool(CONFIG.get("jev_merge"))}
+    if cfg["jev_merge"]:
+        cfg["decision_model_provider"] = \
+            CONFIG.get("decision_model_provider")
+        cfg["decision_model_model"] = CONFIG.get("decision_model_model")
+    return cfg
+
+
+def _merge_config_fingerprint():
+    """Hash of _merge_config(), stamped onto merged-roster.json so
+    a stored merge can be told apart from a merge of the same
+    extraction under a different merge configuration."""
+    import hashlib as _hl
+    return _hl.sha256(json.dumps(
+        _merge_config(), sort_keys=True,
+        default=str).encode()).hexdigest()[:16]
+
+
+def _fold_verdicts(roster_after, keys_before, mechanism):
+    """Verdict records for a deterministic pass's folds: one per
+    roster key that existed before the pass and is gone after it.
+
+    The survivor is READ OFF the final roster, never guessed: a
+    fold unions the dropped entry's forms into the survivor, so the
+    survivor is the entry whose claim surface (_jev_entry_form_keys)
+    now contains the folded key. When no survivor claims it (the
+    form was pruned rather than folded, or claimed ambiguously),
+    b_key is None — an honest gap beats a fabricated attribution.
+    Display names: the survivor's current name is knowable; the
+    folded entry's is not (the entry is gone), so "a" is the key."""
+    out = []
+    for fk in sorted(set(keys_before) - set(roster_after)):
+        survivor = None
+        for k in sorted(roster_after):
+            if fk in _jev_entry_form_keys(k, roster_after[k]):
+                survivor = k
+                break
+        out.append({"mechanism": mechanism, "verdict": "merged",
+                    "a": fk, "a_key": fk,
+                    "b": (roster_after[survivor].get("name", survivor)
+                          if survivor is not None else None),
+                    "b_key": survivor})
+    return out
+
+
+def stage_merge_book(roster, chapters, validator=None, no_pairs=(),
+                     jev_no_pairs=None, series_priors_ctx=None,
+                     book_key=None):
+    """Stage M over one book's extracted state. Mutates ROSTER into
+    the canonical roster and returns everything the drivers need:
+
+        {"roster": the canonical roster (same object, mutated),
+         "reconcile": _roster_reconcile stats or None,
+         "post_pass_merged": int, "post_pass_possible": [...],
+         "merge_judge": jev diagnostics or None,
+         "merge_report": the artefact-bound report (verdict table
+             with packets, per-mechanism folds, config fingerprint)}
+
+    Order and semantics are the monolith's, unchanged: NO loading
+    stays with the CALLER (the loaders key off the book's
+    title/author/identifiers, which are run-acquisition state, and
+    the two paths load through different fail-soft loaders exactly
+    as the inline segment did). Under --jev-merge the janitor runs
+    prune-only and the judge pass replaces both algorithmic stages;
+    otherwise the full janitor (when --roster-reconcile) and
+    post_pass_merge run. The series-priors seed keeps its seam
+    between the janitor and the merge passes. Learned-state writes
+    are whatever the passes themselves write today (reconcile /
+    post-pass record their folds; jev folds write nothing)."""
+    if jev_no_pairs is None:
+        jev_no_pairs = no_pairs
+    # post_pass_merge and _merge_roster_entries read the priors
+    # context off _DIAG; the monolith's head assigns the same object
+    # before the segment, so this assignment is a no-op there and
+    # the standalone entry's way of providing it here.
+    _DIAG.series_priors = series_priors_ctx
+    jev = bool(CONFIG.get("jev_merge"))
+    report = {"merge_config": _merge_config(),
+              "merge_config_fingerprint": _merge_config_fingerprint(),
+              "reconcile": None, "post_pass": None, "jev": None,
+              "series_priors_seeded": False, "verdicts": []}
+
+    # Roster reconciliation / janitor. Under --jev-merge the
+    # reconcile's MERGES stay skipped — folding is the judge's job —
+    # but its pruning is retained as deterministic hygiene ahead of
+    # judging (packet spec §6.2: bake-off run 1's polluted aliases
+    # came from skipping the reconcile entirely).
+    recon_stats = None
+    _keys_before = set(roster)
+    if jev:
+        recon_stats = _roster_reconcile(roster, no_pairs=no_pairs,
+                                        prune_only=True)
+        print(f"  Roster janitor (--jev-merge): "
+              f"{recon_stats['aliases_pruned']} polluted aliases "
+              f"pruned, merges left to the Jev pass")
+    elif CONFIG.get("roster_reconcile"):
+        recon_stats = _roster_reconcile(roster, no_pairs=no_pairs)
+        print(f"  Roster reconcile: {recon_stats['entries_before']} -> "
+              f"{recon_stats['entries_after']} entries "
+              f"({recon_stats['variants_merged']} variants merged, "
+              f"{recon_stats['aliases_pruned']} polluted aliases pruned)")
+        if book_key is not None:
+            UI.console_counts(book_key, {
+                "reconcile_variants_merged":
+                    recon_stats["variants_merged"],
+                "reconcile_aliases_pruned":
+                    recon_stats["aliases_pruned"]})
+    if recon_stats is not None:
+        report["reconcile"] = {"stats": recon_stats}
+        report["verdicts"] += _fold_verdicts(
+            roster, _keys_before, "roster_reconcile")
+
+    # Series priors, final seeding pass: entries restored whole
+    # from a checkpoint never passed through _roster_update in
+    # this run, so seed once more with the whole roster sighted.
+    # Already-seeded (entry, character) pairs are no-ops.
+    if series_priors_ctx is not None:
+        _series_priors_seed(roster, series_priors_ctx)
+        report["series_priors_seeded"] = True
+
+    merge_judge_stats = None
+    pp_merged, pp_possible = 0, []
+    if jev:
+        merge_judge_stats = jev_merge_pass(
+            roster, chapters, validator=validator,
+            no_pairs=jev_no_pairs)
+        print(f"  Jev merge bake-off: "
+              f"{merge_judge_stats['pairs_nominated']} pairs nominated, "
+              f"{merge_judge_stats['pairs_judged']} judged, "
+              f"{len(merge_judge_stats['vetoed'])} vetoed, "
+              f"{merge_judge_stats['merges_applied']} entries merged "
+              f"into {merge_judge_stats['clusters_formed']} clusters")
+        report["jev"] = {k: v for k, v in merge_judge_stats.items()
+                         if k != "verdicts"}
+        report["verdicts"] += [
+            dict(v, mechanism="jev_merge")
+            for v in merge_judge_stats["verdicts"]]
+    else:
+        _keys_before_pp = set(roster)
+        pp_merged, pp_possible = post_pass_merge(
+            roster, validator=validator, no_pairs=no_pairs)
+        if pp_merged:
+            print(f"  Post-pass merge: {pp_merged} roster entries merged")
+        if pp_possible:
+            print(f"  Post-pass merge: {len(pp_possible)} ambiguous pairs "
+                  f"left for review")
+        report["post_pass"] = {"merged": pp_merged,
+                               "possible_merges": pp_possible}
+        report["verdicts"] += _fold_verdicts(
+            roster, _keys_before_pp, "post_pass_merge")
+
+    return {"roster": roster, "reconcile": recon_stats,
+            "post_pass_merged": pp_merged,
+            "post_pass_possible": pp_possible,
+            "merge_judge": merge_judge_stats,
+            "merge_report": report}
+
+
+def _save_merged_roster_artefact(book_key, seg, *, book_fingerprint,
+                                 extraction_flags_hash,
+                                 extraction_processor_version):
+    """Write merged-roster.json (the Stage-M artefact) into the
+    book's checkpoint directory, atomically. Returns True when the
+    artefact is on disk; never raises.
+
+    The artefact records BOTH processor versions (spec §3): the
+    extraction's (from its stamp — an artefact is consumed across
+    versions with a warning, so its provenance must survive) and
+    this merge's own. The roster is stored in the checkpoint JSON
+    shape (_ckpt_json_safe), the same form Stage D will restore
+    through the checkpoint loader's roster path.
+
+    ONE writer, TWO postures, decided by the caller: in the
+    monolith the artefact is bookkeeping beside the run's real
+    outputs, so a False return is ignored there — bookkeeping must
+    never change the outcome of a run that already succeeded (the
+    step-1 stamp lesson). Standalone, the artefact IS the stage's
+    product, so the entry treats False as a failed stage. Under
+    replay it is a silent no-op: replay never writes into the
+    snapshot it reads."""
+    if _REPLAY_CTX is not None:
+        return False  # replay never writes into the snapshot (spine §3.4)
+    report = seg["merge_report"]
+    artefact = {
+        "book_key": book_key,
+        "book_fingerprint": book_fingerprint,
+        "extraction_flags_hash": extraction_flags_hash,
+        "extraction_processor_version": extraction_processor_version,
+        "processor_version": PORTABLE_VERSION,
+        "artefact_format_version": _ARTEFACT_FORMAT_VERSION,
+        "merge_config_fingerprint":
+            report["merge_config_fingerprint"],
+        "merge_config": report["merge_config"],
+        "roster": _ckpt_json_safe(seg["roster"]),
+        "merge_report": _ckpt_json_safe(report),
+        "written_at": time.time(),
+    }
+    d = _checkpoint_dir(book_key)
+    p = d / "merged-roster.json"
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(artefact, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, p)
+    except Exception as e:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        print(f"  merged-roster artefact not written for {book_key}: "
+              f"{e}")
+        return False
+    return True
+
+
+def cmd_stage_merge(fpath):
+    """--stage merge: run Stage M alone over a stored Stage-E
+    extraction. Returns the process exit code (0 = artefact
+    written, 1 = refusal or failure).
+
+    The entry consumes ONLY the extraction's artefacts plus the
+    book file (spec §4): the file locates the book and re-derives
+    its chapters through the shared acquisition path — Stage M's
+    packets are built from chapter text, which the checkpoint set
+    deliberately does not store (it stores Call A/B payloads) — and
+    the recomputed book fingerprint must match the stamp's, so the
+    chapters are PROVEN to be the extraction's own before any
+    packet is built from them. Every unmet precondition is a
+    legible hard stop; the entry never extracts or otherwise runs
+    an upstream stage to fill a gap (spec R4)."""
+    fpath = Path(fpath)
+    if not fpath.is_file():
+        print(f"  --stage merge: file not found: {fpath}")
+        return 1
+    if fpath.suffix.lower() not in (".epub", ".mobi", ".azw3"):
+        print(f"  --stage merge: unsupported format: {fpath.suffix} "
+              f"(need .epub, .mobi, or .azw3)")
+        return 1
+    book_key = _checkpoint_book_key(fpath)
+    stamp = _load_extraction_stamp(book_key)
+    if stamp is None:
+        print(f"  --stage merge: no extraction stamp for "
+              f"'{book_key}' — Stage M consumes a completed Stage-E "
+              f"extraction (run the book once, or finish its "
+              f"--resume, first). Nothing was run.")
+        return 1
+    if stamp.get("artefact_format_version") != _ARTEFACT_FORMAT_VERSION:
+        print(f"  --stage merge: extraction artefact format "
+              f"{stamp.get('artefact_format_version')} is not the "
+              f"current format {_ARTEFACT_FORMAT_VERSION} — the "
+              f"artefact set must be re-extracted by this build. "
+              f"Nothing was run.")
+        return 1
+    if not stamp.get("complete"):
+        print(f"  --stage merge: the extraction for '{book_key}' is "
+              f"not complete ({stamp.get('chapters_present')} of "
+              f"{stamp.get('payload_chapters')} chapter payloads on "
+              f"disk) — Stage M merges complete extractions only. "
+              f"Finish the extraction first; nothing was run.")
+        return 1
+    _flags = stamp.get("extraction_flags") or {}
+    if _flags.get("only_chunks"):
+        print(f"  --stage merge: the extraction for '{book_key}' is "
+              f"chunk-limited (--chunks {_flags.get('only_chunks')}): "
+              f"it is complete only for the selected chapters, and "
+              f"merging it would canonicalize a partial book. "
+              f"Re-extract without --chunks first; nothing was run.")
+        return 1
+    if stamp.get("processor_version") != PORTABLE_VERSION:
+        print(f"  --stage merge: extraction was stamped by portable "
+              f"v{stamp.get('processor_version')} (this build is "
+              f"v{PORTABLE_VERSION}) — proceeding; both versions are "
+              f"recorded on the artefact")
+    loaded = _checkpoint_load(book_key)
+    if loaded is None:
+        print(f"  --stage merge: no readable checkpoint set for "
+              f"'{book_key}' despite its stamp — the artefact set is "
+              f"inconsistent; re-extract. Nothing was run.")
+        return 1
+    _meta, roster, _payloads = loaded
+    _acq = _acquire_chapters(fpath)
+    if _acq is None:
+        print(f"  --stage merge: could not read {fpath}")
+        return 1
+    chapters = _acq["chapters"]
+    title, author = _acq["title"], _acq["author"]
+    identifiers = _acq["identifiers"]
+    _fp = _checkpoint_fingerprint(
+        identifiers, title, author, _checkpoint_text_sample(chapters))
+    if stamp.get("book_fingerprint") and _fp != stamp["book_fingerprint"]:
+        print(f"  --stage merge: {fpath.name} parses to a different "
+              f"book than the stamped extraction (fingerprint "
+              f"{_fp[:12]}… vs {stamp['book_fingerprint'][:12]}…) — "
+              f"refusing to merge one book's roster against another "
+              f"book's text. Nothing was run.")
+        return 1
+    print(f"Stage M (merge) for {fpath.name}: extraction stamped by "
+          f"portable v{stamp.get('processor_version')}, "
+          f"{stamp.get('chapters_present')} chapters")
+    # Per-book state the merge passes read, armed exactly as
+    # process_file_v2's head arms it: the decision budget opens at
+    # the chapter-scaled provisional pool (extraction spends none
+    # of it — the merge passes are its first consumers), and the
+    # _DIAG identity fields the passes consult are the book's own.
+    _dm_budget_reset(chapter_count=len(chapters))
+    _DIAG.learn_isbn = identifiers.get("isbn") or identifiers.get("asin")
+    _DIAG.book_author = author
+    _series_name, _series_pos, _series_source = _detect_series(
+        fpath, identifiers, title, author)
+    _sp_ctx = _series_priors_for_book(identifiers, title, author,
+                                      _series_name)
+    _no_pairs = _roster_no_pairs_for(title or fpath.stem, author,
+                                     identifiers)
+    _seg = stage_merge_book(
+        roster, chapters, validator=_DECISION_VALIDATOR,
+        no_pairs=_no_pairs,
+        jev_no_pairs=(_jev_merge_no_pairs(title, author, identifiers)
+                      if CONFIG.get("jev_merge") else ()),
+        series_priors_ctx=_sp_ctx, book_key=str(fpath))
+    if not _save_merged_roster_artefact(
+            book_key, _seg, book_fingerprint=_fp,
+            extraction_flags_hash=stamp.get("extraction_flags_hash"),
+            extraction_processor_version=stamp.get("processor_version")):
+        print(f"  --stage merge FAILED: the merged-roster artefact "
+              f"could not be written for '{book_key}' — the merge "
+              f"ran, but standalone the artefact is the product, so "
+              f"the stage has not completed.")
+        return 1
+    print(f"  Stage M complete: {len(_seg['roster'])} canonical "
+          f"entries, {len(_seg['merge_report']['verdicts'])} verdicts "
+          f"recorded in merged-roster.json "
+          f"(merge config {_seg['merge_report']['merge_config_fingerprint']})")
+    return 0
 
 
 def _v2_char_confidence(appearances, has_verified_evidence):
@@ -29132,6 +29501,57 @@ def run_replay(snapshot_id, book_path, learn_dir, process_fn=None):
         report["sandbox_deleted"] = not sandbox.exists()
 
 
+def _acquire_chapters(fpath):
+    """Acquire one book's chapters: (chapters, title, author,
+    identifiers, word count, fallback flag) in one dict, or None
+    when the file cannot be read at all.
+
+    THE acquisition path — process_file_v2's head and the standalone
+    stage entries (cmd_stage_merge) both acquire through here, so a
+    stage re-deriving a book's chapters gets the same chapters the
+    run extracted from: corpus-sourced when --use-corpus and the
+    corpus holds this exact file, else parsed from the file (EPUB
+    spine units, or prose splitting for the other formats). The
+    chapter-detection fallback flag rides the _DIAG side channel
+    exactly as the inline version did: reset before the parse,
+    read back after it (split_chapters / _prose_chapters set it
+    when heading-based detection had to step in)."""
+    if CONFIG.get("use_corpus") and _REPLAY_CTX is None:
+        acq = corpus_acquire_for_run(_learn().dir, fpath)
+        if acq is not None:
+            _DIAG.chapter_detection_fallback = bool(
+                acq["chapter_detection_fallback"])
+            print(f"  Corpus-sourced: acquisition read from the "
+                  f"corpus (fingerprint {acq['fingerprint'][:12]}…), "
+                  f"no file parse")
+            return {"chapters": acq["chapters"],
+                    "title": acq["title"], "author": acq["author"],
+                    "identifiers": acq["identifiers"],
+                    "word_count": acq["word_count"],
+                    "chapter_detection_fallback": bool(
+                        acq["chapter_detection_fallback"])}
+    if fpath.suffix.lower() == ".epub":
+        _DIAG.chapter_detection_fallback = False  # reset per book
+        units, title, author, identifiers = extract_epub_units(fpath)
+        chapters = split_chapters(units)
+        return {"chapters": chapters, "title": title, "author": author,
+                "identifiers": identifiers,
+                "word_count": sum(len(u["text"].split()) for u in units),
+                "chapter_detection_fallback": bool(
+                    getattr(_DIAG, "chapter_detection_fallback", False))}
+    extracted = read_ebook(fpath)
+    if extracted is None:
+        return None
+    text, title, author, identifiers = extracted
+    _DIAG.chapter_detection_fallback = False  # reset per book (_prose_chapters may set it)
+    chapters = _prose_chapters(text)
+    return {"chapters": chapters, "title": title, "author": author,
+            "identifiers": identifiers,
+            "word_count": len(text.split()),
+            "chapter_detection_fallback": bool(
+                getattr(_DIAG, "chapter_detection_fallback", False))}
+
+
 def process_file_v2(fpath, dry_run=False, preview=False):
     """v2 pipeline: chapter-level map/reduce. Chapters run Call A (characters,
     sequential for the roster) then Call B (content, parallelizable), followed
@@ -29141,43 +29561,19 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     print(f"\nProcessing (v2): {fpath.name}")
     global _DEBUG_TAG
     _DEBUG_TAG = fpath.stem if (preview or dry_run) and CONFIG.get("debug") else None
-    suffix = fpath.suffix.lower()
 
-    # Corpus-sourced acquisition (corpus-design §11 slice 5,
-    # --use-corpus, default OFF): the corpus already holds this
-    # file's text and the ingest run's own acquisition record, so
-    # the run reads its chapters from the store instead of
-    # re-parsing the file — same chapters, same word count, same
-    # fallback flag (§13 signal 2a). Never under replay: a replay
-    # re-parses the presented file against its snapshot, by design.
-    _acq = None
-    if CONFIG.get("use_corpus") and _REPLAY_CTX is None:
-        _acq = corpus_acquire_for_run(_learn().dir, fpath)
-    if _acq is not None:
-        chapters = _acq["chapters"]
-        title, author = _acq["title"], _acq["author"]
-        identifiers = _acq["identifiers"]
-        word_count = _acq["word_count"]
-        _chap_fallback = bool(_acq["chapter_detection_fallback"])
-        _DIAG.chapter_detection_fallback = _chap_fallback
-        print(f"  Corpus-sourced: acquisition read from the corpus "
-              f"(fingerprint {_acq['fingerprint'][:12]}…), "
-              f"no file parse")
-    elif suffix == ".epub":
-        _DIAG.chapter_detection_fallback = False  # reset per book
-        units, title, author, identifiers = extract_epub_units(fpath)
-        chapters = split_chapters(units)
-        _chap_fallback = getattr(_DIAG, "chapter_detection_fallback", False)
-        word_count = sum(len(u["text"].split()) for u in units)
-    else:
-        extracted = read_ebook(fpath)
-        if extracted is None:
-            return False
-        text, title, author, identifiers = extracted
-        _DIAG.chapter_detection_fallback = False  # reset per book (_prose_chapters may set it)
-        chapters = _prose_chapters(text)
-        _chap_fallback = getattr(_DIAG, "chapter_detection_fallback", False)
-        word_count = len(text.split())
+    # Acquisition (corpus-design §11 slice 5 for the corpus path):
+    # the one shared path in _acquire_chapters — the standalone
+    # stage entries re-derive a book's chapters through the same
+    # code, so what they merge against is what the run extracted.
+    _acq = _acquire_chapters(fpath)
+    if _acq is None:
+        return False
+    chapters = _acq["chapters"]
+    title, author = _acq["title"], _acq["author"]
+    identifiers = _acq["identifiers"]
+    word_count = _acq["word_count"]
+    _chap_fallback = _acq["chapter_detection_fallback"]
 
     _book_key = str(fpath)
     # ISBN resolution: --isbn flag > EPUB metadata > Open Library lookup.
@@ -29528,70 +29924,43 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     _no_pairs = _roster_no_pairs_for(title or fpath.stem, author,
                                      identifiers)
 
-    # Roster reconciliation (Experiment 1, --roster-reconcile): Call A
-    # built the roster chapter by chapter against partial information;
-    # canonicalize it once with the whole book sighted, before the
-    # post-pass merge and the reduce consume it. Deterministic.
-    _recon_stats = None
-    if CONFIG.get("jev_merge"):
-        # Janitor clause (packet spec §6.2): under --jev-merge the
-        # reconcile's MERGES stay skipped — folding is the judge's
-        # job — but its pruning is retained as deterministic hygiene
-        # ahead of judging. Bake-off run 1's roster carried polluted
-        # aliases (one principal holding two other people's name
-        # forms) precisely because skipping the reconcile removed
-        # the janitor along with the merger.
-        _recon_stats = _roster_reconcile(roster, no_pairs=_no_pairs,
-                                         prune_only=True)
-        print(f"  Roster janitor (--jev-merge): "
-              f"{_recon_stats['aliases_pruned']} polluted aliases "
-              f"pruned, merges left to the Jev pass")
-    elif CONFIG.get("roster_reconcile"):
-        _recon_stats = _roster_reconcile(roster, no_pairs=_no_pairs)
-        print(f"  Roster reconcile: {_recon_stats['entries_before']} -> "
-              f"{_recon_stats['entries_after']} entries "
-              f"({_recon_stats['variants_merged']} variants merged, "
-              f"{_recon_stats['aliases_pruned']} polluted aliases pruned)")
-        UI.console_counts(_book_key, {
-            "reconcile_variants_merged":
-                _recon_stats["variants_merged"],
-            "reconcile_aliases_pruned":
-                _recon_stats["aliases_pruned"]})
-
-    # Series priors, final seeding pass: entries restored whole
-    # from a checkpoint never passed through _roster_update in
-    # this run, so seed once more with the whole roster sighted.
-    # Already-seeded (entry, character) pairs are no-ops.
-    if _sp_ctx is not None:
-        _series_priors_seed(roster, _sp_ctx)
-
-    # Post-pass character merge (Tier 1/2 deterministic + Tier 3 decision
-    # model). Runs after all chapters, before the reduce, so v2_reduce sees
-    # the final merged roster and relationships canonical-remap correctly.
-    # --jev-merge bake-off replaces BOTH merge stages (the reconcile
-    # above runs prune-only as janitor): the roster goes to
-    # jev_merge_pass and only the decision model's YES verdicts
-    # fold it.
-    _merge_judge_stats = None
-    if CONFIG.get("jev_merge"):
-        _pp_merged, _pp_possible = 0, []
-        _merge_judge_stats = jev_merge_pass(
-            roster, chapters, validator=_DECISION_VALIDATOR,
-            no_pairs=_jev_merge_no_pairs(title, author, identifiers))
-        print(f"  Jev merge bake-off: "
-              f"{_merge_judge_stats['pairs_nominated']} pairs nominated, "
-              f"{_merge_judge_stats['pairs_judged']} judged, "
-              f"{len(_merge_judge_stats['vetoed'])} vetoed, "
-              f"{_merge_judge_stats['merges_applied']} entries merged "
-              f"into {_merge_judge_stats['clusters_formed']} clusters")
-    else:
-        _pp_merged, _pp_possible = post_pass_merge(
-            roster, validator=_DECISION_VALIDATOR, no_pairs=_no_pairs)
-        if _pp_merged:
-            print(f"  Post-pass merge: {_pp_merged} roster entries merged")
-        if _pp_possible:
-            print(f"  Post-pass merge: {len(_pp_possible)} ambiguous pairs "
-                  f"left for review")
+    # Stage M (stage-split step 2): roster reconciliation, the
+    # series-priors seeding seam and the merge passes — one shared
+    # implementation (stage_merge_book) behind this driver and the
+    # standalone --stage merge entry. Call A built the roster
+    # chapter by chapter against partial information; Stage M
+    # canonicalizes it once with the whole book sighted, before the
+    # reduce consumes it. Under --jev-merge the bake-off replaces
+    # both algorithmic stages (the reconcile runs prune-only as
+    # janitor): only the decision model's YES verdicts fold the
+    # roster. The jev path loads its NOs through its own fail-soft
+    # loader, as the inline segment did.
+    _seg = stage_merge_book(
+        roster, chapters, validator=_DECISION_VALIDATOR,
+        no_pairs=_no_pairs,
+        jev_no_pairs=(_jev_merge_no_pairs(title, author, identifiers)
+                      if CONFIG.get("jev_merge") else ()),
+        series_priors_ctx=_sp_ctx, book_key=_book_key)
+    _recon_stats = _seg["reconcile"]
+    _pp_merged = _seg["post_pass_merged"]
+    _pp_possible = _seg["post_pass_possible"]
+    _merge_judge_stats = _seg["merge_judge"]
+    # The Stage-M artefact (merged-roster.json): persisted beside
+    # the checkpoints so the merge — verdicts and judge packets
+    # included — is reviewable data. BEST-EFFORT here: the artefact
+    # is bookkeeping beside the run's real outputs, so its writer
+    # never raises and its False is ignored (standalone, the same
+    # writer's False fails the stage — the artefact is the product
+    # there). It shares the checkpoint directory's lifecycle: a
+    # finished full run still clears the directory at its end. Not
+    # written for an aborted run: that extraction is incomplete by
+    # definition (it never earned a stamp), and its artefact must
+    # not claim a merge of a complete extraction.
+    if not aborted:
+        _save_merged_roster_artefact(
+            _ckpt_key, _seg, book_fingerprint=_ckpt_fp,
+            extraction_flags_hash=_extraction_flags_hash(),
+            extraction_processor_version=PORTABLE_VERSION)
 
     # Option B seam (design section 7): ONE identity assignment
     # point, after the post-pass merge and before the reduce, over
@@ -31406,7 +31775,7 @@ _PROFILE_EXCLUDE = frozenset({
     # per-run selectors / overrides for a single run
     "alias", "chunks", "file", "import_labels", "import_rejections",
     "from_supabase", "hardcover_refresh", "isbn", "max_books",
-    "resume", "series", "series_position",
+    "resume", "series", "series_position", "stage",
     # companion arguments that only aim a one-shot command
     "explain_character", "explain_claim", "ingest_force",
     "ingest_reason", "json", "quote", "snapshot_reason", "watch_ingest",
@@ -31601,6 +31970,16 @@ def _build_parser():
     g_pipe.add_argument("--pipeline", default=None, choices=["legacy", "v2"],
                     help="extraction pipeline: legacy (fixed chunks) or v2 "
                          "(chapter-level map/reduce with character roster)")
+    g_pipe.add_argument("--stage", default="all",
+                    choices=["all", "extract", "merge", "decide"],
+                    help="stage split: run ONE pipeline stage against "
+                         "stored artefacts instead of the whole run. "
+                         "'merge' runs Stage M (roster merge) over a "
+                         "completed extraction's checkpoints for --file "
+                         "and writes merged-roster.json; 'all' (the "
+                         "default) is the ordinary full run. 'extract' "
+                         "and 'decide' land in later steps of the split "
+                         "and currently refuse, legibly.")
     g_pipe.add_argument("--chunks", default=None,
                     help="process only these chunk indices (e.g. --chunks 2 or --chunks 2,5,8); "
                          "numbering matches the sampled chunk list and debug files")
@@ -32073,6 +32452,11 @@ _ONE_SHOT_FLAGS = {
     # above, but it is the same shape: it runs alone and exits, so a
     # second operation beside it would be dropped exactly the same.
     "replay": "--replay",
+    # --stage (non-default) likewise dispatches alone: it runs one
+    # stage against stored artefacts and exits, so a run-mode flag
+    # beside it would be dropped the same way. --file is its target,
+    # not a dropped mode (the replay pairing).
+    "stage": "--stage",
 }
 
 # Modes, targets and per-run selectors that only a book-processing
@@ -32120,6 +32504,10 @@ def _flag_conflicts(args, defaults):
         return None
     modes = _present(_RUN_MODE_FLAGS)
     if shots == ["--replay"]:
+        modes = [m for m in modes if m != "--file"]
+    if shots == ["--stage"]:
+        # --stage merge locates its book BY --file (the same path
+        # Stage E was given): the pairing is designed, like replay's.
         modes = [m for m in modes if m != "--file"]
     if shots == ["--save-profile"]:
         # --save-profile's whole job is capturing run-shaping
@@ -32186,6 +32574,17 @@ def main():
             sys.exit(f"ERROR: profile '{args.profile}' not found "
                      "(--list-profiles to see available)")
         _apply_profile(args, defaults, profile)
+
+    # Stage entry points land one at a time (stage-split §8): step 2
+    # ships 'merge'; 'extract' and 'decide' refuse here — before any
+    # state migration or other side effect — rather than silently
+    # running something else.
+    if getattr(args, "stage", "all") in ("extract", "decide"):
+        print(f"  --stage {args.stage} is not available yet: the "
+              f"stage entry points land one at a time (this build "
+              f"ships 'merge'; 'extract' and 'decide' follow in "
+              f"steps 3-4 of the stage split). Nothing was run.")
+        sys.exit(2)
 
     # Spine OC-7: the state stores migrate to the SQLite substrate
     # automatically on the first run that touches state. Placed
@@ -32563,6 +32962,20 @@ def main():
     if CONFIG["llm"] == "cohere" and not _cohere_api_key():
         sys.exit("ERROR: Cohere API key is not set (set \"cohere_api_key\" "
                  "in config.json or the COHERE_API_KEY environment variable)")
+
+    # --stage merge (stage-split step 2): run Stage M alone over the
+    # --file book's stored extraction. Dispatched here — after every
+    # CONFIG-shaping flag above has been applied exactly as a full
+    # run applies it (judge, merge and priors flags included), with
+    # the validator and learned state already constructed — and
+    # before the Supabase gate below: Stage M writes only its
+    # artefact, so it must not demand write credentials.
+    if getattr(args, "stage", "all") == "merge":
+        if not args.file:
+            sys.exit("ERROR: --stage merge needs --file <book> — the "
+                     "book whose stored extraction it merges")
+        sys.exit(cmd_stage_merge(args.file))
+
     if not (args.dry_run or args.preview) and not (CONFIG["supabase_url"] and CONFIG["supabase_key"]):
         sys.exit("ERROR: Set supabase_url and supabase_key in config.json")
 

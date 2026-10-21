@@ -26,6 +26,7 @@ Hermetic: the judge is a transport double; stdlib unittest only.
 Run: python -m unittest discover -s tests -v
 """
 import importlib.util
+import inspect
 import re
 import unittest
 from collections import Counter
@@ -346,9 +347,14 @@ class TestJanitor(_Base):
 
 class TestJanitorWiring(unittest.TestCase):
     def test_jev_branch_runs_janitor_before_the_pass(self):
-        src = Path(_MOD_PATH).read_text(encoding="utf-8")
+        # Stage-split step 2 factored the segment into
+        # stage_merge_book (the one implementation both drivers
+        # call); the invariant this pins — the prune-only janitor
+        # runs BEFORE the judge pass inside that implementation —
+        # is unchanged, so the pin reads the factored home.
+        src = inspect.getsource(pp.stage_merge_book)
         janitor_at = src.index("prune_only=True")
-        pass_at = src.index("_merge_judge_stats = jev_merge_pass(")
+        pass_at = src.index("merge_judge_stats = jev_merge_pass(")
         self.assertLess(janitor_at, pass_at)
 
 
