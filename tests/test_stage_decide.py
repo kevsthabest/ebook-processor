@@ -818,10 +818,10 @@ class TestStageDecideCli(unittest.TestCase):
             ["--stage", "merge", "--file", "book.epub", "--preview"])
         self.assertIsNotNone(pp._flag_conflicts(args, defaults))
 
-    def test_stage_decide_needs_a_file(self):
+    def test_stage_analyze_needs_file_and_extraction(self):
         with mock.patch.object(sys, "argv",
                                ["process-portable.py", "--stage",
-                                "decide", "--preview"]), \
+                                "analyze"]), \
                 mock.patch.object(pp, "ensure_state_migrated",
                                   lambda *a, **k: None), \
                 mock.patch.object(pp, "LearnedState",
@@ -833,6 +833,7 @@ class TestStageDecideCli(unittest.TestCase):
                 pp.main()
         self.assertTrue(cm.exception.code)
         self.assertIn("--file", str(cm.exception.code))
+        self.assertIn("--extraction", str(cm.exception.code))
 
 
 if __name__ == "__main__":

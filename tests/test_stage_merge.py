@@ -675,43 +675,29 @@ class TestStageCli(unittest.TestCase):
             ["--stage", "merge", "--file", "book.epub"])
         self.assertIsNone(pp._flag_conflicts(args, defaults))
 
-    def test_stage_extract_refuses_without_running(self):
-        # The message assertion is what makes this a real test: on a
-        # build without --stage, argparse also exits 2 — but with an
-        # "unrecognized arguments" usage error, not this refusal.
-        out = io.StringIO()
+    def test_stage_extract_needs_a_file(self):
+        # Stage E is shipped (wiki-ingestion spec §3.1); its entry
+        # names the missing target instead of refusing as unshipped.
         with mock.patch.object(sys, "argv",
                                ["process-portable.py", "--stage",
-                                "extract"]), \
-                contextlib.redirect_stdout(out):
-            with self.assertRaises(SystemExit) as cm:
-                pp.main()
-        self.assertEqual(cm.exception.code, 2)
-        self.assertIn("not available yet", out.getvalue())
-
-    def test_stage_decide_refuses_without_running(self):
-        # Superseded by stage-split step 3: 'decide' no longer
-        # refuses as unshipped — it dispatches (after state
-        # migration, like merge) and demands its --file target,
-        # the same shape as test_stage_merge_needs_a_file. The
-        # refusal pin for a stage that has not landed moves to
-        # 'extract' (still pinned above). Step 3's own suite
-        # (tests/test_stage_decide.py) pins the decide dispatch
-        # and its refusals in full.
-        with mock.patch.object(sys, "argv",
-                               ["process-portable.py", "--stage",
-                                "decide"]), \
-                mock.patch.object(pp, "ensure_state_migrated",
-                                  lambda *a, **k: None), \
-                mock.patch.object(pp, "LearnedState",
-                                  lambda *a, **k: mock.Mock(
-                                      dir="/tmp", nicknames={},
-                                      trusted_titles=lambda: [],
-                                      rejected_tropes=[])):
+                                "extract"]):
             with self.assertRaises(SystemExit) as cm:
                 pp.main()
         self.assertTrue(cm.exception.code)
         self.assertIn("--file", str(cm.exception.code))
+
+    def test_stage_decide_is_renamed(self):
+        # Wiki-ingestion spec §3.3: the old name refuses by name,
+        # before state migration or any book work.
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv",
+                               ["process-portable.py", "--stage",
+                                "decide"]), \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as cm:
+                pp.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("renamed", out.getvalue())
 
     def test_stage_merge_needs_a_file(self):
         with mock.patch.object(sys, "argv",

@@ -56,6 +56,7 @@ PORTABLE_VERSION = "2.13.85"
 import argparse
 import codecs
 import difflib
+import hashlib
 import json
 import math
 import os
@@ -148,6 +149,10 @@ DEFAULT_CONFIG = {
     # measure. "legacy" (fixed-chunk) stays selectable via
     # --pipeline or this key. (Decision, 2026-10-17: D2.)
     "pipeline": "v2",
+    # Wiki identity (wiki-ingestion spec D3): auto-confirm the
+    # exact-name same-author same-series link rule only after it has
+    # been measured. Off means every proposed link lands suggested.
+    "wiki_links_auto_confirm": False,
     "v2_max_chapter_chars": 16000,  # ~4k tokens; keep well under your
     # server's context window minus prompt (~1k) minus output (~3k)
     # Relationship discovery, shadow mode (spec §3, Decision K5/K6):
@@ -14305,6 +14310,18 @@ _LEARNED = None
 _REPLAY_CTX = None
 _CAPTURE_CTX = None
 
+# Extraction-artefact context (wiki-ingestion spec §3): while set,
+# _checkpoint_dir serves the artefact's payload directory and every
+# checkpoint write is suppressed, exactly like a replay. It is set
+# only around --stage analyze so the analysis consumes the stored
+# extraction instead of running the chapter calls again.
+_EXTRACTION_CTX = None
+
+# Stage write guard (spec §3.4): extract and analyze never write app
+# data. sb() consults this for non-GET calls; the processor schema
+# (run history/bookkeeping) stays allowed.
+_WRITE_GUARD = {"active": False, "stage": "all"}
+
 # Corpus snapshot block staging (corpus-design §4.3): a capture
 # run stashes ITS OWN parse's chapter hashes here, keyed by the
 # run's fingerprint, immediately before capture_snapshot runs;
@@ -19467,6 +19484,222 @@ def stage_decide_book(roster, chapters, indexed, chapter_as, chapter_bs,
 
 
 
+def cmd_stage_extract(fpath):
+    """--stage extract: run Stage E alone and write its artefact.
+
+    No Supabase credentials are required; the run is preview-shaped
+    but its product is the extraction artefact, not a preview file.
+    """
+    p = Path(fpath)
+    if not p.is_file():
+        print(f"  --stage extract: file not found: {p}")
+        return 1
+    if p.suffix.lower() not in (".epub", ".mobi", ".azw3"):
+        print(f"  --stage extract: unsupported format: {p.suffix} "
+              f"(need .epub, .mobi, or .azw3)")
+        return 1
+    ok = process_file_v2(p, dry_run=False, preview=False)
+    return 0 if ok else 1
+
+
+def cmd_stage_analyze(extraction_dir, fpath, preview=False, dry_run=False):
+    """--stage analyze: run Stage D over a stored extraction artefact.
+
+    Preview-shaped by construction: the stage emits an analysis
+    artefact and never writes app data. The extraction's fingerprint
+    is checked against the presented file inside process_file_v2.
+    """
+    p = Path(fpath)
+    if not p.is_file():
+        print(f"  --stage analyze: file not found: {p}")
+        return 1
+    if p.suffix.lower() not in (".epub", ".mobi", ".azw3"):
+        print(f"  --stage analyze: unsupported format: {p.suffix} "
+              f"(need .epub, .mobi, or .azw3)")
+        return 1
+    try:
+        manifest, root = _load_extraction_artefact(extraction_dir)
+    except ValueError as e:
+        print(f"  --stage analyze: {e}. Nothing was run.")
+        return 1
+    global _EXTRACTION_CTX
+    saved = _EXTRACTION_CTX
+    _EXTRACTION_CTX = {
+        "payload_dir": str(root),
+        "manifest": manifest,
+        "extract_key": manifest.get("extract_key"),
+        "fingerprint": manifest.get("fingerprint"),
+    }
+    try:
+        # Preview-shaped: analyze resolves works read-only and the
+        # artefact is its product. The write guard is the backstop.
+        ok = process_file_v2(p, dry_run=False, preview=True)
+    finally:
+        _EXTRACTION_CTX = saved
+    return 0 if ok else 1
+
+
+def _load_analysis_artefact(path):
+    p = Path(path)
+    mp, ap = p / "manifest.json", p / "analysis.json"
+    if not mp.is_file() or not ap.is_file():
+        raise ValueError(f"no analysis artefact at {p}")
+    try:
+        manifest = json.load(open(mp, encoding="utf-8"))
+        data = json.load(open(ap, encoding="utf-8"))
+    except Exception as e:
+        raise ValueError(f"unreadable analysis artefact: {e}")
+    if not isinstance(manifest, dict) or not isinstance(data, dict):
+        raise ValueError(f"analysis artefact is not an object: {p}")
+    if manifest.get("stage") != "analyze":
+        raise ValueError(f"not an analyze artefact: {p}")
+    if manifest.get("format_version") != _ARTEFACT_FORMAT_VERSION:
+        raise ValueError(
+            f"analysis artefact format {manifest.get('format_version')} "
+            f"is not the current format {_ARTEFACT_FORMAT_VERSION}")
+    return manifest, data, p
+
+
+def _link_status(exact_safe):
+    """The auto-approve gate (spec D3).
+
+    A link lands confirmed ONLY when the exact-name rule matched AND
+    the operator enabled auto-confirm. Default is suggested, so the
+    rule can be measured before it is trusted.
+    """
+    if exact_safe and CONFIG.get("wiki_links_auto_confirm"):
+        return "confirmed"
+    return "suggested"
+
+
+def _merge_key(*parts):
+    raw = "|".join("" if p is None else str(p) for p in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def cmd_stage_merge_plan(paths, apply=False):
+    """--stage merge: build a cross-book plan from analysis artefacts.
+
+    Plan-only in this build: --apply refuses until the app migration
+    is present. The plan is the reviewable product; link statuses go
+    through _link_status, so auto-approve is observable before it is
+    ever allowed to write.
+    """
+    if not paths:
+        print("  --stage merge needs at least one --analysis <dir>")
+        return 1
+    loaded = []
+    for path in paths:
+        try:
+            loaded.append(_load_analysis_artefact(path))
+        except ValueError as e:
+            print(f"  --stage merge: {e}. Nothing was run.")
+            return 1
+
+    characters, edges, links = [], [], []
+    groups = {}
+    warnings = []
+    by_work = {}
+    for manifest, data, _p in loaded:
+        work_ref = (manifest.get("work_id")
+                    or manifest.get("book_key")
+                    or manifest.get("fingerprint"))
+        by_work[work_ref] = manifest
+        author_key = norm_name(manifest.get("author") or "")
+        series_key = norm_name(manifest.get("series_name") or "")
+        for c in data.get("characters") or []:
+            name = c.get("name") or ""
+            entity_key = c.get("entity_id") or norm_name(name)
+            pkey = _merge_key(work_ref, entity_key)
+            characters.append({
+                "pipeline_key": pkey,
+                "work_ref": work_ref,
+                "name": name,
+                "role": c.get("role"),
+                "tier": c.get("tier"),
+                "tier_source": c.get("tier_source"),
+                "vitality": c.get("status"),
+                "first_appearance_chapter":
+                    c.get("first_appearance_chapter"),
+                "aliases": c.get("aliases") or [],
+            })
+            if author_key and series_key:
+                groups.setdefault(
+                    (author_key, series_key, norm_name(name)), []
+                ).append((work_ref, pkey, name))
+        for r in data.get("relationships") or []:
+            a = r.get("from_id") or norm_name(r.get("from") or "")
+            b = r.get("to_id") or norm_name(r.get("to") or "")
+            rtype = r.get("type") or ""
+            if not (a and b and rtype):
+                warnings.append(
+                    f"{work_ref}: edge without resolvable endpoints")
+                continue
+            edges.append({
+                "pipeline_key": _merge_key(work_ref, a, b, rtype),
+                "work_ref": work_ref,
+                "from": r.get("from"),
+                "to": r.get("to"),
+                "type": rtype,
+                "claimed_type": r.get("claimed_type"),
+                "evidence": r.get("evidence"),
+                "evidence_source": r.get("evidence_source"),
+                "validation_state": r.get("validation_state"),
+                "review_status": "pending",
+            })
+
+    for (author_key, series_key, name_key), rows in groups.items():
+        works = {r[0] for r in rows}
+        if len(works) < 2:
+            continue
+        for work_ref, pkey, name in rows:
+            links.append({
+                "book_character_pipeline_key": pkey,
+                "work_ref": work_ref,
+                "canonical_key": _merge_key(author_key, series_key,
+                                            name_key),
+                "canonical_name": name,
+                "status": _link_status(True),
+                "link_source": "auto-series",
+                "reason": "same author + same series + normalized name",
+            })
+
+    plan = {
+        "plan_version": 1,
+        "created_at": _now_iso(),
+        "processor_version": PORTABLE_VERSION,
+        "policy": {
+            "wiki_links_auto_confirm": bool(
+                CONFIG.get("wiki_links_auto_confirm")),
+            "link_default": ("confirmed" if CONFIG.get(
+                "wiki_links_auto_confirm") else "suggested"),
+        },
+        "inputs": [{"analysis_key": m.get("analysis_key"),
+                    "work_id": m.get("work_id"),
+                    "title": m.get("title")} for m, _d, _p in loaded],
+        "characters": characters,
+        "edges": edges,
+        "links": links,
+        "warnings": warnings,
+    }
+    out = (_artefact_root(_learn().dir) / "merge"
+           / _new_run_key("merge") / "plan.json")
+    _atomic_json(out, plan)
+    _confirmed = sum(1 for l in links if l["status"] == "confirmed")
+    print(f"  Merge plan: {len(characters)} characters, {len(edges)} edges, "
+          f"{len(links)} links ({_confirmed} confirmed, "
+          f"{len(links) - _confirmed} suggested)")
+    print(f"  Plan: {out}")
+    if warnings:
+        print(f"  Warnings: {len(warnings)}")
+    if apply:
+        print("  --apply refused: the wiki-ingestion migration is not "
+              "applied by this build. The plan is the product here; "
+              "nothing was written to Supabase.")
+        return 1
+    return 0
+
+
 def cmd_stage_decide(fpath, preview=False, dry_run=False):
     """--stage decide: run Stage D alone over a stored Stage-E
     extraction and its Stage-M artefact. Returns the process
@@ -24097,6 +24330,14 @@ def sb(table, method="GET", data=None, params="", prefer=None,
     schema, and claim writes must not grow new headers as a side
     effect of sharing this helper."""
     global _SB_LAST_ERROR
+    # Stage write guard (wiki-ingestion spec §3.4): extract and
+    # analyze may read, never write app data. Bookkeeping in the
+    # processor schema (run history) stays allowed.
+    if (method != "GET" and _WRITE_GUARD.get("active")
+            and schema in (None, "public")):
+        raise RuntimeError(
+            f"write refused: --stage {_WRITE_GUARD.get('stage')} never "
+            f"writes app data ({table} {method})")
     try:
         url = f"{CONFIG['supabase_url']}/rest/v1/{table}{params}"
         _prefer = "return=representation"
@@ -30063,6 +30304,10 @@ def _checkpoint_book_key(fpath):
 
 
 def _checkpoint_dir(book_key):
+    if _EXTRACTION_CTX is not None:
+        # Analyze: payloads are served from the extraction artefact
+        # (wiki-ingestion spec §3.2), never from the live checkpoints.
+        return Path(_EXTRACTION_CTX["payload_dir"])
     if _REPLAY_CTX is not None:
         # Replay: payloads are served from the snapshot's own
         # directory (dir-parameterized load, design §3.4.2).
@@ -30319,6 +30564,8 @@ def _checkpoint_purge_stale(book_key, total_chapters, fingerprint=None):
 
 
 def _checkpoint_save_chapter(book_key, idx, a, b):
+    if _EXTRACTION_CTX is not None:
+        return  # analyze never writes into the extraction artefact
     if _REPLAY_CTX is not None:
         return  # replay never writes into the snapshot (spine §3.4)
     d = _checkpoint_dir(book_key)
@@ -30329,6 +30576,8 @@ def _checkpoint_save_chapter(book_key, idx, a, b):
 
 
 def _checkpoint_save_roster(book_key, roster):
+    if _EXTRACTION_CTX is not None:
+        return  # analyze never writes into the extraction artefact
     if _REPLAY_CTX is not None:
         return  # replay never writes into the snapshot (spine §3.4)
     d = _checkpoint_dir(book_key)
@@ -30406,6 +30655,8 @@ def _checkpoint_save_extraction_stamp(book_key, fingerprint=None,
     prints one line and returns False instead of raising — bookkeeping
     must never change the outcome of the run it merely records.
     """
+    if _EXTRACTION_CTX is not None:
+        return False  # analyze never writes into the extraction artefact
     if _REPLAY_CTX is not None:
         return False  # replay never writes into the snapshot (spine §3.4)
     d = _checkpoint_dir(book_key)
@@ -30557,6 +30808,8 @@ def _checkpoint_load(book_key):
 
 
 def _checkpoint_clear(book_key):
+    if _EXTRACTION_CTX is not None:
+        return  # a finished analyze must not clear the artefact
     if _REPLAY_CTX is not None:
         return  # a finished replay must not clear the snapshot
     import shutil as _sh
@@ -30940,7 +31193,9 @@ def _acquire_chapters(fpath):
                     "identifiers": acq["identifiers"],
                     "word_count": acq["word_count"],
                     "chapter_detection_fallback": bool(
-                        acq["chapter_detection_fallback"])}
+                        acq["chapter_detection_fallback"]),
+                    "source": {"kind": "corpus",
+                               "fingerprint": acq["fingerprint"]}}
     if fpath.suffix.lower() == ".epub":
         _DIAG.chapter_detection_fallback = False  # reset per book
         units, title, author, identifiers = extract_epub_units(fpath)
@@ -30949,7 +31204,8 @@ def _acquire_chapters(fpath):
                 "identifiers": identifiers,
                 "word_count": sum(len(u["text"].split()) for u in units),
                 "chapter_detection_fallback": bool(
-                    getattr(_DIAG, "chapter_detection_fallback", False))}
+                    getattr(_DIAG, "chapter_detection_fallback", False)),
+                "source": {"kind": "file"}}
     extracted = read_ebook(fpath)
     if extracted is None:
         return None
@@ -30960,7 +31216,141 @@ def _acquire_chapters(fpath):
             "identifiers": identifiers,
             "word_count": len(text.split()),
             "chapter_detection_fallback": bool(
-                getattr(_DIAG, "chapter_detection_fallback", False))}
+                getattr(_DIAG, "chapter_detection_fallback", False)),
+            "source": {"kind": "file"}}
+
+
+# ---------------------------------------------------------------------------
+# Stage artefacts (wiki-ingestion spec §3)
+# ---------------------------------------------------------------------------
+
+def _stage_name():
+    return CONFIG.get("stage", "all") or "all"
+
+
+def _artefact_root(learn_dir):
+    return Path(learn_dir) / "artefacts"
+
+
+def _new_run_key(prefix):
+    return (f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}"
+            f"-{os.getpid()}")
+
+
+def _atomic_json(path, obj):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False, default=str)
+    os.replace(tmp, path)
+
+
+def _write_extraction_artefact(*, book_key, fingerprint, fpath, title,
+                               author, identifiers, indexed, chapter_as,
+                               chapter_bs, roster, total, payload_chapters,
+                               coverage, source):
+    """Write one completed extraction as the Stage-E artefact.
+
+    The payload files use the checkpoint format on purpose: the
+    analysis stage already knows how to load them through
+    _checkpoint_load, so an artefact is a checkpoint directory plus
+    a manifest and nothing new to parse.
+    """
+    root = (_artefact_root(_learn().dir) / "extract" / fingerprint
+            / _new_run_key("extract"))
+    meta = {"book_key": book_key, "fingerprint": fingerprint,
+            "total_chapters": total, "created_at": _now_iso()}
+    _atomic_json(root / "meta.json", meta)
+    _atomic_json(root / "roster.json", _ckpt_json_safe(roster))
+    for i, ch in indexed:
+        if ch.get("is_frontmatter"):
+            continue
+        _atomic_json(root / f"chapter_{i}.json",
+                     {"index": i,
+                      "a": _ckpt_json_safe(chapter_as.get(i)),
+                      "b": _ckpt_json_safe(chapter_bs.get(i))})
+    manifest = {
+        "format_version": _ARTEFACT_FORMAT_VERSION,
+        "stage": "extract",
+        "extract_key": root.name,
+        "book_key": book_key,
+        "fingerprint": fingerprint,
+        "file": str(fpath),
+        "title": title,
+        "author": author,
+        "identifiers": dict(identifiers or {}),
+        "chapter_count": total,
+        "payload_chapters": payload_chapters,
+        "coverage": dict(coverage or {}),
+        "source": dict(source or {}),
+        "processor_version": PORTABLE_VERSION,
+        "flags_hash": _checkpoint_flags_hash(),
+        "extraction_flags_hash": _extraction_flags_hash(),
+        "created_at": _now_iso(),
+    }
+    _atomic_json(root / "manifest.json", manifest)
+    return root
+
+
+def _load_extraction_artefact(path):
+    """Read an extraction manifest; refuse a foreign format by name."""
+    p = Path(path)
+    mp = p / "manifest.json"
+    if not mp.is_file():
+        raise ValueError(f"no extraction manifest at {mp}")
+    try:
+        manifest = json.load(open(mp, encoding="utf-8"))
+    except Exception as e:
+        raise ValueError(f"unreadable extraction manifest: {e}")
+    if not isinstance(manifest, dict):
+        raise ValueError("extraction manifest is not an object")
+    if manifest.get("format_version") != _ARTEFACT_FORMAT_VERSION:
+        raise ValueError(
+            f"extraction artefact format "
+            f"{manifest.get('format_version')} is not the current "
+            f"format {_ARTEFACT_FORMAT_VERSION}")
+    if not (p / "meta.json").is_file():
+        raise ValueError(f"extraction artefact has no meta.json: {p}")
+    return manifest, p
+
+
+def _write_analysis_artefact(*, result, fpath, book_key, fingerprint,
+                             extraction_manifest, series_name, series_pos,
+                             wid, how):
+    root = (_artefact_root(_learn().dir) / "analyze" / fingerprint
+            / _new_run_key("analyze"))
+    manifest = {
+        "format_version": _ARTEFACT_FORMAT_VERSION,
+        "stage": "analyze",
+        "analysis_key": root.name,
+        "book_key": book_key,
+        "fingerprint": fingerprint,
+        "file": str(fpath),
+        "extract_key": (extraction_manifest or {}).get("extract_key"),
+        "extraction_fingerprint": (extraction_manifest or {}).get(
+            "fingerprint"),
+        "title": result.get("title"),
+        "author": result.get("author"),
+        "series_name": series_name or result.get("series_name"),
+        "series_position": series_pos,
+        "work_id": wid,
+        "work_resolution": how,
+        "processor_version": PORTABLE_VERSION,
+        "created_at": _now_iso(),
+        "counts": {
+            "characters": len(result.get("characters") or []),
+            "relationships": len(result.get("relationships") or []),
+            "dropped_relationships": len(
+                result.get("dropped_relationships") or []),
+            "tropes": len(result.get("tropes") or []),
+            "triggers": len(result.get("triggers") or []),
+            "quotes": len(result.get("quotes") or []),
+        },
+    }
+    _atomic_json(root / "manifest.json", manifest)
+    _atomic_json(root / "analysis.json", result)
+    return root
 
 
 def process_file_v2(fpath, dry_run=False, preview=False):
@@ -31109,7 +31499,24 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         identifiers, title, author, _checkpoint_text_sample(chapters))
     _resumed_chapters = {}  # idx -> (a, b) loaded from checkpoints
     _resumed_roster = None
-    if _REPLAY_CTX is not None:
+    if _EXTRACTION_CTX is not None:
+        # Analyze (wiki-ingestion spec §3.2): the extraction artefact
+        # IS this run's extraction. Its fingerprint is a hard stop —
+        # a different book never analyzes another's payloads.
+        _src_fp = _EXTRACTION_CTX.get("fingerprint")
+        if _src_fp and _src_fp != _ckpt_fp:
+            print(f"  --stage analyze REFUSED: the presented file's "
+                  f"fingerprint ({_ckpt_fp}) does not match the "
+                  f"extraction artefact's ({_src_fp})")
+            return False
+        _loaded = _checkpoint_load(_ckpt_key)
+        if _loaded is None:
+            print(f"  --stage analyze: extraction artefact at "
+                  f"{_EXTRACTION_CTX.get('payload_dir')} has no "
+                  f"loadable payloads")
+            return False
+        _rmeta, _resumed_roster, _resumed_chapters = _loaded
+    elif _REPLAY_CTX is not None:
         # Spine replay (design §3.4): the payloads ARE the run's
         # extraction. _checkpoint_resume_check is NOT consulted — its
         # flags-hash refusal (which embeds the git SHA) is exactly
@@ -31325,6 +31732,27 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         _checkpoint_save_extraction_stamp(_ckpt_key, _ckpt_fp,
                                           n - len(_fm_idx_v2))
 
+    # Stage E standalone (wiki-ingestion spec §3.1): write the
+    # extraction artefact and stop. No merge, no decide, no DB.
+    if _stage_name() == "extract":
+        if aborted:
+            print("  Extraction aborted — no artefact written")
+            return False
+        _dir = _write_extraction_artefact(
+            book_key=_ckpt_key, fingerprint=_ckpt_fp, fpath=fpath,
+            title=title, author=author, identifiers=identifiers,
+            indexed=indexed, chapter_as=chapter_as, chapter_bs=chapter_bs,
+            roster=roster, total=n,
+            payload_chapters=n - len(_fm_idx_v2),
+            coverage={"a_ok": a_ok, "a_failed": a_failed,
+                      "a_fallback": a_fallback, "b_ok": b_ok,
+                      "b_failed": b_failed},
+            source=_acq.get("source"))
+        print(f"  Extraction artefact: {_dir}")
+        print("  --stage extract complete; merge and decide not run")
+        _checkpoint_clear(_ckpt_key)
+        return True
+
     # Recorded human NOs for this work (roster store): standing
     # rulings the in-run merge passes and alias pruning below must
     # honour. Loaded whether or not --persist-roster is on — the
@@ -31408,6 +31836,20 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     result = _dseg["result"]
     wid, how = _dseg["wid"], _dseg["how"]
     title, author = _dseg["title"], _dseg["author"]
+
+    # Stage D standalone (wiki-ingestion spec §3.2): write the
+    # analysis artefact and stop. The artefact is the product; the
+    # app write stays a later, explicit merge act.
+    if _stage_name() == "analyze":
+        _dir = _write_analysis_artefact(
+            result=result, fpath=fpath, book_key=_ckpt_key,
+            fingerprint=_ckpt_fp,
+            extraction_manifest=(_EXTRACTION_CTX or {}).get("manifest"),
+            series_name=_series_name, series_pos=_series_pos,
+            wid=wid, how=how)
+        print(f"  Analysis artefact: {_dir}")
+        print("  --stage analyze complete; nothing written to Supabase")
+        return not aborted
 
     if dry_run:
         print("  DRY RUN — nothing written")
@@ -32353,7 +32795,8 @@ _PROFILE_PERSISTABLE = frozenset({
     # Run-shaping settings only: models, pipeline and feature toggles,
     # output modes, and thresholds — the values an operator wants the
     # same on every run until the profile itself is changed.
-    "allow_no_isbn", "batch", "corpus_only", "corpus_quotes", "debug",
+    "allow_no_isbn", "auto_confirm_links", "batch", "corpus_only",
+    "corpus_quotes", "debug",
     "decision_model", "decision_model_provider", "decision_model_url",
     "dedupe", "discovery_embedding_rank", "discovery_shadow",
     "dry_run", "emit_run_events", "emit_uncertainty",
@@ -32387,7 +32830,8 @@ _PROFILE_EXCLUDE = frozenset({
     "staging_report", "trope_map",
     "validate", "verify", "watch",
     # per-run selectors / overrides for a single run
-    "alias", "chunks", "file", "import_labels", "import_rejections",
+    "alias", "analysis", "apply_merge", "chunks", "extraction", "file",
+    "import_labels", "import_rejections",
     "from_supabase", "hardcover_refresh", "isbn", "max_books",
     "resume", "series", "series_position", "stage",
     # companion arguments that only aim a one-shot command
@@ -32585,18 +33029,18 @@ def _build_parser():
                     help="extraction pipeline: legacy (fixed chunks) or v2 "
                          "(chapter-level map/reduce with character roster)")
     g_pipe.add_argument("--stage", default="all",
-                    choices=["all", "extract", "merge", "decide"],
+                    choices=["all", "extract", "analyze", "merge", "decide"],
                     help="stage split: run ONE pipeline stage against "
                          "stored artefacts instead of the whole run. "
-                         "'merge' runs Stage M (roster merge) over a "
-                         "completed extraction's checkpoints for --file "
-                         "and writes merged-roster.json; 'decide' runs "
-                         "Stage D (decide) over the extraction plus "
-                         "merged-roster.json and emits the preview "
-                         "(preview-only: --preview required); 'all' "
-                         "(the default) is the ordinary full run. "
-                         "'extract' lands in a later step of the split "
-                         "and currently refuses, legibly.")
+                         "'extract' runs Stage E and writes an extraction "
+                         "artefact; 'analyze' runs Stage D over an "
+                         "extraction artefact and writes an analysis "
+                         "artefact; 'merge' with --analysis builds a "
+                         "cross-book merge plan; 'all' (the default) is "
+                         "the ordinary full run. 'decide' is the old name "
+                         "for 'analyze' and refuses, legibly.")
+    g_pipe.add_argument("--extraction", metavar="DIR", default=None,
+                    help="--stage analyze: extraction artefact directory")
     g_pipe.add_argument("--chunks", default=None,
                     help="process only these chunk indices (e.g. --chunks 2 or --chunks 2,5,8); "
                          "numbering matches the sampled chunk list and debug files")
@@ -32609,6 +33053,22 @@ def _build_parser():
                          "embeddings) before writing; needs embed_url/embed_model")
 
     g_merge = ap.add_argument_group("Merging")
+    g_merge.add_argument("--analysis", action="append", default=None,
+                    metavar="DIR",
+                    help="--stage merge: analysis artefact directory "
+                         "(repeatable)")
+    g_merge.add_argument("--apply", dest="apply_merge",
+                    action="store_true",
+                    help="--stage merge: apply the plan to Supabase "
+                         "(requires the wiki-ingestion migration)")
+    g_merge.add_argument("--auto-confirm-links", dest="auto_confirm_links",
+                    action="store_true", default=None,
+                    help="allow exact-name series links to land as "
+                         "confirmed; default is suggested-only until the "
+                         "rule is measured")
+    g_merge.add_argument("--no-auto-confirm-links",
+                    dest="auto_confirm_links", action="store_false",
+                    help="force every proposed link to suggested")
     g_merge.add_argument("--alias", metavar="A=B", action="append", default=[],
                     help="manual character alias: 'Loki=Brian Gragg' merges them. "
                          "Repeatable. Stored as human-validated, applies cross-book.")
@@ -33126,13 +33586,12 @@ def _flag_conflicts(args, defaults):
         # --stage locates its book BY --file (the same path Stage E
         # was given): the pairing is designed, like replay's.
         modes = [m for m in modes if m != "--file"]
-        if getattr(args, "stage", None) == "decide":
-            # --preview beside --stage decide is likewise designed:
-            # the stage is preview-only, so the flag is its required
-            # posture, honoured by the dispatch — not a dropped
-            # mode. (Beside --stage merge it still conflicts: Stage
-            # M neither previews nor writes, so the flag would be
-            # silently dropped there.)
+        if getattr(args, "stage", None) in ("decide", "analyze"):
+            # --preview beside analyze (or its old name, decide) is
+            # designed: the stage is preview-shaped, so the flag is
+            # its posture, honoured by the dispatch — not a dropped
+            # mode. (Beside the merge stages it still conflicts:
+            # neither previews, so the flag would be dropped there.)
             modes = [m for m in modes if m != "--preview"]
     if shots == ["--save-profile"]:
         # --save-profile's whole job is capturing run-shaping
@@ -33200,15 +33659,13 @@ def main():
                      "(--list-profiles to see available)")
         _apply_profile(args, defaults, profile)
 
-    # Stage entry points land one at a time (stage-split §8):
-    # 'merge' shipped in step 2, 'decide' in step 3; 'extract'
-    # still refuses here — before any state migration or other
-    # side effect — rather than silently running something else.
-    if getattr(args, "stage", "all") == "extract":
-        print(f"  --stage {args.stage} is not available yet: the "
-              f"stage entry points land one at a time (this build "
-              f"ships 'merge' and 'decide'; 'extract' follows in "
-              f"step 4 of the stage split). Nothing was run.")
+    # Stage entry points (wiki-ingestion spec §3): extract and
+    # analyze are dispatched after CONFIG shaping, before the
+    # Supabase credential gate — they never write app data.
+    # 'decide' is the old name for 'analyze' and refuses by name.
+    if getattr(args, "stage", "all") == "decide":
+        print("  --stage decide was renamed --stage analyze "
+              "(extraction artefacts); nothing was run.")
         sys.exit(2)
 
     # Spine OC-7: the state stores migrate to the SQLite substrate
@@ -33574,6 +34031,15 @@ def main():
         CONFIG["only_chunks"] = args.chunks
     if args.pipeline:
         CONFIG["pipeline"] = args.pipeline
+    # Stage context (wiki-ingestion spec §3): extract and analyze are
+    # read-only against app data; the guard is consulted by sb().
+    CONFIG["stage"] = getattr(args, "stage", "all") or "all"
+    _WRITE_GUARD["stage"] = CONFIG["stage"]
+    _WRITE_GUARD["active"] = CONFIG["stage"] in (
+        "extract", "analyze", "decide")
+    if args.auto_confirm_links is not None:
+        CONFIG["wiki_links_auto_confirm"] = bool(
+            args.auto_confirm_links)
     if args.debug:
         CONFIG["debug"] = True
     if args.dedupe:
@@ -33588,33 +34054,33 @@ def main():
         sys.exit("ERROR: Cohere API key is not set (set \"cohere_api_key\" "
                  "in config.json or the COHERE_API_KEY environment variable)")
 
-    # --stage merge (stage-split step 2): run Stage M alone over the
-    # --file book's stored extraction. Dispatched here — after every
-    # CONFIG-shaping flag above has been applied exactly as a full
-    # run applies it (judge, merge and priors flags included), with
-    # the validator and learned state already constructed — and
-    # before the Supabase gate below: Stage M writes only its
-    # artefact, so it must not demand write credentials.
-    if getattr(args, "stage", "all") == "merge":
+    # Stage entries (wiki-ingestion spec §3). Dispatched after every
+    # CONFIG-shaping flag, before the Supabase credential gate:
+    # extract/analyze never write app data, and the merge plan is
+    # read-only in this build.
+    if getattr(args, "stage", "all") == "extract":
         if not args.file:
-            sys.exit("ERROR: --stage merge needs --file <book> — the "
-                     "book whose stored extraction it merges")
-        sys.exit(cmd_stage_merge(args.file))
+            sys.exit("ERROR: --stage extract needs --file <book>")
+        if args.extraction:
+            sys.exit("ERROR: --stage extract does not take --extraction")
+        sys.exit(cmd_stage_extract(args.file))
 
-    # --stage decide (stage-split step 3): run Stage D alone over
-    # the --file book's stored extraction + merged-roster
-    # artefact. Same dispatch discipline as merge — after every
-    # CONFIG-shaping flag, before the Supabase gate: the stage is
-    # preview-only and never writes app data, so it must not
-    # demand write credentials. Its preview-only posture is
-    # enforced inside the command (a write-posture invocation
-    # refuses by name there).
-    if getattr(args, "stage", "all") == "decide":
+    if getattr(args, "stage", "all") == "analyze":
+        if not args.file or not args.extraction:
+            sys.exit("ERROR: --stage analyze needs --file <book> and "
+                     "--extraction <dir>")
+        sys.exit(cmd_stage_analyze(args.extraction, args.file))
+
+    if getattr(args, "stage", "all") == "merge":
+        if args.analysis:
+            sys.exit(cmd_stage_merge_plan(args.analysis,
+                                          apply=args.apply_merge))
         if not args.file:
-            sys.exit("ERROR: --stage decide needs --file <book> — "
-                     "the book whose stored artefacts it decides")
-        sys.exit(cmd_stage_decide(args.file, preview=args.preview,
-                                  dry_run=args.dry_run))
+            sys.exit("ERROR: --stage merge needs --analysis <dir> [<dir> ...] "
+                     "or --file <book> (legacy within-book merge)")
+        print("  NOTE: per-book --stage merge is the legacy within-book "
+              "entry; cross-book merge uses --analysis.")
+        sys.exit(cmd_stage_merge(args.file))
 
     if not (args.dry_run or args.preview) and not (CONFIG["supabase_url"] and CONFIG["supabase_key"]):
         sys.exit("ERROR: Set supabase_url and supabase_key in config.json")
