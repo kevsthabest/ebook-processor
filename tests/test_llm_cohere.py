@@ -193,6 +193,44 @@ class TestResponseHandling(_CohereCase):
                              {"prompt_tokens": None, "completion_tokens": None})
 
 
+class TestMalformedResponseShapes(_CohereCase):
+    """Off-spec response shapes must degrade to an empty completion,
+    never raise: llm_cohere runs inside worker threads whose callers
+    do not guard result retrieval, so an AttributeError/TypeError
+    here aborts the whole book instead of failing one chunk."""
+
+    def setUp(self):
+        super().setUp()
+        pp.CONFIG["cohere_api_key"] = "k"
+
+    def test_message_not_a_dict_degrades_to_empty(self):
+        self.fake_post({"message": "oops", "finish_reason": "COMPLETE"})
+        out = pp.llm_cohere("P", "c", 1, 2)
+        self.assertEqual(out, "")
+
+    def test_text_item_with_dict_text_is_skipped(self):
+        resp = {"finish_reason": "COMPLETE",
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": {"unexpected": "object"}},
+                    {"type": "text", "text": "real answer"}]}}
+        self.fake_post(resp)
+        self.assertEqual(pp.llm_cohere("P", "c", 1, 2), "real answer")
+
+    def test_text_item_with_only_dict_text_degrades_to_empty(self):
+        resp = {"finish_reason": "COMPLETE",
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": {"unexpected": "object"}}]}}
+        self.fake_post(resp)
+        self.assertEqual(pp.llm_cohere("P", "c", 1, 2), "")
+
+    def test_content_not_a_list_degrades_to_empty(self):
+        resp = {"finish_reason": "COMPLETE",
+                "message": {"role": "assistant",
+                            "content": {"type": "text", "text": "x"}}}
+        self.fake_post(resp)
+        self.assertEqual(pp.llm_cohere("P", "c", 1, 2), "")
+
+
 class TestFailureLegibility(_CohereCase):
     def test_missing_key_errors_before_any_http(self):
         self.fake_post(_v2_response("{}"))

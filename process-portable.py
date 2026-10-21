@@ -20317,7 +20317,13 @@ def llm_cohere(prompt, chunk, i, n):
     if not isinstance(resp, dict):
         print("\n  Cohere error: malformed response (not a JSON object)")
         return None
-    content = (resp.get("message") or {}).get("content")
+    # The parse below is guarded shape by shape, the same defensive
+    # posture as _cohere_usage: this runs inside worker threads whose
+    # callers do not guard result retrieval, so an off-spec response
+    # must degrade to the empty-completion return, never raise — a
+    # raise here aborts the book instead of failing one chunk.
+    message = resp.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
     parts = []
     saw_thinking = False
     if isinstance(content, str):
@@ -20327,7 +20333,9 @@ def llm_cohere(prompt, chunk, i, n):
             if not isinstance(item, dict):
                 continue
             if item.get("type") == "text":
-                parts.append(item.get("text") or "")
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
             elif item.get("type") == "thinking":
                 saw_thinking = True
     _pt, _ct = _cohere_usage(resp)
