@@ -13,7 +13,7 @@ Setup:
   5. Run: python process-portable.py
 
 Usage:
-  python process-portable.py [--llm ollama|openrouter|openai] [--dry-run] [--preview] [--watch]
+  python process-portable.py [--llm ollama|openrouter|openai|cohere] [--dry-run] [--preview] [--watch]
 
   --dry-run   Run extraction, print a summary, write nothing, move no files.
   --preview   Run extraction, save preview/<book>.json + .md, write nothing to
@@ -38,6 +38,8 @@ Config (config.json):
   "ollama_model": "qwen2.5:7b-instruct",
   "openai_base_url": "http://127.0.0.1:8888/v1",  // for --llm openai (Unsloth etc.)
   "openai_model": "qwen2.5-2k:latest",
+  "cohere_api_key": "<key>",                  // for --llm cohere (or COHERE_API_KEY env)
+  "cohere_model": "command-a-plus-05-2026",
   "embed_url": "http://127.0.0.1:8888/v1",      // for --dedupe (OpenAI-compatible /v1/embeddings)
   "embed_model": "",
   "dedupe_threshold": 0.85,
@@ -48,7 +50,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.80"
+PORTABLE_VERSION = "2.13.81"
 
 
 import argparse
@@ -100,6 +102,9 @@ DEFAULT_CONFIG = {
     "openrouter_model": "qwen/qwen3-27b",
     "openai_base_url": "http://127.0.0.1:8888/v1",
     "openai_model": "",
+    "cohere_api_key": "",  # --llm cohere key (or COHERE_API_KEY env)
+    "cohere_key": "",  # alias for cohere_api_key
+    "cohere_model": "command-a-plus-05-2026",
     "sample_rate": 1,
     "sample_edges": 2,
     "batch_size": 1,
@@ -7442,11 +7447,12 @@ def _effective_judge_identity():
     never invalidated a stored verdict (§4.2's contract is that
     the hash covers the judge's backend, model and prompt)."""
     backend = CONFIG.get("llm") or ""
-    if backend not in ("ollama", "openrouter", "openai"):
+    if backend not in ("ollama", "openrouter", "openai", "cohere"):
         backend = "ollama"
     models = {"ollama": CONFIG.get("ollama_model") or "",
               "openrouter": CONFIG.get("openrouter_model") or "",
-              "openai": CONFIG.get("openai_model") or ""}
+              "openai": CONFIG.get("openai_model") or "",
+              "cohere": CONFIG.get("cohere_model") or ""}
     return backend, models[backend]
 
 
@@ -20217,6 +20223,126 @@ def llm_openrouter(prompt, chunk, i, n):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Cohere v2 chat provider (--llm cohere): the second hosted sibling of
+# llm_openrouter, speaking Cohere's native v2 chat API rather than an
+# OpenAI-shaped endpoint. Same (prompt, chunk, i, n) contract and the
+# same failure contract (print + None) as every other backend.
+# ---------------------------------------------------------------------------
+COHERE_CHAT_URL = "https://api.cohere.com/v2/chat"
+COHERE_DEFAULT_MODEL = "command-a-plus-05-2026"  # Command A+
+
+
+def _cohere_api_key(config=None, env=None):
+    """Resolve the Cohere API key: COHERE_API_KEY env first (the
+    decision-model resolver's env-first convention), then config
+    \"cohere_api_key\", then the \"cohere_key\" alias. Returns \"\" when
+    unset everywhere. The key is never logged or printed."""
+    cfg = CONFIG if config is None else config
+    environ = os.environ if env is None else env
+    return ((environ.get("COHERE_API_KEY") or "").strip()
+            or cfg.get("cohere_api_key", "")
+            or cfg.get("cohere_key", ""))
+
+
+def _cohere_usage(resp):
+    """(prompt_tokens, completion_tokens) from a v2 response's usage
+    block, or (None, None) when it is absent or malformed. The counts
+    live under usage.tokens in the current API; flat and billed_units
+    shapes are accepted defensively so an upstream shape shift degrades
+    telemetry to unreported instead of crashing a finished call."""
+    usage = resp.get("usage") if isinstance(resp, dict) else None
+    if not isinstance(usage, dict):
+        return None, None
+    for block in (usage.get("tokens"), usage, usage.get("billed_units")):
+        if isinstance(block, dict) and ("input_tokens" in block
+                                        or "output_tokens" in block):
+            return block.get("input_tokens"), block.get("output_tokens")
+    return None, None
+
+
+def llm_cohere(prompt, chunk, i, n):
+    """Cohere v2 chat extraction backend.
+
+    The completion is assembled ONLY from message.content items typed
+    "text": Command models reason in a separate "thinking" channel,
+    and that channel must never reach the parsers as if it were the
+    answer (a prior extractor-seat candidate was disqualified for
+    exactly that leakage). Empty-response forensics mirror the
+    openai path's _DIAG.info stash, with MAX_TOKENS normalized to
+    "length" so _run_task's doubled-budget truncation retry engages
+    identically. What v2 cannot express degrades the way the hosted
+    sibling (openrouter) degrades: no response_format forcing (the
+    prompts demand JSON and the parsers tolerate prose around it) and
+    no thinking on/off knob (llm_enable_thinking is a chat-template
+    concept; the text/thinking split in the response is what the
+    pipeline actually depends on, and it is handled above).
+    """
+    _diag_reset()
+    api_key = _cohere_api_key()
+    if not api_key:
+        # Pre-flight, before any HTTP: a misconfigured run must say
+        # what is missing instead of failing chunk after chunk.
+        print("\n  Cohere error: no API key — set \"cohere_api_key\" in "
+              "config.json or the COHERE_API_KEY environment variable")
+        return None
+    model = CONFIG.get("cohere_model") or COHERE_DEFAULT_MODEL
+    max_tokens = CONFIG.get("llm_max_tokens", 8000)
+    if getattr(_DIAG, "token_boost", False):
+        max_tokens *= 2  # truncation retry: doubled budget, thread-local
+    system_prefix = CONFIG.get("llm_system_prefix", "")
+    system_prompt = f"{system_prefix}\n{prompt}" if system_prefix else prompt
+    # Per-call override (v2 sets this thread-locally); falls back to global.
+    think_suffix = getattr(_DIAG, "think_suffix", None)
+    if think_suffix is None:
+        think_suffix = CONFIG.get("llm_think_suffix", "")
+    if think_suffix:
+        system_prompt = f"{system_prompt}\n{think_suffix}"
+    payload = {"model": model,
+               "messages": [{"role": "system", "content": system_prompt},
+                            {"role": "user",
+                             "content": f"Excerpt {i}/{n}:\n\n{chunk}"}],
+               "temperature": 0.2,
+               "max_tokens": max_tokens}
+    try:
+        resp = _post_json(COHERE_CHAT_URL, payload,
+                          {"Content-Type": "application/json",
+                           "Authorization": f"Bearer {api_key}"}, 300)
+    except urllib.error.HTTPError as e:
+        print(f"\n  Cohere {e.code}: {e.read().decode('utf-8', 'ignore')[:200]}")
+        return None
+    except Exception as e:
+        print(f"\n  Cohere error: {e}")
+        return None
+    if not isinstance(resp, dict):
+        print("\n  Cohere error: malformed response (not a JSON object)")
+        return None
+    content = (resp.get("message") or {}).get("content")
+    parts = []
+    saw_thinking = False
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
+                parts.append(item.get("text") or "")
+            elif item.get("type") == "thinking":
+                saw_thinking = True
+    _pt, _ct = _cohere_usage(resp)
+    _fr = resp.get("finish_reason")
+    _DIAG.info = {
+        "finish_reason": "length" if _fr == "MAX_TOKENS" else _fr,
+        "completion_tokens": _ct,
+        "reasoning_content": saw_thinking,
+    }
+    # Telemetry usage stash (spec §6): absent counts stay None and the
+    # recorder falls back to the prompt character estimate.
+    _DIAG.telemetry_usage = {"prompt_tokens": _pt, "completion_tokens": _ct}
+    return "".join(parts)
+
+
 # Thread-local stash for per-call LLM diagnostics (empty-response forensics).
 # Set by llm_openai_compat, read by _run_task. Thread-local because chunks run
 # in a ThreadPoolExecutor when --batch > 1.
@@ -21311,7 +21437,8 @@ def extract_llm(chunk, i, n):
     invalidate the other. If the rich identity prompt fails twice, one attempt
     is made with the simplified no-evidence fallback prompt. Returns merged
     dict, or None if both failed."""
-    backends = {"ollama": llm_ollama, "openrouter": llm_openrouter, "openai": llm_openai_compat}
+    backends = {"ollama": llm_ollama, "openrouter": llm_openrouter, "openai": llm_openai_compat,
+                "cohere": llm_cohere}
     call = backends.get(CONFIG["llm"], llm_ollama)
     disc = _run_task(call, PROMPT_DISCIPLINE, chunk, i, n, "discipline")
     ident = _run_task(call, _rel_prompt(PROMPT_IDENTITY), chunk, i, n,
@@ -22945,7 +23072,8 @@ def _history_models():
     backend = CONFIG.get("llm") or ""
     per_backend = {"ollama": CONFIG.get("ollama_model"),
                    "openrouter": CONFIG.get("openrouter_model"),
-                   "openai": CONFIG.get("openai_model")}
+                   "openai": CONFIG.get("openai_model"),
+                   "cohere": CONFIG.get("cohere_model")}
     judge_backend, judge_model = _effective_judge_identity()
     return {
         "llm_backend": backend or None,
@@ -27089,7 +27217,8 @@ def write_claims(work_id, result, trope_mappings=None):
         return 1
     errors = 0
     _models = {"ollama": CONFIG["ollama_model"], "openrouter": CONFIG["openrouter_model"],
-               "openai": CONFIG.get("openai_model", "")}
+               "openai": CONFIG.get("openai_model", ""),
+               "cohere": CONFIG.get("cohere_model", "")}
     model = _models.get(CONFIG["llm"], "")
     wrote = {"tropes": 0, "triggers": 0, "characters": 0, "proposals": 0, "quotes": 0}
     deleted = {"tropes": 0, "triggers": 0, "characters": 0, "proposals": 0, "quotes": 0}
@@ -27463,7 +27592,8 @@ def plan_replace(work_id, result, trope_mappings=None):
     if not work_id or not (CONFIG.get("supabase_url") and CONFIG.get("supabase_key")):
         return None
     _models = {"ollama": CONFIG["ollama_model"], "openrouter": CONFIG["openrouter_model"],
-               "openai": CONFIG.get("openai_model", "")}
+               "openai": CONFIG.get("openai_model", ""),
+               "cohere": CONFIG.get("cohere_model", "")}
     model = _models.get(CONFIG["llm"], "")
     _cat = dict(result.get("trope_catalog_map", {}) or {})
     if trope_mappings:
@@ -28838,7 +28968,7 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     UI.book_start(_book_key, f"📖 {title or fpath.stem}", total=2 * n)
 
     backends = {"ollama": llm_ollama, "openrouter": llm_openrouter,
-                "openai": llm_openai_compat}
+                "openai": llm_openai_compat, "cohere": llm_cohere}
     call = backends.get(CONFIG["llm"], llm_ollama)
     batch_size = effective_batch_size()
 
@@ -31116,7 +31246,7 @@ def _build_parser():
                          "as evidence (v2 pipeline only)")
 
     g_models = ap.add_argument_group("Models")
-    g_models.add_argument("--llm", choices=["ollama", "openrouter", "openai"], help="override config llm")
+    g_models.add_argument("--llm", choices=["ollama", "openrouter", "openai", "cohere"], help="override config llm")
     g_models.add_argument("--decision-model", action="store_true",
                     help="enable decision-model trigger validation using the "
                          "configured openai_base_url (same Unsloth server)")
@@ -32090,10 +32220,13 @@ def main():
         CONFIG["dedupe"] = True
     if CONFIG.get("dedupe") and not CONFIG.get("embed_url"):
         sys.exit("ERROR: --dedupe needs embed_url (and embed_model) set in config.json")
-    if CONFIG["llm"] not in ("ollama", "openrouter", "openai"):
-        sys.exit(f"ERROR: unknown llm '{CONFIG['llm']}' (use ollama, openrouter, or openai)")
+    if CONFIG["llm"] not in ("ollama", "openrouter", "openai", "cohere"):
+        sys.exit(f"ERROR: unknown llm '{CONFIG['llm']}' (use ollama, openrouter, openai, or cohere)")
     if CONFIG["llm"] == "openrouter" and not CONFIG["openrouter_key"]:
         sys.exit("ERROR: openrouter_key is not set")
+    if CONFIG["llm"] == "cohere" and not _cohere_api_key():
+        sys.exit("ERROR: Cohere API key is not set (set \"cohere_api_key\" "
+                 "in config.json or the COHERE_API_KEY environment variable)")
     if not (args.dry_run or args.preview) and not (CONFIG["supabase_url"] and CONFIG["supabase_key"]):
         sys.exit("ERROR: Set supabase_url and supabase_key in config.json")
 
