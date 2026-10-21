@@ -13197,13 +13197,22 @@ def cmd_roster_no(work, form_a, form_b, learn_dir=None):
         print(f"Refused: a NO needs two distinct name forms "
               f"(got '{form_a}' and '{form_b}').")
         return
+    # A work_id is a UUID and store lookup is exact-string: the
+    # key a run derives for a work is the canonical lowercase
+    # rendering. Canonicalize before find/create — an uppercase
+    # rendering taken verbatim would create a store under a key
+    # no run ever derives, and the NO would sit in a store
+    # nothing reads.
+    _is_uuid = isinstance(work, str) and bool(re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", work))
+    if _is_uuid:
+        work = work.lower()
     learn_dir = _roster_cmd_learn_dir(learn_dir)
     store, err = find_roster_store(learn_dir, work)
     created = False
     if store is None:
-        if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
-                        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-                        r"[0-9a-fA-F]{12}", work or ""):
+        if _is_uuid:
             store = RosterStore(learn_dir=learn_dir,
                                 work_key=str(work))
             created = True
@@ -13215,7 +13224,14 @@ def cmd_roster_no(work, form_a, form_b, learn_dir=None):
         print(f"NO already recorded: '{form_a}' is not "
               f"'{form_b}' in this work's roster store.")
         return
-    store.save()
+    if not store.save():
+        # record_no changed only memory; a failed write means the
+        # ruling is not in force. Say so plainly — claiming the
+        # recording would leave the user trusting a ban the next
+        # run never sees.
+        print(f"FAILED: the roster store could not be written "
+              f"({store.path}); the NO was NOT recorded.")
+        return
     print(f"Recorded NO: '{form_a}' is not '{form_b}' "
           f"({'created' if created else 'found'} roster store "
           f"{store.path}) — the pair cannot merge, link, or "

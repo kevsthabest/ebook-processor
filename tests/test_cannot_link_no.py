@@ -318,6 +318,36 @@ class TestRecordingPath(unittest.TestCase):
         self.assertTrue(store.has_no("karl devon",
                                      "major pain in the ass"))
 
+    def test_record_with_uppercase_work_id_creates_findable_store(self):
+        # A work_id pasted in uppercase is still the same UUID:
+        # the store must be created under the canonical lowercase
+        # key a run derives, or the NO lands in a store that
+        # lowercase lookup (every run, every later command) never
+        # finds.
+        wid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        text = _capture(pp.cmd_roster_no, wid.upper(), "Karl Devon",
+                        "Major Pain in the Ass", learn_dir=self.dir)
+        self.assertIn("Recorded NO", text)
+        store, err = pp.find_roster_store(self.dir, wid)
+        self.assertIsNone(err)
+        self.assertEqual(store.work_key, wid)
+        self.assertTrue(store.has_no("karl devon",
+                                     "major pain in the ass"))
+
+    def test_record_reports_failure_when_save_fails(self):
+        # save() returning False means the ruling never reached
+        # disk: the command must report the failure, not claim a
+        # recording the next run would not honour.
+        self._seed_store()
+        with mock.patch.object(pp.RosterStore, "save",
+                               return_value=False):
+            text = _capture(pp.cmd_roster_no, "Daemon", "Karl Devon",
+                            "Major Pain in the Ass", learn_dir=self.dir)
+        self.assertNotIn("Recorded NO", text)
+        self.assertIn("NOT recorded", text)
+        store = pp.RosterStore(learn_dir=self.dir, work_key="wk-daemon")
+        self.assertEqual(store.data["no_pairs"], [])
+
     def test_record_refuses_unknown_work_and_self_pair(self):
         text = _capture(pp.cmd_roster_no, "No Such Work", "Karl Devon",
                         "Major Pain in the Ass", learn_dir=self.dir)
