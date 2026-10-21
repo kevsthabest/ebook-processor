@@ -268,6 +268,107 @@ class TestNomination(_Base):
                       state)
 
 
+class TestBudgetAllowance(_Base):
+    """The pass judges EVERY nominated, non-vetoed pair — the
+    bake-off measures the judge, never the budget.
+
+    The shared pool opens at the chapter floor (50) and protects
+    the later stages' reserves (31) against a first-stage
+    consumer, so claiming under the old merge_tier3 key would
+    leave a crowded roster's pairs mostly skipped, budget-starved
+    and unjudged. The pass instead funds itself: an additive
+    top-up of exactly its non-vetoed pair count, claimed under
+    its own "jev_merge" consumer key, one claim per pair."""
+
+    def _crowded_roster(self):
+        # Every entry shares the surname Halloway, so every pair
+        # is nominated on the surname route: C(8, 2) = 28 pairs —
+        # more than the 19 claims the unfunded shared pool would
+        # grant a first-stage consumer.
+        firsts = ("Anna", "Berta", "Carl", "Dora", "Emil",
+                  "Frieda", "Gustav", "Hanna")
+        return _roster(*[_entry(f"{f} Halloway", chapters=(0,))
+                         for f in firsts])
+
+    def test_starved_pool_still_judges_every_pair(self):
+        roster = self._crowded_roster()
+        judge = _FakeValidator(default=(False, 0.10))
+        diag = pp.jev_merge_pass(
+            roster, _CHAPTERS, validator=judge,
+            no_pairs=[("Anna Halloway", "Berta Halloway")])
+        self.assertEqual(diag["pairs_nominated"], 28)
+        self.assertEqual(len(diag["vetoed"]), 1)
+        # 27 non-vetoed pairs, every one judged: no budget skips.
+        self.assertEqual(diag["pairs_judged"], 27)
+        self.assertEqual(len(judge.states), 27)
+        self.assertFalse(any(v["verdict"] == "skipped"
+                             for v in diag["verdicts"]))
+        # The funding is exactly the non-vetoed count, spent under
+        # the pass's own consumer key — never the shared merge key.
+        self.assertEqual(diag["budget_topup"], 27)
+        snap = pp._dm_budget_snapshot()
+        self.assertEqual(snap["jev_merge"]["spent"], 27)
+        self.assertEqual(snap.get("merge_tier3", {}).get("spent", 0),
+                         0)
+
+    def test_relationship_reserves_and_availability_untouched(self):
+        # The §1.3 slices are byte-identical: the pass's consumer
+        # carries no reserve entry of its own (a missing entry is
+        # the zero reserve it funds around), so the scheme — a
+        # config-fingerprint input — never changes.
+        for consumer, reserve in (("merge_tier3", 10),
+                                  ("rel_family", 10),
+                                  ("rel_nonfamily", 5),
+                                  ("trigger_gate", 15),
+                                  ("quote_poll", 1),
+                                  ("discovery", 0),
+                                  ("untagged", 0)):
+            self.assertEqual(pp._DM_BUDGET_RESERVES[consumer],
+                             reserve)
+        self.assertNotIn("jev_merge", pp._DM_BUDGET_RESERVES)
+
+        def _family_availability():
+            granted = 0
+            while pp._dm_budget_claim(1, consumer="rel_family"):
+                granted += 1
+            return granted
+
+        # Reference book: the algorithmic merge stage ran and
+        # finished, then relationship validation draws.
+        pp._dm_budget_reset()
+        pp._dm_budget_finish("merge_tier3")
+        reference = _family_availability()
+        self.assertGreater(reference, 0)
+
+        # Bake-off book: the pass judges all 28 pairs first. Its
+        # addition and its spend cancel, so the family stage that
+        # follows can claim exactly what it could in the reference.
+        pp._dm_budget_reset()
+        roster = self._crowded_roster()
+        judge = _FakeValidator(default=(False, 0.10))
+        diag = pp.jev_merge_pass(roster, _CHAPTERS, validator=judge)
+        self.assertEqual(diag["pairs_judged"], 28)
+        self.assertEqual(_family_availability(), reference)
+
+    def test_no_topup_without_the_pass(self):
+        # Flag off — the pass never runs — arming and ordinary
+        # claims leave the pool at exactly the chapter formula:
+        # the top-up exists only inside the pass's funding step.
+        pp._dm_budget_reset(72)
+        self.assertEqual(pp._dm_budget_pool(), 72)
+        for _ in range(5):
+            self.assertTrue(
+                pp._dm_budget_claim(1, consumer="merge_tier3"))
+        self.assertEqual(pp._dm_budget_pool(), 72)
+        # A pass with no live judge judges nothing and therefore
+        # funds nothing: the pool is still untouched afterwards.
+        roster = self._crowded_roster()
+        diag = pp.jev_merge_pass(roster, _CHAPTERS, validator=None)
+        self.assertEqual(diag["pairs_judged"], 0)
+        self.assertEqual(diag["budget_topup"], 0)
+        self.assertEqual(pp._dm_budget_pool(), 72)
+
+
 class TestFlagWiring(unittest.TestCase):
     def test_flag_defaults_off_and_parses(self):
         parser = pp._build_parser()

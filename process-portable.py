@@ -17215,7 +17215,8 @@ def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
     experiment is scored."""
     diag = {"pairs_nominated": 0, "pairs_judged": 0,
             "merges_applied": 0, "clusters_formed": 0,
-            "vetoed": [], "verdicts": [], "transitive_veto_blocks": 0}
+            "vetoed": [], "verdicts": [], "transitive_veto_blocks": 0,
+            "budget_topup": 0}
     if len(roster) < 2:
         return diag
     chapters_by_index = {c.get("index"): c.get("text") or ""
@@ -17226,7 +17227,10 @@ def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
     diag["pairs_nominated"] = len(nominated)
     ordered = sorted(nominated.items(), key=lambda kv: (-kv[1], kv[0]))
     snip_cache = {}
-    yes_pairs = []
+    # Vetoes are settled before any judging: a vetoed pair is
+    # never judged, so it must never be funded either — the
+    # allowance below counts only the pairs that survive.
+    to_judge = []
     for (ka, kb), _sig in ordered:
         ea, eb = roster[ka], roster[kb]
         name_a, name_b = ea.get("name", ka), eb.get("name", kb)
@@ -17242,12 +17246,29 @@ def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
                       f"VETOED by recorded NO "
                       f"({_veto[0]} / {_veto[1]})")
                 continue
+        to_judge.append((ka, kb))
+    # Fund the judging before it begins: one added call per pair
+    # about to be judged, claimed below under the pass's own
+    # consumer key. Claiming against the shared pool instead
+    # would starve the pass against the validation stages'
+    # protected reserves — most pairs skipped unjudged, and the
+    # bake-off measuring the budget instead of the judge. No
+    # live judge means no judging happens, hence nothing to
+    # fund and the pool stays exactly as armed.
+    if to_judge and validator is not None \
+            and not getattr(validator, "disabled", False):
+        diag["budget_topup"] = len(to_judge)
+        _dm_budget_jev_merge_topup(len(to_judge))
+    yes_pairs = []
+    for ka, kb in to_judge:
+        ea, eb = roster[ka], roster[kb]
+        name_a, name_b = ea.get("name", ka), eb.get("name", kb)
         if validator is None or getattr(validator, "disabled", False):
             diag["verdicts"].append(
                 {"a": name_a, "b": name_b, "verdict": "skipped",
                  "confidence": None})
             continue
-        if not _dm_budget_claim(1, consumer="merge_tier3"):
+        if not _dm_budget_claim(1, consumer="jev_merge"):
             diag["verdicts"].append(
                 {"a": name_a, "b": name_b, "verdict": "skipped",
                  "confidence": None})
@@ -17279,7 +17300,12 @@ def jev_merge_pass(roster, chapters, validator=None, no_pairs=()):
             yes_pairs.append((ka, kb))
     # The merge stage is done: its unused budget reserve becomes
     # borrowable by the validation stages that follow (as in
-    # post_pass_merge).
+    # post_pass_merge). The pass's own consumer finishes too —
+    # allowance it did not spend (a judge that disabled itself
+    # mid-pass) rejoins the shared pool on the same terms, and
+    # the merge_tier3 finish keeps the downstream borrowing
+    # state identical to the algorithmic path's.
+    _dm_budget_finish("jev_merge")
     _dm_budget_finish("merge_tier3")
 
     # Union-find over YES verdicts only. A union that would put
@@ -24406,7 +24432,7 @@ _TELEMETRY_DECISION_ELAPSED = {}
 # is one stage with two consumers (family runs before non-family
 # in pipeline order, but both judge relationship claims).
 _TELEMETRY_DECISION_STAGES = (
-    ("merge", ("merge_tier3",)),
+    ("merge", ("merge_tier3", "jev_merge")),
     ("relationship", ("rel_family", "rel_nonfamily")),
     ("trigger", ("trigger_gate",)),
     ("quote", ("quote_poll",)),
@@ -24681,6 +24707,19 @@ def _dm_budget_pool():
 #   reserve. This closes the phase-1 bypass (untagged claims
 #   used to keep whole-pool semantics and could silently defeat
 #   the floor — recorded as a PASS_WITH_RISK item in 2.13.18).
+# - jev_merge (NO entry in the dict below): the --jev-merge
+#   bake-off's merge pass. It is not part of this scheme — the
+#   dict is a config-fingerprint input and must stay identical
+#   on runs that never use the flag — so its key lives only in
+#   _DM_BUDGET_ORDER, where a missing reserve reads as the zero
+#   it carries. The pass funds itself instead: before judging,
+#   it tops the pool up by exactly its nominated, non-vetoed
+#   pair count (_dm_budget_jev_merge_topup) and claims once per
+#   pair under its own key, so its spend is fully covered by
+#   its own addition and it never draws on the slices above.
+#   It sits LAST in pipeline order, so its presence can neither
+#   unlock borrowing nor add protection for any consumer that
+#   runs ahead of it.
 _DM_BUDGET_RESERVES = {
     "merge_tier3": 10,
     "rel_family": 10,
@@ -24692,7 +24731,7 @@ _DM_BUDGET_RESERVES = {
 }
 _DM_BUDGET_ORDER = ("merge_tier3", "rel_family", "rel_nonfamily",
                     "trigger_gate", "quote_poll", "discovery",
-                    "untagged")
+                    "untagged", "jev_merge")
 _DM_BUDGET_FINISHED = set()
 # Kept for the phase-1 tests and code that reference the floor by
 # name: the trigger reserve IS the old provisional floor.
@@ -24804,6 +24843,43 @@ def _dm_budget_resize_pool(relationship_census):
         if new_pool > _DM_BUDGET_POOL:
             _DM_BUDGET_POOL = new_pool
         return _DM_BUDGET_POOL
+
+
+def _dm_budget_jev_merge_topup(pairs):
+    """Add the --jev-merge bake-off's own allowance to the armed
+    pool and return the pool in force.
+
+    The bake-off replaces both algorithmic merge stages with the
+    judge, and the question it exists to answer — is the judge
+    better than the algorithm? — is only answered if EVERY
+    nominated, non-vetoed pair is actually judged. The shared
+    pool cannot fund that: it opens at one call per chapter and
+    protects the later stages' reserves against the first
+    consumer, so on a real book most pairs would be skipped
+    unjudged and the run would measure budget starvation, not
+    judgment. The pass therefore funds itself additively: the
+    pool grows by exactly the number of pairs about to be
+    judged, and the pass claims once per pair under its own
+    consumer key ("jev_merge"), so every call it spends is
+    matched by a call it added. The reserves are never drawn
+    on, and the pool the later stages draw on is exactly what
+    it would have been without the flag — the addition and the
+    spend cancel before any other stage claims.
+
+    Only jev_merge_pass calls this, only on a --jev-merge run
+    with a live judge, and only for the pairs that survived the
+    NO veto: nothing here runs on a normal run, and a vetoed
+    pair is never funded."""
+    global _DM_BUDGET_POOL
+    try:
+        pairs = int(pairs)
+    except (TypeError, ValueError):
+        pairs = 0
+    pairs = max(0, pairs)
+    if pairs:
+        with _DM_BUDGET_LOCK:
+            _DM_BUDGET_POOL += pairs
+    return _dm_budget_pool()
 
 
 def _dm_budget_arm_seq():
