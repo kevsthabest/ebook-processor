@@ -234,6 +234,30 @@ class TestStampWriterReader(_CheckpointDirCase):
         self.assertFalse(
             (pp._checkpoint_dir("book") / "extraction.json").exists())
 
+    def test_write_failure_is_bookkeeping_not_a_run_failure(self):
+        # The stamp is bookkeeping about a finished extraction: if the
+        # write itself fails (the Advisor's probe: os.replace raising
+        # OSError "disk full"), the exception must not escape — the
+        # extraction it describes already succeeded, and a stamp
+        # failure must never fail the run. The writer reports False,
+        # prints one line, and leaves neither a partial stamp nor the
+        # temp file behind.
+        import contextlib
+        import io
+        fp = self._seed()
+        d = pp._checkpoint_dir("book")
+        with mock.patch.object(pp.os, "replace",
+                               side_effect=OSError("disk full")):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ok = pp._checkpoint_save_extraction_stamp(
+                    "book", fingerprint=fp, payload_chapters=3)
+        self.assertFalse(ok)
+        self.assertIn("extraction stamp", buf.getvalue())
+        self.assertFalse((d / "extraction.json").exists())
+        self.assertFalse((d / "extraction.json.tmp").exists())
+        self.assertIsNone(pp._load_extraction_stamp("book"))
+
 
 # ---------------------------------------------------------------------------
 # End-to-end seam tests: a real (tiny) book through process_file_v2.

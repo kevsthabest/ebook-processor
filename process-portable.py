@@ -28619,6 +28619,12 @@ def _checkpoint_save_extraction_stamp(book_key, fingerprint=None,
 
     The write is atomic (temp file + os.replace): a crash mid-write
     leaves no stamp rather than a truncated one a reader might trust.
+
+    The write is best-effort bookkeeping, like every stamp in this
+    codebase: the extraction it describes has already succeeded when
+    this runs, so a failing write (disk full, a locked directory)
+    prints one line and returns False instead of raising — bookkeeping
+    must never change the outcome of the run it merely records.
     """
     if _REPLAY_CTX is not None:
         return False  # replay never writes into the snapshot (spine §3.4)
@@ -28657,9 +28663,21 @@ def _checkpoint_save_extraction_stamp(book_key, fingerprint=None,
     }
     p = d / "extraction.json"
     tmp = p.with_suffix(p.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(stamp, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, p)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(stamp, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, p)
+    except Exception as e:
+        # Clean up the temp file so a failed write leaves the
+        # directory exactly as it was — no partial stamp, no litter
+        # (the cleanup itself is best-effort too).
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        print(f"  extraction stamp not written for {book_key}: {e} "
+              f"(extraction itself is unaffected)")
+        return False
     return True
 
 
