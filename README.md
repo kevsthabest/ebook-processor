@@ -7,7 +7,7 @@ whatever ebook files you hand it. **Preview first, write later** — every run
 can save a full Markdown/JSON report for human review before anything
 touches the database.
 
-**Current version: 2.13.77** (`PORTABLE_VERSION` in `process-portable.py`).
+**Current version: 2.13.78** (`PORTABLE_VERSION` in `process-portable.py`).
 
 ## How it works
 
