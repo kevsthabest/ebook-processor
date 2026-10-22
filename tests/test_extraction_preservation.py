@@ -191,6 +191,12 @@ class TestOrdinaryRunPreservesExtraction(unittest.TestCase):
         }
         self.assertTrue(self._run())
         self.assertEqual(len(self._artefacts()), 1)
+        # And _save_merged_roster_artefact must not write merged-roster.json
+        # into the immutable extraction artefact directory when _EXTRACTION_CTX
+        # is active.
+        self.assertFalse(pp._save_merged_roster_artefact(
+            self._tmp / "book.epub", {}, {"stage": "merge"}))
+        self.assertFalse((hits[0].parent / "merged-roster.json").exists())
 
 
 if __name__ == "__main__":

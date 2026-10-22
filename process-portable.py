@@ -17859,6 +17859,49 @@ def _jev_merge_nominate(roster):
     return pairs
 
 
+_JEV_QUOTE_TRANS = str.maketrans({
+    "\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'",
+})
+_JEV_ABBREV_END_RE = re.compile(
+    r"(?:^|\s)(?:Mr|Mrs|Ms|Dr|Prof|St|Jr|Sr|vs|etc|[A-Z])\.$"
+)
+_JEV_GEN_SUFFIX_RE = re.compile(r",?\s+(?:Jr\.?|Sr\.?|II|III|IV)$", re.I)
+
+
+def _jev_fold_quotes(text):
+    """Lowercase text with curly quotes normalized to ASCII quotes."""
+    return (text or "").translate(_JEV_QUOTE_TRANS).lower()
+
+
+def _jev_form_regex(form_folded):
+    """Word-boundary regex for a quote-folded name form, allowing an
+    optional middle initial between the tokens of a 2-token proper
+    name (e.g. 'Charles Taylor' matches 'Charles W. Taylor')."""
+    toks = form_folded.split()
+    if len(toks) == 2 and all(t.isalpha() for t in toks):
+        body = (re.escape(toks[0]) + r"\s+(?:[a-z]\.\s+)?"
+                + re.escape(toks[1]))
+    else:
+        body = re.escape(form_folded)
+    prefix = r"\b" if form_folded and form_folded[0].isalnum() else ""
+    suffix = r"\b" if form_folded and form_folded[-1].isalnum() else ""
+    return re.compile(prefix + body + suffix, re.I)
+
+
+def _jev_expand_sentence(sents, idx, cap=260, min_len=140):
+    """Expand a short sentence (e.g. a bare name fragment like
+    'Agent Roy Merritt.') with immediately following sentence(s)
+    within CAP chars so a snippet or bridge slot carries surrounding
+    narrative context instead of a bare fragment."""
+    acc = sents[idx]
+    k = idx + 1
+    while (len(acc) < min_len and k < len(sents)
+           and len(acc) + 1 + len(sents[k]) <= cap):
+        acc = acc + " " + sents[k]
+        k += 1
+    return acc[:cap]
+
+
 def _jev_entry_snippets(key, entry, chapters_by_index, cache):
     """Up to 3 verbatim sentences from the entry's own chapters that
     contain one of its name forms (primary or alias), longest forms
@@ -17866,22 +17909,20 @@ def _jev_entry_snippets(key, entry, chapters_by_index, cache):
     principal appears in many pairs but its evidence never changes."""
     if key in cache:
         return cache[key]
-    forms = sorted({f for f in [entry.get("name") or ""]
-                    + list(entry.get("aliases") or ()) if len(f) >= 3},
-                   key=len, reverse=True)
-    lowered = [f.lower() for f in forms]
+    forms = [_jev_fold_quotes(f) for f in _jev_entry_forms(entry)]
+    pats = [_jev_form_regex(f) for f in forms]
     out = []
     for idx in sorted(entry.get("chapters") or ()):
         text = chapters_by_index.get(idx)
         if not text:
             continue
-        for sent in re.split(r"(?<=[.!?])\s+", text):
-            s = sent.strip()
-            if not s:
-                continue
-            low = s.lower()
-            if any(f in low for f in lowered):
-                out.append(s[:260])
+        sents = _jev_sentences(text)
+        for i, s in enumerate(sents):
+            low = _jev_fold_quotes(s)
+            if any(p.search(low) for p in pats):
+                snip = _jev_expand_sentence(sents, i, cap=260, min_len=140)
+                if snip not in out:
+                    out.append(snip)
                 if len(out) >= 3:
                     break
         if len(out) >= 3:
@@ -17914,18 +17955,36 @@ _JEV_BRIEF_BLOCK = (
 
 
 def _jev_sentences(text):
-    """Sentences of a chapter text, in order (the split convention
-    the snippet builder already used)."""
-    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text or "")
-            if s.strip()]
+    """Sentences of a chapter text, in order, keeping closing quotes
+    attached and avoiding mid-name splits after honorifics, suffixes,
+    or middle initials ('Mr.', 'Jr.', 'Charles W. Taylor')."""
+    parts = re.split(
+        r"(?:(?<=[.!?])|(?<=[.!?][\"'\u201d\u2019]))\s+", text or "")
+    out = []
+    for p in parts:
+        s = p.strip()
+        if not s:
+            continue
+        if out and _JEV_ABBREV_END_RE.search(out[-1]):
+            out[-1] = out[-1] + " " + s
+        else:
+            out.append(s)
+    return out
 
 
 def _jev_entry_forms(entry):
-    """Display forms an entry answers to: its name plus its aliases,
-    longest first (the longer form is the more specific match)."""
-    return sorted({f for f in [entry.get("name") or ""]
-                   + list(entry.get("aliases") or ()) if len(f) >= 3},
-                  key=len, reverse=True)
+    """Display forms an entry answers to: its name plus its aliases
+    (and generational-suffix-stripped multi-token forms such as
+    'Charles Taylor' for 'Charles Taylor, Jr.'), longest first."""
+    base = {f for f in [entry.get("name") or ""]
+            + list(entry.get("aliases") or ()) if len(f) >= 3}
+    extra = set()
+    for f in base:
+        stripped = _JEV_GEN_SUFFIX_RE.sub("", f).strip()
+        if (stripped and stripped != f
+                and len(stripped.split()) >= 2 and len(stripped) >= 3):
+            extra.add(stripped)
+    return sorted(base | extra, key=len, reverse=True)
 
 
 def _jev_cooccurrence_lines(ea, eb):
@@ -17949,22 +18008,39 @@ def _jev_cooccurrence_lines(ea, eb):
     return lines, shared
 
 
+def _jev_has_two_mentions(low, pats_a, pats_b):
+    """True when LOW contains a match for PATS_A and a non-overlapping
+    match for PATS_B (so a single mention of 'Agent Roy Merritt' does
+    not count as two separate mentions of 'Roy Merritt' and 'Agent Roy
+    Merritt' on the same span)."""
+    for pa in pats_a:
+        for ma in pa.finditer(low):
+            sa = ma.span()
+            rem = low[:sa[0]] + (" " * (sa[1] - sa[0])) + low[sa[1]:]
+            if any(pb.search(rem) for pb in pats_b):
+                return True
+    return False
+
+
 def _jev_bridging(ea, eb, chapters_by_index):
     """(lines, count): verbatim passages linking the two entries'
     forms — sentences carrying forms of BOTH entries first (up to
     3), then sentence windows where the two sides' forms sit within
-    +/-2 sentences of each other (up to 2), the evidence-window
-    convention the relationship validator uses. Searched over the
-    union of the two entries' chapters: a linking sentence lives
-    where at least one side was sighted."""
-    fa = [f.lower() for f in _jev_entry_forms(ea)]
-    fb = [f.lower() for f in _jev_entry_forms(eb)]
+    +/-2 sentences of each other (up to 2, or filling up to 5 total
+    bridges), the evidence-window convention the relationship
+    validator uses. Searched over the union of the two entries'
+    chapters: a linking sentence lives where at least one side was
+    sighted."""
+    fa = [_jev_fold_quotes(f) for f in _jev_entry_forms(ea)]
+    fb = [_jev_fold_quotes(f) for f in _jev_entry_forms(eb)]
+    pats_a = [_jev_form_regex(f) for f in fa]
+    pats_b = [_jev_form_regex(f) for f in fb]
 
-    def _hits(forms, lowered):
+    def _hits(pats, lowered):
         return [i for i, s in enumerate(lowered)
-                if any(f in s for f in forms)]
+                if any(p.search(s) for p in pats)]
 
-    both, windows = [], []
+    both_distinct, both_overlap, windows = [], [], []
     seen = set()
     union = sorted(set(ea.get("chapters") or ())
                    | set(eb.get("chapters") or ()))
@@ -17973,33 +18049,49 @@ def _jev_bridging(ea, eb, chapters_by_index):
         if not text:
             continue
         sents = _jev_sentences(text)
-        lowered = [s.lower() for s in sents]
-        hits_a = _hits(fa, lowered)
-        hits_b = set(_hits(fb, lowered))
+        lowered = [_jev_fold_quotes(s) for s in sents]
+        hits_a = _hits(pats_a, lowered)
+        hits_b = set(_hits(pats_b, lowered))
         for i in hits_a:
-            if i in hits_b and len(both) < 3:
-                passage = sents[i][:260]
-                if passage not in seen:
-                    seen.add(passage)
-                    both.append(passage)
-        if len(windows) < 2:
+            if i in hits_b:
+                passage = _jev_expand_sentence(
+                    sents, i, cap=260, min_len=140)
+                if _jev_has_two_mentions(lowered[i], pats_a, pats_b):
+                    if len(both_distinct) < 3 and passage not in seen:
+                        seen.add(passage)
+                        both_distinct.append(passage)
+                else:
+                    if len(both_overlap) < 3 and passage not in seen:
+                        both_overlap.append(passage)
+        if len(windows) < 3:
             for i in hits_a:
                 for j in sorted(hits_b):
                     if i != j and abs(i - j) <= 2:
                         lo, hi = min(i, j), max(i, j)
-                        passage = " ".join(sents[lo:hi + 1])[:500]
+                        passage = " ".join(sents[lo:hi + 1])
+                        if len(passage) < 160 and hi + 1 < len(sents):
+                            passage = " ".join(sents[lo:hi + 2])
+                        passage = passage[:500]
                         if passage not in seen:
                             seen.add(passage)
                             windows.append(passage)
                         break
-                if len(windows) >= 2:
+                if len(windows) >= 3:
                     break
+    both = list(both_distinct)
+    for p in both_overlap:
+        if len(both) >= 3 or len(both) + len(windows) >= 5:
+            break
+        if p not in seen:
+            seen.add(p)
+            both.append(p)
+    win_keep = windows[:max(2, 5 - len(both))]
     lines = []
-    if both or windows:
+    if both or win_keep:
         lines.append("Bridging passages (verbatim):")
         lines.extend(both)
-        lines.extend(windows)
-    return lines, len(both) + len(windows)
+        lines.extend(win_keep)
+    return lines, len(both) + len(win_keep)
 
 
 def _jev_definitional(key, entry, chapters_by_index, cache,
@@ -18130,7 +18222,7 @@ def _jev_merge_packet(ka, ea, kb, eb, chapters_by_index, snip_cache,
     if def_cache is None:
         def_cache = {}
 
-    def _card(tag, key, entry):
+    def _card(tag, key, entry, other_entry):
         out = [f"Character {tag}: {entry.get('name', key)}"]
         forms = [entry.get("name", key)] + sorted(entry.get("aliases")
                                                   or ())
@@ -18145,12 +18237,24 @@ def _jev_merge_packet(ka, ea, kb, eb, chapters_by_index, snip_cache,
                    f"{entry.get('appearances', 0)} mentions")
         desc = _roster_best_desc(entry)
         if desc:
+            other_chs = set((other_entry or {}).get("chapters") or ())
+            if other_chs:
+                _descs = [d if isinstance(d, tuple) else (0, d, False)
+                          for d in entry.get("descriptions", [])]
+                chosen = [desc]
+                for _ch, _txt, _ev in sorted(
+                        _descs, key=lambda x: (x[0], -len(x[1]))):
+                    if (_ev and _txt and _txt not in chosen
+                            and _ch in other_chs):
+                        if len(" | ".join(chosen + [_txt])) <= 600:
+                            chosen.append(_txt)
+                desc = " | ".join(chosen)
             out.append(f"Description {tag}: {desc[:600]}")
         return out
 
     lines = [_JEV_BRIEF_BLOCK, ""]
-    lines += _card("A", ka, ea)
-    lines += _card("B", kb, eb)
+    lines += _card("A", ka, ea, eb)
+    lines += _card("B", kb, eb, ea)
     co_lines, shared = _jev_cooccurrence_lines(ea, eb)
     lines += co_lines
     br_lines, br_n = _jev_bridging(ea, eb, chapters_by_index)
@@ -18738,6 +18842,8 @@ def _save_merged_roster_artefact(book_key, seg, *, book_fingerprint,
     product, so the entry treats False as a failed stage. Under
     replay it is a silent no-op: replay never writes into the
     snapshot it reads."""
+    if _EXTRACTION_CTX is not None:
+        return False  # analyze never writes into the extraction artefact
     if _REPLAY_CTX is not None:
         return False  # replay never writes into the snapshot (spine §3.4)
     report = seg["merge_report"]
@@ -32489,6 +32595,8 @@ def _checkpoint_save_extraction_stamp(book_key, fingerprint=None,
     prints one line and returns False instead of raising — bookkeeping
     must never change the outcome of the run it merely records.
     """
+    if _EXTRACTION_CTX is not None:
+        return False  # analyze never writes into the extraction artefact
     if _EXTRACTION_CTX is not None:
         return False  # analyze never writes into the extraction artefact
     if _REPLAY_CTX is not None:

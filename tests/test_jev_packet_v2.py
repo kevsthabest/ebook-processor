@@ -358,5 +358,85 @@ class TestJanitorWiring(unittest.TestCase):
         self.assertLess(janitor_at, pass_at)
 
 
+class TestPacketParityFixes(_Base):
+    def test_curly_quotes_and_short_fragment_expansion(self):
+        """Tripwire Merritt shape: ASCII quotes on the entry name match
+        curly quotes in the chapter text, and a bare-name fragment
+        ('Agent Roy Merritt.') expands to include the immediately
+        following sentence ('No one called him Tripwire anymore.') while
+        prioritizing non-overlapping two-mention sentences."""
+        ch_by_idx = {
+            25: ('Agent Roy “Tripwire” Merritt sat on a tree '
+                 'stump inside a heavy bamboo thicket.'),
+            42: ('A forty-something man in a dark suit sat forward in '
+                 'front of the microphone. Agent Roy Merritt. No one '
+                 'called him Tripwire anymore. The men who had were '
+                 'long gone.'),
+        }
+        a = _entry('Agent Roy "Tripwire" Merritt',
+                   aliases=('Tripwire Merritt', 'Tripwire'),
+                   chapters=(25, 42), appearances=6)
+        b = _entry('Agent Roy Merritt',
+                   aliases=('Roy Merritt', 'Merritt'),
+                   chapters=(42,), appearances=3)
+        roster = _roster(a, b)
+        text, facts = pp._jev_merge_packet(
+            pp.norm_name(a["name"]), a, pp.norm_name(b["name"]), b,
+            ch_by_idx, {}, roster=roster)
+        self.assertIn("sat on a tree stump", text)
+        self.assertIn("Agent Roy Merritt. No one called him Tripwire anymore.",
+                      text)
+        self.assertGreaterEqual(facts["bridging_found"], 1)
+
+    def test_abbreviation_and_initial_safe_sentence_splitting(self):
+        """Eichhorn / Taylor, Jr. shape: periods after 'Jr.' and single
+        initials ('J.', 'W.') do not split a single sentence in half,
+        and generational-suffix-stripped multi-token forms ('Charles
+        Taylor') match 'Charles W. Taylor, Jr.' across an optional middle
+        initial."""
+        ch_by_idx = {
+            16: ("A message appeared on screen. From: Eichhorn, Stanley J. "
+                 "Subject: Quarterly numbers."),
+            40: ("The passport read Charles W. Taylor, Jr. beside the "
+                 "photograph. Charles Mosely studied the signature on "
+                 "the card."),
+        }
+        stan = _entry("Stan Eichhorn", aliases=("Eichhorn",),
+                      chapters=(16,), appearances=4)
+        stanley = _entry("Stanley J.", chapters=(16,), appearances=1)
+        roster_e = _roster(stan, stanley)
+        text_e, facts_e = pp._jev_merge_packet(
+            "stan eichhorn", stan, "stanley j", stanley,
+            ch_by_idx, {}, roster=roster_e)
+        self.assertIn("From: Eichhorn, Stanley J.", text_e)
+        self.assertGreaterEqual(facts_e["bridging_found"], 1)
+
+        mosely = _entry(
+            "Charles Mosely", aliases=("Mosely",), chapters=(10, 40),
+            appearances=5,
+            descriptions=[
+                "A prisoner at Terre Haute.",
+                "A prisoner with a complicated past who is given a new "
+                "identity and a plan for escape."],
+            evidence="Charles Mosely studied the signature on the card.")
+        mosely["appearances_desc"] = [
+            (10, "A prisoner at Terre Haute.", "Mosely waited."),
+            (40, "A prisoner with a complicated past who is given a new "
+                 "identity and a plan for escape.",
+             "Charles Mosely studied the signature on the card."),
+        ]
+        taylor = _entry(
+            "Charles Taylor, Jr.", chapters=(40,), appearances=2,
+            descriptions=[
+                "The assumed identity Charles Mosely receives."])
+        roster_m = _roster(mosely, taylor)
+        text_m, facts_m = pp._jev_merge_packet(
+            "charles mosely", mosely, "charles taylor jr", taylor,
+            ch_by_idx, {}, roster=roster_m)
+        self.assertIn("Charles W. Taylor, Jr. beside the photograph", text_m)
+        self.assertGreaterEqual(facts_m["bridging_found"], 1)
+        self.assertIn("given a new identity and a plan for escape", text_m)
+
+
 if __name__ == "__main__":
     unittest.main()
