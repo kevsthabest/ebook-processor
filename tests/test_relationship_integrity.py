@@ -135,20 +135,29 @@ class TestFamilyGuard(unittest.TestCase):
     }
 
     def test_family_wins_over_enemy_preview(self):
+        # The guard's job is SELECTION: the sibling claim wins the pair,
+        # so the enemy is suppressed. The sibling then dies at
+        # validation with no evidence, and preview mirrors the write
+        # decision (2026-10-22) — the pair ships nothing, and both
+        # audit rows are present. (Before that change preview kept the
+        # dead sibling as a shipped row.)
         red = _reduce(self._FW, preview=True)
-        self.assertEqual(len(red["relationships"]), 1)
-        rel = red["relationships"][0]
-        self.assertEqual(rel["type"], "sibling")
-        self.assertEqual({rel["from"], rel["to"]},
-                         {"Mira Sorrengail", "Brennan Sorrengail"})
+        self.assertEqual(red["relationships"], [])
+        dropped = red["dropped_relationships"]
+        self.assertTrue(any(d.get("family_guard") == "suppressed_by_family"
+                            for d in dropped))
+        sibling = [d for d in dropped if d.get("type") == "sibling"]
+        self.assertEqual(len(sibling), 1, dropped)
+        self.assertEqual(sibling[0]["validation_note"], "no_evidence")
 
     def test_suppressed_claim_is_auditable(self):
         red = _reduce(self._FW, preview=True)
-        dropped = red["dropped_relationships"]
-        self.assertEqual(len(dropped), 1)
-        self.assertEqual(dropped[0]["type"], "enemy")
-        self.assertEqual(dropped[0]["family_guard"], "suppressed_by_family")
-        self.assertEqual(dropped[0]["suppressed_by_type"], "sibling")
+        guard = [d for d in red["dropped_relationships"]
+                 if d.get("family_guard")]
+        self.assertEqual(len(guard), 1, red["dropped_relationships"])
+        self.assertEqual(guard[0]["type"], "enemy")
+        self.assertEqual(guard[0]["family_guard"], "suppressed_by_family")
+        self.assertEqual(guard[0]["suppressed_by_type"], "sibling")
 
     def test_family_winner_no_evidence_drops_in_write_mode(self):
         # BAR-MOVE (family fail-closed, 2026-10-14): this test used to
@@ -197,8 +206,10 @@ class TestFamilyGuard(unittest.TestCase):
                    "dropped_relationships": red["dropped_relationships"]}
         back = json.loads(json.dumps(payload))
         self.assertEqual(back, payload)
-        self.assertEqual(back["dropped_relationships"][0]["family_guard"],
-                         "suppressed_by_family")
+        guard = [d for d in back["dropped_relationships"]
+                 if d.get("family_guard")]
+        self.assertEqual(len(guard), 1, back["dropped_relationships"])
+        self.assertEqual(guard[0]["family_guard"], "suppressed_by_family")
 
 
 class TestAliasPollution(unittest.TestCase):

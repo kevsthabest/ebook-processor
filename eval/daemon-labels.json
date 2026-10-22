@@ -1,0 +1,192 @@
+{
+  "pack": "v1.2",
+  "frozen": "2026-10-22",
+  "book": "Daemon",
+  "author": "Daniel Suarez",
+  "passed_with": null,
+  "target": {
+    "precision": 0.9,
+    "recall": 0.7
+  },
+  "must_ship": [
+    {
+      "from": "Brian Gragg",
+      "to": "Jon Ross",
+      "type": "enemy"
+    },
+    {
+      "from": "Brian Gragg",
+      "to": "Matthew Sobol",
+      "type": "ally"
+    },
+    {
+      "from": "Brian Gragg",
+      "to": "Roy Merritt",
+      "type": "enemy"
+    },
+    {
+      "from": "Cheryl Lanthrop",
+      "to": "Matthew Sobol",
+      "type": "colleague"
+    },
+    {
+      "from": "Garrett Lindhurst",
+      "to": "Russell Vanowen Jr.",
+      "type": "colleague",
+      "acceptable": [
+        "colleague",
+        "enemy"
+      ]
+    },
+    {
+      "from": "Jon Ross",
+      "to": "Natalie Philips",
+      "type": "romantic"
+    },
+    {
+      "from": "Matthew Sobol",
+      "to": "Michael Kirchner",
+      "type": "enemy"
+    },
+    {
+      "from": "Matthew Sobol",
+      "to": "Peter Sebeck",
+      "type": "enemy"
+    },
+    {
+      "from": "Peter Sebeck",
+      "to": "Steven Trear",
+      "type": "colleague"
+    },
+    {
+      "from": "Roy Merritt",
+      "to": "Matthew Sobol",
+      "type": "enemy"
+    },
+    {
+      "from": "Roy Merritt",
+      "to": "Steven Trear",
+      "type": "colleague"
+    },
+    {
+      "from": "Steven Trear",
+      "to": "Michael Kirchner",
+      "type": "colleague"
+    },
+    {
+      "from": "Steven Trear",
+      "to": "Natalie Philips",
+      "type": "colleague",
+      "acceptable": [
+        "colleague",
+        "ally",
+        "enemy"
+      ],
+      "ruled": "Kevin 2026-10-22: colleague is the more accurate typing for Trear and Philips; ally and enemy also score correct."
+    }
+  ],
+  "must_not_ship": [
+    {
+      "from": "Anji Anderson",
+      "to": "Peter Sebeck",
+      "type": "enemy",
+      "acceptable": [
+        "other"
+      ]
+    },
+    {
+      "from": "Cheryl Lanthrop",
+      "to": "Jon Ross",
+      "type": "enemy",
+      "acceptable": [
+        "enemy"
+      ]
+    },
+    {
+      "from": "Garrett Lindhurst",
+      "to": "Russell Vanowen Jr.",
+      "type": "enemy",
+      "acceptable": [
+        "colleague",
+        "enemy"
+      ]
+    },
+    {
+      "from": "Jon Ross",
+      "to": "Roy Merritt",
+      "type": "enemy",
+      "acceptable": [
+        "colleague",
+        "ally"
+      ]
+    },
+    {
+      "from": "Major Pain in the Ass",
+      "to": "Steven Trear",
+      "type": "enemy",
+      "acceptable": []
+    },
+    {
+      "from": "Roy Merritt",
+      "to": "Jon Ross",
+      "type": "enemy",
+      "acceptable": [
+        "colleague",
+        "ally"
+      ]
+    },
+    {
+      "from": "Steven Trear",
+      "to": "Karl Devon",
+      "type": "enemy",
+      "acceptable": [
+        "colleague"
+      ]
+    }
+  ],
+  "either": [
+    {
+      "from": "Natalie Philips",
+      "to": "Karl Devon",
+      "type": "ally",
+      "acceptable": [
+        "ally",
+        "enemy"
+      ]
+    },
+    {
+      "from": "Peter Sebeck",
+      "to": "The Daemon",
+      "type": "enemy",
+      "acceptable": [
+        "enemy",
+        "ally"
+      ]
+    }
+  ],
+  "identity_rulings": [
+    {
+      "rule": "Major Pain in the Ass is a screen name, not Karl Devon; it must not exist as a character."
+    },
+    {
+      "rule": "Karl Devon is The Major; one character, not two."
+    },
+    {
+      "rule": "Brian Gragg and Loki are one character (Loki is the handle)."
+    }
+  ],
+  "trope_rulings": {
+    "must_not_ship": [
+      "Enemies to Lovers",
+      "Revenge"
+    ]
+  },
+  "changes": [
+    "v1.1 (2026-10-22): frozen against extraction extract-20261022-110407-15384 (the GLM run Kevin ruled acceptable — extraction is not this project's weakness).",
+    "principal_cap raised 20 -> 30: judge-kept relationships now promote their minor endpoint to principal (2026-10-22 Filtered step 4), so a book's shipped cast legitimately grows past 20.",
+    "relationship scoring resolves gold names through the run's own roster aliases and ignores the preview rows a write deletes.",
+    "v1.2 (2026-10-22): ruling — Steven Trear / Natalie Philips re-centred on 'colleague' (acceptable colleague/ally/enemy); Kevin judged colleague the more accurate typing than the pack's original ally."
+  ],
+  "baseline_extraction": "extract-20261022-110407-15384",
+  "principal_cap": 30
+}

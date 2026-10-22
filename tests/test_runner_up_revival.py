@@ -340,24 +340,26 @@ class TestRunnerUpRevival(unittest.TestCase):
         self.assertEqual(rels[0]["validation_note"], "kept")
         self.assertNotIn("revived_runner_up", rels[0])
 
-    def test_preview_mode_revival_mirrors_without_dropping(self):
-        # Test (8): preview records but changes nothing — the dead
-        # parent stays with its no_evidence note, and the revived
-        # romantic appears alongside it with its preview state and
-        # the revival stamp. Nothing lands in dropped.
+    def test_preview_mode_revival_keeps_one_row_per_pair(self):
+        # Test (8): preview mirrors the write decision (2026-10-22).
+        # The rejected parent leaves the shipped row set — not kept for
+        # audit in the row list — and the runner-up revival decides the
+        # pair exactly as it would at write time: the romantic ships,
+        # the parent lands in the audit list under its own note. Two
+        # rows for one pair was a real defect in the Daemon gold run,
+        # where a pair shipped "child" beside "mentor".
         pp._DECISION_VALIDATOR = _MapValidator({"romantic": 0.9})
         chapter_as, chs = self._fw_shape()
         red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=True)
         rels = _pair_rels(red, "Anna", "Ben")
-        by_type = {r["type"]: r for r in rels}
-        self.assertEqual(set(by_type), {"parent", "romantic"})
-        self.assertEqual(by_type["parent"]["validation_note"],
-                         "no_evidence")
-        self.assertEqual(by_type["romantic"]["validation_note"],
-                         "kept")
-        self.assertTrue(by_type["romantic"]["revived_runner_up"])
-        self.assertEqual(red["dropped_relationships"], [])
-
+        self.assertEqual(len(rels), 1, rels)
+        self.assertEqual(rels[0]["type"], "romantic")
+        self.assertEqual(rels[0]["validation_note"], "kept")
+        self.assertTrue(rels[0]["revived_runner_up"])
+        audit = [d for d in red["dropped_relationships"]
+                 if d.get("type") == "parent"]
+        self.assertEqual(len(audit), 1, red["dropped_relationships"])
+        self.assertEqual(audit[0]["validation_note"], "no_evidence")
 
     def test_no_validator_no_revival(self):
         # Test (9): revival is a validation-stage mechanism. With

@@ -642,9 +642,12 @@ class TestNonFamilyValidation(unittest.TestCase):
             "from": "Alice", "to": "Bob", "type": "friend",
             "evidence": "a quote about somebody else entirely"}],
             preview=True)
-        rel = red["relationships"][0]
-        self.assertEqual(rel["validation_note"], "would_drop")
-        self.assertEqual(red["dropped_relationships"], [])
+        # Preview mirrors write: the rejected claim is not a shipped
+        # row; it is an audit row naming the mode.
+        self.assertEqual(red["relationships"], [])
+        self.assertEqual(len(red["dropped_relationships"]), 1)
+        self.assertEqual(red["dropped_relationships"][0]["validation_note"],
+                         "would_drop")
 
     def test_evidenceless_nonfamily_judged_on_mined_sentence(self):
         # No extracted quote: the judge weighs the mined both-names
@@ -902,6 +905,25 @@ class TestValidationContext(unittest.TestCase):
     def tearDown(self):
         pp._DECISION_VALIDATOR = self._old_validator
         pp._dm_budget_reset()
+
+    def test_context_names_the_pairs_rival_types(self):
+        # Extraction asserted two different types for ONE pair. The
+        # judge is asked one type at a time, so without the rival list
+        # it can affirm a plausible-but-wrong type at high confidence
+        # (the gold run kept "colleague" at P=0.80 for a pair the pack
+        # rules "ally"). The rival list is what lets it discriminate.
+        rels = [{"from": "Ann", "to": "Ben", "type": "enemy",
+                 "evidence": "Ann and Ben were at war over the estate."},
+                {"from": "Ann", "to": "Ben", "type": "colleague",
+                 "evidence": "Ann and Ben worked the same shift for years."}]
+        chapter_as = {1: {"relationships": rels, "pov_character": None}}
+        text = ("Ann and Ben were at war over the estate. "
+                "Ann and Ben worked the same shift for years. " + "x " * 200)
+        pp.v2_reduce(chapter_as, {}, {}, _chs(text), preview=False)
+        call = self.validator.calls[0]
+        rival = "colleague" if call["type"] == "enemy" else "enemy"
+        self.assertIn("other relationship types", call["context"].lower())
+        self.assertIn(rival, call["context"])
 
     def test_extracted_quote_gets_neighbour_context(self):
         # The Mira eval case shape: the quote names only Violet;

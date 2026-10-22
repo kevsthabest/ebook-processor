@@ -50,7 +50,7 @@ Any key can also be set via an env var named EBOOK_<KEY>, e.g. EBOOK_SUPABASE_KE
 Keep config.json out of version control.
 """
 
-PORTABLE_VERSION = "2.13.85"
+PORTABLE_VERSION = "2.13.86"
 
 
 import argparse
@@ -2586,6 +2586,41 @@ def _filter_principals(characters, relationships, min_frequency=0.20):
             break
         principals.update(newly)
 
+    # Pass 4 (judged significance, 2026-10-22): a claim the judge KEPT
+    # that ties a principal to a less-visible person promotes that
+    # person. Without this, a correct claim about a principal and a
+    # mid-tier character is judged (a decision-model call spent) and
+    # then filtered away for falling below min_frequency — the run
+    # pays to validate a claim it then refuses to ship, and the
+    # operator never sees it. Deliberately asymmetric: only a claim
+    # ANCHORED on an existing principal promotes, so the promotion
+    # extends the significant cast by its confirmed connections instead
+    # of promoting every named walk-on (two minors confirming each
+    # other is the noise tail, not the cast). An unjudged claim (no
+    # note) promotes nobody, so a run without a decision model behaves
+    # exactly as before.
+    # Iterated to a fixed point, like passes 2-3: a promotion can turn
+    # another kept claim into an anchored one (the Major's confirmed
+    # link promotes Vanowen, whose confirmed link to Lindhurst then
+    # promotes Lindhurst). A single pass would leave the second
+    # character a minor purely because of claim order.
+    for _ in range(3):
+        _promoted = set()
+        for r in relationships or []:
+            if (r.get("validation_note") or "") != "kept":
+                continue
+            _a = norm_name(r.get("from", ""))
+            _b = norm_name(r.get("to", ""))
+            if _a in principals and _b in char_by_norm \
+                    and _b not in principals:
+                _promoted.add(_b)
+            elif _b in principals and _a in char_by_norm \
+                    and _a not in principals:
+                _promoted.add(_a)
+        if not _promoted:
+            break
+        principals.update(_promoted)
+
     principal_chars = [c for c in (characters or [])
                        if norm_name(c.get("name", "")) in principals]
     minor_chars = [c for c in (characters or [])
@@ -2702,12 +2737,12 @@ _BUILTIN_REL_TYPES = [
      "exclusivity": "exclusive", "precedence": 4,
      "graph_group": "friend", "suggestible": True},
     {"id": "colleague", "label": "Colleague",
-     "gloss": "People who work together in the same organization or profession, without a closer bond being stated.",
+     "gloss": "People who work together in the same organization or profession, without a closer bond being stated. Disagreement or friction inside one firm is still colleague, not enemy.",
      "direction": "symmetric", "is_family": False,
      "exclusivity": "exclusive", "precedence": 4,
      "graph_group": "friend", "suggestible": True},
     {"id": "enemy", "label": "Enemy",
-     "gloss": "An adversary or opponent: the pair are actively opposed or hostile to each other.",
+     "gloss": "An adversary or opponent: the pair are actively opposed or hostile to each other — sustained opposition or an explicit threat. NOT a single argument, workplace friction, or two people on the same side.",
      "direction": "symmetric", "is_family": False,
      "exclusivity": "exclusive", "precedence": 5,
      "graph_group": "rival", "suggestible": True},
@@ -2970,6 +3005,115 @@ def _rel_gloss(rtype):
     type is unknown — an unknown type gets no invented definition."""
     entry = _REL_VOCAB["by_id"].get(str(rtype or "").strip().lower())
     return entry["gloss"] if entry else ""
+
+
+# ---------------------------------------------------------------------------
+# Relationship-type proposals (2026-10-22)
+# ---------------------------------------------------------------------------
+# A type the model asserted that the active vocabulary does not carry
+# ("employer", "commanding officer"). The reduce drops such a claim —
+# the vocabulary is the contract the prompts, the judge and the app
+# share, and an unknown type has no gloss, no direction and no place in
+# the exclusivity lattice — but the drop used to be one console line and
+# nothing else. The operator could not see what the book actually
+# needed, and adding a type meant knowing that the registry is a table
+# and writing the row by hand.
+#
+# So every drop is recorded here with its claim provenance, surfaced on
+# the run record, and written beside the preview as a small editable
+# file. `--apply-rel-types <file>` adds the rows the operator kept. The
+# defaults are the least invasive row a type can have — see
+# _rel_type_proposal_rows — and nothing here guesses a gloss, a family
+# flag or a direction: those are the operator's rulings, made by editing
+# the file.
+_REL_TYPE_PROPOSALS = {}
+
+
+def _rel_type_proposals_reset():
+    """Empty the per-book accumulator. Called once per reduce."""
+    _REL_TYPE_PROPOSALS.clear()
+
+
+def _rel_type_proposal_id(raw):
+    """A stable registry id for a proposed type.
+
+    Spaces and punctuation fold to underscores so "Commanding Officer"
+    and "commanding-officer" land on one id and the operator sees one
+    row. An id that folds to nothing is not a proposal.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", str(raw or "").strip().lower())
+    return slug.strip("_")
+
+
+def _rel_type_proposal_note(raw_type, claim):
+    """Record one dropped claim under its type. Idempotent per type:
+    the row is the type, the count and up to three examples are the
+    evidence that it was real."""
+    tid = _rel_type_proposal_id(raw_type)
+    if not tid:
+        return
+    rec = _REL_TYPE_PROPOSALS.setdefault(tid, {
+        "type": str(raw_type or "").strip(), "id": tid,
+        "seen": 0, "examples": []})
+    rec["seen"] += 1
+    if len(rec["examples"]) < 3:
+        rec["examples"].append({
+            "from": claim.get("from"),
+            "to": claim.get("to"),
+            "chapter": claim.get("_idx"),
+            "evidence": (claim.get("evidence") or "")[:200],
+        })
+
+
+def _write_rel_type_review(path, result, run_key=None):
+    """Write the editable review file for proposed relationship types.
+
+    Returns the path written, or None when the run proposed nothing.
+    One writer for both products (a preview, a staged analysis
+    artefact): the review rows are the operator's to edit, and
+    --apply-rel-types reads exactly this shape.
+    """
+    rows = result.get("relationship_type_proposals") or []
+    if not rows:
+        return None
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"book": result.get("title"),
+                   "author": result.get("author"),
+                   "run": run_key,
+                   "relationship_types": rows}, f, indent=2,
+                  ensure_ascii=False)
+    return path
+
+
+def _rel_type_proposal_rows():
+    """The proposals as registry-shaped rows, most frequent first.
+
+    The defaults are the least invasive row a type can have:
+    non-family, `extra` exclusivity (no precedence, so the lattice is
+    untouched and the type can co-exist with any other), symmetric (no
+    inverse partner required), and suggestible. The gloss is empty on
+    purpose — a definition nobody ruled is worse than none, because the
+    judge is told to weigh claims against the gloss.
+    """
+    rows = []
+    for rec in sorted(_REL_TYPE_PROPOSALS.values(),
+                      key=lambda r: (-r["seen"], r["id"])):
+        rows.append({
+            "id": rec["id"],
+            "label": rec["type"].title() if rec["type"] else rec["id"],
+            "gloss": "",
+            "direction": "symmetric",
+            "is_family": False,
+            "exclusivity": "extra",
+            "precedence": None,
+            "graph_group": "friend",
+            "suggestible": True,
+            "seen": rec["seen"],
+            "examples": rec["examples"],
+        })
+    return rows
 
 
 # The type list exactly as the prompt constants below spell it today.
@@ -4689,6 +4833,18 @@ OPENROUTER_SYSTEMONE_URL = "https://openrouter.ai/api/v1/systemone"
 OPENROUTER_DECISION_MODEL = "typesafe/jev-1.13"
 OPENROUTER_ATTRIBUTION_TITLE = "ebook-processor"
 
+# Decision-client retry policy. Only statuses that mean "ask again"
+# are re-sent; a deterministic refusal is never paid for twice.
+_DECISION_MAX_ATTEMPTS = 3
+_DECISION_RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_DECISION_RETRY_DELAY = 1.0
+_DECISION_RETRY_DELAY_MAX = 8.0
+_DECISION_RETRY_AFTER_CAP = 30.0
+# Circuit breaker, split by failure kind: a rate limit is not a dead
+# model, so status failures need a longer unbroken run to trip.
+_DECISION_ERROR_TRIP = 3
+_DECISION_STATUS_TRIP = 6
+
 
 def resolve_decision_model(provider, url_override="", config=None, env=None):
     """Resolve decision-model connection details for the given provider.
@@ -4766,18 +4922,41 @@ class DecisionValidator:
         self.timeout = timeout
         self._lock = threading.Lock()
         self._consec_errors = 0
+        self._consec_status = 0
         self._disabled = False
         self._disable_warned = False
 
     def _record_success(self):
         with self._lock:
             self._consec_errors = 0
+            self._consec_status = 0
 
     def _record_error(self):
-        """Record an error. Returns True if this tripped the circuit breaker."""
+        """Record a transport/parse error. Returns True if it tripped."""
         with self._lock:
             self._consec_errors += 1
-            if self._consec_errors >= 3 and not self._disabled:
+            if self._consec_errors >= _DECISION_ERROR_TRIP \
+                    and not self._disabled:
+                self._disabled = True
+                return True
+            return False
+
+    def _record_status_error(self):
+        """Record an exhausted HTTP-status failure. Returns True if it
+        tripped.
+
+        Kept apart from _record_error on purpose: a 429 or a 5xx is
+        the service saying "not now", and on a hosted judge a rate
+        limit is the normal shape of a busy minute, not evidence the
+        model is broken. Counting them with transport errors meant
+        three consecutive 429s disabled the judge for the rest of a
+        book — every later claim silently fell back. Status failures
+        still trip, but only after a longer run of them, which is what
+        a genuinely dead endpoint looks like."""
+        with self._lock:
+            self._consec_status += 1
+            if self._consec_status >= _DECISION_STATUS_TRIP \
+                    and not self._disabled:
                 self._disabled = True
                 return True
             return False
@@ -4788,13 +4967,90 @@ class DecisionValidator:
             if self._disable_warned:
                 return
             self._disable_warned = True
-        print("  Decision model disabled after 3 consecutive errors; "
-              "falling back to regex for remainder of run")
+        print("  Decision model disabled after repeated errors; "
+              "remaining claims take their no-judgment path")
 
     @property
     def disabled(self):
         with self._lock:
             return self._disabled
+
+    def _post_json(self, payload, label):
+        """POST one decision request, surviving a transient refusal.
+
+        The retry policy is deliberately narrow, because a retry is a
+        real second request: only statuses that mean "try again"
+        (429, 408, 425, and the 5xx family) are re-sent, at most
+        _DECISION_MAX_ATTEMPTS times, honouring Retry-After when the
+        server sends one (capped so a hostile value cannot stall the
+        run). A deterministic refusal (400/401/403/404/422 — a bad
+        key, a wrong endpoint, a malformed body) is never re-sent: it
+        will fail the same way, and paying for it twice is waste.
+        Transport errors and unparseable bodies are not retried here
+        either; the callers own their own one-shot retry semantics.
+
+        Breaker accounting is split by kind (see _record_status_error)
+        and this method raises the last error either way — the callers
+        translate every failure into their own no-verdict shape.
+        """
+        headers = {"Content-Type": "application/json"}
+        headers.update(self.extra_headers)
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        delay = _DECISION_RETRY_DELAY
+        last = None
+        for attempt in range(_DECISION_MAX_ATTEMPTS):
+            try:
+                req = urllib.request.Request(
+                    self.endpoint, data=payload, headers=headers)
+                with urllib.request.urlopen(req,
+                                            timeout=self.timeout) as resp:
+                    return json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                code = getattr(e, "code", None)
+                if code not in _DECISION_RETRY_STATUSES:
+                    # Deterministic: the request or the credential is
+                    # wrong. Say so once; do not spend the breaker on
+                    # it, because it says nothing about the model.
+                    raise
+                last = e
+                if attempt + 1 >= _DECISION_MAX_ATTEMPTS:
+                    break
+                wait = self._retry_after_seconds(e)
+                if wait is None:
+                    # No usable header: our own backoff. (Zero is a
+                    # real instruction — "retry now" — not a missing
+                    # value, so it must not fall through to delay.)
+                    wait = delay
+                print(f"  Decision model status {code} ({label}); "
+                      f"retrying in {wait:.1f}s")
+                time.sleep(wait)
+                delay = min(_DECISION_RETRY_DELAY_MAX, delay * 2)
+            except Exception as e:
+                if self._record_error():
+                    self._note_disabled()
+                raise
+        # Every attempt was refused by status.
+        if self._record_status_error():
+            self._note_disabled()
+        raise last
+
+    @staticmethod
+    def _retry_after_seconds(err):
+        """Retry-After in seconds (delta-seconds form only), capped."""
+        try:
+            raw = err.headers.get("Retry-After") if err.headers else None
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            val = float(str(raw).strip())
+        except (TypeError, ValueError):
+            return None
+        if val < 0 or math.isnan(val) or math.isinf(val):
+            return None
+        return min(val, _DECISION_RETRY_AFTER_CAP)
 
     def _ask_noul(self, question_key, instructions, state, label="decision"):
         """Ask one noul question. Returns p_yes (float) or None on any error.
@@ -4816,15 +5072,8 @@ class DecisionValidator:
                 }
             },
         }).encode()
-        headers = {"Content-Type": "application/json"}
-        headers.update(self.extra_headers)
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
         try:
-            req = urllib.request.Request(
-                self.endpoint, data=payload, headers=headers)
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                result = json.loads(resp.read())
+            result = self._post_json(payload, label)
             ans = result["answers"][question_key]
             p_yes = ans.get("noul")
             if p_yes is None:
@@ -4842,9 +5091,10 @@ class DecisionValidator:
             self._record_success()
             return float(p_yes)
         except Exception as e:
-            _tripped = self._record_error()
-            if _tripped:
-                self._note_disabled()
+            # _post_json already recorded the failure against the
+            # breaker with its own kind; recording it again here would
+            # count one failed request twice and let a status refusal
+            # masquerade as a transport error.
             print(f"  Decision model error ({label}): {e}; "
                   f"falling back to regex")
             return None
@@ -8013,16 +8263,12 @@ def _ask_noul_batch(validator, questions, state, label="quote poll"):
         "questions": {k: {"type": "noul", "instructions": v}
                       for k, v in questions.items()},
     }).encode()
-    headers = {"Content-Type": "application/json"}
-    headers.update(validator.extra_headers)
-    if validator.api_key:
-        headers["Authorization"] = f"Bearer {validator.api_key}"
     try:
-        req = urllib.request.Request(
-            validator.endpoint, data=payload, headers=headers)
-        with urllib.request.urlopen(req, timeout=validator.timeout) \
-                as resp:
-            result = json.loads(resp.read())
+        # Same transport discipline as the single-question path:
+        # a "try again" status is retried inside _post_json, a
+        # deterministic refusal is not, and the breaker counts
+        # each kind separately.
+        result = validator._post_json(payload, label)
         out = {}
         for key in questions:
             ans = result["answers"][key]
@@ -8043,9 +8289,9 @@ def _ask_noul_batch(validator, questions, state, label="quote poll"):
         validator._record_success()
         return out
     except Exception as e:
-        _tripped = validator._record_error()
-        if _tripped:
-            validator._note_disabled()
+        # _post_json recorded the transport/status failure with its
+        # own kind; a score-validation failure below it is counted
+        # here, as the single-question path does.
         print(f"  Decision model error ({label}): {e}; "
               f"quote poll shed")
         return None
@@ -15815,13 +16061,18 @@ Known characters so far (reuse these EXACT names when the same person appears; a
 RULES:
 1. ENTITY MERGING: "Mother", "the narrator", "I" and the author's name are one person — list ONCE under the most specific name, put the rest in aliases.
 2. NEVER INVENT NAMES. If gender is ambiguous from the name alone, leave it out rather than guessing.
-3. REAL PEOPLE ONLY who appear or are directly involved in this chapter.
-   - Appearance and description must describe the character themselves, not someone they observe.
-     If the point-of-view character sees another person, do not attribute that person's looks
-     to the POV character.
-   - A character is an individual person. NOT organizations, companies, ships, places, or groups.
-   - "O Palácio" (a casino), "EVA masters" (a job title), "the committee" are NOT characters — skip them.
-   - If a name could be a place or thing rather than a person, skip it unless the chapter clearly treats it as a person.
+3. NAMED INDIVIDUALS ONLY.
+   - A character is one named person. Use the most specific name the chapter
+     gives (full name when available). Never invent a name. Appearance and
+     description must describe this character, never someone they observe.
+   - ROLE NOUNS ARE NOT NAMES: "mother", "father", "deputy", "sergeant",
+     "the major", "the voice", "the narrator" describe a role. If the chapter
+     never gives the individual a proper name, omit the person entirely.
+   - NOTHING UNNAMED: "second victim", "Asian woman", "the guards",
+     "Go-Go Girls", company names, tickers (HSTM), games, and places are not
+     characters.
+   - One entry per individual. Put every other form used in this chapter in
+     "aliases" instead of creating a second entry.
 4. EVIDENCE: best supporting sentence copied exactly from the chapter; empty string if none — never invent, never repeat.
 5. ROLE must be exactly one of: protagonist, antagonist, supporting, minor. When in doubt, supporting.
 6. pov_character is ONLY someone who narrates this chapter. Most chapters have one; some have none (null).
@@ -15839,7 +16090,7 @@ PROMPT_V2_CHARACTERS_SIMPLE = """Extract character information from this book ch
   "relationships": [{"from": "...", "to": "...", "type": "spouse|parent|child|sibling|friend|enemy|mentor|colleague|neighbor|other"}],
   "pov_character": null
 }
-List every person named or clearly present. Merge obvious aliases. Do not invent names.
+List every NAMED individual person. Omit role nouns and unnamed descriptors. Do not invent names.
 Start your response with {."""
 
 PROMPT_V2_CONTENT = """Analyze this book chapter and return ONLY valid JSON. No commentary, no markdown, just the JSON object.
@@ -15898,16 +16149,53 @@ _ALIAS_BAN_WORDS = frozenset({
     "boyfriend", "girlfriend", "fiance", "fiancee",
 })
 
+# Role nouns: describe what a person IS to the story, not who they are.
+# A name made only of these ("Mother", "Second Victim", "Asian Woman")
+# is a description of an unnamed person, never a character identity.
+_ROLE_NOUNS = frozenset({
+    # family terms (mirrors _ALIAS_BAN_WORDS deliberately)
+    "wife", "husband", "son", "daughter", "mother", "father", "brother",
+    "sister", "parent", "child", "spouse", "partner", "mom", "dad",
+    # titles and jobs
+    "deputy", "detective", "sergeant", "lieutenant", "captain", "major",
+    "colonel", "general", "doctor", "nurse", "agent", "officer",
+    "sheriff", "marshal", "judge", "lawyer", "professor", "teacher",
+    "student", "victim", "suspect", "witness", "narrator", "voice",
+    "waiter", "waitress", "driver", "guard", "soldier", "priest",
+    "receptionist", "secretary", "assistant",
+    # unnamed-person nouns a chapter label tends to use
+    "man", "woman", "boy", "girl", "person", "individual", "stranger",
+    "figure", "someone", "male", "female",
+})
+_DESCRIPTOR_TOKENS = frozenset({
+    "second", "third", "fourth", "first", "young", "old", "older",
+    "younger", "asian", "black", "white", "unknown", "female", "male",
+    "other", "lead", "main", "mysterious", "beautiful", "angry",
+})
+_GROUP_NOUNS_ANY_CASE = frozenset({
+    "girls", "boys", "men", "women", "people", "kids", "guys", "ladies",
+    "gents", "guards", "soldiers", "troops", "workers", "staff", "team",
+    "committee", "council", "board", "agents",
+})
+# Characters a name may not contain: dialogue marks and symbols.
+_NON_NAME_CHARS = "!?@#$%&*()"
+
+
 def _is_person_like(name):
     """Heuristic: is this name likely an individual person, not a group/place/thing?
 
-    Catches what the prompt misses: plural job titles ("EVA masters"),
-    generic groups ("the guards"). Conservative — only rejects clear non-persons.
+    Catches what the prompt misses: plural group nouns ("EVA masters",
+    "Go-Go Girls"), "the/a + group" forms, role nouns standing in for a
+    name ("Mother", "Second Victim", "Asian Woman", "Unknown Female
+    Voice"), tickers ("HSTM") and non-name punctuation ("Go Mets!").
+    Conservative — only rejects clear non-persons, except that a name
+    made ONLY of role/descriptor words is rejected: an unnamed
+    "Mother" is a description, not an identity. The article form
+    "the <role>" survives ("The Major" is a real Daemon character).
     """
-    if not name:
+    if not name or not name.strip():
         return False
     nl = name.strip().lower()
-    words = nl.split()
     # Plural group nouns: "eva masters", "the guards", "soldiers"
     _group_words = {"masters", "guards", "soldiers", "troops", "workers", "crew",
                     "staff", "team", "committee", "council", "board", "agents"}
@@ -15925,6 +16213,29 @@ def _is_person_like(name):
         if len(orig_words) == 2 and orig_words[0].lower() in ("the", "a", "an"):
             if orig_words[-1].lower().rstrip("s") in {w.rstrip("s") for w in _group_words}:
                 return False
+        # A group noun in ANY case ("Go-Go Girls", "The Staff") is a group.
+        if last.lower() in _GROUP_NOUNS_ANY_CASE:
+            return False
+    # Dialogue marks and symbols never belong in a character's name.
+    if any(ch in name for ch in _NON_NAME_CHARS) or "\t" in name:
+        return False
+    # A single ALL-CAPS token is a ticker/acronym ("HSTM", "NSA"), not a person.
+    if len(orig_words) == 1:
+        _letters = re.sub(r"[^A-Za-z]", "", orig_words[0])
+        if len(_letters) >= 2 and _letters.isupper():
+            return False
+    # Split on whitespace and hyphens; drop the leading article if any.
+    tokens = [t for t in re.split(r"[\s\-]+", nl.strip()) if t]
+    if tokens and tokens[0] in ("the", "a", "an"):
+        _rest = tokens[1:]
+        # The one deliberate allowance: "The Major" is a name (Daemon's
+        # Major is called that throughout); a bare role noun is not.
+        if len(_rest) == 1 and _rest[0] in _ROLE_NOUNS:
+            return True
+        tokens = _rest
+    if tokens and all(t in _ROLE_NOUNS or t in _DESCRIPTOR_TOKENS
+                      for t in tokens):
+        return False
     return True
 
 
@@ -16675,6 +16986,62 @@ def _roster_canonical(roster, name):
     if len(hits) == 1:
         return hits[0]
     return name
+
+
+def _endpoint_forms(roster, name):
+    """Every normalized form the roster holds for one name, or None
+    when the name resolves to no entry.
+
+    The forms are the entry's primary and alias keys plus the
+    canonical name itself and its last token (the surname), so a
+    claim naming "Steven Trear" also matches evidence that says
+    "Trear"."""
+    canon = _roster_canonical(roster or {}, name or "")
+    entry = (roster or {}).get(norm_name(canon)) if canon else None
+    if not isinstance(entry, dict):
+        return None
+    forms = set(entry.get("primary_keys") or ())
+    forms |= set(entry.get("alias_keys") or ())
+    forms.add(norm_name(canon))
+    _toks = norm_name(canon).split()
+    if _toks:
+        forms.add(_toks[-1])
+    return {f for f in forms if f}
+
+
+def _canonical_name_forms(roster, name):
+    """The canonical name (and its surname) the roster holds for a name.
+
+    Alias keys are deliberately NOT included: a polluted alias set
+    (the extractor once filed "merritt" under Sobol) would let any
+    quote that merely mentions a different person "ground" its
+    speaker. This is the form set quote speaker checks use."""
+    canon = _roster_canonical(roster or {}, name or "")
+    form = norm_name(canon) or norm_name(name or "")
+    forms = {form}
+    _toks = form.split()
+    if _toks:
+        forms.add(_toks[-1])
+    return {f for f in forms if f}
+
+
+def _evidence_names_pair(roster, rel, evidence):
+    """True when the evidence names both endpoints (any form).
+
+    Used to prefer a mined sentence that actually establishes a pair
+    over an extracted quote that names neither side: the judge can
+    only confirm a relationship from text that places both people."""
+    text = norm_name(evidence or "")
+    if not text:
+        return False
+    for _name in (rel.get("from"), rel.get("to")):
+        _forms = _endpoint_forms(roster, _name)
+        if not _forms:
+            return False
+        if not any(re.search(r"(?<!\w)" + re.escape(_f) + r"(?!\w)", text)
+                   for _f in _forms):
+            return False
+    return True
 
 
 def _merge_roster_entries(roster, keep_key, drop_key):
@@ -18739,8 +19106,62 @@ def stage_decide_book(roster, chapters, indexed, chapter_as, chapter_bs,
             trope_conf[_tnorm(c)] = round(
                 min(0.9, 0.55 + 0.1 * counts.get(_tnorm(c), auto_min)), 2)
         if gated:
-            g_tropes, g_conf = v2_trope_gate(
-                call, red["chapter_summaries"], gated, counts)
+            g_tropes, g_conf = [], {}
+            # The noul batch speaks the validator's own protocol
+            # (_lock/_post_json): a validator that cannot carry one
+            # (a stand-in, or a judge limited to single questions)
+            # takes the extractor-gate path below instead of raising.
+            if _DECISION_VALIDATOR is not None \
+                    and not getattr(_DECISION_VALIDATOR,
+                                    "disabled", False) \
+                    and getattr(_DECISION_VALIDATOR, "_post_json",
+                                None) is not None:
+                # Same model that judges the claims, asked the one
+                # question a trope gate exists to answer: is this a
+                # narrative structure the book develops, or a genre
+                # label / a single scene? ONE batch call; each
+                # question carries the candidate and the summaries of
+                # the chapters that proposed it (book order, capped
+                # as the embedding query is). A failed batch falls
+                # back to the extractor-model gate below — a trope
+                # list must not empty itself because a call failed.
+                _tch = red.get("trope_chapters") or {}
+                _summ_order = [s for s in red["chapter_summaries"]
+                               if s.get("summary")]
+                _quest = {}
+                for _i, _c in enumerate(gated):
+                    _labs = set(_tch.get(_tnorm(_c)) or ())
+                    # The map holds chapter LABELS from the reduce and
+                    # chapter INDICES from the fallback above; accept
+                    # either, in book order.
+                    _ctxs = " ".join(s["summary"] for s in _summ_order
+                                     if (s.get("label") in _labs
+                                         or s.get("index") in _labs))[:1400]
+                    _quest[f"t{_i}"] = (
+                        "Is %s a narrative trope this book actually "
+                        "develops (not a genre label or a single "
+                        "scene)? Candidate: %s. Supporting chapter "
+                        "summaries: %s" % (_c, _c, _ctxs or "(none)"))
+                _votes = _ask_noul_batch(
+                    _DECISION_VALIDATOR, _quest,
+                    "Trope confirmation for one book.", label="trope gate")
+                if _votes is not None:
+                    for _i, _c in enumerate(gated):
+                        _p = _votes.get(f"t{_i}")
+                        if _p is None or _p < 0.5:
+                            continue
+                        g_tropes.append(_c)
+                        _n_ch = counts.get(_tnorm(_c), 1)
+                        g_conf[_tnorm(_c)] = round(
+                            min(0.9, 0.55 + 0.1 * _n_ch), 2)
+                else:
+                    print("  Trope gate: judge poll failed; "
+                          "falling back to the extractor gate")
+                    g_tropes, g_conf = v2_trope_gate(
+                        call, red["chapter_summaries"], gated, counts)
+            else:
+                g_tropes, g_conf = v2_trope_gate(
+                    call, red["chapter_summaries"], gated, counts)
             tropes.extend(g_tropes)
             trope_conf.update(g_conf)
         # Rejection learning: human rejections raise the acceptance bar for
@@ -19127,6 +19548,8 @@ def stage_decide_book(roster, chapters, indexed, chapter_as, chapter_bs,
         "rel_registry": red.get("rel_registry"),
         "relationship_type_vocabulary": red.get(
             "relationship_type_vocabulary"),
+        "relationship_type_proposals": red.get(
+            "relationship_type_proposals") or [],
         "validator_circuit_breaker": red.get(
             "validator_circuit_breaker"),
         "self_pairs_dropped": red.get("self_pairs_dropped",
@@ -19148,6 +19571,7 @@ def stage_decide_book(roster, chapters, indexed, chapter_as, chapter_bs,
         "trigger_chapters": red["trigger_chapters"],
         "avg_dialogue_ratio": red["avg_dialogue_ratio"],
         "povs": red["povs"], "quotes": red["quotes"],
+        "quote_poll": red.get("quote_poll"),
         "chapter_summaries": red["chapter_summaries"],
         "is_anthology": False, "stories": [],
         "aborted": aborted, "chunks_ok": a_ok,
@@ -19234,6 +19658,18 @@ def stage_decide_book(roster, chapters, indexed, chapter_as, chapter_bs,
     # was decided from, and a staged decide (per-stage budget) is
     # never silently compared against a monolith one (shared pool).
     result["decide_report"] = decide_report
+    _rtp = result.get("relationship_type_proposals") or []
+    if _rtp:
+        # Say it out loud: a dropped unknown type is a relationship
+        # the book had and this run does not. The review file beside
+        # the preview is where it becomes a registry row.
+        _rtp_brief = ", ".join(f"{r['id']}×{r['seen']}" for r in _rtp[:6])
+        if len(_rtp) > 6:
+            _rtp_brief += f", +{len(_rtp) - 6} more"
+        print(f"  Relationship types not in the vocabulary (claims "
+              f"dropped): {_rtp_brief}")
+        print(f"  Review them in this run's rel-types.json; add the ones "
+              f"you want with --apply-rel-types <rel-types.json>")
     v = red["verification"]
     if v["evidence_checked"]:
         print(f"  Evidence: {v['evidence_verified']}/{v['evidence_checked']} verified")
@@ -20295,6 +20731,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     """
     n = len(chapters)
     idx_to_label = {c["index"]: c["label"] for c in chapters}
+    # One reduce = one book's proposal set. A reduce run twice in a
+    # process (a --jobs worker reusing one, a test) must not carry the
+    # previous book's unknown types into this one's review file.
+    _rel_type_proposals_reset()
+
     # Console seam (Phase 3): verdict streaming. Everything below
     # publishes facts at the point they become true; with no
     # observer attached every helper here is inert and the reduce
@@ -20564,6 +21005,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         for c in cands:
             t = c["type"]
             if t not in _REL_PRECEDENCE and t not in _REL_NONEXCLUSIVE:
+                # Dropped from this run (an unknown type has no gloss,
+                # direction or lattice slot) but recorded: the book
+                # needed a type the registry does not carry, and the
+                # operator gets to decide whether to add it.
+                _rel_type_proposal_note(t, c)
                 print(f"  Dropping unknown relationship type: {t!r}")
                 continue
             _n_quotes = sum(1 for cc in cands
@@ -20837,6 +21283,26 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                   f"falling back to label {rel.get('chapter')!r}")
         return _chapters_by_label.get(rel.get("chapter") or "")
 
+    # Competing types per pair. Extraction routinely asserts several
+    # different types for ONE pair (Daemon: "enemy", "colleague" and
+    # "ally" for the same two people). The judge is asked one type at a
+    # time, so it can affirm a plausible-but-wrong type at high
+    # confidence — the gold run has a "colleague" kept at P=0.80 for a
+    # pair the pack rules "ally" — because it never sees that a rival
+    # type was also asserted for the same pair. The pair's candidate set
+    # is the strongest discrimination signal extraction produced, and
+    # handing it over costs no extra call.
+    _pair_types = {}
+
+    def _pair_key_of(rel):
+        return tuple(sorted((norm_name(rel.get("from", "")),
+                             norm_name(rel.get("to", "")))))
+
+    for _pr in list(relationships) + list(_pair_losers):
+        _pt = _pr.get("type")
+        if _pt:
+            _pair_types.setdefault(_pair_key_of(_pr), set()).add(_pt)
+
     def _validation_context(ev_quote, rel, mined_idx=None):
         """Context for the validator: the sentences around the
         evidence quote in its own chapter (see _evidence_window).
@@ -20859,6 +21325,16 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             rel.get("endpoint_provenance") or {})
         if _lines:
             _ctx = (_ctx + "\n" if _ctx else "") + "\n".join(_lines)
+        # Rival types for the same pair: the judge weighs the claimed
+        # type against them instead of against nothing.
+        _rivals = sorted(t for t in _pair_types.get(_pair_key_of(rel), ())
+                         if t and t != rel.get("type"))
+        if _rivals:
+            _ctx = (_ctx + "\n" if _ctx else "") + (
+                "Extraction also asserted these other relationship types "
+                "for this same pair (each may be wrong — do not treat the "
+                "claim's own type as the only possibility): "
+                + ", ".join(_rivals))
         return _ctx
 
     # The chapter's focal character, where extraction identified
@@ -20990,6 +21466,21 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             if _mined["grade"] == "binding":
                 rel["evidence_mined"] = _mined["sentence"]
                 _ev = _mined["sentence"]
+        # Judge the sentence that ESTABLISHES the pair, not one that
+        # only happens to be attached to it: a quote naming neither
+        # endpoint (or one of them) reads as an unsupported claim and
+        # costs the pair its recall. A binding mined sentence that
+        # names both endpoints replaces it; otherwise the claim is
+        # judged on exactly the evidence it came with.
+        if _ev and not _evidence_names_pair(roster, rel, _ev):
+            _both = _mine(rel["from"], rel["to"])
+            if _both and _both.get("grade") == "binding" \
+                    and _evidence_names_pair(roster, rel,
+                                             _both["sentence"]):
+                _ev = _both["sentence"]
+                _mined = _both
+                rel["evidence_grade"] = "binding"
+                rel["evidence_mined"] = _both["sentence"]
         if not _ev:
             # No evidence at all — no extracted quote and no
             # binding-grade mined sentence: fail closed. The claim
@@ -21001,17 +21492,17 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             # No decision-model call is spent. In write mode the
             # claim moves to dropped_relationships with its ORIGINAL
             # family type; the note records the reason (location +
-            # note carry the meaning). In preview mode the claim
-            # stays in relationships with the note, as with every
-            # other validation outcome — preview changes nothing.
+            # note carry the meaning). The row leaves the shipped set
+            # in BOTH modes and stays visible in the audit list: preview
+            # records the write decision (2026-10-22), so it can never
+            # advertise a row the write path deletes.
             # The budget boundary is separate: a claim WITH a quote
             # whose validation is skipped on budget keeps its type
             # with note "budget_exhausted" below; "the validator
             # wasn't consulted" is never conflated with "no evidence".
             rel["validation_p"] = None
             rel["validation_note"] = "no_evidence"
-            if not preview:
-                _dropped_relationships.append(rel)
+            _dropped_relationships.append(rel)
             return "no_evidence"
         if _DECISION_VALIDATOR is None:
             return "unvalidated"  # no validator configured; as-is
@@ -21056,10 +21547,14 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                     rel["claimed_type"] = rel["type"]
                 rel["type"] = "other"
             return "downgraded"
-        # Very low P: likely hallucinated. Drop (audit in preview).
+        # Very low P: likely hallucinated. The row leaves the shipped
+        # set in both modes; preview keeps it in the audit list with a
+        # note naming the mode ("would_drop"), write names the outcome
+        # ("dropped"). Preview mirrors write (2026-10-22): the pair's
+        # runner-up still gets its one revival, and whatever survives it
+        # is what ships — the same decision a write run makes.
         rel["validation_note"] = "dropped" if not preview else "would_drop"
-        if not preview:
-            _dropped_relationships.append(rel)
+        _dropped_relationships.append(rel)
         return "dropped"
 
     for rel in _ordered_rels:
@@ -21118,6 +21613,19 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             if _mined:
                 _ev = _mined["sentence"]
                 rel["evidence_grade"] = _mined["grade"]
+        # Same rule as the family pass: when the attached quote does
+        # not name both endpoints, a binding sentence that does is
+        # what the judge should see. The claim is still judged —
+        # only the sentence changes.
+        if _ev and not _evidence_names_pair(roster, rel, _ev):
+            _both = _mine(rel["from"], rel["to"])
+            if _both and _both.get("grade") == "binding" \
+                    and _evidence_names_pair(roster, rel,
+                                             _both["sentence"]):
+                _ev = _both["sentence"]
+                _mined = _both
+                rel["evidence_grade"] = "binding"
+                rel["evidence_mined"] = _both["sentence"]
         if not _ev:
             return "unvalidated"
         if _mined:
@@ -21139,10 +21647,12 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         if _p >= _REL_DROP_THRESHOLD:
             rel["validation_note"] = "kept"
             return "kept"
+        # Same rule as the family pass: the rejected row leaves the
+        # shipped set in both modes, preview keeps it in the audit list
+        # under a mode-naming note.
         rel["validation_note"] = ("dropped" if not preview
                                   else "would_drop")
-        if not preview:
-            _dropped_relationships.append(rel)
+        _dropped_relationships.append(rel)
         return "dropped"
 
     if _DECISION_VALIDATOR is not None:
@@ -21466,6 +21976,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     sev_names = ["none", "mentioned", "on_page", "graphic"]
     triggers = []
     _gated_dropped = 0
+    # Categories the judge rejected outright. They are not dropped:
+    # a content warning that no quote supports is downgraded to
+    # "mentioned" further down (see the loop after this one).
+    _rejected_categories = []
 
     def _pub_trigger(cat, acc, decision, gate, sev_final=None):
         if not _con:
@@ -21523,6 +22037,16 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                                  _label_to_text.get(
                                      _ev.get("chapter", ""), ""))
                     _ctx = _extract_quote_context(_ctx_text, _q)
+                    if getattr(_DECISION_VALIDATOR, "disabled", False):
+                        # A disabled judge sends nothing, so a claim
+                        # here would record spend for a request that
+                        # never leaves the process — the relationship
+                        # passes check this same predicate before
+                        # theirs. The category takes the no-judgment
+                        # fallback below, exactly as on a validator
+                        # error.
+                        _dv_error = True
+                        break
                     if not _dm_budget_claim(1, consumer="trigger_gate"):
                         # Budget exhausted mid-gate: this category is
                         # NOT judged — take the regex-gate fallback,
@@ -21557,8 +22081,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                             _downgrade = True
                         # else: discard this quote's evidence
                     if not _kept:
-                        _gated_dropped += 1
                         _pub_trigger(cat, acc, "dropped", "decision")
+                        _rejected_categories.append({
+                            "warning": cat, "acc": acc,
+                            "decision_p": max(_p for _p, _ in _judged)})
                         continue
                     if _downgrade:
                         sev = 1
@@ -21629,6 +22155,55 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             UI.console_verdict(_bk, {
                 "table": "triggers", "row_key": f"trig:{cat}",
                 "decision": _trec["status"], "record": _trec})
+    # A category whose EVERY quote the judge rejected is downgraded to
+    # "mentioned", never silently dropped. A missing content warning is
+    # the failure this gate must not have: Daemon's graphic_violence
+    # scored P=0.05 on quotes that were not violent and the warning
+    # vanished, so the reader was told nothing at all. The row keeps
+    # its chapters and its (rejected) evidence with the judge's score;
+    # only the severity falls to the floor.
+    for _rej in _rejected_categories:
+        _racc = _rej["acc"]
+        _rev = []
+        for _e in _racc["evidence"]:
+            _e = dict(_e)
+            _e.setdefault("decision_gate", "rejected")
+            _e.pop("_idx", None)
+            _rev.append(_e)
+        triggers.append({
+            "warning": _rej["warning"],
+            "severity": sev_names[1],
+            "severity_claimed": sev_names[_racc["sev"]],
+            "chapters": _racc["chapters"],
+            "chapter_indices": sorted(_racc["chapter_indices"]),
+            "chapter_count": len(_racc["chapters"]),
+            "frequency": (round(len(_racc["chapters"]) / n_successful_b, 4)
+                          if n_successful_b else 0),
+            "prominence": _trigger_prominence(
+                sev_names[1], len(_racc["chapters"]), n_successful_b),
+            "evidence": _rev,
+            "evidence_verified": bool(_rev),
+            "evidence_offered": bool(_racc["evidence"]),
+            "decision_p": round(_rej["decision_p"], 4),
+            "decision_gate": "rejected",
+            "detail": "judge rejected every evidence quote; "
+                      "category kept at mentioned",
+            "confidence": (0.0 if not _rev else
+                           _v2_trigger_confidence(
+                               1, len(_racc["chapters"]), len(_rev))),
+        })
+        if not _racc["chapter_indices"]:
+            _gated_dropped += 1
+        if _con:
+            UI.console_verdict(_bk, {
+                "table": "triggers", "row_key": f"trig:{_rej['warning']}",
+                "decision": "downgraded",
+                "record": {"warning": _rej["warning"],
+                           "severity": sev_names[1],
+                           "severity_claimed": sev_names[_racc["sev"]],
+                           "chapters": len(_racc["chapters"]),
+                           "gate": "decision",
+                           "decision_p": round(_rej["decision_p"], 4)}})
     if _gated_dropped:
         print(f"  Trigger gate: dropped {_gated_dropped} unsupported claim(s)")
     # The trigger stage is done: its unused reserve becomes
@@ -21801,6 +22376,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         return set((s or "").lower().split())
 
     _cand_quotes = []
+    # What the judge poll did to this run's quote list: {"polled": n,
+    # "kept": k, "failed": bool}. Zero polled means the poll never ran
+    # (no decision model configured).
+    _quote_poll = {"polled": 0, "kept": 0, "failed": False}
     for idx in sorted(chapter_bs):
         b = chapter_bs[idx]
         if not b:
@@ -21822,6 +22401,21 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             if _qt and _sum_tokens:
                 if len(_qt & _sum_tokens) / len(_qt) > 0.6:
                     continue
+            # Speaker grounding: a quote ships only with a speaker, and
+            # a speaker the chapter does not place next to the line is
+            # a misattribution — worse than shipping no quote at all.
+            # The speaker's canonical name (or its surname) must
+            # appear in the line or the ~300 chars around it.
+            _spk_forms = _canonical_name_forms(roster,
+                                               q.get("speaker") or "")
+            _ctx_text = (_chapters_by_index.get(idx) or {}).get("text", "")
+            _speaker_hay = norm_name(
+                _text + " " + _extract_quote_context(_ctx_text, _text,
+                                                     window=300))
+            if not any(re.search(r"(?<!\w)" + re.escape(_f) + r"(?!\w)",
+                                 _speaker_hay)
+                       for _f in _spk_forms):
+                continue
             _cand_quotes.append({**q, "chapter": _ch_label, "_tokens": _qt})
 
     # Rank by (length * distinctiveness); distinctiveness = 1 - max token
@@ -21840,8 +22434,57 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         _scored.append((len(q.get("text", "")) * _distinct, q))
     _scored.sort(key=lambda x: -x[0])
     _qlimit = 8 if len(_scored) > 20 else 5
+    # ONE judge poll over the top candidates (the §10.2 questions, at
+    # batch shape). The poll reorders and screens the deterministic
+    # ranking; it never invents a quote. A failed or refused poll
+    # leaves the ranking exactly as it was — fail-open, as before.
+    if _DECISION_VALIDATOR is not None and _scored:
+        _poll_set = _scored[:12]
+        _poll_cands = [{"quote_id": _i, "text": _q.get("text", "")}
+                       for _i, (_, _q) in enumerate(_poll_set)]
+        _votes = None
+        if not getattr(_DECISION_VALIDATOR, "disabled", False) \
+                and _dm_budget_claim(1, consumer="quote_poll"):
+            _votes = corpus_quote_poll(
+                _poll_cands,
+                lambda _questions, _state: _ask_noul_batch(
+                    _DECISION_VALIDATOR, _questions, _state,
+                    label="quote poll"))
+        if _votes is None:
+            _quote_poll["failed"] = True
+        else:
+            _quote_poll["polled"] = len(_poll_cands)
+            _unpolled = list(_scored[len(_poll_set):])
+            _passed, _filler = [], []
+            for _i, _item in enumerate(_poll_set):
+                _v = _votes.get(_i) or {}
+                if _v.get("spoiler", 1.0) >= 0.5:
+                    continue  # accuracy: a spoiling line never ships
+                if _v.get("heat", 1.0) >= 0.5:
+                    continue  # accuracy: an explicit line never ships
+                if (_v.get("quotability", 0.0) >= 0.5
+                        and _v.get("representative", 0.0) >= 0.5):
+                    _passed.append((_item, _v))
+                else:
+                    _filler.append((_item, _v))
+
+            def _vote_rank(pair):
+                _it, _v = pair
+                return (-(_v.get("quotability", 0.0)
+                          + _v.get("representative", 0.0)), -_it[0])
+            _passed.sort(key=_vote_rank)
+            _filler.sort(key=_vote_rank)
+            # The judge's bar ORDERS the list; it never empties it. When
+            # too few lines clear it, the best-scoring clean lines fill
+            # the remaining slots: a book whose every line reads as
+            # merely serviceable still gets a quote section, drawn from
+            # verified, speaker-grounded, non-spoiling text. Only the
+            # spoiler/heat drops are absolute.
+            _scored = ([_it for _it, _ in _passed]
+                       + [_it for _it, _ in _filler] + _unpolled)
     quotes = [{k: v for k, v in q.items() if not k.startswith("_")}
               for _, q in _scored[:_qlimit]]
+    _quote_poll["kept"] = len(quotes)
 
     # --- Chapter summaries ---
     chapter_summaries = [{"index": c["index"], "label": c["label"],
@@ -21857,6 +22500,42 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
 
     # --- Grounding: verify names against raw text (catches hallucinations) ---
     _grounding = _ground_entities(characters, relationships, chapters)
+
+    # ONE ROW PER PAIR (2026-10-22). The pair competition keeps one
+    # winner per pair, but the runner-up revival appends a claim for a
+    # pair whose winner died — and in preview the dead winner stays in
+    # the row set (preview keeps `would_drop`/`no_evidence` rows for
+    # audit), so the shipped document carried two rows for the same
+    # pair, sometimes contradicting each other ("child" beside
+    # "mentor" for one pair in the Daemon gold run). A pair is one
+    # relationship: the extra row moves to the audit list under its own
+    # note, and the surviving row is the one the write path ships — a
+    # judged-kept claim outranks a rejected one, then first row wins.
+    _by_pair = {}
+    _dup_rows = []
+    for _r in relationships:
+        _k = tuple(sorted((norm_name(_r.get("from", "")),
+                           norm_name(_r.get("to", "")))))
+        _prev = _by_pair.get(_k)
+        if _prev is None:
+            _by_pair[_k] = _r
+            continue
+        _prev_kept = (_prev.get("validation_note") or "") == "kept"
+        _cur_kept = (_r.get("validation_note") or "") == "kept"
+        if _cur_kept and not _prev_kept:
+            _by_pair[_k] = _r
+            _loser = _prev
+        else:
+            _loser = _r
+        _loser["prior_note"] = _loser.get("validation_note")
+        _loser["validation_note"] = "duplicate_pair"
+        _loser["superseded_by_type"] = _by_pair[_k].get("type")
+        _dup_rows.append(_loser)
+    if _dup_rows:
+        relationships = list(_by_pair.values())
+        _dropped_relationships.extend(_dup_rows)
+        print(f"  Relationships: collapsed {len(_dup_rows)} duplicate "
+              f"row(s) for a pair already shipped")
 
     # The internal chapter identity has now served its purpose:
     # every validation window, provenance stamp and grounding check
@@ -21923,6 +22602,11 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # and a registry that changed between runs shows the
         # difference on the face of the two artefacts.
         "relationship_type_vocabulary": _rel_vocabulary_ids(),
+        # Types extraction asserted that the vocabulary does not
+        # carry, with the claims they were asserted on. Their claims
+        # are dropped from this run; the rows are the operator's
+        # review list (--apply-rel-types adds the ones they keep).
+        "relationship_type_proposals": _rel_type_proposal_rows(),
         # The decision pool this book was armed with (v2.13.33):
         # stamped beside the scheme stamps above so the artefact
         # records the pool size its judged coverage was produced
@@ -21954,6 +22638,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         "tropes": [],  # filled by the trope gate
         "trope_confidence": {},
         "quotes": quotes,
+        "quote_poll": _quote_poll,
         "chapter_summaries": chapter_summaries,
         "verification": {"evidence_checked": v_checked,
                          "evidence_verified": v_verified},
@@ -24305,6 +24990,98 @@ def cmd_trope_map(preview_path):
     out_path = os.path.splitext(preview_path)[0] + "-trope-map.json"
     json.dump(out, open(out_path, "w", encoding="utf-8"), indent=2)
     print(f"  {len(mappings)} mapped, {len(proposals)} proposals -> {out_path}")
+
+
+def cmd_apply_rel_types(path):
+    """Add reviewed relationship types to the registry.
+
+    Input is the companion file a run writes beside its preview
+    (`<preview>--rel-types.json`): small, editable, and the only
+    place a gloss, a direction or a family flag can be set — nothing
+    in the pipeline invents them, because the judge weighs claims
+    against the gloss and the lattice reads the exclusivity.
+
+    The write is additive and idempotent: an id already in the
+    registry is reported and skipped, never overwritten, so applying
+    the same review file twice changes nothing. It refuses when the
+    registry cannot be READ, because "applied" against the built-in
+    fallback would write rows nobody can see and claim success.
+    Returns a process exit code.
+    """
+    p = Path(path)
+    if not p.is_file():
+        print(f"  --apply-rel-types: file not found: {p}")
+        return 1
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"  --apply-rel-types: unreadable JSON: {e}")
+        return 1
+    rows = doc.get("relationship_types") if isinstance(doc, dict) else doc
+    if not isinstance(rows, list) or not rows:
+        print("  --apply-rel-types: no relationship types in this file — "
+              "nothing to do")
+        return 0
+    if not CONFIG.get("supabase_url") or not CONFIG.get("supabase_key"):
+        print("  --apply-rel-types: Supabase is not configured; nothing "
+              "was written")
+        return 1
+    existing = sb("relationship_types", params=_REL_REGISTRY_SELECT)
+    if existing is None:
+        print(f"  --apply-rel-types: cannot read the relationship registry "
+              f"({_SB_LAST_ERROR or 'table missing or unreachable'}); "
+              f"nothing was written")
+        return 1
+    have = {str(r.get("id") or "").strip().lower()
+            for r in existing if isinstance(r, dict)}
+    payload, skipped = [], []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        tid = _rel_type_proposal_id(row.get("id") or row.get("label"))
+        if not tid or tid in have:
+            skipped.append(tid or "?")
+            continue
+        # Only registry columns are sent; `seen`/`examples` in the
+        # review file are provenance for the operator, not data.
+        payload.append({
+            "id": tid,
+            "label": str(row.get("label") or tid),
+            "gloss": str(row.get("gloss") or "").strip(),
+            "direction": ("directed" if row.get("direction") == "directed"
+                          else "symmetric"),
+            "is_family": bool(row.get("is_family")),
+            "exclusivity": ("exclusive"
+                            if row.get("exclusivity") == "exclusive"
+                            else "extra"),
+            "precedence": row.get("precedence"),
+            "graph_group": str(row.get("graph_group") or "friend"),
+            "suggestible": bool(row.get("suggestible", True)),
+        })
+        have.add(tid)
+    if skipped:
+        print(f"  --apply-rel-types: already in the registry, skipped: "
+              f"{', '.join(sorted(set(skipped)))}")
+    if not payload:
+        print("  --apply-rel-types: nothing new to add")
+        return 0
+    print(f"  --apply-rel-types: adding {len(payload)} type(s): "
+          f"{', '.join(r['id'] for r in payload)}")
+    for r in payload:
+        if not r["gloss"]:
+            print(f"    ! {r['id']} has no gloss — the judge will weigh "
+                  f"claims against the type's name alone. Edit the review "
+                  f"file if that is not what you want.")
+    out = sb("relationship_types", method="POST", data=payload)
+    if out is None:
+        print(f"  --apply-rel-types: write failed: "
+              f"{_SB_LAST_ERROR or 'no response'}; nothing was added")
+        return 1
+    _load_rel_registry(force=True)
+    print(f"  --apply-rel-types: registry now "
+          f"{_REL_REGISTRY_STATUS.get('types')} type(s) "
+          f"({_REL_REGISTRY_STATUS.get('source')})")
+    return 0
 
 
 # The most recent transport failure, in one short line, for a
@@ -30626,6 +31403,18 @@ def _extraction_chapter_coverage(book_key):
     return present, total
 
 
+def _extractor_identity():
+    """{"llm": ..., "model": ...} for the active backend.
+
+    The model is the one piece of extraction provenance that is
+    invisible today (openai_model defaults to "" and the server picks),
+    so a run cannot say which model produced it."""
+    llm = (CONFIG.get("llm") or "ollama").lower()
+    key = {"openai": "openai_model", "openrouter": "openrouter_model",
+           "cohere": "cohere_model", "ollama": "ollama_model"}.get(llm, "")
+    return {"llm": llm, "model": (CONFIG.get(key) or "") or "server-default"}
+
+
 def _checkpoint_save_extraction_stamp(book_key, fingerprint=None,
                                       payload_chapters=None):
     """Stamp a COMPLETED extraction into its checkpoint directory.
@@ -30684,8 +31473,8 @@ def _checkpoint_save_extraction_stamp(book_key, fingerprint=None,
         "extraction_flags_hash": _extraction_flags_hash(),
         "flags_hash": _checkpoint_flags_hash(),
         "extraction_flags": {k: CONFIG.get(k) for k in _EXTRACTION_FLAGS},
-        "extractor": {"backend": models.get("llm_backend"),
-                      "model": models.get("llm_model")},
+        "extractor": _extractor_identity(),
+        "run_models": models,
         "total_chapters": total,
         "payload_chapters": expected,
         "chapters_present": present,
@@ -30816,6 +31605,34 @@ def _checkpoint_clear(book_key):
     d = _checkpoint_dir(book_key)
     if d.is_dir():
         _sh.rmtree(d)
+
+
+def cmd_clear_checkpoints():
+    """Delete every per-book checkpoint directory, printing each path.
+
+    A finished run keeps its checkpoint directory — that directory is
+    the run's review bundle — so nothing purges it automatically any
+    more. This command is the operator's explicit purge. Refused under
+    replay: there the payload directory is the snapshot's, and a
+    snapshot is never deleted by a bookkeeping command."""
+    if _REPLAY_CTX is not None:
+        print("  --clear-checkpoints refused: a replay is in progress "
+              "(the payload directory is the snapshot's)")
+        return False
+    root = SCRIPT_DIR / "preview" / ".checkpoints"
+    if not root.is_dir():
+        print(f"  no checkpoint directory at {root}")
+        return True
+    removed = 0
+    for d in sorted(root.iterdir()):
+        if not d.is_dir():
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        print(f"  removed {d}")
+        removed += 1
+    print(f"  cleared {removed} checkpoint "
+          f"director{'y' if removed == 1 else 'ies'}")
+    return True
 
 
 def _checkpoint_resume_check(book_key, total_chapters, fingerprint=None):
@@ -31287,6 +32104,7 @@ def _write_extraction_artefact(*, book_key, fingerprint, fpath, title,
         "processor_version": PORTABLE_VERSION,
         "flags_hash": _checkpoint_flags_hash(),
         "extraction_flags_hash": _extraction_flags_hash(),
+        "extractor": _extractor_identity(),
         "created_at": _now_iso(),
     }
     _atomic_json(root / "manifest.json", manifest)
@@ -31732,13 +32550,9 @@ def process_file_v2(fpath, dry_run=False, preview=False):
         _checkpoint_save_extraction_stamp(_ckpt_key, _ckpt_fp,
                                           n - len(_fm_idx_v2))
 
-    # Stage E standalone (wiki-ingestion spec §3.1): write the
-    # extraction artefact and stop. No merge, no decide, no DB.
-    if _stage_name() == "extract":
-        if aborted:
-            print("  Extraction aborted — no artefact written")
-            return False
-        _dir = _write_extraction_artefact(
+    def _write_stage_e_artefact():
+        """This run's extraction as a Stage-E artefact."""
+        return _write_extraction_artefact(
             book_key=_ckpt_key, fingerprint=_ckpt_fp, fpath=fpath,
             title=title, author=author, identifiers=identifiers,
             indexed=indexed, chapter_as=chapter_as, chapter_bs=chapter_bs,
@@ -31748,10 +32562,40 @@ def process_file_v2(fpath, dry_run=False, preview=False):
                       "a_fallback": a_fallback, "b_ok": b_ok,
                       "b_failed": b_failed},
             source=_acq.get("source"))
+
+    # Stage E standalone (wiki-ingestion spec §3.1): write the
+    # extraction artefact and stop. No merge, no decide, no DB.
+    if _stage_name() == "extract":
+        if aborted:
+            print("  Extraction aborted — no artefact written")
+            return False
+        _dir = _write_stage_e_artefact()
         print(f"  Extraction artefact: {_dir}")
         print("  --stage extract complete; merge and decide not run")
-        _checkpoint_clear(_ckpt_key)
+        # The checkpoint directory is KEPT (it is the review bundle):
+        # `--clear-checkpoints` is the explicit purge.
         return True
+
+    # Stage-E artefact on the ORDINARY run path (stage-split step 4).
+    # A completed extraction is the one thing a decision re-run cannot
+    # rebuild without paying the models again: the roster is built
+    # during Call A and lives nowhere else, and the full run clears its
+    # checkpoints below. Until now that meant the newest preview's
+    # extraction was gone the moment the preview existed, so re-deciding
+    # it (--stage analyze) required a whole re-extraction. The artefact
+    # lives under the learn dir, outside the checkpoint lifecycle, and
+    # is written best-effort like the stamp: a bookkeeping failure must
+    # not change the outcome of the work it records, but it is named,
+    # because "this run can no longer be re-decided" is a fact the
+    # operator should see. Skipped when the payloads were served FROM
+    # an artefact (analyze/replay): re-writing a copy under a new run
+    # key would present the source extraction as a new one.
+    if not aborted and _EXTRACTION_CTX is None and _REPLAY_CTX is None:
+        try:
+            print(f"  Extraction artefact: {_write_stage_e_artefact()}")
+        except Exception as e:
+            print(f"  Extraction artefact NOT written: {e} — this run "
+                  f"cannot be re-decided without re-extracting")
 
     # Recorded human NOs for this work (roster store): standing
     # rulings the in-run merge passes and alias pruning below must
@@ -31848,8 +32692,37 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             series_name=_series_name, series_pos=_series_pos,
             wid=wid, how=how)
         print(f"  Analysis artefact: {_dir}")
+        # The review file the preview path writes beside its preview
+        # (save_preview) is written here too: a staged analysis IS this
+        # entry's review product, and proposals stranded inside a
+        # multi-megabyte analysis.json would not be reviewable.
+        # No run key to pass: the file sits inside the analysis
+        # artefact directory, whose own name already carries it.
+        _rtp_path = _write_rel_type_review(
+            _dir / "rel-types.json", result, None)
+        if _rtp_path is not None:
+            print(f"  Relationship types for review: {_rtp_path}")
         print("  --stage analyze complete; nothing written to Supabase")
         return not aborted
+
+    # The checkpoint directory is the run's REVIEW bundle: the book's
+    # reduce document (the same one _write_analysis_artefact writes)
+    # and the relationship-type review land beside the chapter
+    # payloads, the roster, the extraction stamp and the merged
+    # roster, so a human can read what was extracted and what was
+    # decided in one place. Best-effort: a bookkeeping failure prints
+    # one line and never fails the run.
+    if not dry_run:
+        _bundle_dir = _checkpoint_dir(_ckpt_key)
+        try:
+            _atomic_json(_bundle_dir / "analysis.json", result)
+        except Exception as e:
+            print(f"  checkpoint analysis.json not written: {e}")
+        try:
+            _write_rel_type_review(_bundle_dir / "rel-types.json",
+                                   result, None)
+        except Exception as e:
+            print(f"  checkpoint rel-types.json not written: {e}")
 
     if dry_run:
         print("  DRY RUN — nothing written")
@@ -31863,7 +32736,9 @@ def process_file_v2(fpath, dry_run=False, preview=False):
             # Replace-wholesale validation gate: log what a write run
             # would replace for this in-DB work (read-only).
             print_replace_plan(wid, result)
-        _checkpoint_clear(_ckpt_key)  # P8: run complete, checkpoints unneeded
+        # P8: run complete. The checkpoint directory is KEPT — it is
+        # the run's review bundle (see the Stage-D save above);
+        # --clear-checkpoints is the operator's explicit purge.
         UI.run_summary(title or fpath.stem,
                        _run_summary_stats(result, True, time.time() - _t0))
         return not aborted
@@ -31896,7 +32771,8 @@ def process_file_v2(fpath, dry_run=False, preview=False):
     if errors:
         print(f"  {errors} database operation(s) failed")
         return False
-    _checkpoint_clear(_ckpt_key)  # P8: run complete, checkpoints unneeded
+    # P8: run complete. Checkpoints are kept (review bundle);
+    # --clear-checkpoints is the explicit purge.
     UI.run_summary(title or fpath.stem,
                    _run_summary_stats(result, False, time.time() - _t0))
     return True
@@ -32314,6 +33190,18 @@ def save_preview(fpath, result):
     with open(prev_dir / f"{base}.json", "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
+    # Relationship-type review file (2026-10-22): a small, editable
+    # companion to the preview. The preview JSON carries the same
+    # rows, but it is a megabyte of claims; the operator's decision
+    # is a half-dozen type rows, and --apply-rel-types reads exactly
+    # this file. Written only when there is something to decide.
+    _rtp = result.get("relationship_type_proposals") or []
+    _rtp_path = _write_rel_type_review(
+        prev_dir / f"{base}--rel-types.json", result, run_key)
+    if _rtp_path is not None:
+        print(f"  Relationship types for review: "
+              f"preview/{_rtp_path.name}")
+
     md = [f"# {result['title']}", f"*{result['author'] or 'Unknown author'}*", ""]
     if result.get("aborted"):
         md.append(f"## ⚠️ ABORTED — partial results "
@@ -32488,6 +33376,25 @@ def save_preview(fpath, result):
             spoiler = " ⚠️ SPOILER" if q.get("spoiler") else ""
             md.append(f"> {q['text']}{spoiler}")
             md.append("")
+    if _rtp:
+        md.append(f"## Proposed relationship types ({len(_rtp)})")
+        md.append("")
+        md.append("The extraction asserted these types, but the registry "
+                  "does not carry them, so their claims were dropped from "
+                  "this run. Edit a row in the companion file (id, label, "
+                  "gloss, direction, is_family, exclusivity, precedence, "
+                  "graph_group, suggestible), then add it:")
+        md.append("")
+        md.append(f"`py process-portable.py --apply-rel-types "
+                  f"\"preview/{base}--rel-types.json\"`")
+        md.append("")
+        for _r in _rtp:
+            md.append(f"- **{_r['label']}** (`{_r['id']}`) — "
+                      f"{_r['seen']} claim(s)")
+            for _ex in (_r.get("examples") or [])[:2]:
+                md.append(f"  - {_ex.get('from')} → {_ex.get('to')} "
+                          f"(ch. {_ex.get('chapter')})")
+        md.append("")
     with open(prev_dir / f"{base}.md", "w", encoding="utf-8") as f:
         f.write("\n".join(md))
     print(f"  Preview saved to preview/{base}.md")
@@ -32827,7 +33734,7 @@ _PROFILE_EXCLUDE = frozenset({
     "restore_state", "retry_failed", "roster_link", "roster_no",
     "roster_report", "roster_split", "roster_unlink",
     "run_history_backfill",
-    "staging_report", "trope_map",
+    "staging_report", "trope_map", "clear_checkpoints",
     "validate", "verify", "watch",
     # per-run selectors / overrides for a single run
     "alias", "analysis", "apply_merge", "chunks", "extraction", "file",
@@ -33316,6 +34223,16 @@ def _build_parser():
     g_out.add_argument("--trope-map", metavar="PREVIEW_JSON",
                     help="map a preview file's tropes to the Cozy Libram catalog "
                          "via embeddings; writes a review JSON, nothing to Supabase")
+    g_out.add_argument("--clear-checkpoints", action="store_true",
+                    help="delete every per-book checkpoint directory under "
+                         "preview/.checkpoints/ (each is a finished run's "
+                         "review bundle) and exit")
+    g_out.add_argument("--apply-rel-types", metavar="REVIEW_JSON",
+                    help="add reviewed relationship types to the registry "
+                         "(input: the <preview>--rel-types.json a run writes "
+                         "when extraction used a type the vocabulary lacks); "
+                         "additive and idempotent, existing ids are never "
+                         "overwritten")
 
     g_learn.add_argument("--corpus-status", action="store_true",
                     help="print the corpus store status (works, "
@@ -33500,6 +34417,8 @@ _ONE_SHOT_FLAGS = {
     "list_profiles": "--list-profiles",
     "save_profile": "--save-profile",
     "trope_map": "--trope-map",
+    "clear_checkpoints": "--clear-checkpoints",
+    "apply_rel_types": "--apply-rel-types",
     "preview_diff": "--preview-diff",
     "recalibrate_spice": "--recalibrate-spice",
     "validate": "--validate",
@@ -33681,6 +34600,13 @@ def main():
         load_config()
         cmd_trope_map(args.trope_map)
         return
+
+    if args.clear_checkpoints:
+        sys.exit(0 if cmd_clear_checkpoints() else 1)
+
+    if args.apply_rel_types:
+        load_config()
+        sys.exit(cmd_apply_rel_types(args.apply_rel_types))
 
     if args.preview_diff:
         print(_cmd_preview_diff(args.preview_diff[0], args.preview_diff[1]))
@@ -34027,6 +34953,22 @@ def main():
         CONFIG["batch_size"] = args.batch
     if args.jobs:
         CONFIG["jobs"] = max(1, args.jobs)
+    # The decision budget is process-global — one pool, one spent
+    # counter, one finished set (see _dm_budget_reset) — while --jobs
+    # runs whole books on parallel threads. The second book's reset
+    # zeroes the first book's spend and re-protects the reserves the
+    # first book had already earned the right to borrow, so its later
+    # claims are denied against a pool it was never granted and its
+    # outcomes become budget_exhausted for reasons that are not the
+    # budget. Refusing is the honest posture until the pool is
+    # per-book; silently producing two differently-judged books is not.
+    if _DECISION_VALIDATOR is not None and int(
+            CONFIG.get("jobs", 1) or 1) > 1:
+        sys.exit("ERROR: --jobs > 1 cannot be combined with a decision "
+                 "model: the decision budget is process-global, so "
+                 "parallel books would reset and spend one another's "
+                 "pool. Run the books sequentially (drop --jobs) or drop "
+                 "the decision model.")
     if args.chunks:
         CONFIG["only_chunks"] = args.chunks
     if args.pipeline:

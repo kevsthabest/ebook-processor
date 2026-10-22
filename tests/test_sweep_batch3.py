@@ -993,7 +993,9 @@ class TestOvernightWatchHistory(unittest.TestCase):
                        / ".overnight-watch.json")
 
     def _run(self, counts, new_rows, alert=""):
-        env = dict(os.environ, HOME=self._tmp)
+        # POSIX expanduser reads HOME; ntpath reads USERPROFILE. Both are
+        # overridden so the script's ~ lands in the fixture on either OS.
+        env = dict(os.environ, HOME=self._tmp, USERPROFILE=self._tmp)
         return subprocess.run(
             [sys.executable, "-c", self._py, counts, new_rows, alert],
             env=env, capture_output=True, text=True)

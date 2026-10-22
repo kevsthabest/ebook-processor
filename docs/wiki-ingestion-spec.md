@@ -487,5 +487,57 @@ Slice 1 is implemented on branch `wiki-ingestion-slice1`:
   exact-name rule can be measured before it is trusted.
 - `--stage decide` refuses with the rename message.
 
+Stage-split step 4 (v2.13.86) closes the reuse gap the split existed
+for:
+
+- **Every completed ordinary run now writes the Stage-E artefact it
+  used to throw away.** A full run stamped the extraction into the
+  checkpoint directory and then cleared that directory, so the
+  extraction behind the newest preview was gone the moment the
+  preview existed and `--stage analyze` always cost a re-extraction.
+  The artefact is written under the learn dir before the clear
+  (best-effort: a write failure is named and does not fail the run),
+  and is skipped when the payloads were served FROM an artefact
+  (analyze, replay).
+- **Decision-client transport is status-aware.** `429/408/425/5xx`
+  are retried (max 3 attempts, `Retry-After` honoured and capped,
+  exponential fallback); deterministic refusals (`401/403/404/422`)
+  are never re-sent; the circuit breaker counts status failures
+  separately from transport failures and trips at 6 rather than 3,
+  so a rate-limit burst can no longer disable the judge for the rest
+  of a book. The batched transport (quote poll, discovery) shares the
+  policy.
+- **`--jobs > 1` is refused when a decision model is configured**,
+  because the decision budget is process-global and parallel books
+  would reset and spend one another's pool.
+- **The trigger gate no longer claims budget for a call it will not
+  make** when the judge's breaker has already tripped.
+- Measured on the live judge (2026-10-22): `typesafe/jev-1.13` via
+  OpenRouter answers a relationship judgment in ~0.3 s, so a
+  73-chapter book's ~50 decision calls cost seconds, not minutes —
+  decision latency is not the bottleneck; identity and evidence
+  quality are.
+
+Relationship-type proposals (2026-10-22) close the vocabulary gap the
+operator kept hitting:
+
+- A type the model asserts that the registry lacks is still dropped
+  from the run (the vocabulary is the contract the prompts, judge and
+  app share), but each drop is now recorded with its claim
+  provenance: `relationship_type_proposals` on the book record, a
+  console line, and a small editable companion file beside the
+  preview (`<preview>--rel-types.json`).
+- The proposed rows carry the least invasive registry defaults —
+  non-family, `extra` exclusivity, symmetric, suggestible, and an
+  EMPTY gloss — because a definition nobody ruled is worse than none
+  when the judge weighs claims against it.
+- `--apply-rel-types REVIEW_JSON` writes the rows the operator kept:
+  additive, idempotent (existing ids are skipped, never overwritten),
+  and it refuses when the registry cannot be read so a write that
+  lands nowhere never reports success.
+- The next run's `_load_rel_registry` picks the added types up, and
+  the prompts, validator glosses and exclusivity lattice follow from
+  the one vocabulary seam — no code change per type.
+
 Not yet in this slice: the app migration, merge apply, discovery
 promotion, full-cast writes, series-position writes, and events/recaps.

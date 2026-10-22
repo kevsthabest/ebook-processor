@@ -7,7 +7,7 @@ whatever ebook files you hand it. **Preview first, write later** — every run
 can save a full Markdown/JSON report for human review before anything
 touches the database.
 
-**Current version: 2.13.85** (`PORTABLE_VERSION` in `process-portable.py`).
+**Current version: 2.13.86** (`PORTABLE_VERSION` in `process-portable.py`).
 
 ## How it works
 
@@ -88,6 +88,18 @@ one failing chunk), `--debug` (save raw failed-chunk output),
 `--dedupe` (embedding merge), `--trope-map PREVIEW_JSON` (map a preview's
 tropes to the catalog via embeddings; writes a `<preview>-trope-map.json`
 review file, nothing to Supabase).
+
+`--apply-rel-types REVIEW_JSON` adds relationship types the extraction
+asserted but the registry does not carry. Such claims are dropped from
+the run (an unknown type has no gloss, direction, or place in the
+exclusivity lattice), and the run now writes the proposed rows beside
+its preview as `<preview>--rel-types.json` — one row per type, with the
+claim examples that produced it. Edit a row's `gloss`, `direction`,
+`is_family`, `precedence` or `graph_group` there, then apply it. The
+write is additive and idempotent (an id already in `relationship_types`
+is reported and skipped, never overwritten) and it refuses when the
+registry cannot be read, so a write that lands nowhere never reports
+success.
 
 The abort threshold is the `MAX_FAILED_CHUNK_RATIO = 0.5` constant
 (`:169`), not a flag; aborted runs still save a preview marked

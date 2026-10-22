@@ -136,10 +136,8 @@ class TestStampWriterReader(_CheckpointDirCase):
         self.assertEqual(raw["chapters_present"], 3)
         self.assertTrue(raw["complete"])
         self.assertIn("written_at", raw)
-        models = pp._history_models()
-        self.assertEqual(raw["extractor"],
-                         {"backend": models["llm_backend"],
-                          "model": models["llm_model"]})
+        self.assertEqual(raw["extractor"], pp._extractor_identity())
+        self.assertEqual(raw["run_models"], pp._history_models())
         stamp = pp._load_extraction_stamp("book")
         self.assertIsNotNone(stamp)
         self.assertTrue(stamp["complete"])
@@ -358,7 +356,7 @@ class TestStampSeams(unittest.TestCase):
         stamp = pp._load_extraction_stamp(self.book_key)
         self.assertIsNotNone(stamp)
         self.assertTrue(stamp["complete"])
-        self.assertEqual(stamp["extractor"]["backend"], "ollama")
+        self.assertEqual(stamp["extractor"]["llm"], "ollama")
         self.assertEqual(stamp["total_chapters"], 3)
         self.assertEqual(stamp["payload_chapters"], 3)
         self.assertTrue(pp._extraction_complete(self.book_key))

@@ -1266,7 +1266,22 @@ class TestRemainingFixes(unittest.TestCase):
             if summaries and idx in summaries:
                 b["summary"] = summaries[idx]
             bs[idx] = b
-        chs = [_ch(i, f"Ch{i}") for i in sorted(quotes_by_chapter)]
+        # The chapter text carries the quotes and their speakers: a
+        # quote now ships only when the chapter places its speaker
+        # next to the line, so a fixture whose chapter text contains
+        # neither is testing the grounding rule, not the rule it
+        # means to test.
+        chs = []
+        for i in sorted(quotes_by_chapter):
+            _qs = quotes_by_chapter[i]
+            # Speaker and line adjacent, as they are in a book: the
+            # grounding window is ~300 characters, so a speaker list
+            # parked at the head of the chapter would ground only the
+            # first few lines.
+            _text = " ".join(
+                '%s said, "%s"' % (q.get("speaker") or "", q.get("text") or "")
+                for q in _qs) + " " + "x " * 50
+            chs.append(_ch(i, f"Ch{i}", text=_text))
         return pp.v2_reduce({}, bs, {}, chs)["quotes"]
 
     def test_quote_length_filter(self):
@@ -2913,14 +2928,16 @@ class TestRelationshipDropThreshold(unittest.TestCase):
         self.assertEqual(red["relationships"][0]["type"], "other")
         self.assertEqual(red["dropped_relationships"], [])
 
-    def test_preview_does_not_drop(self):
+    def test_preview_records_the_write_decision(self):
         red = self._run(0.15, preview=True)
-        # Audit only: relationship kept, marked would_drop.
-        self.assertEqual(len(red["relationships"]), 1)
-        self.assertEqual(red["relationships"][0]["type"], "spouse")
-        self.assertEqual(red["relationships"][0]["validation_note"],
-                         "would_drop")
-        self.assertEqual(red["dropped_relationships"], [])
+        # Preview mirrors write (2026-10-22): a claim the write path
+        # deletes leaves the shipped row set in both modes, and stays
+        # visible in the audit list under a mode-naming note.
+        self.assertEqual(red["relationships"], [])
+        self.assertEqual(len(red["dropped_relationships"]), 1)
+        audit = red["dropped_relationships"][0]
+        self.assertEqual(audit["type"], "spouse")
+        self.assertEqual(audit["validation_note"], "would_drop")
 
     def test_dropped_in_result_dict(self):
         red = self._run(0.10)

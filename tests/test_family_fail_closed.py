@@ -164,24 +164,23 @@ class TestFamilyFailClosed(unittest.TestCase):
         self.assertNotIn("validation_note", rel)
         self.assertEqual(red["dropped_relationships"], [])
 
-    def test_evidenceless_family_preview_records_without_dropping(self):
-        # Preview mode records but changes nothing (the standing
-        # preview contract): the claim stays in relationships with
-        # its original type and the no_evidence note; the drop lands
-        # when the same input runs in write mode (pinned above).
+    def test_evidenceless_family_preview_mirrors_write(self):
+        # Preview mirrors the write decision (2026-10-22): an
+        # evidence-less family winner is not a shipped row in either
+        # mode — it lands in the audit list with its no_evidence note.
+        # (Before that change preview kept it as a shipped row, so a
+        # preview could advertise a claim the write path deletes.)
         chs = _chs("x " * 200, "y " * 200)
         chapter_as = _chapter_a([{
             "from": "Alice", "to": "Bob", "type": "spouse",
             "evidence": ""}])
         red = pp.v2_reduce(chapter_as, {}, {}, chs, preview=True)
         self.assertEqual(self.validator.calls, [])
-        self.assertEqual(len(red["relationships"]), 1)
-        rel = red["relationships"][0]
-        self.assertEqual(rel["type"], "spouse")
-        self.assertEqual(rel["validation_note"], "no_evidence")
-        self.assertFalse(any(
-            d.get("validation_note") == "no_evidence"
-            for d in red["dropped_relationships"]))
+        self.assertEqual(red["relationships"], [])
+        audit = [d for d in red["dropped_relationships"]
+                 if d.get("validation_note") == "no_evidence"]
+        self.assertEqual(len(audit), 1, red["dropped_relationships"])
+        self.assertEqual(audit[0]["type"], "spouse")
 
 
 if __name__ == "__main__":
