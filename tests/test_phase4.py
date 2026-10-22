@@ -3075,7 +3075,7 @@ class TestSeriesDetection(unittest.TestCase):
                                        "9781615871100", 2.0, chars)
             # Path format: series/{normalized}/roster.json
             p = ln._named_series_path(key)
-            self.assertTrue(str(p).endswith("series/daemon/roster.json"))
+            self.assertTrue(p.as_posix().endswith("series/daemon/roster.json"))
             self.assertTrue(p.exists())
             hints = ln.load_series_name_hints(key)
             self.assertEqual(hints.get("loki"), "brian gragg")

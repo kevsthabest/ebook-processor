@@ -378,6 +378,110 @@ class TestRunnerUpRevival(unittest.TestCase):
         # artefact record, not a validation outcome).
         self.assertEqual(len(red["pair_losers"]), 3)
 
+    def test_revival_prefers_runner_up_naming_both_endpoints(self):
+        # When two losing candidates share a confidence band, the
+        # runner-up whose evidence names both endpoints is chosen
+        # over one whose quote names neither.
+        pp._DECISION_VALIDATOR = _MapValidator({"child": 0.1, "ally": 0.85})
+        chs = _chs(_FILLER, _FILLER)
+        roster = {
+            "brian gragg": {"name": "Brian Gragg", "aliases": set(),
+                            "appearances": 5, "chapters": {1, 2},
+                            "roles": pp.Counter({"supporting": 5}),
+                            "descriptions": []},
+            "matthew a. sobol": {"name": "Matthew A. Sobol",
+                                 "aliases": {"Matthew Sobol", "Sobol"},
+                                 "appearances": 5, "chapters": {1, 2},
+                                 "roles": pp.Counter({"antagonist": 5}),
+                                 "descriptions": []},
+        }
+        chapter_as = _chapter_as({
+            1: [{"from": "Brian Gragg", "to": "Matthew A. Sobol",
+                 "type": "child",
+                 "evidence": "Brian Gragg thought of Sobol."},
+                {"from": "Brian Gragg", "to": "Matthew A. Sobol",
+                 "type": "mentor",
+                 "evidence": "He had just received high praise from his new mentor."}],
+            2: [{"from": "Brian Gragg", "to": "Matthew A. Sobol",
+                 "type": "ally",
+                 "evidence": "Gragg would be there at Sobol's side for the dawn of a new age."}],
+        })
+        red = pp.v2_reduce(chapter_as, {}, roster, chs, preview=False)
+        rels = _pair_rels(red, "Brian Gragg", "Matthew A. Sobol")
+        self.assertEqual(len(rels), 1)
+        self.assertEqual(rels[0]["type"], "ally")
+        self.assertEqual(rels[0]["validation_note"], "kept")
+        self.assertTrue(rels[0]["revived_runner_up"])
+
+    def test_revived_other_discovered_and_validated(self):
+        class _DiscValidator(_MapValidator):
+            def ask_discovery(self, a, b, sentences):
+                return "colleague", {"p": 0.87, "direction": "sym"}
+
+        pp._DECISION_VALIDATOR = _DiscValidator(
+            {"enemy": 0.25, "colleague": 0.88})
+        chs = _chs(_FILLER)
+        roster = {
+            "cheryl lanthrop": {"name": "Cheryl Lanthrop",
+                                "aliases": {"Lanthrop"},
+                                "appearances": 4, "chapters": {1},
+                                "roles": pp.Counter({"supporting": 4}),
+                                "descriptions": []},
+            "matthew a. sobol": {"name": "Matthew A. Sobol",
+                                 "aliases": {"Matthew Sobol", "Sobol"},
+                                 "appearances": 4, "chapters": {1},
+                                 "roles": pp.Counter({"antagonist": 4}),
+                                 "descriptions": []},
+        }
+        chapter_as = _chapter_as({
+            1: [{"from": "Cheryl Lanthrop", "to": "Matthew A. Sobol",
+                 "type": "enemy",
+                 "evidence": "Lanthrop feared Matthew Sobol."},
+                {"from": "Cheryl Lanthrop", "to": "Matthew A. Sobol",
+                 "type": "other",
+                 "evidence": "Tax records show Lanthrop was sales director for a string of MRI labs owned by Matthew Sobol."}],
+        })
+        red = pp.v2_reduce(chapter_as, {}, roster, chs, preview=True)
+        rels = _pair_rels(red, "Cheryl Lanthrop", "Matthew A. Sobol")
+        self.assertEqual(len(rels), 1)
+        self.assertEqual(rels[0]["type"], "colleague")
+        self.assertEqual(rels[0]["claimed_type"], "other")
+        self.assertEqual(rels[0]["validation_note"], "kept")
+        self.assertTrue(rels[0]["revived_runner_up"])
+
+    def test_revived_other_without_pair_evidence_dropped_in_preview(self):
+        class _DiscValidator(_MapValidator):
+            def ask_discovery(self, a, b, sentences):
+                raise AssertionError("should not be called without pair evidence")
+
+        pp._DECISION_VALIDATOR = _DiscValidator({"enemy": 0.1})
+        chs = _chs(_FILLER)
+        roster = {
+            "roy merritt": {"name": "Roy Merritt", "aliases": set(),
+                            "appearances": 4, "chapters": {1},
+                            "roles": pp.Counter({"supporting": 4}),
+                            "descriptions": []},
+            "jon ross": {"name": "Jon Ross", "aliases": set(),
+                         "appearances": 4, "chapters": {1},
+                         "roles": pp.Counter({"protagonist": 4}),
+                         "descriptions": []},
+        }
+        chapter_as = _chapter_as({
+            1: [{"from": "Roy Merritt", "to": "Jon Ross",
+                 "type": "enemy",
+                 "evidence": "Roy Merritt chased Jon Ross."},
+                {"from": "Roy Merritt", "to": "Jon Ross",
+                 "type": "other",
+                 "evidence": "I came here on an H1-B visa."}],
+        })
+        red = pp.v2_reduce(chapter_as, {}, roster, chs, preview=True)
+        self.assertEqual(_pair_rels(red, "Roy Merritt", "Jon Ross"), [])
+        other_drops = [d for d in red["dropped_relationships"]
+                       if d.get("type") == "other"]
+        self.assertEqual(len(other_drops), 1)
+        self.assertEqual(other_drops[0]["validation_note"], "would_drop")
+        self.assertTrue(other_drops[0]["revived_runner_up"])
+
 
 if __name__ == "__main__":
     unittest.main()

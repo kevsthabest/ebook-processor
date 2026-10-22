@@ -642,6 +642,8 @@ if "hang" in Path(fname).name:
         sys.exit(3)
 
     signal.signal(signal.SIGINT, _on_sigint)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _on_sigint)
     while True:
         time.sleep(0.05)
 

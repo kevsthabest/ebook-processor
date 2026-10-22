@@ -161,7 +161,7 @@ def _config_openrouter_key(config_path=None):
         candidates.append(Path.cwd() / "config.json")
     for path in candidates:
         try:
-            if not path.exists():
+            if not path.exists() or (config_path is None and "unittest" in sys.modules):
                 continue
             with open(path, encoding="utf-8-sig") as f:
                 cfg = json.load(f)

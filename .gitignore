@@ -10,3 +10,13 @@ import/failed/
 
 # ScaleDown lab outputs
 scaledown-lab-out/
+
+# Local caches, book imports, and scratch drills
+import/
+portal-cache/
+trope-vectors.json
+.suite-full.txt
+drill*
+s13-*
+merge-labels.json
+probe_kv_cache.py

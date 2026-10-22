@@ -63,6 +63,7 @@ import os
 import posixpath
 import re
 import shutil
+import signal
 import sqlite3
 import struct
 import sys
@@ -84,6 +85,14 @@ from urllib.parse import quote, unquote
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+# Windows delivers CTRL_BREAK_EVENT (SIGBREAK) from portal Stop; map it to
+# KeyboardInterrupt so the chapter loop checkpoints and exits cleanly.
+if hasattr(signal, "SIGBREAK"):
+    try:
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
     except Exception:
         pass
 
@@ -218,7 +227,7 @@ _BOOL_CONFIG_KEYS = {"debug", "dedupe", "llm_enable_thinking", "llm_json_schema"
 
 def load_config():
     cfg = DEFAULT_CONFIG.copy()
-    if CONFIG_PATH.exists():
+    if CONFIG_PATH.exists() and "unittest" not in sys.modules:
         # utf-8-sig tolerates the BOM that Windows Notepad adds
         with open(CONFIG_PATH, encoding="utf-8-sig") as f:
             cfg.update(json.load(f))
@@ -5454,8 +5463,15 @@ class _SubstrateHandle:
     def _connect(cls, path):
         conn = sqlite3.connect(str(path), check_same_thread=False,
                                timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
         return conn
 
     @classmethod
@@ -5741,12 +5757,14 @@ def _dump_hash_conn(conn, tables=None):
 
 
 _STATE_DBS = {}
+_ALL_STATE_DBS = []
 _STATE_DBS_LOCK = threading.Lock()
 
 
 def _register_state_db(db):
     with _STATE_DBS_LOCK:
         _STATE_DBS[str(db.path.parent.resolve())] = db
+        _ALL_STATE_DBS.append(db)
 
 
 def _state_db_for(learn_dir):
@@ -5768,8 +5786,9 @@ def _state_db_for(learn_dir):
 def _close_state_dbs():
     """Close every registered substrate (tests, process hygiene)."""
     with _STATE_DBS_LOCK:
-        dbs = list(_STATE_DBS.values())
+        dbs = list(_STATE_DBS.values()) + list(_ALL_STATE_DBS)
         _STATE_DBS.clear()
+        _ALL_STATE_DBS.clear()
     for db in dbs:
         db.close()
 
@@ -5954,7 +5973,14 @@ class CorpusDB(_SubstrateHandle):
     @classmethod
     def _connect(cls, path):
         conn = super()._connect(path)
-        conn.execute(f"PRAGMA busy_timeout={_CORPUS_BUSY_TIMEOUT_MS}")
+        try:
+            conn.execute(f"PRAGMA busy_timeout={_CORPUS_BUSY_TIMEOUT_MS}")
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
         return conn
 
     @classmethod
@@ -6081,12 +6107,15 @@ class CorpusDB(_SubstrateHandle):
 
 
 _CORPUS_DBS = {}
+_ALL_CORPUS_DBS = []
 _CORPUS_DBS_LOCK = threading.Lock()
 
 
 def _register_corpus_db(db):
     with _CORPUS_DBS_LOCK:
-        _CORPUS_DBS[str(db.path.parent.resolve())] = db
+        if not getattr(db, "_readonly", False):
+            _CORPUS_DBS[str(db.path.parent.resolve())] = db
+        _ALL_CORPUS_DBS.append(db)
 
 
 def _corpus_db_for(learn_dir, mode="processor"):
@@ -6113,8 +6142,9 @@ def _corpus_db_for(learn_dir, mode="processor"):
 def _close_corpus_dbs():
     """Close every registered corpus handle (tests, hygiene)."""
     with _CORPUS_DBS_LOCK:
-        dbs = list(_CORPUS_DBS.values())
+        dbs = list(_CORPUS_DBS.values()) + list(_ALL_CORPUS_DBS)
         _CORPUS_DBS.clear()
+        _ALL_CORPUS_DBS.clear()
     for db in dbs:
         db.close()
 
@@ -19981,8 +20011,8 @@ def _load_analysis_artefact(path):
     if not mp.is_file() or not ap.is_file():
         raise ValueError(f"no analysis artefact at {p}")
     try:
-        manifest = json.load(open(mp, encoding="utf-8"))
-        data = json.load(open(ap, encoding="utf-8"))
+        manifest = json.loads(mp.read_text(encoding="utf-8"))
+        data = json.loads(ap.read_text(encoding="utf-8"))
     except Exception as e:
         raise ValueError(f"unreadable analysis artefact: {e}")
     if not isinstance(manifest, dict) or not isinstance(data, dict):
@@ -19993,6 +20023,14 @@ def _load_analysis_artefact(path):
         raise ValueError(
             f"analysis artefact format {manifest.get('format_version')} "
             f"is not the current format {_ARTEFACT_FORMAT_VERSION}")
+    if (manifest.get("extraction_fingerprint")
+            and manifest.get("fingerprint")
+            and manifest.get("extraction_fingerprint")
+            != manifest.get("fingerprint")):
+        raise ValueError(
+            f"analysis artefact fingerprint mismatch "
+            f"({manifest.get('fingerprint')} vs extraction "
+            f"{manifest.get('extraction_fingerprint')}): {p}")
     return manifest, data, p
 
 
@@ -20013,13 +20051,890 @@ def _merge_key(*parts):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
-def cmd_stage_merge_plan(paths, apply=False):
-    """--stage merge: build a cross-book plan from analysis artefacts.
+def _edge_direction(rtype):
+    """Map relationship type to character_relationships.direction (spec §4.2)."""
+    entry = _REL_VOCAB["by_id"].get(str(rtype or "").strip().lower())
+    if entry and entry.get("direction") == "directed":
+        return "a_to_b"
+    return "mutual"
 
-    Plan-only in this build: --apply refuses until the app migration
-    is present. The plan is the reviewable product; link statuses go
-    through _link_status, so auto-approve is observable before it is
-    ever allowed to write.
+
+def _edge_confidence(r):
+    """Extract numeric confidence for a relationship edge (spec §4.2)."""
+    vp = r.get("validation_p")
+    if isinstance(vp, (int, float)) and not isinstance(vp, bool):
+        return round(float(vp), 4)
+    conf = r.get("confidence")
+    if isinstance(conf, (int, float)) and not isinstance(conf, bool):
+        return round(float(conf), 4)
+    if isinstance(conf, str):
+        return {"high": 0.9, "medium": 0.7, "low": 0.5}.get(
+            conf.strip().lower())
+    return None
+
+
+def _wiki_merge_schema_preflight():
+    """Verify the additive wiki-ingestion migration columns exist on Supabase.
+
+    Probes each table with a 1-row SELECT naming the migration columns
+    (spec §4). Returns (True, None) when all probes succeed, or
+    (False, table_name) when any column is missing or unreadable.
+    """
+    probes = (
+        ("book_characters",
+         "?select=id,pipeline_key,name_norm,last_appearance_chapter,"
+         "source_run,analysis_version&limit=1"),
+        ("character_relationships",
+         "?select=id,pipeline_key,evidence,evidence_source,"
+         "validation_state,claimed_type,confidence,source_run&limit=1"),
+        ("character_links",
+         "?select=id,status,link_source,confidence,evidence,source_run"
+         "&limit=1"),
+        ("works",
+         "?select=id,series_key,series_position&limit=1"),
+    )
+    for table, params in probes:
+        if sb(table, params=params) is None:
+            return False, table
+    return True, None
+
+
+def _apply_merge_work_claims(wid, data, merge_run_key):
+    """Idempotently publish tropes, proposals, triggers, quotes, and book_meta
+    for one work during --stage merge --apply, stamping source_run and
+    pipeline_key while preserving confirmed/rejected/contributor rows.
+    """
+    errors = 0
+    wrote = {"tropes": 0, "triggers": 0, "proposals": 0, "quotes": 0}
+    preserved_rej = 0
+    preserved_conf = 0
+    _models = {"ollama": CONFIG["ollama_model"],
+               "openrouter": CONFIG["openrouter_model"],
+               "openai": CONFIG.get("openai_model", ""),
+               "cohere": CONFIG.get("cohere_model", "")}
+    model = _models.get(CONFIG["llm"], "")
+    _cat = dict(data.get("trope_catalog_map", {}) or {})
+    unmatched = []
+
+    # 1. Tropes -> book_trope_claims
+    _tstate = _sb_fetch_all(
+        "book_trope_claims",
+        f"?work_id=eq.{quote(str(wid), safe='')}"
+        f"&select=id,trope_id,status,source_type,pipeline_key")
+    if _tstate is None:
+        errors += 1
+    else:
+        _preserved, _rejected, _ndel = _partition_claims(
+            "book_trope_claims", _tstate)
+        preserved_rej += len(_rejected)
+        preserved_conf += sum(1 for r in _tstate
+                              if (r.get("status") or "") == "confirmed")
+        rows, unmatched, _lookup_failed = _build_trope_rows(
+            wid, data, _cat, None, model, _preserved)
+        if _lookup_failed:
+            errors += len(_lookup_failed)
+        _existing_by_tid = {}
+        for r in _tstate:
+            if not _row_is_preserved("book_trope_claims", r):
+                _existing_by_tid[str(r.get("trope_id") or "").lower()] = r
+        _kept_ids = set()
+        for row in rows:
+            pkey = _merge_key(wid, "trope", row["trope_id"])
+            row["pipeline_key"] = pkey
+            row["source_run"] = merge_run_key
+            row["validation_state"] = (
+                ((row.get("evidence") or {}).get("retrieval") or {}).get(
+                    "support") or "validated")
+            tid_key = str(row["trope_id"]).lower()
+            ex = _existing_by_tid.get(tid_key)
+            if ex and ex.get("id") is not None:
+                _kept_ids.add(ex["id"])
+                if sb("book_trope_claims", method="PATCH",
+                      params=f"?id=eq.{ex['id']}", data=row) is None:
+                    errors += 1
+                else:
+                    wrote["tropes"] += 1
+            else:
+                if sb("book_trope_claims", method="POST",
+                      data=[row]) is None:
+                    errors += 1
+                else:
+                    wrote["tropes"] += 1
+        for ex in _existing_by_tid.values():
+            if ex.get("id") is not None and ex["id"] not in _kept_ids:
+                if sb("book_trope_claims", method="DELETE",
+                      params=f"?id=eq.{ex['id']}") is None:
+                    errors += 1
+
+    # 2. Unmapped tropes -> trope_proposals
+    _all_keys, _own = _proposal_state(data)
+    if _all_keys is None:
+        errors += 1
+    else:
+        _prop_key, _prop_isbn_keyed = _proposal_book_key(data)
+        _own_pending_rows = {
+            r["name_key"]: r for r in _own
+            if (r.get("status") or "pending") == "pending"
+            and r.get("name_key")
+        }
+        _own_pending = set(_own_pending_rows)
+        preserved_rej += sum(1 for r in _own
+                             if (r.get("status") or "") == "rejected")
+        prop_rows = _build_proposal_rows(
+            data, unmatched,
+            _all_keys if not _prop_isbn_keyed
+            else _all_keys - _own_pending)
+        _kept_prop_ids = set()
+        for row in prop_rows:
+            ex = _own_pending_rows.get(row["name_key"])
+            if ex and ex.get("id") is not None:
+                _kept_prop_ids.add(ex["id"])
+                if sb("trope_proposals", method="PATCH",
+                      params=f"?id=eq.{ex['id']}", data=row) is None:
+                    errors += 1
+                else:
+                    wrote["proposals"] += 1
+            else:
+                if sb("trope_proposals", method="POST",
+                      data=[row]) is None:
+                    errors += 1
+                else:
+                    wrote["proposals"] += 1
+        if _prop_isbn_keyed:
+            for ex in _own_pending_rows.values():
+                if (ex.get("id") is not None
+                        and ex["id"] not in _kept_prop_ids):
+                    if sb("trope_proposals", method="DELETE",
+                          params=f"?id=eq.{ex['id']}") is None:
+                        errors += 1
+
+    # 3. Triggers -> book_trigger_claims
+    _gstate = _sb_fetch_all(
+        "book_trigger_claims",
+        f"?work_id=eq.{quote(str(wid), safe='')}"
+        f"&select=id,warning,status,source_type,pipeline_key")
+    if _gstate is None:
+        errors += 1
+    else:
+        _preserved, _rejected, _ndel = _partition_claims(
+            "book_trigger_claims", _gstate)
+        preserved_rej += len(_rejected)
+        preserved_conf += sum(1 for r in _gstate
+                              if (r.get("status") or "") == "confirmed")
+        rows = _build_trigger_rows(wid, data, model, _preserved)
+        _existing_by_warn = {}
+        for r in _gstate:
+            if not _row_is_preserved("book_trigger_claims", r):
+                _existing_by_warn[str(r.get("warning") or "").lower()] = r
+        _kept_ids = set()
+        for row in rows:
+            wkey = str(row["warning"]).lower()
+            pkey = _merge_key(wid, "trigger", wkey)
+            row["pipeline_key"] = pkey
+            row["source_run"] = merge_run_key
+            row["validation_state"] = (
+                ((row.get("evidence") or {}).get("retrieval") or {}).get(
+                    "support")
+                or ("validated" if (row.get("confidence") or 0) > 0
+                    else "needs_evidence"))
+            ex = _existing_by_warn.get(wkey)
+            if ex and ex.get("id") is not None:
+                _kept_ids.add(ex["id"])
+                if sb("book_trigger_claims", method="PATCH",
+                      params=f"?id=eq.{ex['id']}", data=row) is None:
+                    errors += 1
+                else:
+                    wrote["triggers"] += 1
+            else:
+                if sb("book_trigger_claims", method="POST",
+                      data=[row]) is None:
+                    errors += 1
+                else:
+                    wrote["triggers"] += 1
+        for ex in _existing_by_warn.values():
+            if ex.get("id") is not None and ex["id"] not in _kept_ids:
+                if sb("book_trigger_claims", method="DELETE",
+                      params=f"?id=eq.{ex['id']}") is None:
+                    errors += 1
+
+    # 4. Quotes -> book_quotes
+    _qstate = _sb_fetch_all(
+        "book_quotes",
+        f"?work_id=eq.{quote(str(wid), safe='')}"
+        f"&select=id,quote,source_type,pipeline_key")
+    if _qstate is None:
+        errors += 1
+    else:
+        _preserved, _rejected, _ndel = _partition_claims(
+            "book_quotes", _qstate)
+        _existing_by_q = {}
+        for r in _qstate:
+            if not _row_is_preserved("book_quotes", r):
+                _existing_by_q[(r.get("quote") or "")[:100]] = r
+        qrows, seen_q = [], set(_preserved)
+        for q in _shippable_quotes(data.get("quotes", []))[:5]:
+            qtext = q.get("text", "") if isinstance(q, dict) else str(q)
+            qpref = qtext[:100]
+            if not qtext or qpref in seen_q:
+                continue
+            seen_q.add(qpref)
+            _spk = q.get("speaker") if isinstance(q, dict) else None
+            qrows.append({
+                "work_id": wid,
+                "quote": qtext,
+                "speaker_name": _spk,
+                "source_type": "pipeline",
+                "confidence": 0.7,
+                "chapter_index": (q.get("chapter_index")
+                                  if isinstance(q, dict) else None),
+                "chapter_label": (q.get("chapter")
+                                  if isinstance(q, dict) else None),
+                "spoiler": (bool(q.get("spoiler"))
+                            if isinstance(q, dict) else False),
+                "verified": (bool(q.get("evidence_verified", True))
+                             if isinstance(q, dict) else True),
+                "pipeline_key": _merge_key(wid, "quote", qpref),
+                "source_run": merge_run_key,
+            })
+        _kept_ids = set()
+        for row in qrows:
+            qpref = row["quote"][:100]
+            ex = _existing_by_q.get(qpref)
+            if ex and ex.get("id") is not None:
+                _kept_ids.add(ex["id"])
+                if sb("book_quotes", method="PATCH",
+                      params=f"?id=eq.{ex['id']}", data=row) is None:
+                    errors += 1
+                else:
+                    wrote["quotes"] += 1
+            else:
+                if sb("book_quotes", method="POST",
+                      data=[row]) is None:
+                    errors += 1
+                else:
+                    wrote["quotes"] += 1
+        for ex in _existing_by_q.values():
+            if ex.get("id") is not None and ex["id"] not in _kept_ids:
+                if sb("book_quotes", method="DELETE",
+                      params=f"?id=eq.{ex['id']}") is None:
+                    errors += 1
+
+    # 5. POVs, quotes, series -> book_meta.data (merge with existing)
+    meta_updates = {}
+    if data.get("povs"):
+        meta_updates["povs"] = data["povs"]
+    if data.get("series_name"):
+        meta_updates["series_name"] = data["series_name"]
+    if data.get("series_position") is not None:
+        meta_updates["series_position"] = data["series_position"]
+    if data.get("series_source"):
+        meta_updates["series_source"] = data["series_source"]
+    quotes = [{"text": q["text"], "chapter": q.get("chapter", "")}
+              for q in _shippable_quotes(data.get("quotes", []))
+              if isinstance(q, dict) and q.get("text")]
+    if quotes:
+        meta_updates["notable_quotes"] = quotes[:20]
+    isbn = data.get("isbn")
+    if meta_updates and isbn:
+        existing_meta = sb("book_meta",
+                           params=f"?isbn=eq.{isbn}&select=data")
+        if existing_meta is None:
+            errors += 1
+        else:
+            _stored = existing_meta[0].get("data") if existing_meta else None
+            if _stored and not isinstance(_stored, dict):
+                errors += 1
+            else:
+                merged = dict(_stored) if _stored else {}
+                merged.update(meta_updates)
+                if existing_meta:
+                    if sb("book_meta", method="PATCH",
+                          params=f"?isbn=eq.{isbn}",
+                          data={"data": merged}) is None:
+                        errors += 1
+                else:
+                    if sb("book_meta", method="POST",
+                          params="?on_conflict=isbn",
+                          data={"isbn": isbn, "data": merged},
+                          prefer="resolution=merge-duplicates") is None:
+                        errors += 1
+
+    return wrote, preserved_conf, preserved_rej, errors
+
+
+def _apply_merge_plan(loaded, plan, plan_path, merge_run_key):
+    """Execute a merge plan against Supabase (spec §3.3 Phase 4, §4).
+
+    Writes works metadata, full-cast book_characters, reviewable
+    character_relationships edges, cross-book character_links, and
+    trope/trigger/quote claims. Preserves confirmed/rejected human
+    curation and writes receipt.json beside plan.json.
+    """
+    if not (CONFIG.get("supabase_url") and CONFIG.get("supabase_key")):
+        print("  --apply refused: supabase_url and supabase_key must "
+              "be set in config.json; nothing was written to Supabase.")
+        return 1
+    ok_schema, failed_table = _wiki_merge_schema_preflight()
+    if not ok_schema:
+        print(f"  --apply refused: the wiki-ingestion migration is not "
+              f"applied to Supabase ({failed_table} is missing required "
+              f"columns). Apply docs/processor-wiki-ingestion-migration-"
+              f"DRAFT.sql first; nothing was written to Supabase.")
+        return 1
+
+    totals = {
+        "characters": 0, "edges": 0, "links": 0,
+        "tropes": 0, "triggers": 0, "quotes": 0, "proposals": 0,
+        "preserved_confirmed": 0, "preserved_rejected": 0, "errors": 0,
+    }
+    work_receipts = []
+    skipped_rejected_edges = []
+    apply_warnings = []
+    char_id_by_pkey = {}
+
+    chars_by_work = {}
+    for pc in plan.get("characters") or []:
+        chars_by_work.setdefault(pc["work_ref"], []).append(pc)
+    edges_by_work = {}
+    for pe in plan.get("edges") or []:
+        edges_by_work.setdefault(pe["work_ref"], []).append(pe)
+
+    for manifest, data, _p in loaded:
+        work_ref = (manifest.get("work_id")
+                    or data.get("work_id")
+                    or manifest.get("book_key")
+                    or manifest.get("fingerprint"))
+        title = data.get("title") or manifest.get("title") or ""
+        author = data.get("author") or manifest.get("author") or ""
+        _breaker = (data.get("validator_circuit_breaker") or {})
+        if _breaker.get("tripped"):
+            msg = (f"{title or work_ref}: validator circuit breaker "
+                   f"tripped; skipped")
+            apply_warnings.append(msg)
+            totals["errors"] += 1
+            continue
+
+        wid = manifest.get("work_id") or data.get("work_id")
+        if not wid:
+            identifiers = {}
+            if data.get("isbn") or manifest.get("isbn"):
+                identifiers["isbn"] = (data.get("isbn")
+                                       or manifest.get("isbn"))
+            if data.get("asin"):
+                identifiers["asin"] = data.get("asin")
+            wid, _how = resolve_work(title, author, identifiers, False,
+                                     create=True)
+        if not wid:
+            apply_warnings.append(
+                f"{title or work_ref}: could not resolve work_id")
+            totals["errors"] += 1
+            continue
+
+        # 1. Update works series & spice fields (spec §4.4).
+        work_patch = {}
+        if data.get("spice_level") is not None:
+            work_patch["spice_detected"] = data["spice_level"]
+        author_key = norm_name(author)
+        series_name = (manifest.get("series_name")
+                       or data.get("series_name") or "")
+        series_key_norm = norm_name(series_name)
+        if series_key_norm:
+            work_patch["series_key"] = (
+                f"{author_key}:{series_key_norm}"
+                if author_key else series_key_norm)
+        spos = (manifest.get("series_position")
+                if manifest.get("series_position") is not None
+                else data.get("series_position"))
+        if spos is not None:
+            work_patch["series_position"] = spos
+        if work_patch:
+            if sb("works", method="PATCH", params=f"?id=eq.{wid}",
+                  data=work_patch) is None:
+                totals["errors"] += 1
+
+        # 2. Publish tropes, proposals, triggers, quotes, book_meta.
+        w_claims, w_conf, w_rej, w_errs = _apply_merge_work_claims(
+            wid, data, merge_run_key)
+        for k, v in w_claims.items():
+            totals[k] += v
+        totals["preserved_confirmed"] += w_conf
+        totals["preserved_rejected"] += w_rej
+        totals["errors"] += w_errs
+
+        # 3. Publish full-cast book_characters (spec §4.1, D4, D7).
+        # Build embedded rel_map over the planned edges for this work so
+        # legacy JSONB readers see the same relationships.
+        rel_map = {}
+        for pe in edges_by_work.get(work_ref, []):
+            rel_map.setdefault(_char_name_key(pe.get("from")), []).append({
+                "to": pe.get("to"),
+                "type": pe["type"],
+                "claimed_type": pe.get("claimed_type"),
+                "evidence": pe.get("evidence") or "",
+                "evidence_source": pe.get("evidence_source"),
+                "validation_state": pe.get("validation_state"),
+                "source": pe.get("evidence_source") or "extracted",
+            })
+
+        existing_chars = _sb_fetch_all(
+            "book_characters",
+            f"?work_id=eq.{quote(str(wid), safe='')}"
+            f"&select=id,name,name_norm,pipeline_key,status,source_type,"
+            f"character_id,tier,tier_source,appearance,vitality,aliases,"
+            f"first_appearance_chapter,last_appearance_chapter")
+        if existing_chars is None:
+            totals["errors"] += 1
+            continue
+
+        by_pkey = {}
+        by_nkey = {}
+        for r in existing_chars:
+            if r.get("pipeline_key"):
+                by_pkey[r["pipeline_key"]] = r
+            nk = _char_name_key(r.get("name") or r.get("name_norm") or "")
+            if nk and nk not in by_nkey:
+                by_nkey[nk] = r
+
+        work_char_id_by_nkey = {}
+        kept_char_ids = set()
+        w_chars_written = 0
+        for pc in chars_by_work.get(work_ref, []):
+            pkey = pc["pipeline_key"]
+            nkey = _char_name_key(pc["name"])
+            ex = by_pkey.get(pkey) or by_nkey.get(nkey)
+            if ex is not None:
+                ex_id = ex.get("id")
+                if ex_id is not None:
+                    kept_char_ids.add(ex_id)
+                ex_status = ex.get("status") or ""
+                ex_src = ex.get("source_type") or "ai"
+                if ex_status in ("rejected", "merged"):
+                    totals["preserved_rejected"] += 1
+                    continue
+                if ex_status == "confirmed" or ex_src != "ai":
+                    totals["preserved_confirmed"] += 1
+                    if ex_id is not None:
+                        char_id_by_pkey[pkey] = ex_id
+                        work_char_id_by_nkey[nkey] = ex_id
+                    null_patch = {
+                        "pipeline_key": ex.get("pipeline_key") or pkey,
+                        "name_norm": ex.get("name_norm") or pc["name_norm"],
+                        "source_run": merge_run_key,
+                        "analysis_version": PORTABLE_VERSION,
+                    }
+                    if not ex.get("appearance") and pc.get("appearance"):
+                        null_patch["appearance"] = pc["appearance"]
+                    if not ex.get("vitality") and pc.get("vitality"):
+                        null_patch["vitality"] = pc["vitality"]
+                    if not ex.get("aliases") and pc.get("aliases"):
+                        null_patch["aliases"] = pc["aliases"]
+                    if (ex.get("first_appearance_chapter") is None
+                            and pc.get("first_appearance_chapter")
+                            is not None):
+                        null_patch["first_appearance_chapter"] = (
+                            pc["first_appearance_chapter"])
+                    if (ex.get("last_appearance_chapter") is None
+                            and pc.get("last_appearance_chapter")
+                            is not None):
+                        null_patch["last_appearance_chapter"] = (
+                            pc["last_appearance_chapter"])
+                    if ex_id is not None:
+                        if sb("book_characters", method="PATCH",
+                              params=f"?id=eq.{ex_id}",
+                              data=null_patch) is None:
+                            totals["errors"] += 1
+                    continue
+
+                # Candidate AI row: update in place to preserve UUID & FKs.
+                keep_tier = (ex.get("tier_source")
+                             not in (None, "", "pipeline"))
+                patch_row = {
+                    "name": pc["name"],
+                    "name_norm": pc["name_norm"],
+                    "role": pc["role"],
+                    "tier": ex.get("tier") if keep_tier else pc["tier"],
+                    "tier_source": (ex.get("tier_source") if keep_tier
+                                    else pc["tier_source"]),
+                    "description": pc.get("description", ""),
+                    "appearance": pc.get("appearance", ""),
+                    "vitality": pc.get("vitality") or "unknown",
+                    "aliases": pc.get("aliases") or [],
+                    "first_appearance_chapter":
+                        pc.get("first_appearance_chapter"),
+                    "last_appearance_chapter":
+                        pc.get("last_appearance_chapter"),
+                    "relationships": rel_map.get(nkey, []),
+                    "confidence": pc.get("confidence", 0.7),
+                    "pipeline_key": pkey,
+                    "source_run": merge_run_key,
+                    "analysis_version": PORTABLE_VERSION,
+                }
+                if sb("book_characters", method="PATCH",
+                      params=f"?id=eq.{ex_id}", data=patch_row) is None:
+                    totals["errors"] += 1
+                else:
+                    char_id_by_pkey[pkey] = ex_id
+                    work_char_id_by_nkey[nkey] = ex_id
+                    w_chars_written += 1
+            else:
+                new_row = {
+                    "work_id": wid,
+                    "name": pc["name"],
+                    "name_norm": pc["name_norm"],
+                    "role": pc["role"],
+                    "tier": pc["tier"],
+                    "tier_source": pc["tier_source"],
+                    "description": pc.get("description", ""),
+                    "appearance": pc.get("appearance", ""),
+                    "vitality": pc.get("vitality") or "unknown",
+                    "status": "candidate",
+                    "aliases": pc.get("aliases") or [],
+                    "first_appearance_chapter":
+                        pc.get("first_appearance_chapter"),
+                    "last_appearance_chapter":
+                        pc.get("last_appearance_chapter"),
+                    "relationships": rel_map.get(nkey, []),
+                    "source_type": "ai",
+                    "confidence": pc.get("confidence", 0.7),
+                    "pipeline_key": pkey,
+                    "source_run": merge_run_key,
+                    "analysis_version": PORTABLE_VERSION,
+                }
+                inserted = sb("book_characters", method="POST",
+                              data=[new_row])
+                if not inserted or not inserted[0].get("id"):
+                    totals["errors"] += 1
+                else:
+                    new_id = inserted[0]["id"]
+                    kept_char_ids.add(new_id)
+                    char_id_by_pkey[pkey] = new_id
+                    work_char_id_by_nkey[nkey] = new_id
+                    w_chars_written += 1
+
+        # Remove stale processor candidate rows no longer in the work's cast.
+        for r in existing_chars:
+            rid = r.get("id")
+            if (rid is not None
+                    and rid not in kept_char_ids
+                    and not _row_is_preserved("book_characters", r)):
+                if sb("book_characters", method="DELETE",
+                      params=f"?id=eq.{rid}") is None:
+                    totals["errors"] += 1
+
+        totals["characters"] += w_chars_written
+
+        # 4. Publish reviewable character_relationships edges (spec §4.2, D5).
+        all_work_char_ids = sorted(
+            {str(cid) for cid in work_char_id_by_nkey.values() if cid}
+            | {str(r["id"]) for r in existing_chars if r.get("id")})
+        existing_edges = []
+        for i in range(0, len(all_work_char_ids), 40):
+            chunk_ids = all_work_char_ids[i:i + 40]
+            or_cond = ",".join(
+                f"character_a_id.eq.{quote(cid, safe='')}"
+                for cid in chunk_ids)
+            page = _sb_fetch_all(
+                "character_relationships",
+                f"?or=({or_cond})"
+                f"&select=id,character_a_id,character_b_id,"
+                f"relationship_type,direction,review_status,"
+                f"pipeline_key,claimed_type,source_run")
+            if page is None:
+                totals["errors"] += 1
+                existing_edges = None
+                break
+            existing_edges.extend(page)
+        if existing_edges is None:
+            continue
+
+        edge_by_pkey = {}
+        edge_by_tuple = {}
+        curated_by_pair_type = {}
+        for er in existing_edges:
+            if er.get("pipeline_key"):
+                edge_by_pkey[er["pipeline_key"]] = er
+            ca = str(er.get("character_a_id") or "")
+            cb = str(er.get("character_b_id") or "")
+            rt = er.get("relationship_type") or ""
+            dr = er.get("direction") or "mutual"
+            edge_by_tuple[(ca, cb, rt, dr)] = er
+            if dr == "mutual":
+                edge_by_tuple.setdefault((cb, ca, rt, dr), er)
+            rstat = er.get("review_status") or "pending"
+            if rstat in ("rejected", "confirmed"):
+                for t in (rt, er.get("claimed_type")):
+                    if t:
+                        curated_by_pair_type[(ca, cb, t)] = er
+                        if dr == "mutual":
+                            curated_by_pair_type.setdefault(
+                                (cb, ca, t), er)
+
+        kept_edge_ids = set()
+        w_edges_written = 0
+        for pe in edges_by_work.get(work_ref, []):
+            ca_id = work_char_id_by_nkey.get(_char_name_key(pe.get("from")))
+            cb_id = work_char_id_by_nkey.get(_char_name_key(pe.get("to")))
+            if not ca_id or not cb_id or ca_id == cb_id:
+                apply_warnings.append(
+                    f"{title or work_ref}: skipped edge "
+                    f"{pe.get('from')} -> {pe.get('to')} ({pe['type']}): "
+                    f"endpoint character row unavailable")
+                continue
+            ca_s, cb_s = str(ca_id), str(cb_id)
+            rtype = pe["type"]
+            direction = pe.get("direction") or _edge_direction(rtype)
+            epkey = pe["pipeline_key"]
+            ex_edge = (
+                edge_by_pkey.get(epkey)
+                or edge_by_tuple.get((ca_s, cb_s, rtype, direction))
+                or curated_by_pair_type.get((ca_s, cb_s, rtype))
+                or (curated_by_pair_type.get(
+                    (ca_s, cb_s, pe.get("claimed_type")))
+                    if pe.get("claimed_type") else None)
+            )
+            if ex_edge is not None:
+                ex_id = ex_edge.get("id")
+                if ex_id is not None:
+                    kept_edge_ids.add(ex_id)
+                rstat = ex_edge.get("review_status") or "pending"
+                if rstat == "rejected":
+                    totals["preserved_rejected"] += 1
+                    skipped_rejected_edges.append({
+                        "work_id": wid,
+                        "pipeline_key": epkey,
+                        "from": pe.get("from"),
+                        "to": pe.get("to"),
+                        "type": rtype,
+                        "claimed_type": pe.get("claimed_type"),
+                    })
+                    continue
+                if rstat == "confirmed":
+                    totals["preserved_confirmed"] += 1
+                    continue
+                patch_edge = {
+                    "character_a_id": ca_id,
+                    "character_b_id": cb_id,
+                    "relationship_type": rtype,
+                    "direction": direction,
+                    "description": pe.get("evidence") or "",
+                    "evidence": pe.get("evidence"),
+                    "evidence_source": pe.get("evidence_source"),
+                    "validation_state": pe.get("validation_state"),
+                    "claimed_type": pe.get("claimed_type"),
+                    "confidence": pe.get("confidence"),
+                    "pipeline_key": epkey,
+                    "source_run": merge_run_key,
+                }
+                if sb("character_relationships", method="PATCH",
+                      params=f"?id=eq.{ex_id}", data=patch_edge) is None:
+                    totals["errors"] += 1
+                else:
+                    w_edges_written += 1
+            else:
+                new_edge = {
+                    "character_a_id": ca_id,
+                    "character_b_id": cb_id,
+                    "relationship_type": rtype,
+                    "direction": direction,
+                    "description": pe.get("evidence") or "",
+                    "evidence": pe.get("evidence"),
+                    "evidence_source": pe.get("evidence_source"),
+                    "validation_state": pe.get("validation_state"),
+                    "claimed_type": pe.get("claimed_type"),
+                    "confidence": pe.get("confidence"),
+                    "review_status": "pending",
+                    "pipeline_key": epkey,
+                    "source_run": merge_run_key,
+                }
+                ins_edge = sb("character_relationships", method="POST",
+                              data=[new_edge])
+                if not ins_edge:
+                    totals["errors"] += 1
+                else:
+                    if ins_edge[0].get("id") is not None:
+                        kept_edge_ids.add(ins_edge[0]["id"])
+                    w_edges_written += 1
+
+        # Remove stale pending processor edges no longer in the work's plan.
+        for er in existing_edges:
+            er_id = er.get("id")
+            if (er_id is not None
+                    and er_id not in kept_edge_ids
+                    and (er.get("review_status") or "pending") == "pending"
+                    and er.get("source_run")):
+                if sb("character_relationships", method="DELETE",
+                      params=f"?id=eq.{er_id}") is None:
+                    totals["errors"] += 1
+
+        totals["edges"] += w_edges_written
+        work_receipts.append({
+            "work_ref": work_ref,
+            "work_id": wid,
+            "title": title,
+            "characters_written": w_chars_written,
+            "edges_written": w_edges_written,
+            "tropes_written": w_claims["tropes"],
+            "triggers_written": w_claims["triggers"],
+            "quotes_written": w_claims["quotes"],
+            "proposals_written": w_claims["proposals"],
+        })
+
+    # 5. Publish cross-book character_links (spec §4.3, D3).
+    links_by_canon = {}
+    for pl in plan.get("links") or []:
+        links_by_canon.setdefault(pl["canonical_key"], []).append(pl)
+
+    for canon_key, group_links in links_by_canon.items():
+        resolved_members = []
+        for pl in group_links:
+            bc_id = char_id_by_pkey.get(pl["book_character_pipeline_key"])
+            if bc_id is not None:
+                resolved_members.append((bc_id, pl))
+        if len(resolved_members) < 2:
+            continue
+
+        # Check existing character_links for any member in this group.
+        or_cond = ",".join(
+            f"book_character_id.eq.{quote(str(bc_id), safe='')}"
+            for bc_id, _ in resolved_members)
+        existing_links = _sb_fetch_all(
+            "character_links",
+            f"?or=({or_cond})"
+            f"&select=id,book_character_id,character_id,status,"
+            f"link_source,source_run")
+        if existing_links is None:
+            totals["errors"] += 1
+            continue
+
+        # Find or create canonical characters row (never auto-merge
+        # distinct canonical characters rows — spec §3.3 Phase 3, §5.2).
+        linked_char_ids = []
+        for el in existing_links:
+            if (el.get("status") or "confirmed") != "rejected" \
+                    and el.get("character_id") is not None:
+                cid = el["character_id"]
+                if cid not in linked_char_ids:
+                    linked_char_ids.append(cid)
+
+        canon_char_id = None
+        if len(linked_char_ids) > 1:
+            apply_warnings.append(
+                f"canonical group {group_links[0]['canonical_name']} "
+                f"already spans multiple canonical characters "
+                f"{linked_char_ids}; manual merged_into review needed")
+            continue
+        elif len(linked_char_ids) == 1:
+            canon_char_id = linked_char_ids[0]
+        else:
+            name_norm = norm_name(group_links[0]["canonical_name"])
+            matches = sb(
+                "characters",
+                params=f"?name_norm=eq.{quote(name_norm, safe='')}"
+                       f"&select=id,name,name_norm,merged_into")
+            if matches is None:
+                totals["errors"] += 1
+                continue
+            active = [m for m in matches if not m.get("merged_into")]
+            if len(active) == 1:
+                canon_char_id = active[0]["id"]
+            elif len(active) > 1:
+                apply_warnings.append(
+                    f"multiple canonical characters match "
+                    f"name_norm='{name_norm}'; skipped auto-link")
+                continue
+            else:
+                created = sb("characters", method="POST", data=[{
+                    "name": group_links[0]["canonical_name"],
+                    "name_norm": name_norm,
+                    "aliases": [],
+                }])
+                if not created or not created[0].get("id"):
+                    totals["errors"] += 1
+                    continue
+                canon_char_id = created[0]["id"]
+
+        ex_link_by_bc = {
+            str(el.get("book_character_id")): el
+            for el in existing_links
+            if str(el.get("character_id")) == str(canon_char_id)
+        }
+
+        for bc_id, pl in resolved_members:
+            ex_l = ex_link_by_bc.get(str(bc_id))
+            l_status = pl["status"]
+            if ex_l is not None:
+                ex_l_status = ex_l.get("status") or "confirmed"
+                if ex_l_status == "rejected":
+                    totals["preserved_rejected"] += 1
+                    continue
+                if ex_l_status == "confirmed":
+                    totals["preserved_confirmed"] += 1
+                    continue
+                if sb("character_links", method="PATCH",
+                      params=f"?id=eq.{ex_l['id']}",
+                      data={
+                          "status": l_status,
+                          "link_source": pl["link_source"],
+                          "confidence": 1.0,
+                          "evidence": pl["reason"],
+                          "source_run": merge_run_key,
+                      }) is None:
+                    totals["errors"] += 1
+                    continue
+                totals["links"] += 1
+            else:
+                if sb("character_links", method="POST", data=[{
+                    "book_character_id": bc_id,
+                    "character_id": canon_char_id,
+                    "status": l_status,
+                    "link_source": pl["link_source"],
+                    "confidence": 1.0,
+                    "evidence": pl["reason"],
+                    "note": pl["reason"],
+                    "source_run": merge_run_key,
+                }]) is None:
+                    totals["errors"] += 1
+                    continue
+                totals["links"] += 1
+
+            # Mirror onto book_characters pointer columns for UI parity.
+            bc_patch = ({"character_id": canon_char_id}
+                        if l_status == "confirmed"
+                        else {"suggested_character_id": canon_char_id})
+            if sb("book_characters", method="PATCH",
+                  params=f"?id=eq.{bc_id}", data=bc_patch) is None:
+                totals["errors"] += 1
+
+    receipt = {
+        "receipt_version": 1,
+        "created_at": _now_iso(),
+        "processor_version": PORTABLE_VERSION,
+        "source_run": merge_run_key,
+        "plan_path": str(plan_path),
+        "works": work_receipts,
+        "totals": totals,
+        "skipped_rejected_edges": skipped_rejected_edges,
+        "warnings": apply_warnings,
+    }
+    receipt_path = plan_path.parent / "receipt.json"
+    _atomic_json(receipt_path, receipt)
+    print(f"  Applied merge plan ({merge_run_key}): "
+          f"{totals['characters']} characters, {totals['edges']} edges, "
+          f"{totals['links']} links, {totals['tropes']} tropes, "
+          f"{totals['triggers']} triggers, {totals['quotes']} quotes")
+    print(f"  Receipt: {receipt_path}")
+    if totals["errors"]:
+        print(f"  Errors: {totals['errors']}")
+        return 1
+    return 0
+
+
+def cmd_stage_merge_plan(paths, apply=False, source_run=None):
+    """--stage merge: build a cross-book plan from analysis artefacts,
+    and optionally publish it to Supabase when apply=True.
+
+    The plan is the reviewable product; link statuses go through
+    _link_status, so auto-approve is observable before it is written.
     """
     if not paths:
         print("  --stage merge needs at least one --analysis <dir>")
@@ -20038,49 +20953,109 @@ def cmd_stage_merge_plan(paths, apply=False):
     by_work = {}
     for manifest, data, _p in loaded:
         work_ref = (manifest.get("work_id")
+                    or data.get("work_id")
                     or manifest.get("book_key")
                     or manifest.get("fingerprint"))
         by_work[work_ref] = manifest
-        author_key = norm_name(manifest.get("author") or "")
-        series_key = norm_name(manifest.get("series_name") or "")
-        for c in data.get("characters") or []:
+        author_key = norm_name(
+            manifest.get("author") or data.get("author") or "")
+        series_key = norm_name(
+            manifest.get("series_name") or data.get("series_name") or "")
+        suppressed = set(
+            (data.get("roster_persistence") or {}).get(
+                "suppressed_entities") or ())
+
+        # Full cast (spec D4, A6): both principal characters and
+        # minor_characters ship in the plan with their tier stamped.
+        seen_char_pkeys = set()
+        seen_group_pkeys = set()
+        full_cast = (
+            [("principal", c) for c in (data.get("characters") or [])]
+            + [("minor", c) for c in (data.get("minor_characters") or [])]
+        )
+        for default_tier, c in full_cast:
+            if c.get("entity_id") and c["entity_id"] in suppressed:
+                continue
             name = c.get("name") or ""
+            if not name:
+                continue
             entity_key = c.get("entity_id") or norm_name(name)
             pkey = _merge_key(work_ref, entity_key)
+            if pkey in seen_char_pkeys:
+                continue
+            seen_char_pkeys.add(pkey)
             characters.append({
                 "pipeline_key": pkey,
                 "work_ref": work_ref,
                 "name": name,
+                "name_norm": norm_name(name),
                 "role": c.get("role"),
-                "tier": c.get("tier"),
-                "tier_source": c.get("tier_source"),
-                "vitality": c.get("status"),
+                "tier": c.get("tier") or default_tier,
+                "tier_source": c.get("tier_source") or "pipeline",
+                "vitality": (c.get("status") or c.get("vitality")
+                             or "unknown"),
                 "first_appearance_chapter":
                     c.get("first_appearance_chapter"),
+                "last_appearance_chapter":
+                    c.get("last_appearance_chapter"),
                 "aliases": c.get("aliases") or [],
+                "description": c.get("description") or "",
+                "appearance": c.get("appearance") or "",
+                "confidence": c.get("confidence", 0.7),
             })
-            if author_key and series_key:
+            if author_key and series_key and pkey not in seen_group_pkeys:
+                seen_group_pkeys.add(pkey)
                 groups.setdefault(
                     (author_key, series_key, norm_name(name)), []
                 ).append((work_ref, pkey, name))
-        for r in data.get("relationships") or []:
+
+        # Full edges (spec D5, A5, §5.1): relationships plus
+        # minor_sourced_relationships. Evidence-less claims ship as
+        # type='other', claimed_type=<original>,
+        # validation_state='needs_evidence'.
+        seen_edge_pkeys = set()
+        all_rels = (
+            list(data.get("relationships") or [])
+            + list(data.get("minor_sourced_relationships") or [])
+        )
+        for r in all_rels:
             a = r.get("from_id") or norm_name(r.get("from") or "")
             b = r.get("to_id") or norm_name(r.get("to") or "")
-            rtype = r.get("type") or ""
-            if not (a and b and rtype):
+            raw_type = r.get("type") or ""
+            if not (a and b and raw_type):
                 warnings.append(
                     f"{work_ref}: edge without resolvable endpoints")
                 continue
+            ev = r.get("evidence") or ""
+            if not str(ev).strip():
+                rtype = "other"
+                claimed_type = r.get("claimed_type") or raw_type
+                val_state = "needs_evidence"
+                ev_source = r.get("evidence_source")
+            else:
+                rtype = raw_type
+                claimed_type = r.get("claimed_type")
+                val_state = (r.get("validation_state")
+                             or _rel_validation_state(r))
+                ev_source = (r.get("evidence_source")
+                             or r.get("source")
+                             or "extracted")
+            epkey = _merge_key(work_ref, a, b, rtype)
+            if epkey in seen_edge_pkeys:
+                continue
+            seen_edge_pkeys.add(epkey)
             edges.append({
-                "pipeline_key": _merge_key(work_ref, a, b, rtype),
+                "pipeline_key": epkey,
                 "work_ref": work_ref,
                 "from": r.get("from"),
                 "to": r.get("to"),
                 "type": rtype,
-                "claimed_type": r.get("claimed_type"),
+                "direction": _edge_direction(rtype),
+                "claimed_type": claimed_type,
                 "evidence": r.get("evidence"),
-                "evidence_source": r.get("evidence_source"),
-                "validation_state": r.get("validation_state"),
+                "evidence_source": ev_source,
+                "validation_state": val_state,
+                "confidence": _edge_confidence(r),
                 "review_status": "pending",
             })
 
@@ -20100,10 +21075,12 @@ def cmd_stage_merge_plan(paths, apply=False):
                 "reason": "same author + same series + normalized name",
             })
 
+    merge_run_key = source_run or _new_run_key("merge")
     plan = {
         "plan_version": 1,
         "created_at": _now_iso(),
         "processor_version": PORTABLE_VERSION,
+        "source_run": merge_run_key,
         "policy": {
             "wiki_links_auto_confirm": bool(
                 CONFIG.get("wiki_links_auto_confirm")),
@@ -20119,7 +21096,7 @@ def cmd_stage_merge_plan(paths, apply=False):
         "warnings": warnings,
     }
     out = (_artefact_root(_learn().dir) / "merge"
-           / _new_run_key("merge") / "plan.json")
+           / merge_run_key / "plan.json")
     _atomic_json(out, plan)
     _confirmed = sum(1 for l in links if l["status"] == "confirmed")
     print(f"  Merge plan: {len(characters)} characters, {len(edges)} edges, "
@@ -20129,10 +21106,7 @@ def cmd_stage_merge_plan(paths, apply=False):
     if warnings:
         print(f"  Warnings: {len(warnings)}")
     if apply:
-        print("  --apply refused: the wiki-ingestion migration is not "
-              "applied by this build. The plan is the product here; "
-              "nothing was written to Supabase.")
-        return 1
+        return _apply_merge_plan(loaded, plan, out, merge_run_key)
     return 0
 
 
@@ -21107,7 +22081,18 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 _sup_rel["direction_contradiction"] = _contra
             _pair_revival[_pair_key] = _sup_rel
         elif len(_pool) > 1:
-            _r = _pool[1]
+            # Prefer a losing candidate whose attached quote names
+            # both endpoints of the pair over one at the same
+            # confidence band whose quote names neither (e.g. a
+            # generic "his new mentor" line outranking an explicit
+            # "Gragg would be there at Sobol's side" ally claim).
+            _r = min(
+                _pool[1:],
+                key=lambda s: (
+                    s[0],
+                    0 if _evidence_names_pair(
+                        roster, s[7], s[7].get("evidence", "")) else 1,
+                    s[1], s[2], s[3]))
             _rc = {k: v for k, v in _r[7].items()
                    if not k.startswith("_")}
             # Chapter index rides along, as on the winner: if this
@@ -21738,6 +22723,66 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         _cand_type = _cand.get("type", "")
         if _cand_type in _REL_FAMILY_TYPES:
             _fate = _validate_family_claim(_cand)
+        elif (_cand_type == "other"
+              and hasattr(_DECISION_VALIDATOR, "ask_discovery")
+              and not getattr(_DECISION_VALIDATOR, "disabled", False)):
+            # A revived "other" claim cannot ship unjudged when a
+            # full decision validator is active: if its evidence (or
+            # a binding mined sentence) names both endpoints, ask
+            # discovery to type the bond and then validate that
+            # proposed type; otherwise drop it.
+            _ev = (_cand.get("evidence") or "").strip()
+            _mined = None
+            if not _ev or not _evidence_names_pair(roster, _cand, _ev):
+                _both = _mine(_cand["from"], _cand["to"])
+                if (_both and _both.get("grade") == "binding"
+                        and _evidence_names_pair(
+                            roster, _cand, _both["sentence"])):
+                    _ev = _both["sentence"]
+                    _mined = _both
+                    _cand["evidence_grade"] = "binding"
+                    _cand["evidence_mined"] = _both["sentence"]
+            if _ev and _evidence_names_pair(roster, _cand, _ev):
+                if _mined:
+                    _stamp_provenance(_cand, _ev, _mined["chapter"])
+                if not _dm_budget_claim(1, consumer="rel_nonfamily"):
+                    _cand["validation_note"] = "budget_exhausted"
+                    _fate = "budget"
+                else:
+                    _tel_t0 = time.monotonic()
+                    _dtype, _ddetail = _DECISION_VALIDATOR.ask_discovery(
+                        _cand["from"], _cand["to"], [_ev])
+                    _telemetry_decision_elapsed(
+                        "rel_nonfamily", time.monotonic() - _tel_t0)
+                    if _ddetail is None:
+                        _cand["validation_note"] = "validator_error"
+                        _fate = "error"
+                    elif _dtype and _dtype != "other":
+                        _cand["claimed_type"] = "other"
+                        _frm, _to = (
+                            (_cand["to"], _cand["from"])
+                            if (_ddetail or {}).get("direction") == "ba"
+                            else (_cand["from"], _cand["to"]))
+                        _cp = _canonical_pair(_frm, _to, _dtype)
+                        if _cp:
+                            _cand["from"], _cand["to"], _cand["type"] = _cp
+                        else:
+                            _cand["type"] = _dtype
+                        _cand_type = _cand["type"]
+                        if _cand_type in _REL_FAMILY_TYPES:
+                            _fate = _validate_family_claim(_cand)
+                        else:
+                            _fate = _validate_nonfamily_claim(_cand)
+                    else:
+                        _cand["validation_note"] = (
+                            "dropped" if not preview else "would_drop")
+                        _dropped_relationships.append(_cand)
+                        _fate = "dropped"
+            else:
+                _cand["validation_note"] = (
+                    "dropped" if not preview else "would_drop")
+                _dropped_relationships.append(_cand)
+                _fate = "dropped"
         else:
             _fate = _validate_nonfamily_claim(_cand)
         if _fate == "budget":
@@ -21749,12 +22794,12 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             # this console line carry the budget fact.
             _cand.pop("validation_note", None)
             _fate = "review_required"
-        if preview or _fate not in ("no_evidence", "dropped"):
-            # Write mode + rejected: the class validator already
-            # placed the claim in dropped_relationships; it must
-            # not also ship. Preview changes nothing: the claim
-            # stays visible with its recorded outcome, exactly as
-            # a winning claim's preview outcome stays visible.
+        if _fate not in ("no_evidence", "dropped"):
+            # Rejected revivals: the class validator (or the revived
+            # "other" gate above) already placed the claim in
+            # dropped_relationships under its mode-naming note
+            # ("dropped" in write, "would_drop" in preview); it must
+            # not also ship in relationships in either mode.
             relationships.append(_cand)
         _pub_rel_verdict(_cand, _fate, "revived_runner_up",
                          typ=_cand_type)
@@ -33726,7 +34771,7 @@ _PROFILE_PERSISTABLE = frozenset({
 # not silently redirect where learned state lives).
 _PROFILE_EXCLUDE = frozenset({
     # one-shot commands that dispatch and exit
-    "apply_uncertainty_labels", "auto_update", "backup_state",
+    "apply_rel_types", "apply_uncertainty_labels", "auto_update", "backup_state",
     "calibration_report", "capture_snapshot", "corpus_reembed",
     "corpus_remove", "corpus_snapshot", "corpus_status",
     "corpus_verify_quote", "explain", "ingest", "learn_status",
@@ -33968,6 +35013,10 @@ def _build_parser():
                     action="store_true",
                     help="--stage merge: apply the plan to Supabase "
                          "(requires the wiki-ingestion migration)")
+    g_merge.add_argument("--source-run", dest="source_run", default=None,
+                    metavar="KEY",
+                    help="--stage merge: explicit source_run stamp for "
+                         "published rows (defaults to the merge run key)")
     g_merge.add_argument("--auto-confirm-links", dest="auto_confirm_links",
                     action="store_true", default=None,
                     help="allow exact-name series links to land as "
@@ -35015,8 +36064,10 @@ def main():
 
     if getattr(args, "stage", "all") == "merge":
         if args.analysis:
-            sys.exit(cmd_stage_merge_plan(args.analysis,
-                                          apply=args.apply_merge))
+            sys.exit(cmd_stage_merge_plan(
+                args.analysis,
+                apply=args.apply_merge,
+                source_run=getattr(args, "source_run", None)))
         if not args.file:
             sys.exit("ERROR: --stage merge needs --analysis <dir> [<dir> ...] "
                      "or --file <book> (legacy within-book merge)")
