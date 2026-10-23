@@ -16209,6 +16209,10 @@ _GROUP_NOUNS_ANY_CASE = frozenset({
 })
 # Characters a name may not contain: dialogue marks and symbols.
 _NON_NAME_CHARS = "!?@#$%&*()"
+_PLACEHOLDER_NAMES = frozenset({
+    "none", "null", "n/a", "na", "unknown", "unspecified", "unnamed",
+    "none specified", "not described", "n a",
+})
 
 
 def _is_person_like(name):
@@ -16226,6 +16230,8 @@ def _is_person_like(name):
     if not name or not name.strip():
         return False
     nl = name.strip().lower()
+    if nl in _PLACEHOLDER_NAMES or norm_name(nl) in _PLACEHOLDER_NAMES:
+        return False
     # Plural group nouns: "eva masters", "the guards", "soldiers"
     _group_words = {"masters", "guards", "soldiers", "troops", "workers", "crew",
                     "staff", "team", "committee", "council", "board", "agents"}
@@ -16282,7 +16288,11 @@ def _is_valid_alias(alias):
     if not a:
         return False
     al = a.lower()
+    if al in _PLACEHOLDER_NAMES or norm_name(al) in _PLACEHOLDER_NAMES:
+        return False
     words = [w.strip(".,") for w in al.split()]
+    if any(w in _PLACEHOLDER_NAMES for w in words):
+        return False
     # Possessives: "Sebeck's wife", "Peter's son" — describes a relationship, not a name
     if "'s " in al or al.endswith("'s"):
         return False
@@ -17066,6 +17076,9 @@ def _evidence_names_pair(roster, rel, evidence):
         return False
     for _name in (rel.get("from"), rel.get("to")):
         _forms = _endpoint_forms(roster, _name)
+        _e = roster.get(norm_name(_name)) if isinstance(roster, dict) else None
+        if _e and _e.get("is_pov"):
+            _forms = set(_forms) | {"i", "me", "my", "myself"}
         if not _forms:
             return False
         if not any(re.search(r"(?<!\w)" + re.escape(_f) + r"(?!\w)", text)
@@ -17238,6 +17251,17 @@ def _roster_reconcile(roster, no_pairs=(), prune_only=False):
     no_pairs = [(norm_name(a), norm_name(b))
                 for a, b in (no_pairs or ()) if a and b]
     no_pairs = [(a, b) for a, b in no_pairs if a and b and a != b]
+    # Discard prompt-echoed placeholder names/entries (e.g. "None", "null", "N/A")
+    for _jk in list(roster.keys()):
+        if _jk in _PLACEHOLDER_NAMES or norm_name(roster[_jk].get("name", "")) in _PLACEHOLDER_NAMES:
+            del roster[_jk]
+    for _e in roster.values():
+        _e["aliases"] = {a for a in _e.get("aliases", set())
+                         if norm_name(a) not in _PLACEHOLDER_NAMES and not any(w in _PLACEHOLDER_NAMES for w in a.lower().split())}
+        _e["alias_keys"] = {ak for ak in _e.get("alias_keys", set())
+                            if ak not in _PLACEHOLDER_NAMES and not any(w in _PLACEHOLDER_NAMES for w in ak.split())}
+        _e["unresolved_mentions"] = {u for u in _e.get("unresolved_mentions", set())
+                                     if norm_name(u) not in _PLACEHOLDER_NAMES}
     stats = {"entries_before": len(roster),
              "entries_after": len(roster),
              "variants_merged": 0, "aliases_pruned": 0,
@@ -17875,12 +17899,17 @@ def _jev_fold_quotes(text):
 
 def _jev_form_regex(form_folded):
     """Word-boundary regex for a quote-folded name form, allowing an
-    optional middle initial between the tokens of a 2-token proper
-    name (e.g. 'Charles Taylor' matches 'Charles W. Taylor')."""
+    optional middle initial or given name between tokens (e.g.
+    'Charles Taylor' matches 'Charles W. Taylor', 'General Melgren'
+    matches 'General Augustine Melgren', and 'Special Agent Boerner'
+    matches 'Special Agent Heinrich Boerner')."""
     toks = form_folded.split()
     if len(toks) == 2 and all(t.isalpha() for t in toks):
-        body = (re.escape(toks[0]) + r"\s+(?:[a-z]\.\s+)?"
+        body = (re.escape(toks[0]) + r"\s+(?:[a-z]+\.?\s+)?"
                 + re.escape(toks[1]))
+    elif len(toks) >= 3 and toks[-1].isalpha():
+        body = (re.escape(" ".join(toks[:-1])) + r"\s+(?:[a-z]+\.?\s+)?"
+                + re.escape(toks[-1]))
     else:
         body = re.escape(form_folded)
     prefix = r"\b" if form_folded and form_folded[0].isalnum() else ""
@@ -22096,15 +22125,18 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                             if cc["type"] == t and cc.get("evidence"))
             _co = len(_pair_chapters.get(_pair_key, set()))
             _conf = _rel_confidence(_n_quotes, _co, t)
+            _has_ev = 0 if (c.get("evidence") or "").strip() else 1
+            _names_pair = 0 if _evidence_names_pair(roster, c, c.get("evidence", "")) else 1
             _scored.append((_CONF_RANK[_conf],
+                            _has_ev,
+                            _names_pair,
                             _TYPE_SPEC_RANK[_rel_type_band(t)],
-                            0 if c.get("evidence") else 1,
                             c["_idx"], _conf, _n_quotes, _co, c))
         if not _scored:
             continue
-        # Best: highest confidence, then most specific type, then evidence,
-        # then earliest chapter.
-        _scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
+        # Best: highest confidence, then evidence presence, then whether the
+        # quote names the pair, then most specific type, then earliest chapter.
+        _scored.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
         # The full ranked pool, snapshotted before the family
         # guard narrows _scored: the loser record and the revival
         # candidate are facts about the whole competition, not
@@ -22115,7 +22147,7 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # before the family guard narrows the pool — a contradiction
         # is a fact about everything extraction claimed for the
         # pair, not about whichever subset survives to compete.
-        _contra = _generational_contradiction([s[7] for s in _scored])
+        _contra = _generational_contradiction([s[8] for s in _scored])
         # Family guard: a family claim (spouse/parent/child/sibling) is the
         # canonical winner for its pair. Family types are all "specific"
         # band, so a family claim's matrix confidence is never below medium
@@ -22126,26 +22158,30 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # drop), so when any family candidate exists the winner is chosen
         # from the family pool. The suppressed non-family winner is kept
         # for audit in dropped_relationships.
-        _fam = [s for s in _scored if s[7]["type"] in _REL_FAMILY_TYPES]
-        if _fam and _scored[0][7]["type"] not in _REL_FAMILY_TYPES:
-            _sup = _scored[0]
-            _sup_rel = {k: v for k, v in _sup[7].items()
-                        if not k.startswith("_")}
-            # The candidate's chapter index rides along (see the
-            # winner below): a suppressed claim can revive, and a
-            # revived claim must still resolve to its own chapter.
-            _sup_rel["_idx"] = _sup[7]["_idx"]
-            _sup_rel["confidence"] = _sup[4]
-            _sup_rel["evidence_count"] = _sup[5]
-            _sup_rel["cooccurrence_count"] = _sup[6]
-            _sup_rel["family_guard"] = "suppressed_by_family"
-            _sup_rel["suppressed_by_type"] = _fam[0][7]["type"]
-            _guard_suppressed.append(_sup_rel)
-            print(f"  Family guard: {_sup_rel['from']} / {_sup_rel['to']} "
-                  f"'{_sup_rel['type']}' suppressed by family claim "
-                  f"'{_fam[0][7]['type']}'")
-            _scored = _fam
-        _, _, _, _, _conf, _nq, _co, _w = _scored[0]
+        _fam = [s for s in _scored if s[8]["type"] in _REL_FAMILY_TYPES]
+        if _fam and _scored[0][8]["type"] not in _REL_FAMILY_TYPES:
+            _top_has_ev = bool((_scored[0][8].get("evidence") or "").strip())
+            _fam_has_ev = [s for s in _fam if bool((s[8].get("evidence") or "").strip())]
+            if not _top_has_ev or _fam_has_ev:
+                _eligible_fam = _fam_has_ev if _top_has_ev else _fam
+                _sup = _scored[0]
+                _sup_rel = {k: v for k, v in _sup[8].items()
+                            if not k.startswith("_")}
+                # The candidate's chapter index rides along (see the
+                # winner below): a suppressed claim can revive, and a
+                # revived claim must still resolve to its own chapter.
+                _sup_rel["_idx"] = _sup[8]["_idx"]
+                _sup_rel["confidence"] = _sup[5]
+                _sup_rel["evidence_count"] = _sup[6]
+                _sup_rel["cooccurrence_count"] = _sup[7]
+                _sup_rel["family_guard"] = "suppressed_by_family"
+                _sup_rel["suppressed_by_type"] = _eligible_fam[0][8]["type"]
+                _guard_suppressed.append(_sup_rel)
+                print(f"  Family guard: {_sup_rel['from']} / {_sup_rel['to']} "
+                      f"'{_sup_rel['type']}' suppressed by family claim "
+                      f"'{_eligible_fam[0][8]['type']}'")
+                _scored = _eligible_fam
+        _, _, _, _, _, _conf, _nq, _co, _w = _scored[0]
         _rel = {k: v for k, v in _w.items() if not k.startswith("_")}
         # The candidate's chapter index is the one piece of its
         # internal shape that must survive materialisation:
@@ -22195,35 +22231,37 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             _r = min(
                 _pool[1:],
                 key=lambda s: (
-                    s[0],
-                    0 if _evidence_names_pair(
-                        roster, s[7], s[7].get("evidence", "")) else 1,
-                    s[1], s[2], s[3]))
-            _rc = {k: v for k, v in _r[7].items()
+                    s[0], # confidence
+                    s[1], # has evidence
+                    s[2], # names pair
+                    s[3], # type specificity
+                    s[4])) # chapter index
+            _rc = {k: v for k, v in _r[8].items()
                    if not k.startswith("_")}
             # Chapter index rides along, as on the winner: if this
             # candidate revives it is validated as a claim in its
             # own right, against its own chapter.
-            _rc["_idx"] = _r[7]["_idx"]
-            _rc["confidence"] = _r[4]
-            _rc["evidence_count"] = _r[5]
-            _rc["cooccurrence_count"] = _r[6]
+            _rc["_idx"] = _r[8]["_idx"]
+            _rc["confidence"] = _r[5]
+            _rc["evidence_count"] = _r[6]
+            _rc["cooccurrence_count"] = _r[7]
             if _contra:
                 _rc["direction_contradiction"] = _contra
             _pair_revival[_pair_key] = _rc
         if len(_pool) > 1:
             for _s in _pool:
-                _lc = _s[7]
+                _lc = _s[8]
                 if _lc is _w or (_sup is not None
-                                 and _lc is _sup[7]):
+                                 and _lc is _sup[8]):
                     continue
                 _pair_losers.append({
                     "from": _lc["from"], "to": _lc["to"],
                     "type": _lc["type"],
-                    "confidence": _s[4],
-                    "evidence_count": _s[5],
-                    "cooccurrence_count": _s[6],
+                    "confidence": _s[5],
+                    "evidence_count": _s[6],
+                    "cooccurrence_count": _s[7],
                     "chapter": _lc.get("chapter", ""),
+                    "evidence": _lc.get("evidence", ""),
                     "lost_to_type": _winner_type,
                 })
 
