@@ -17006,7 +17006,7 @@ def _v2_call_b_inner(call, chapter, n_chapters):
 def _roster_canonical(roster, name):
     """Map any name/alias to the roster's canonical name (or the name itself).
 
-    Two passes, in strict order:
+    Three passes, in strict order:
     1. Primary: an exact roster key or primary-key match. A real character's
        own name ALWAYS wins — an entry's alias list can be polluted with
        other people's names (LLM alias errors folded in by _roster_update /
@@ -17016,8 +17016,13 @@ def _roster_canonical(roster, name):
     2. Alias: alias_keys, but only when exactly ONE entry claims the key.
        An alias claimed by two entries is ambiguous; leaving the name
        unresolved is safer than guessing (false merges are worse than
-       unresolved duplicates)."""
+       unresolved duplicates).
+    3. Given name / Nickname: when name is a single token, resolve to an
+       entry whose first name token matches (or matches via common nickname),
+       provided exactly ONE roster entry matches."""
     nkey = norm_name(name)
+    if not nkey or nkey in _PLACEHOLDER_NAMES:
+        return name
     for k, e in roster.items():
         if nkey == k or nkey in e.get("primary_keys", set()):
             return e["name"]
@@ -17025,6 +17030,13 @@ def _roster_canonical(roster, name):
             if nkey in e.get("alias_keys", set())]
     if len(hits) == 1:
         return hits[0]
+    all_titles = _effective_titles() | _PROFESSIONAL_TITLES
+    if " " not in nkey and nkey not in all_titles:
+        base_given = _COMMON_NICKNAMES.get(nkey, nkey)
+        first_hits = [e["name"] for e in roster.values()
+                      if norm_name(e.get("name", "")).split()[:1] in ([nkey], [base_given])]
+        if len(first_hits) == 1:
+            return first_hits[0]
     return name
 
 
@@ -17033,9 +17045,9 @@ def _endpoint_forms(roster, name):
     when the name resolves to no entry.
 
     The forms are the entry's primary and alias keys plus the
-    canonical name itself and its last token (the surname), so a
-    claim naming "Steven Trear" also matches evidence that says
-    "Trear"."""
+    canonical name itself, its last token (the surname), and its
+    first token (given name) when multi-token, so a claim naming
+    'Xaden Riorson' also matches evidence that says 'Xaden' or 'Riorson'."""
     canon = _roster_canonical(roster or {}, name or "")
     entry = (roster or {}).get(norm_name(canon)) if canon else None
     if not isinstance(entry, dict):
@@ -17046,6 +17058,9 @@ def _endpoint_forms(roster, name):
     _toks = norm_name(canon).split()
     if _toks:
         forms.add(_toks[-1])
+        all_titles = _effective_titles() | _PROFESSIONAL_TITLES
+        if len(_toks) >= 2 and _toks[0] not in all_titles:
+            forms.add(_toks[0])
     return {f for f in forms if f}
 
 
@@ -18849,9 +18864,10 @@ def stage_merge_book(roster, chapters, validator=None, no_pairs=(),
             "merge_report": report}
 
 
-def _save_merged_roster_artefact(book_key, seg, *, book_fingerprint,
-                                 extraction_flags_hash,
-                                 extraction_processor_version):
+def _save_merged_roster_artefact(book_key, seg, report=None, *,
+                                 book_fingerprint=None,
+                                 extraction_flags_hash=None,
+                                 extraction_processor_version=None):
     """Write merged-roster.json (the Stage-M artefact) into the
     book's checkpoint directory, atomically. Returns True when the
     artefact is on disk; never raises.
@@ -18875,7 +18891,7 @@ def _save_merged_roster_artefact(book_key, seg, *, book_fingerprint,
         return False  # analyze never writes into the extraction artefact
     if _REPLAY_CTX is not None:
         return False  # replay never writes into the snapshot (spine §3.4)
-    report = seg["merge_report"]
+    report = report or seg.get("merge_report") or {}
     artefact = {
         "book_key": book_key,
         "book_fingerprint": book_fingerprint,
@@ -21930,6 +21946,10 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
     _pov_threshold = max(2, n // 10) if n >= 4 else 1
     povs = sorted(p for p, c in pov_counts.items() if c >= _pov_threshold)
     _pov_set = {p.lower() for p in povs}
+    for p in povs:
+        _pk = norm_name(p)
+        if isinstance(roster, dict) and _pk in roster:
+            roster[_pk]["is_pov"] = True
 
     # --- Characters: from the roster (aliases already merged) ---
     # Keep only characters with a proper name OR 3+ chapter appearances.
@@ -22034,8 +22054,12 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         if idx in _fm_idx:
             continue  # front/back matter: not relationship evidence
         for r in a["relationships"]:
+            if norm_name(r.get("from", "")) in _PLACEHOLDER_NAMES or norm_name(r.get("to", "")) in _PLACEHOLDER_NAMES:
+                continue
             frm = _roster_canonical(roster, r["from"])
             to = _roster_canonical(roster, r["to"])
+            if norm_name(frm) in _PLACEHOLDER_NAMES or norm_name(to) in _PLACEHOLDER_NAMES:
+                continue
             if _rel_involves_author({"from": frm, "to": to}, _book_author):
                 continue
             # Self-relationship guard (after canonicalisation). The origin
@@ -22127,16 +22151,17 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
             _conf = _rel_confidence(_n_quotes, _co, t)
             _has_ev = 0 if (c.get("evidence") or "").strip() else 1
             _names_pair = 0 if _evidence_names_pair(roster, c, c.get("evidence", "")) else 1
+            _prec = _REL_PRECEDENCE.get(t, 99)
             _scored.append((_CONF_RANK[_conf],
                             _has_ev,
+                            _prec,
                             _names_pair,
-                            _TYPE_SPEC_RANK[_rel_type_band(t)],
                             c["_idx"], _conf, _n_quotes, _co, c))
         if not _scored:
             continue
-        # Best: highest confidence, then evidence presence, then whether the
-        # quote names the pair, then most specific type, then earliest chapter.
-        _scored.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
+        # Best: highest confidence, then precedence, then evidence presence,
+        # then whether the quote names the pair, then earliest chapter.
+        _scored.sort(key=lambda x: (x[0], x[2], x[1], x[3], x[4]))
         # The full ranked pool, snapshotted before the family
         # guard narrows _scored: the loser record and the revival
         # candidate are facts about the whole competition, not
@@ -22160,27 +22185,23 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
         # for audit in dropped_relationships.
         _fam = [s for s in _scored if s[8]["type"] in _REL_FAMILY_TYPES]
         if _fam and _scored[0][8]["type"] not in _REL_FAMILY_TYPES:
-            _top_has_ev = bool((_scored[0][8].get("evidence") or "").strip())
-            _fam_has_ev = [s for s in _fam if bool((s[8].get("evidence") or "").strip())]
-            if not _top_has_ev or _fam_has_ev:
-                _eligible_fam = _fam_has_ev if _top_has_ev else _fam
-                _sup = _scored[0]
-                _sup_rel = {k: v for k, v in _sup[8].items()
-                            if not k.startswith("_")}
-                # The candidate's chapter index rides along (see the
-                # winner below): a suppressed claim can revive, and a
-                # revived claim must still resolve to its own chapter.
-                _sup_rel["_idx"] = _sup[8]["_idx"]
-                _sup_rel["confidence"] = _sup[5]
-                _sup_rel["evidence_count"] = _sup[6]
-                _sup_rel["cooccurrence_count"] = _sup[7]
-                _sup_rel["family_guard"] = "suppressed_by_family"
-                _sup_rel["suppressed_by_type"] = _eligible_fam[0][8]["type"]
-                _guard_suppressed.append(_sup_rel)
-                print(f"  Family guard: {_sup_rel['from']} / {_sup_rel['to']} "
-                      f"'{_sup_rel['type']}' suppressed by family claim "
-                      f"'{_eligible_fam[0][8]['type']}'")
-                _scored = _eligible_fam
+            _sup = _scored[0]
+            _sup_rel = {k: v for k, v in _sup[8].items()
+                        if not k.startswith("_")}
+            # The candidate's chapter index rides along (see the
+            # winner below): a suppressed claim can revive, and a
+            # revived claim must still resolve to its own chapter.
+            _sup_rel["_idx"] = _sup[8]["_idx"]
+            _sup_rel["confidence"] = _sup[5]
+            _sup_rel["evidence_count"] = _sup[6]
+            _sup_rel["cooccurrence_count"] = _sup[7]
+            _sup_rel["family_guard"] = "suppressed_by_family"
+            _sup_rel["suppressed_by_type"] = _fam[0][8]["type"]
+            _guard_suppressed.append(_sup_rel)
+            print(f"  Family guard: {_sup_rel['from']} / {_sup_rel['to']} "
+                  f"'{_sup_rel['type']}' suppressed by family claim "
+                  f"'{_fam[0][8]['type']}'")
+            _scored = _fam
         _, _, _, _, _, _conf, _nq, _co, _w = _scored[0]
         _rel = {k: v for k, v in _w.items() if not k.startswith("_")}
         # The candidate's chapter index is the one piece of its
@@ -22232,9 +22253,9 @@ def v2_reduce(chapter_as, chapter_bs, roster, chapters, preview=False,
                 _pool[1:],
                 key=lambda s: (
                     s[0], # confidence
+                    s[2], # precedence
                     s[1], # has evidence
-                    s[2], # names pair
-                    s[3], # type specificity
+                    s[3], # names pair
                     s[4])) # chapter index
             _rc = {k: v for k, v in _r[8].items()
                    if not k.startswith("_")}
@@ -26512,7 +26533,7 @@ _COMMON_NICKNAMES = {
     "ted": "theodore", "liz": "elizabeth", "beth": "elizabeth",
     "betty": "elizabeth", "kate": "katherine", "katie": "katherine",
     "jen": "jennifer", "jenny": "jennifer", "jess": "jessica",
-    "becky": "rebecca", "sue": "susan", "nat": "natalie",
+    "becky": "rebecca", "sue": "susan", "nat": "natalie", "vi": "violet",
 }
 
 # Decision-model merge threshold (Tier 3). Deliberately high: a false merge
